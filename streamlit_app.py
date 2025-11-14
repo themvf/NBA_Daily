@@ -191,6 +191,17 @@ def build_games_table(
         int(row["team_id"]): row for _, row in context_df.iterrows()
     }
 
+    team_lookup_query = """
+        SELECT team_id, full_name, nickname, city
+        FROM teams
+    """
+    team_lookup_df = run_query(db_path, team_lookup_query)
+    team_label_map: Dict[int, str] = {}
+    for _, row in team_lookup_df.iterrows():
+        label = row.get("full_name") or format_team_label(row.get("city"), row.get("nickname"))
+        if label:
+            team_label_map[int(row["team_id"])] = label
+
     def get_context(team_id: int) -> Mapping[str, Any]:
         return context_map.get(team_id, {})
 
@@ -200,6 +211,12 @@ def build_games_table(
             return ""
         value = row.get(column)
         return "" if value is None else str(value)
+
+    def resolve_team_label(team_id: int, city: Any, name: Any) -> str:
+        label = format_team_label(city, name)
+        if label == "TBD":
+            return team_label_map.get(team_id, label)
+        return label
 
     rows: list[Dict[str, Any]] = []
     for _, game in header_df.iterrows():
@@ -217,14 +234,14 @@ def build_games_table(
                 "sort_ts": tipoff_ts,
                 "Start (ET)": tipoff_display,
                 "Status": str(game.get("GAME_STATUS_TEXT") or ""),
-                "Away": format_team_label(
-                    game.get("VISITOR_TEAM_CITY"), game.get("VISITOR_TEAM_NAME")
+                "Away": resolve_team_label(
+                    away_id, game.get("VISITOR_TEAM_CITY"), game.get("VISITOR_TEAM_NAME")
                 ),
                 "Away Record": get_line_stat(away_id, "TEAM_WINS_LOSSES"),
                 "Away Win% (Standings)": format_pct(away_ctx.get("win_pct")),
                 "Away Conf Rank": format_rank(away_ctx.get("conference_rank")),
-                "Home": format_team_label(
-                    game.get("HOME_TEAM_CITY"), game.get("HOME_TEAM_NAME")
+                "Home": resolve_team_label(
+                    home_id, game.get("HOME_TEAM_CITY"), game.get("HOME_TEAM_NAME")
                 ),
                 "Home Record": get_line_stat(home_id, "TEAM_WINS_LOSSES"),
                 "Home Win% (Standings)": format_pct(home_ctx.get("win_pct")),
