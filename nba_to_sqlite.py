@@ -1166,9 +1166,28 @@ def create_team_defense_mix_view(
     conn.commit()
 
 
-def main() -> None:
-    args = parse_args()
-    db_path = Path(args.db_path).expanduser()
+def build_database(
+    *,
+    db_path: str | Path = "nba_stats.db",
+    season: str = "2023-24",
+    season_type: str = "Regular Season",
+    include_rosters: bool = True,
+    throttle_seconds: float = 0.6,
+    shooting_season: str | None = None,
+    shooting_season_type: str | None = None,
+    top_3pt_view_season: str = "2024-25",
+    top_3pt_view_season_type: str | None = None,
+    defense_view_season: str = "2024-25",
+    defense_view_season_type: str | None = None,
+    top_pts_view_season: str = "2024-25",
+    top_pts_view_season_type: str | None = None,
+    defense_pts_view_season: str = "2024-25",
+    defense_pts_view_season_type: str | None = None,
+    defense_mix_view_season: str = "2025-26",
+    defense_mix_view_season_type: str | None = None,
+) -> Path:
+    """Build the NBA SQLite database and return the resulting path."""
+    db_path = Path(db_path).expanduser()
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     try:
@@ -1181,32 +1200,28 @@ def main() -> None:
         player_count = load_players(conn)
         print(f"Upserted {player_count} players.")
 
-        print(
-            f"Loading standings for season {args.season} ({args.season_type}) ..."
-        )
-        standings_count = load_standings(
-            conn, args.season, args.season_type
-        )
+        print(f"Loading standings for season {season} ({season_type}) ...")
+        standings_count = load_standings(conn, season, season_type)
         print(f"Upserted {standings_count} standings rows.")
 
-        if args.include_rosters:
-            print(f"Loading team rosters for {args.season} ...")
+        if include_rosters:
+            print(f"Loading team rosters for {season} ...")
             roster_count = load_team_rosters(
                 conn,
-                args.season,
-                max(args.throttle_seconds, 0.0),
+                season,
+                max(throttle_seconds, 0.0),
             )
             print(f"Upserted {roster_count} roster rows.")
 
-        shooting_season = args.shooting_season or args.season
-        shooting_season_type = args.shooting_season_type or args.season_type
-        three_pt_view_season = args.top_3pt_view_season or shooting_season
+        shooting_season = shooting_season or season
+        shooting_season_type = shooting_season_type or season_type
+        three_pt_view_season = top_3pt_view_season or shooting_season
         three_pt_view_season_type = (
-            args.top_3pt_view_season_type or shooting_season_type
+            top_3pt_view_season_type or shooting_season_type
         )
-        points_view_season = args.top_pts_view_season or shooting_season
+        points_view_season = top_pts_view_season or shooting_season
         points_view_season_type = (
-            args.top_pts_view_season_type or shooting_season_type
+            top_pts_view_season_type or shooting_season_type
         )
 
         def add_unique(targets, season, season_type):
@@ -1263,21 +1278,21 @@ def main() -> None:
             f"{points_view_season} ({points_view_season_type})."
         )
 
-        defense_view_season = args.defense_view_season or shooting_season
+        defense_view_season = defense_view_season or shooting_season
         defense_view_season_type = (
-            args.defense_view_season_type or shooting_season_type
+            defense_view_season_type or shooting_season_type
         )
         defense_pts_view_season = (
-            args.defense_pts_view_season or defense_view_season
+            defense_pts_view_season or defense_view_season
         )
         defense_pts_view_season_type = (
-            args.defense_pts_view_season_type or defense_view_season_type
+            defense_pts_view_season_type or defense_view_season_type
         )
         defense_mix_view_season = (
-            args.defense_mix_view_season or defense_pts_view_season
+            defense_mix_view_season or defense_pts_view_season
         )
         defense_mix_view_season_type = (
-            args.defense_mix_view_season_type or defense_pts_view_season_type
+            defense_mix_view_season_type or defense_pts_view_season_type
         )
 
         team_log_targets: List[tuple[str, str]] = []
@@ -1337,6 +1352,12 @@ def main() -> None:
     finally:
         conn.close()
     print(f"Database ready at {db_path}")
+    return db_path
+
+
+def main() -> None:
+    args = parse_args()
+    build_database(**vars(args))
 
 
 if __name__ == "__main__":

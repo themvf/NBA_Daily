@@ -7,13 +7,18 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Dict, Iterable
 
 import pandas as pd
 import streamlit as st
 
+from nba_to_sqlite import build_database
+
 DEFAULT_DB_PATH = Path(__file__).with_name("nba_stats.db")
 DEFAULT_PREDICTIONS_PATH = Path(__file__).with_name("predictions.csv")
+DEFAULT_SEASON = "2024-25"
+DEFAULT_SEASON_TYPE = "Regular Season"
+DEFAULT_DEFENSE_MIX_SEASON = "2025-26"
 
 st.set_page_config(page_title="NBA Daily Insights", layout="wide", initial_sidebar_state="expanded")
 st.title("NBA Daily Insights")
@@ -59,19 +64,43 @@ def persist_uploaded_file(file, suffix: str) -> Path:
     return temp_path
 
 
+def normalize_optional(text: str | None) -> str | None:
+    if text is None:
+        return None
+    cleaned = text.strip()
+    return cleaned or None
+
+
+def rebuild_database(config: Dict[str, Any], reason: str) -> bool:
+    try:
+        with st.spinner(
+            f"{reason} (season {config['season']} - {config['season_type']}). "
+            "This can take several minutes while the NBA API is queried."
+        ):
+            build_database(**config)
+        st.cache_data.clear()
+        st.success("Database refreshed from the NBA API.")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Database rebuild failed: {exc}")
+        return False
+
+
 if "db_path_input" not in st.session_state:
     st.session_state["db_path_input"] = str(DEFAULT_DB_PATH)
 if "predictions_path_input" not in st.session_state:
     st.session_state["predictions_path_input"] = str(DEFAULT_PREDICTIONS_PATH)
+if "auto_build_attempted" not in st.session_state:
+    st.session_state["auto_build_attempted"] = False
 
 with st.sidebar:
     st.header("Data Inputs")
 
-    db_path_input = st.text_input(
+    st.text_input(
         "SQLite database path",
         value=st.session_state["db_path_input"],
         key="db_path_input",
-        help="Point to an existing nba_stats.db or upload one below.",
+        help="Point to an existing nba_stats.db or let the app build one automatically.",
     )
 
     uploaded_db = st.file_uploader(
@@ -84,7 +113,7 @@ with st.sidebar:
         st.session_state["db_path_input"] = str(saved_db_path)
         st.success(f"Uploaded database stored at {saved_db_path}")
 
-    predictions_path_input = st.text_input(
+    st.text_input(
         "Predictions CSV (optional)",
         value=st.session_state["predictions_path_input"],
         key="predictions_path_input",
@@ -104,14 +133,114 @@ with st.sidebar:
         st.cache_data.clear()
         st.success("Caches cleared. Rerun queries to refresh.")
 
+    with st.expander("NBA API Builder", expanded=False):
+        builder_season = st.text_input(
+            "Season label (e.g., 2024-25)",
+            value=DEFAULT_SEASON,
+            key="builder_season",
+        )
+        builder_season_type = st.selectbox(
+            "Season type",
+            options=[DEFAULT_SEASON_TYPE, "Playoffs", "Pre Season"],
+            index=0,
+            key="builder_season_type",
+        )
+        builder_include_rosters = st.checkbox(
+            "Include team rosters",
+            value=True,
+            key="builder_include_rosters",
+        )
+        builder_throttle = st.slider(
+            "Throttle between API calls (seconds)",
+            min_value=0.0,
+            max_value=2.0,
+            value=0.6,
+            step=0.1,
+            key="builder_throttle",
+        )
+        shooting_season_override = st.text_input(
+            "Shooting season override (optional)",
+            placeholder="Leave blank to mirror season above",
+            key="builder_shooting_season",
+        )
+        shooting_type_override = st.text_input(
+            "Shooting season type override (optional)",
+            placeholder="Leave blank to mirror season type above",
+            key="builder_shooting_type",
+        )
+        link_views = st.checkbox(
+            "Use the same season for leader/defense views",
+            value=True,
+            key="builder_link_views",
+        )
+
+        def get_view_input(label: str, key: str, default: str) -> str:
+            return st.text_input(
+                label,
+                value=default,
+                key=key,
+            )
+
+        three_pt_view_season = builder_season
+        points_view_season = builder_season
+        defense_view_season = builder_season
+        defense_pts_view_season = builder_season
+        defense_mix_view_season = DEFAULT_DEFENSE_MIX_SEASON
+        if not link_views:
+            three_pt_view_season = get_view_input(
+                "3PT leaderboard season", "builder_three_pt_view", builder_season
+            )
+            points_view_season = get_view_input(
+                "Points leaderboard season", "builder_points_view", builder_season
+            )
+            defense_view_season = get_view_input(
+                "3PT defense season", "builder_defense_view", builder_season
+            )
+            defense_pts_view_season = get_view_input(
+                "Points allowed season", "builder_defense_pts_view", builder_season
+            )
+            defense_mix_view_season = get_view_input(
+                "Defense mix season", "builder_defense_mix_view", DEFAULT_DEFENSE_MIX_SEASON
+            )
+
+        builder_config: Dict[str, Any] = {
+            "db_path": st.session_state["db_path_input"],
+            "season": builder_season.strip() or DEFAULT_SEASON,
+            "season_type": builder_season_type,
+            "include_rosters": builder_include_rosters,
+            "throttle_seconds": float(builder_throttle),
+            "shooting_season": normalize_optional(shooting_season_override),
+            "shooting_season_type": normalize_optional(shooting_type_override),
+            "top_3pt_view_season": three_pt_view_season.strip() or builder_season,
+            "top_3pt_view_season_type": None,
+            "top_pts_view_season": points_view_season.strip() or builder_season,
+            "top_pts_view_season_type": None,
+            "defense_view_season": defense_view_season.strip() or builder_season,
+            "defense_view_season_type": None,
+            "defense_pts_view_season": defense_pts_view_season.strip() or builder_season,
+            "defense_pts_view_season_type": None,
+            "defense_mix_view_season": defense_mix_view_season.strip() or builder_season,
+            "defense_mix_view_season_type": None,
+        }
+
+        if st.button("Rebuild database from NBA API", use_container_width=True):
+            st.session_state["auto_build_attempted"] = True
+            rebuild_database(builder_config, "Manual rebuild requested")
+
 db_path = Path(st.session_state["db_path_input"]).expanduser()
 if not db_path.exists():
-    st.warning(
-        f"SQLite database not found at `{db_path}`. "
-        "Run `python nba_to_sqlite.py` locally, upload the output via the sidebar, "
-        "or point to a mounted location."
-    )
-    st.stop()
+    if not st.session_state["auto_build_attempted"]:
+        st.session_state["auto_build_attempted"] = True
+        st.info("No local database found. Building from the NBA API now...")
+        build_ok = rebuild_database(builder_config, "Automatic rebuild")
+        if not build_ok:
+            st.stop()
+        db_path = Path(st.session_state["db_path_input"]).expanduser()
+    else:
+        st.error(
+            f"SQLite database not found at `{db_path}` even after rebuild attempts."
+        )
+        st.stop()
 
 # Key metrics ---------------------------------------------------------------
 summary_queries = {
