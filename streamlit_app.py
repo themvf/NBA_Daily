@@ -158,12 +158,11 @@ def format_rank(value: Any) -> str:
 
 
 @st.cache_data(ttl=300)
-def fetch_scoreboard_frames(game_date_str: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def fetch_scoreboard_frames(game_date_str: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     scoreboard = scoreboardv2.ScoreboardV2(game_date=game_date_str, league_id="00")
     return (
         scoreboard.game_header.get_data_frame(),
         scoreboard.line_score.get_data_frame(),
-        scoreboard.broadcasts.get_data_frame(),
     )
 
 
@@ -173,25 +172,13 @@ def build_games_table(
     context_season: str,
     context_season_type: str,
 ) -> pd.DataFrame:
-    header_df, line_df, broadcast_df = fetch_scoreboard_frames(format_game_date_str(game_date))
+    header_df, line_df = fetch_scoreboard_frames(format_game_date_str(game_date))
     if header_df.empty:
         return pd.DataFrame()
 
     line_lookup: Dict[int, Mapping[str, Any]] = {}
     for _, line in line_df.iterrows():
         line_lookup[int(line["TEAM_ID"])] = line
-
-    broadcast_map: Dict[str, str] = {}
-    if not broadcast_df.empty:
-        grouped = (
-            broadcast_df.groupby("GAME_ID")["BROADCAST_DISPLAY"]
-            .apply(
-                lambda items: ", ".join(
-                    sorted({str(item) for item in items if isinstance(item, str) and item.strip()})
-                )
-            )
-        )
-        broadcast_map = grouped.to_dict()
 
     context_query = """
         SELECT team_id, wins, losses, win_pct, conference_rank, division_rank
@@ -222,9 +209,7 @@ def build_games_table(
         arena = safe_text(game.get("ARENA_NAME"))
         city = safe_text(game.get("HOME_TEAM_CITY"))
         arena_display = f"{arena} ({city})" if arena and city else arena or city
-        national_tv = broadcast_map.get(game["GAME_ID"]) or str(
-            game.get("NATL_TV_BROADCASTER_ABBREVIATION") or ""
-        )
+        national_tv = str(game.get("NATL_TV_BROADCASTER_ABBREVIATION") or "")
         away_ctx = get_context(away_id)
         home_ctx = get_context(home_id)
         rows.append(
