@@ -6,11 +6,19 @@ from __future__ import annotations
 
 import sqlite3
 import tempfile
+from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable
+from typing import Any, Dict, Iterable, Mapping, Tuple
 
 import pandas as pd
 import streamlit as st
+
+try:
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover - fallback for Windows builds without tzdata
+    ZoneInfo = None
+
+from nba_api.stats.endpoints import scoreboardv2
 
 from nba_to_sqlite import build_database
 
@@ -19,6 +27,18 @@ DEFAULT_PREDICTIONS_PATH = Path(__file__).with_name("predictions.csv")
 DEFAULT_SEASON = "2024-25"
 DEFAULT_SEASON_TYPE = "Regular Season"
 DEFAULT_DEFENSE_MIX_SEASON = "2025-26"
+
+
+def _resolve_eastern_zone() -> timezone:
+    if ZoneInfo is not None:
+        try:
+            return ZoneInfo("America/New_York")
+        except Exception:
+            return timezone.utc
+    return timezone.utc
+
+
+EASTERN_TZ = _resolve_eastern_zone()
 
 st.set_page_config(page_title="NBA Daily Insights", layout="wide", initial_sidebar_state="expanded")
 st.title("NBA Daily Insights")
@@ -62,6 +82,178 @@ def persist_uploaded_file(file, suffix: str) -> Path:
     with open(temp_path, "wb") as handle:
         handle.write(file.getbuffer())
     return temp_path
+
+
+def default_game_date() -> date:
+    return datetime.now(EASTERN_TZ).date()
+
+
+def format_game_date_str(target: date) -> str:
+    return target.strftime("%m/%d/%Y")
+
+
+def parse_game_datetime(value: object) -> datetime | None:
+    if value is None:
+        return None
+    value_str = str(value)
+    if not value_str:
+        return None
+    if value_str.endswith("Z"):
+        value_str = value_str.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(value_str)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=EASTERN_TZ)
+    else:
+        dt = dt.astimezone(EASTERN_TZ)
+    return dt
+
+
+def format_tipoff_display(row: Mapping[str, Any]) -> Tuple[str, float]:
+    dt = parse_game_datetime(row.get("GAME_DATE_EST"))
+    default_display = "TBD"
+    timestamp = 0.0
+    if dt:
+        timestamp = dt.timestamp()
+        default_display = dt.strftime("%I:%M %p ET").lstrip("0")
+    status = str(row.get("GAME_STATUS_TEXT") or "").strip()
+    if status and status.lower() not in {"scheduled"}:
+        return status, timestamp
+    return default_display, timestamp
+
+
+def safe_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float) and pd.isna(value):
+        return ""
+    return str(value)
+
+
+def format_team_label(city: Any, name: Any) -> str:
+    parts = [safe_text(city), safe_text(name)]
+    label = " ".join(part for part in parts if part).strip()
+    return label or "TBD"
+
+
+def format_pct(value: Any) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    try:
+        return f"{float(value):.3f}"
+    except (TypeError, ValueError):
+        return ""
+
+
+def format_rank(value: Any) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    try:
+        rank_int = int(value)
+    except (TypeError, ValueError):
+        return ""
+    return f"#{rank_int}"
+
+
+@st.cache_data(ttl=300)
+def fetch_scoreboard_frames(game_date_str: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    scoreboard = scoreboardv2.ScoreboardV2(game_date=game_date_str, league_id="00")
+    return (
+        scoreboard.game_header.get_data_frame(),
+        scoreboard.line_score.get_data_frame(),
+        scoreboard.broadcasts.get_data_frame(),
+    )
+
+
+def build_games_table(
+    db_path: str,
+    game_date: date,
+    context_season: str,
+    context_season_type: str,
+) -> pd.DataFrame:
+    header_df, line_df, broadcast_df = fetch_scoreboard_frames(format_game_date_str(game_date))
+    if header_df.empty:
+        return pd.DataFrame()
+
+    line_lookup: Dict[int, Mapping[str, Any]] = {}
+    for _, line in line_df.iterrows():
+        line_lookup[int(line["TEAM_ID"])] = line
+
+    broadcast_map: Dict[str, str] = {}
+    if not broadcast_df.empty:
+        grouped = (
+            broadcast_df.groupby("GAME_ID")["BROADCAST_DISPLAY"]
+            .apply(
+                lambda items: ", ".join(
+                    sorted({str(item) for item in items if isinstance(item, str) and item.strip()})
+                )
+            )
+        )
+        broadcast_map = grouped.to_dict()
+
+    context_query = """
+        SELECT team_id, wins, losses, win_pct, conference_rank, division_rank
+        FROM standings
+        WHERE season = ?
+          AND season_type = ?
+    """
+    context_df = run_query(db_path, context_query, params=(context_season, context_season_type))
+    context_map: Dict[int, Mapping[str, Any]] = {
+        int(row["team_id"]): row for _, row in context_df.iterrows()
+    }
+
+    def get_context(team_id: int) -> Mapping[str, Any]:
+        return context_map.get(team_id, {})
+
+    def get_line_stat(team_id: int, column: str) -> str:
+        row = line_lookup.get(team_id)
+        if row is None:
+            return ""
+        value = row.get(column)
+        return "" if value is None else str(value)
+
+    rows: list[Dict[str, Any]] = []
+    for _, game in header_df.iterrows():
+        home_id = int(game["HOME_TEAM_ID"])
+        away_id = int(game["VISITOR_TEAM_ID"])
+        tipoff_display, tipoff_ts = format_tipoff_display(game)
+        arena = safe_text(game.get("ARENA_NAME"))
+        city = safe_text(game.get("HOME_TEAM_CITY"))
+        arena_display = f"{arena} ({city})" if arena and city else arena or city
+        national_tv = broadcast_map.get(game["GAME_ID"]) or str(
+            game.get("NATL_TV_BROADCASTER_ABBREVIATION") or ""
+        )
+        away_ctx = get_context(away_id)
+        home_ctx = get_context(home_id)
+        rows.append(
+            {
+                "sort_ts": tipoff_ts,
+                "Start (ET)": tipoff_display,
+                "Status": str(game.get("GAME_STATUS_TEXT") or ""),
+                "Away": format_team_label(
+                    game.get("VISITOR_TEAM_CITY"), game.get("VISITOR_TEAM_NAME")
+                ),
+                "Away Record": get_line_stat(away_id, "TEAM_WINS_LOSSES"),
+                "Away Win% (Standings)": format_pct(away_ctx.get("win_pct")),
+                "Away Conf Rank": format_rank(away_ctx.get("conference_rank")),
+                "Home": format_team_label(
+                    game.get("HOME_TEAM_CITY"), game.get("HOME_TEAM_NAME")
+                ),
+                "Home Record": get_line_stat(home_id, "TEAM_WINS_LOSSES"),
+                "Home Win% (Standings)": format_pct(home_ctx.get("win_pct")),
+                "Home Conf Rank": format_rank(home_ctx.get("conference_rank")),
+                "Arena": arena_display,
+                "National TV": national_tv,
+                "Series": str(game.get("SERIES_TEXT") or ""),
+            }
+        )
+
+    games_df = pd.DataFrame(rows)
+    if "sort_ts" in games_df.columns:
+        games_df = games_df.sort_values("sort_ts").drop(columns=["sort_ts"])
+    return games_df
 
 
 def normalize_optional(text: str | None) -> str | None:
@@ -258,20 +450,66 @@ for metric_col, (label, query) in zip(metric_cols, summary_queries.items()):
     except Exception as exc:  # noqa: BLE001 - surface errors to the UI
         metric_col.error(f"{label}: {exc}")
 
-tabs = st.tabs(
-    [
-        "Standings",
-        "3PT Leaders",
-        "Scoring Leaders",
-        "3PT Defense",
-        "Points Allowed",
-        "Defense Mix",
-        "Prediction Log",
-    ]
-)
+tab_titles = [
+    "Today's Games",
+    "Standings",
+    "3PT Leaders",
+    "Scoring Leaders",
+    "3PT Defense",
+    "Points Allowed",
+    "Defense Mix",
+    "Prediction Log",
+]
+tabs = st.tabs(tab_titles)
+(
+    games_tab,
+    standings_tab,
+    three_pt_tab,
+    scoring_tab,
+    defense_3pt_tab,
+    defense_pts_tab,
+    defense_mix_tab,
+    predictions_tab,
+) = tabs
+
+# Today's games tab --------------------------------------------------------
+with games_tab:
+    st.subheader("Today's Games (Scoreboard)")
+    selected_date = st.date_input(
+        "Game date",
+        value=default_game_date(),
+        key="scoreboard_date",
+    )
+    context_season = st.text_input(
+        "Standings season for context",
+        value=builder_config["season"],
+        key="scoreboard_context_season",
+    ).strip() or builder_config["season"]
+    context_season_type = st.selectbox(
+        "Season type for context",
+        options=[DEFAULT_SEASON_TYPE, "Playoffs", "Pre Season"],
+        index=0,
+        key="scoreboard_context_season_type",
+    )
+    try:
+        games_df = build_games_table(
+            str(db_path),
+            selected_date,
+            context_season,
+            context_season_type,
+        )
+        if games_df.empty:
+            st.info("No NBA games scheduled for this date per the official scoreboard.")
+        else:
+            render_dataframe(games_df)
+            st.caption(
+                "Data source: nba_api ScoreboardV2 + standings context from the local SQLite database."
+            )
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Unable to load today's games: {exc}")
 
 # Standings tab -------------------------------------------------------------
-with tabs[0]:
+with standings_tab:
     st.subheader("League Standings")
     seasons = fetch_distinct_values(str(db_path), "standings", "season")
     season = st.selectbox("Season", options=seasons, index=0 if seasons else None)
@@ -299,7 +537,7 @@ with tabs[0]:
         st.info("Standings data not available in the database.")
 
 # 3PT Leaders tab ----------------------------------------------------------
-with tabs[1]:
+with three_pt_tab:
     st.subheader("Player 3PT Leaders View")
     row_limit = st.slider("Rows to display", min_value=10, max_value=100, value=25, step=5)
     try:
@@ -322,7 +560,7 @@ with tabs[1]:
         st.warning(f"Three-point leaderboard view not available: {exc}")
 
 # Scoring leaders tab ------------------------------------------------------
-with tabs[2]:
+with scoring_tab:
     st.subheader("Player Scoring Leaders View")
     row_limit_pts = st.slider("Rows to display ", min_value=10, max_value=100, value=25, step=5, key="pts_slider")
     try:
@@ -344,7 +582,7 @@ with tabs[2]:
         st.warning(f"Scoring leaderboard view not available: {exc}")
 
 # 3PT Defense tab ----------------------------------------------------------
-with tabs[3]:
+with defense_3pt_tab:
     st.subheader("Team 3PT Defense View")
     try:
         defense_query = """
@@ -363,7 +601,7 @@ with tabs[3]:
         st.warning(f"3PT defensive view not available: {exc}")
 
 # Points allowed tab -------------------------------------------------------
-with tabs[4]:
+with defense_pts_tab:
     st.subheader("Team Points Allowed View")
     try:
         pts_def_query = """
@@ -381,7 +619,7 @@ with tabs[4]:
         st.warning(f"Points-allowed view not available: {exc}")
 
 # Defense mix tab ----------------------------------------------------------
-with tabs[5]:
+with defense_mix_tab:
     st.subheader("Team Defense Mix (Points vs 3PM)")
     try:
         mix_query = """
@@ -401,7 +639,7 @@ with tabs[5]:
         st.warning(f"Defense mix view not available: {exc}")
 
 # Prediction tab -----------------------------------------------------------
-with tabs[6]:
+with predictions_tab:
     st.subheader("3PT Leader Predictions")
     predictions_path = Path(st.session_state["predictions_path_input"]).expanduser()
     if not predictions_path.exists():
