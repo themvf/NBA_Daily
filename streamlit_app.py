@@ -187,6 +187,11 @@ def build_games_table(
           AND season_type = ?
     """
     context_df = run_query(db_path, context_query, params=(context_season, context_season_type))
+    if not context_df.empty and "conference" in context_df.columns:
+        context_df["computed_conf_rank"] = (
+            context_df.groupby("conference")["win_pct"]
+            .rank(method="min", ascending=False)
+        )
     context_map: Dict[int, Mapping[str, Any]] = {
         int(row["team_id"]): row for _, row in context_df.iterrows()
     }
@@ -218,6 +223,27 @@ def build_games_table(
             return team_label_map.get(team_id, label)
         return label
 
+    def get_record(team_id: int) -> str:
+        record = get_line_stat(team_id, "TEAM_WINS_LOSSES")
+        if record:
+            return record
+        ctx = get_context(team_id)
+        wins = ctx.get("wins")
+        losses = ctx.get("losses")
+        if wins is None or losses is None:
+            return ""
+        try:
+            return f"{int(wins)}-{int(losses)}"
+        except (TypeError, ValueError):
+            return ""
+
+    def get_conf_rank(team_id: int) -> Any:
+        ctx = get_context(team_id)
+        rank_value = ctx.get("conference_rank")
+        if rank_value in (None, "", "None"):
+            rank_value = ctx.get("computed_conf_rank")
+        return rank_value
+
     rows: list[Dict[str, Any]] = []
     for _, game in header_df.iterrows():
         home_id = int(game["HOME_TEAM_ID"])
@@ -237,15 +263,15 @@ def build_games_table(
                 "Away": resolve_team_label(
                     away_id, game.get("VISITOR_TEAM_CITY"), game.get("VISITOR_TEAM_NAME")
                 ),
-                "Away Record": get_line_stat(away_id, "TEAM_WINS_LOSSES"),
+                "Away Record": get_record(away_id),
                 "Away Win% (Standings)": format_pct(away_ctx.get("win_pct")),
-                "Away Conf Rank": format_rank(away_ctx.get("conference_rank")),
+                "Away Conf Rank": format_rank(get_conf_rank(away_id)),
                 "Home": resolve_team_label(
                     home_id, game.get("HOME_TEAM_CITY"), game.get("HOME_TEAM_NAME")
                 ),
-                "Home Record": get_line_stat(home_id, "TEAM_WINS_LOSSES"),
+                "Home Record": get_record(home_id),
                 "Home Win% (Standings)": format_pct(home_ctx.get("win_pct")),
-                "Home Conf Rank": format_rank(home_ctx.get("conference_rank")),
+                "Home Conf Rank": format_rank(get_conf_rank(home_id)),
                 "Arena": arena_display,
                 "National TV": national_tv,
                 "Series": str(game.get("SERIES_TEXT") or ""),
