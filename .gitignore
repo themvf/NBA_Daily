@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+nba_stats.db
+*.sqlite
+*.db
+predictions.csv
+.env
+*.log
