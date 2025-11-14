@@ -5,6 +5,7 @@ Streamlit dashboard for exploring locally built NBA stats.
 from __future__ import annotations
 
 import sqlite3
+import tempfile
 from pathlib import Path
 from typing import Iterable
 
@@ -14,7 +15,7 @@ import streamlit as st
 DEFAULT_DB_PATH = Path(__file__).with_name("nba_stats.db")
 DEFAULT_PREDICTIONS_PATH = Path(__file__).with_name("predictions.csv")
 
-st.set_page_config(page_title="NBA Daily Insights", layout="wide")
+st.set_page_config(page_title="NBA Daily Insights", layout="wide", initial_sidebar_state="expanded")
 st.title("NBA Daily Insights")
 st.caption(
     "Explore league standings, leaderboards, and prediction outputs produced "
@@ -49,21 +50,66 @@ def render_dataframe(df: pd.DataFrame, use_container_width: bool = True) -> None
         st.dataframe(df, use_container_width=use_container_width)
 
 
+def persist_uploaded_file(file, suffix: str) -> Path:
+    temp_dir = Path(tempfile.gettempdir()) / "nba_daily_uploads"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    temp_path = temp_dir / f"upload{suffix}"
+    with open(temp_path, "wb") as handle:
+        handle.write(file.getbuffer())
+    return temp_path
+
+
+if "db_path_input" not in st.session_state:
+    st.session_state["db_path_input"] = str(DEFAULT_DB_PATH)
+if "predictions_path_input" not in st.session_state:
+    st.session_state["predictions_path_input"] = str(DEFAULT_PREDICTIONS_PATH)
+
 with st.sidebar:
     st.header("Data Inputs")
-    db_path_input = st.text_input("SQLite database path", value=str(DEFAULT_DB_PATH))
-    predictions_path_input = st.text_input(
-        "Predictions CSV (optional)", value=str(DEFAULT_PREDICTIONS_PATH)
+
+    db_path_input = st.text_input(
+        "SQLite database path",
+        value=st.session_state["db_path_input"],
+        key="db_path_input",
+        help="Point to an existing nba_stats.db or upload one below.",
     )
+
+    uploaded_db = st.file_uploader(
+        "Upload nba_stats.db",
+        type=["db", "sqlite"],
+        help="Used mainly on Streamlit Cloud; uploads are stored temporarily per session.",
+    )
+    if uploaded_db is not None:
+        saved_db_path = persist_uploaded_file(uploaded_db, suffix=".db")
+        st.session_state["db_path_input"] = str(saved_db_path)
+        st.success(f"Uploaded database stored at {saved_db_path}")
+
+    predictions_path_input = st.text_input(
+        "Predictions CSV (optional)",
+        value=st.session_state["predictions_path_input"],
+        key="predictions_path_input",
+    )
+    uploaded_predictions = st.file_uploader(
+        "Upload predictions.csv",
+        type=["csv"],
+        help="Optional file produced by predict_top_3pm.py for the Predictions tab.",
+        key="predictions_uploader",
+    )
+    if uploaded_predictions is not None:
+        saved_predictions_path = persist_uploaded_file(uploaded_predictions, suffix=".csv")
+        st.session_state["predictions_path_input"] = str(saved_predictions_path)
+        st.success(f"Uploaded predictions stored at {saved_predictions_path}")
+
     if st.button("Clear cached data"):
         st.cache_data.clear()
         st.success("Caches cleared. Rerun queries to refresh.")
 
-db_path = Path(db_path_input).expanduser()
+db_path = Path(st.session_state["db_path_input"]).expanduser()
 if not db_path.exists():
     st.warning(
         f"SQLite database not found at `{db_path}`. "
-        "Run `python nba_to_sqlite.py` locally or update the path in the sidebar."
+        "Run `python nba_to_sqlite.py` locally, upload the output via the sidebar, "
+        "or point to a mounted location."
     )
     st.stop()
 
@@ -228,7 +274,7 @@ with tabs[5]:
 # Prediction tab -----------------------------------------------------------
 with tabs[6]:
     st.subheader("3PT Leader Predictions")
-    predictions_path = Path(predictions_path_input).expanduser()
+    predictions_path = Path(st.session_state["predictions_path_input"]).expanduser()
     if not predictions_path.exists():
         st.info("No predictions CSV detected. Run `predict_top_3pm.py` with `--output-predictions`.")
     else:
