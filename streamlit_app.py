@@ -24,9 +24,9 @@ from nba_to_sqlite import build_database
 
 DEFAULT_DB_PATH = Path(__file__).with_name("nba_stats.db")
 DEFAULT_PREDICTIONS_PATH = Path(__file__).with_name("predictions.csv")
-DEFAULT_SEASON = "2024-25"
+DEFAULT_SEASON = "2025-26"
 DEFAULT_SEASON_TYPE = "Regular Season"
-DEFAULT_DEFENSE_MIX_SEASON = "2025-26"
+DEFAULT_DEFENSE_MIX_SEASON = "2026-27"
 
 
 def _resolve_eastern_zone() -> timezone:

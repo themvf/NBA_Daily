@@ -25,7 +25,7 @@ Once the SQLite file exists, launch the dashboard locally:
 streamlit run streamlit_app.py
 ```
 
-When the app boots it checks for `nba_stats.db`. If the file is missing it automatically rebuilds it by calling the same pipeline as `nba_to_sqlite.py` using the seasons configured in the sidebar’s “NBA API Builder” section. Manual rebuilds are available via a button, and you can still point the sidebar inputs to an alternate path or uploaded file if you prefer a pre-generated snapshot. The “Today’s Games” tab calls the NBA Scoreboard API on demand to show the current day’s matchups (with standings context pulled from the local database), so you can scan upcoming tip-offs alongside the historical leaderboards.
+When the app boots it checks for `nba_stats.db`. If the file is missing it automatically rebuilds it by calling the same pipeline as `nba_to_sqlite.py` using the seasons configured in the sidebar’s “NBA API Builder” section (defaults to the current season, 2025-26). Manual rebuilds are available via a button, and you can still point the sidebar inputs to an alternate path or uploaded file if you prefer a pre-generated snapshot. The “Today’s Games” tab calls the NBA Scoreboard API on demand to show the current day’s matchups (with standings context pulled from the local database), so you can scan upcoming tip-offs alongside the historical leaderboards.
 
 Key options:
 
