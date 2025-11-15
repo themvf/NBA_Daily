@@ -175,6 +175,49 @@ def prepare_weighted_scores(
     return filtered.sort_values("weighted_score", ascending=False)
 
 
+@st.cache_data(ttl=300)
+def load_team_scoring_stats(
+    db_path: str,
+    season: str,
+    season_type: str,
+) -> pd.DataFrame:
+    query = """
+        SELECT team_id, pts, fg3m, game_date
+        FROM team_game_logs
+        WHERE season = ?
+          AND season_type = ?
+    """
+    df = run_query(db_path, query, params=(season, season_type))
+    if df.empty:
+        return df
+    df["team_id"] = pd.to_numeric(df["team_id"], errors="coerce")
+    df["pts"] = pd.to_numeric(df["pts"], errors="coerce")
+    df["fg3m"] = pd.to_numeric(df["fg3m"], errors="coerce")
+    df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
+    df = df.dropna(subset=["team_id", "pts"])
+    aggregates = (
+        df.groupby("team_id")
+        .agg(
+            games_played=("pts", "count"),
+            total_pts=("pts", "sum"),
+            avg_pts=("pts", "mean"),
+            median_pts=("pts", "median"),
+            median_fg3m=("fg3m", "median"),
+        )
+        .reset_index()
+    )
+    last5 = (
+        df.sort_values("game_date")
+        .groupby("team_id")
+        .tail(5)
+        .groupby("team_id")["pts"]
+        .median()
+        .reset_index(name="median_pts_last5")
+    )
+    aggregates = aggregates.merge(last5, on="team_id", how="left")
+    return aggregates
+
+
 def default_game_date() -> date:
     return datetime.now(EASTERN_TZ).date()
 
@@ -248,6 +291,18 @@ def format_rank(value: Any) -> str:
     return f"#{rank_int}"
 
 
+def format_number(value: Any, decimals: int = 1) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if decimals <= 0:
+        return f"{number:.0f}"
+    return f"{number:.{decimals}f}"
+
+
 @st.cache_data(ttl=300)
 def fetch_scoreboard_frames(game_date_str: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     scoreboard = scoreboardv2.ScoreboardV2(game_date=game_date_str, league_id="00")
@@ -298,6 +353,11 @@ def build_games_table(
         if label:
             team_label_map[int(row["team_id"])] = label
 
+    scoring_df = load_team_scoring_stats(db_path, context_season, context_season_type)
+    scoring_map: Dict[int, Mapping[str, Any]] = {
+        int(row["team_id"]): row for _, row in scoring_df.iterrows()
+    }
+
     def get_context(team_id: int) -> Mapping[str, Any]:
         return context_map.get(team_id, {})
 
@@ -335,6 +395,12 @@ def build_games_table(
             rank_value = ctx.get("computed_conf_rank")
         return rank_value
 
+    def get_scoring_stat(team_id: int, column: str, decimals: int) -> str:
+        stats = scoring_map.get(team_id)
+        if not stats:
+            return ""
+        return format_number(stats.get(column), decimals)
+
     rows: list[Dict[str, Any]] = []
     for _, game in header_df.iterrows():
         home_id = int(game["HOME_TEAM_ID"])
@@ -360,12 +426,22 @@ def build_games_table(
                 "Away Record": get_record(away_id),
                 "Away Win% (Standings)": format_pct(away_ctx.get("win_pct")),
                 "Away Conf Rank": format_rank(get_conf_rank(away_id)),
+                "Away Total Pts": get_scoring_stat(away_id, "total_pts", 0),
+                "Away Avg Pts": get_scoring_stat(away_id, "avg_pts", 1),
+                "Away Median Pts": get_scoring_stat(away_id, "median_pts", 1),
+                "Away Median 3PM": get_scoring_stat(away_id, "median_fg3m", 1),
+                "Away Last5 Median Pts": get_scoring_stat(away_id, "median_pts_last5", 1),
                 "Home": resolve_team_label(
                     home_id, game.get("HOME_TEAM_CITY"), game.get("HOME_TEAM_NAME")
                 ),
                 "Home Record": get_record(home_id),
                 "Home Win% (Standings)": format_pct(home_ctx.get("win_pct")),
                 "Home Conf Rank": format_rank(get_conf_rank(home_id)),
+                "Home Total Pts": get_scoring_stat(home_id, "total_pts", 0),
+                "Home Avg Pts": get_scoring_stat(home_id, "avg_pts", 1),
+                "Home Median Pts": get_scoring_stat(home_id, "median_pts", 1),
+                "Home Median 3PM": get_scoring_stat(home_id, "median_fg3m", 1),
+                "Home Last5 Median Pts": get_scoring_stat(home_id, "median_pts_last5", 1),
                 "Arena": arena_display,
                 "National TV": national_tv,
                 "Series": str(game.get("SERIES_TEXT") or ""),
