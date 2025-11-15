@@ -26,7 +26,7 @@ DEFAULT_DB_PATH = Path(__file__).with_name("nba_stats.db")
 DEFAULT_PREDICTIONS_PATH = Path(__file__).with_name("predictions.csv")
 DEFAULT_SEASON = "2025-26"
 DEFAULT_SEASON_TYPE = "Regular Season"
-DEFAULT_DEFENSE_MIX_SEASON = "2026-27"
+DEFAULT_DEFENSE_MIX_SEASON = "2025-26"
 MATCHUP_INTERNAL_COLUMNS = ["away_team_id", "home_team_id", "game_id"]
 WEIGHT_METRIC_MAP = {
     "avg": "avg_points",
