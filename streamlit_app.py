@@ -271,6 +271,56 @@ def load_team_scoring_stats(
     return aggregates
 
 
+@st.cache_data(ttl=300)
+def load_team_defense_stats(
+    db_path: str,
+    season: str,
+    season_type: str,
+) -> pd.DataFrame:
+    query = """
+        SELECT team_id, opp_pts, game_date
+        FROM team_game_logs
+        WHERE season = ?
+          AND season_type = ?
+    """
+    df = run_query(db_path, query, params=(season, season_type))
+    if df.empty:
+        return df
+    df["team_id"] = pd.to_numeric(df["team_id"], errors="coerce")
+    df["opp_pts"] = pd.to_numeric(df["opp_pts"], errors="coerce")
+    df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
+    df = df.dropna(subset=["team_id", "opp_pts"])
+    aggregates = (
+        df.groupby("team_id")
+        .agg(
+            games_played=("opp_pts", "count"),
+            total_allowed_pts=("opp_pts", "sum"),
+            avg_allowed_pts=("opp_pts", "mean"),
+            median_allowed_pts=("opp_pts", "median"),
+        )
+        .reset_index()
+    )
+
+    def compute_recent(team_df: pd.DataFrame, window: int) -> float | None:
+        subset = team_df.sort_values("game_date", ascending=False).head(window)["opp_pts"].dropna()
+        if subset.empty:
+            return None
+        return subset.mean()
+
+    recent_records = []
+    for team_id, team_df in df.groupby("team_id"):
+        recent_records.append(
+            {
+                "team_id": team_id,
+                "avg_allowed_pts_last3": compute_recent(team_df, 3),
+                "avg_allowed_pts_last5": compute_recent(team_df, 5),
+            }
+        )
+    recent_df = pd.DataFrame(recent_records)
+    aggregates = aggregates.merge(recent_df, on="team_id", how="left")
+    return aggregates
+
+
 def default_game_date() -> date:
     return datetime.now(EASTERN_TZ).date()
 
@@ -354,6 +404,17 @@ def format_number(value: Any, decimals: int = 1) -> str:
     if decimals <= 0:
         return f"{number:.0f}"
     return f"{number:.{decimals}f}"
+
+
+def safe_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, float) and pd.isna(value):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 @st.cache_data(ttl=300)
@@ -711,6 +772,7 @@ for metric_col, (label, query) in zip(metric_cols, summary_queries.items()):
 
 tab_titles = [
     "Today's Games",
+    "Matchup Spotlight",
     "Standings",
     "3PT Leaders",
     "Scoring Leaders",
@@ -722,6 +784,7 @@ tab_titles = [
 tabs = st.tabs(tab_titles)
 (
     games_tab,
+    matchup_spotlight_tab,
     standings_tab,
     three_pt_tab,
     scoring_tab,
@@ -730,6 +793,8 @@ tabs = st.tabs(tab_titles)
     defense_mix_tab,
     predictions_tab,
 ) = tabs
+
+matchup_spotlight_rows: list[Dict[str, Any]] = []
 
 # Today's games tab --------------------------------------------------------
 with games_tab:
@@ -794,6 +859,7 @@ with games_tab:
             f"Max: {normalized_weights['max']:.2f}"
         )
     try:
+        matchup_spotlight_rows.clear()
         games_df = build_games_table(
             str(db_path),
             selected_date,
@@ -818,6 +884,14 @@ with games_tab:
                 int(min_games_input),
                 normalized_weights,
             )
+            defense_stats = load_team_defense_stats(
+                str(db_path),
+                context_season,
+                context_season_type,
+            )
+            defense_map: Dict[int, Mapping[str, Any]] = {
+                int(row["team_id"]): row.to_dict() for _, row in defense_stats.iterrows()
+            }
             st.subheader("Top scorers per matchup")
             if leaders_df.empty:
                 st.info(
@@ -842,7 +916,29 @@ with games_tab:
                         )
                         if team_leaders.empty:
                             continue
+                        opponent_id = home_id if team_label == "Away" else away_id
+                        opponent_name = matchup["Home"] if team_label == "Away" else matchup["Away"]
+                        opponent_stats = defense_map.get(int(opponent_id)) if opponent_id is not None else None
+                        opp_avg_allowed = safe_float(opponent_stats.get("avg_allowed_pts")) if opponent_stats else None
+                        opp_recent_allowed = safe_float(
+                            opponent_stats.get("avg_allowed_pts_last5")
+                        ) if opponent_stats else None
                         for _, player in team_leaders.iterrows():
+                            avg_pts_last5 = safe_float(player.get("avg_pts_last5")) or safe_float(
+                                player.get("avg_points")
+                            )
+                            avg_pts_last3 = safe_float(player.get("avg_pts_last3")) or avg_pts_last5
+                            avg_fg3_last3 = safe_float(player.get("avg_fg3m_last3"))
+                            avg_fg3_last5 = safe_float(player.get("avg_fg3m_last5"))
+                            weighted_score = safe_float(player.get("weighted_score")) or 0.0
+                            season_avg_pts = safe_float(player.get("avg_points")) or 0.0
+                            defense_factor = opp_recent_allowed or opp_avg_allowed or 0.0
+                            matchup_score = (
+                                season_avg_pts * 0.4
+                                + (avg_pts_last5 or season_avg_pts) * 0.3
+                                + weighted_score * 10.0 * 0.2
+                                + defense_factor * 0.1
+                            )
                             matchup_rows.append(
                                 {
                                     "Side": team_label,
@@ -861,6 +957,24 @@ with games_tab:
                                     "Score": f"{player['weighted_score']:.2f}",
                                 }
                             )
+                            matchup_spotlight_rows.append(
+                                {
+                                    "Matchup": f"{matchup['Away']} at {matchup['Home']}",
+                                    "Side": team_label,
+                                    "Team": team_name,
+                                    "Player": player["player_name"],
+                                    "Season Avg PPG": season_avg_pts,
+                                    "Last5 Avg PPG": avg_pts_last5,
+                                    "Last3 Avg PPG": avg_pts_last3,
+                                    "Last5 Avg 3PM": avg_fg3_last5,
+                                    "Last3 Avg 3PM": avg_fg3_last3,
+                                    "Opponent": opponent_name,
+                                    "Opp Avg Allowed PPG": opp_avg_allowed,
+                                    "Opp Last5 Avg Allowed": opp_recent_allowed,
+                                    "Weighted Score": weighted_score,
+                                    "Matchup Score": matchup_score,
+                                }
+                            )
                     st.markdown(f"**{matchup['Away']} at {matchup['Home']}**")
                     if matchup_rows:
                         matchup_df = pd.DataFrame(matchup_rows)
@@ -869,6 +983,33 @@ with games_tab:
                         st.caption("No qualified players for this matchup yet.")
     except Exception as exc:  # noqa: BLE001
         st.error(f"Unable to load today's games: {exc}")
+
+# Matchup spotlight tab ----------------------------------------------------
+with matchup_spotlight_tab:
+    st.subheader("Player Matchup Spotlight")
+    if not matchup_spotlight_rows:
+        st.info("Run the Today's Games tab to populate matchup insights.")
+    else:
+        spotlight_df = pd.DataFrame(matchup_spotlight_rows)
+        sort_column = st.selectbox(
+            "Sort by",
+            options=[
+                "Matchup Score",
+                "Season Avg PPG",
+                "Last5 Avg PPG",
+                "Opp Avg Allowed PPG",
+                "Weighted Score",
+            ],
+            index=0,
+        )
+        ascending = st.checkbox("Sort ascending (default descending)", value=False)
+        top_n = st.slider("Rows to display", min_value=10, max_value=200, value=50, step=10)
+        display_df = (
+            spotlight_df.sort_values(sort_column, ascending=ascending)
+            .head(top_n)
+            .reset_index(drop=True)
+        )
+        st.dataframe(display_df, use_container_width=True)
 
 # Standings tab -------------------------------------------------------------
 with standings_tab:
