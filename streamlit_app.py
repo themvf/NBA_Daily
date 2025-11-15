@@ -935,7 +935,28 @@ with defense_mix_tab:
             FROM teams_2026_defense_mix
             ORDER BY pct_points_from_3_total DESC
         """
-        mix_df = run_query(str(db_path), mix_query)
+        try:
+            mix_df = run_query(str(db_path), mix_query)
+        except Exception as inner_exc:
+            if "no such column" in str(inner_exc).lower():
+                fallback_query = """
+                    SELECT team_name,
+                           total_allowed_pts,
+                           median_allowed_pts,
+                           total_allowed_fg3m,
+                           median_allowed_fg3m,
+                           pct_points_from_3_total,
+                           pct_points_from_3_median
+                    FROM teams_2026_defense_mix
+                    ORDER BY pct_points_from_3_total DESC
+                """
+                mix_df = run_query(str(db_path), fallback_query)
+                st.caption(
+                    "Defense mix view missing new assist/rebound columns. "
+                    "Rebuild the database to populate them."
+                )
+            else:
+                raise
         render_dataframe(mix_df)
     except Exception as exc:  # noqa: BLE001
         st.warning(f"Defense mix view not available: {exc}")
