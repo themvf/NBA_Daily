@@ -275,10 +275,29 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             opp_fg3a REAL,
             pts REAL,
             opp_pts REAL,
+            ast REAL,
+            reb REAL,
+            opp_ast REAL,
+            opp_reb REAL,
             PRIMARY KEY (season, season_type, team_id, game_id)
         );
         """
     )
+    alter_columns = [
+        ("team_game_logs", "ast", "REAL"),
+        ("team_game_logs", "reb", "REAL"),
+        ("team_game_logs", "opp_ast", "REAL"),
+        ("team_game_logs", "opp_reb", "REAL"),
+    ]
+    for table, column, col_type in alter_columns:
+        try:
+            conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN {column} {col_type}"
+            )
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" in str(exc).lower():
+                continue
+            raise
     conn.commit()
 
 
@@ -564,6 +583,10 @@ def load_team_game_logs(
                 "opp_fg3a": data.get("opp_fg3a"),
                 "pts": data.get("pts"),
                 "opp_pts": data.get("opp_pts"),
+                "ast": data.get("ast"),
+                "reb": data.get("reb"),
+                "opp_ast": data.get("opp_ast"),
+                "opp_reb": data.get("opp_reb"),
             }
         )
     return upsert_rows(
@@ -1069,7 +1092,9 @@ def create_team_defense_mix_view(
                 t.team_abbreviation,
                 t.game_id,
                 opp.pts AS allowed_pts,
-                opp.fg3m AS allowed_fg3m
+                opp.fg3m AS allowed_fg3m,
+                opp.ast AS allowed_ast,
+                opp.reb AS allowed_reb
             FROM team_game_logs AS t
             JOIN team_game_logs AS opp
                 ON opp.game_id = t.game_id
@@ -1086,7 +1111,11 @@ def create_team_defense_mix_view(
                 SUM(allowed_pts) AS total_allowed_pts,
                 AVG(allowed_pts) AS avg_allowed_pts,
                 SUM(allowed_fg3m) AS total_allowed_fg3m,
-                AVG(allowed_fg3m) AS avg_allowed_fg3m
+                AVG(allowed_fg3m) AS avg_allowed_fg3m,
+                SUM(allowed_ast) AS total_allowed_ast,
+                AVG(allowed_ast) AS avg_allowed_ast,
+                SUM(allowed_reb) AS total_allowed_reb,
+                AVG(allowed_reb) AS avg_allowed_reb
             FROM paired
             GROUP BY team_id
             HAVING COUNT(*) > 0
@@ -1142,6 +1171,10 @@ def create_team_defense_mix_view(
             COALESCE(mp.median_allowed_pts, a.avg_allowed_pts) AS median_allowed_pts,
             a.total_allowed_fg3m,
             COALESCE(mf.median_allowed_fg3m, a.avg_allowed_fg3m) AS median_allowed_fg3m,
+            a.total_allowed_ast,
+            a.avg_allowed_ast,
+            a.total_allowed_reb,
+            a.avg_allowed_reb,
             CASE
                 WHEN a.total_allowed_pts > 0
                     THEN (a.total_allowed_fg3m * 3.0) / a.total_allowed_pts

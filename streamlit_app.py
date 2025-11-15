@@ -845,9 +845,14 @@ with defense_mix_tab:
         mix_query = """
             SELECT team_name,
                    total_allowed_pts,
+                   avg_allowed_pts,
                    total_allowed_fg3m,
                    median_allowed_pts,
                    median_allowed_fg3m,
+                   total_allowed_ast,
+                   avg_allowed_ast,
+                   total_allowed_reb,
+                   avg_allowed_reb,
                    pct_points_from_3_total,
                    pct_points_from_3_median
             FROM teams_2026_defense_mix

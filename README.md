@@ -128,19 +128,25 @@ ORDER BY rank_avg_allowed_pts ASC;
 
 ### Defensive Mix View (Points vs 3PM)
 
-`teams_2026_defense_mix` focuses on how much of each opponent’s scoring (total + median per game) comes from made threes.
+	eams_2026_defense_mix focuses on how much of each opponent's scoring (total + median per game) comes from made threes, and now surfaces assist/rebound volume allowed to show how teams defend playmaking and the glass.
 
-```sql
+`sql
 SELECT team_name,
        total_allowed_pts,
+       avg_allowed_pts,
        median_allowed_pts,
        total_allowed_fg3m,
        median_allowed_fg3m,
+       total_allowed_ast,
+       avg_allowed_ast,
+       total_allowed_reb,
+       avg_allowed_reb,
        pct_points_from_3_total,
        pct_points_from_3_median
 FROM teams_2026_defense_mix
 ORDER BY pct_points_from_3_total DESC;
-```
+`
+
 
 ## Predicting Team 3PM Leaders
 
