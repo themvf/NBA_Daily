@@ -137,6 +137,27 @@ def aggregate_player_scoring(
         )
         .reset_index()
     )
+
+    recent_records = []
+    for (team_id, player_id), player_df in logs_df.groupby(["team_id", "player_id"]):
+        player_df = player_df.sort_values("game_date", ascending=False)
+        def calc_recent(window: int, column: str) -> float | None:
+            subset = player_df.head(window)[column].dropna()
+            if subset.empty:
+                return None
+            return subset.mean()
+        recent_records.append(
+            {
+                "team_id": team_id,
+                "player_id": player_id,
+                "avg_pts_last3": calc_recent(3, "points"),
+                "avg_pts_last5": calc_recent(5, "points"),
+                "avg_fg3m_last3": calc_recent(3, "fg3m"),
+                "avg_fg3m_last5": calc_recent(5, "fg3m"),
+            }
+        )
+    recent_df = pd.DataFrame(recent_records)
+    grouped = grouped.merge(recent_df, on=["team_id", "player_id"], how="left")
     team_names = run_query(
         db_path,
         "SELECT team_id, full_name FROM teams",
@@ -822,6 +843,10 @@ with games_tab:
                                     "Max PPG": f"{player['max_points']:.1f}",
                                     "Avg 3PM": f"{player['avg_fg3m']:.1f}",
                                     "Median 3PM": f"{player['median_fg3m']:.1f}",
+                                    "Last3 Avg Pts": format_number(player.get("avg_pts_last3"), 1),
+                                    "Last3 Avg 3PM": format_number(player.get("avg_fg3m_last3"), 1),
+                                    "Last5 Avg Pts": format_number(player.get("avg_pts_last5"), 1),
+                                    "Last5 Avg 3PM": format_number(player.get("avg_fg3m_last5"), 1),
                                     "Score": f"{player['weighted_score']:.2f}",
                                 }
                             )
