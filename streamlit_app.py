@@ -708,7 +708,8 @@ with games_tab:
                         for _, player in team_leaders.iterrows():
                             matchup_rows.append(
                                 {
-                                    "Team": f"{team_label}: {team_name}",
+                                    "Side": team_label,
+                                    "Team": team_name,
                                     "Player": player["player_name"],
                                     "Games": int(player["games_played"]),
                                     "Avg PPG": f"{player['avg_points']:.1f}",
