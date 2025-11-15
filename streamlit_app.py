@@ -355,7 +355,7 @@ def build_games_table(
 
     scoring_df = load_team_scoring_stats(db_path, context_season, context_season_type)
     scoring_map: Dict[int, Mapping[str, Any]] = {
-        int(row["team_id"]): row for _, row in scoring_df.iterrows()
+        int(row["team_id"]): row.to_dict() for _, row in scoring_df.iterrows()
     }
 
     def get_context(team_id: int) -> Mapping[str, Any]:
