@@ -35,6 +35,7 @@ WEIGHT_METRIC_MAP = {
 }
 DEFAULT_WEIGHTS = {"avg": 0.4, "median": 0.4, "max": 0.2}
 DEFAULT_MIN_GAMES = 10
+TOP_LEADERS_COUNT = 5
 
 
 def _resolve_eastern_zone() -> timezone:
@@ -111,7 +112,8 @@ def aggregate_player_scoring(
         SELECT player_id,
                player_name,
                team_id,
-               points
+               points,
+               fg3m
         FROM player_game_logs
         WHERE season = ?
           AND season_type = ?
@@ -119,17 +121,19 @@ def aggregate_player_scoring(
     logs_df = run_query(db_path, query, params=(season, season_type))
     if logs_df.empty:
         return pd.DataFrame()
-    numeric_cols = ["player_id", "team_id", "points"]
+    numeric_cols = ["player_id", "team_id", "points", "fg3m"]
     for col in numeric_cols:
         logs_df[col] = pd.to_numeric(logs_df[col], errors="coerce")
     logs_df = logs_df.dropna(subset=["player_id", "team_id", "points"])
     grouped = (
-        logs_df.groupby(["team_id", "player_id", "player_name"])["points"]
+        logs_df.groupby(["team_id", "player_id", "player_name"])
         .agg(
-            games_played="count",
-            avg_points="mean",
-            median_points="median",
-            max_points="max",
+            games_played=("points", "count"),
+            avg_points=("points", "mean"),
+            median_points=("points", "median"),
+            max_points=("points", "max"),
+            avg_fg3m=("fg3m", "mean"),
+            median_fg3m=("fg3m", "median"),
         )
         .reset_index()
     )
@@ -697,7 +701,7 @@ with games_tab:
                         ("Home", home_id, matchup["Home"]),
                     ]:
                         team_leaders = leaders_df[leaders_df["team_id"] == team_id].nlargest(
-                            2, "weighted_score"
+                            TOP_LEADERS_COUNT, "weighted_score"
                         )
                         if team_leaders.empty:
                             continue
@@ -710,6 +714,8 @@ with games_tab:
                                     "Avg PPG": f"{player['avg_points']:.1f}",
                                     "Median PPG": f"{player['median_points']:.1f}",
                                     "Max PPG": f"{player['max_points']:.1f}",
+                                    "Avg 3PM": f"{player['avg_fg3m']:.1f}",
+                                    "Median 3PM": f"{player['median_fg3m']:.1f}",
                                     "Score": f"{player['weighted_score']:.2f}",
                                 }
                             )
