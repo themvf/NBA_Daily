@@ -206,15 +206,36 @@ def load_team_scoring_stats(
         )
         .reset_index()
     )
-    last5 = (
-        df.sort_values("game_date")
-        .groupby("team_id")
-        .tail(5)
-        .groupby("team_id")["pts"]
-        .median()
-        .reset_index(name="median_pts_last5")
-    )
-    aggregates = aggregates.merge(last5, on="team_id", how="left")
+    def compute_recent(team_df: pd.DataFrame, window: int, column: str, agg_fn: str) -> float | None:
+        subset = (
+            team_df.sort_values("game_date", ascending=False)
+            .head(window)
+        )
+        if subset.empty:
+            return None
+        values = subset[column].dropna()
+        if values.empty:
+            return None
+        if agg_fn == "mean":
+            return values.mean()
+        if agg_fn == "median":
+            return values.median()
+        return None
+
+    recent_stats = []
+    for team_id, team_df in df.groupby("team_id"):
+        recent_stats.append(
+            {
+                "team_id": team_id,
+                "median_pts_last5": compute_recent(team_df, 5, "pts", "median"),
+                "avg_pts_last5": compute_recent(team_df, 5, "pts", "mean"),
+                "avg_pts_last3": compute_recent(team_df, 3, "pts", "mean"),
+                "avg_fg3m_last3": compute_recent(team_df, 3, "fg3m", "mean"),
+                "avg_fg3m_last5": compute_recent(team_df, 5, "fg3m", "mean"),
+            }
+        )
+    recent_df = pd.DataFrame(recent_stats)
+    aggregates = aggregates.merge(recent_df, on="team_id", how="left")
     return aggregates
 
 
@@ -431,6 +452,10 @@ def build_games_table(
                 "Away Median Pts": get_scoring_stat(away_id, "median_pts", 1),
                 "Away Median 3PM": get_scoring_stat(away_id, "median_fg3m", 1),
                 "Away Last5 Median Pts": get_scoring_stat(away_id, "median_pts_last5", 1),
+                "Away Last3 Avg Pts": get_scoring_stat(away_id, "avg_pts_last3", 1),
+                "Away Last3 Avg 3PM": get_scoring_stat(away_id, "avg_fg3m_last3", 1),
+                "Away Last5 Avg Pts": get_scoring_stat(away_id, "avg_pts_last5", 1),
+                "Away Last5 Avg 3PM": get_scoring_stat(away_id, "avg_fg3m_last5", 1),
                 "Home": resolve_team_label(
                     home_id, game.get("HOME_TEAM_CITY"), game.get("HOME_TEAM_NAME")
                 ),
@@ -442,6 +467,10 @@ def build_games_table(
                 "Home Median Pts": get_scoring_stat(home_id, "median_pts", 1),
                 "Home Median 3PM": get_scoring_stat(home_id, "median_fg3m", 1),
                 "Home Last5 Median Pts": get_scoring_stat(home_id, "median_pts_last5", 1),
+                "Home Last3 Avg Pts": get_scoring_stat(home_id, "avg_pts_last3", 1),
+                "Home Last3 Avg 3PM": get_scoring_stat(home_id, "avg_fg3m_last3", 1),
+                "Home Last5 Avg Pts": get_scoring_stat(home_id, "avg_pts_last5", 1),
+                "Home Last5 Avg 3PM": get_scoring_stat(home_id, "avg_fg3m_last5", 1),
                 "Arena": arena_display,
                 "National TV": national_tv,
                 "Series": str(game.get("SERIES_TEXT") or ""),
