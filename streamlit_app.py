@@ -167,6 +167,16 @@ def aggregate_player_scoring(
         )
 
     recent_df = pd.DataFrame(recent_records)
+    if recent_df.empty:
+        recent_df = pd.DataFrame(
+            columns=[
+                "player_id",
+                "avg_pts_last3",
+                "avg_pts_last5",
+                "avg_fg3m_last3",
+                "avg_fg3m_last5",
+            ]
+        )
     grouped = grouped.merge(latest_team, on="player_id", how="left")
     grouped = grouped.merge(recent_df, on="player_id", how="left")
     team_names = run_query(
@@ -317,6 +327,10 @@ def load_team_defense_stats(
             }
         )
     recent_df = pd.DataFrame(recent_records)
+    if recent_df.empty:
+        recent_df = pd.DataFrame(
+            columns=["team_id", "avg_allowed_pts_last3", "avg_allowed_pts_last5"]
+        )
     aggregates = aggregates.merge(recent_df, on="team_id", how="left")
     return aggregates
 
