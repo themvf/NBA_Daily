@@ -113,7 +113,8 @@ def aggregate_player_scoring(
                player_name,
                team_id,
                points,
-               fg3m
+               fg3m,
+               game_date
         FROM player_game_logs
         WHERE season = ?
           AND season_type = ?
@@ -124,7 +125,8 @@ def aggregate_player_scoring(
     numeric_cols = ["player_id", "team_id", "points", "fg3m"]
     for col in numeric_cols:
         logs_df[col] = pd.to_numeric(logs_df[col], errors="coerce")
-    logs_df = logs_df.dropna(subset=["player_id", "team_id", "points"])
+    logs_df["game_date"] = pd.to_datetime(logs_df["game_date"], errors="coerce")
+    logs_df = logs_df.dropna(subset=["player_id", "team_id", "points", "game_date"])
     grouped = (
         logs_df.groupby(["team_id", "player_id", "player_name"])
         .agg(
