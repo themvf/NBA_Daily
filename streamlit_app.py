@@ -27,6 +27,14 @@ DEFAULT_PREDICTIONS_PATH = Path(__file__).with_name("predictions.csv")
 DEFAULT_SEASON = "2025-26"
 DEFAULT_SEASON_TYPE = "Regular Season"
 DEFAULT_DEFENSE_MIX_SEASON = "2026-27"
+MATCHUP_INTERNAL_COLUMNS = ["away_team_id", "home_team_id", "game_id"]
+WEIGHT_METRIC_MAP = {
+    "avg": "avg_points",
+    "median": "median_points",
+    "max": "max_points",
+}
+DEFAULT_WEIGHTS = {"avg": 0.4, "median": 0.4, "max": 0.2}
+DEFAULT_MIN_GAMES = 10
 
 
 def _resolve_eastern_zone() -> timezone:
@@ -82,6 +90,85 @@ def persist_uploaded_file(file, suffix: str) -> Path:
     with open(temp_path, "wb") as handle:
         handle.write(file.getbuffer())
     return temp_path
+
+
+def normalize_weight_map(weight_map: Dict[str, float]) -> Dict[str, float]:
+    sanitized = {k: max(0.0, float(v)) for k, v in weight_map.items()}
+    total = sum(sanitized.values())
+    if total <= 0:
+        uniform = 1.0 / len(sanitized)
+        return {k: uniform for k in sanitized}
+    return {k: value / total for k, value in sanitized.items()}
+
+
+@st.cache_data(ttl=600)
+def aggregate_player_scoring(
+    db_path: str,
+    season: str,
+    season_type: str,
+) -> pd.DataFrame:
+    query = """
+        SELECT player_id,
+               player_name,
+               team_id,
+               points
+        FROM player_game_logs
+        WHERE season = ?
+          AND season_type = ?
+    """
+    logs_df = run_query(db_path, query, params=(season, season_type))
+    if logs_df.empty:
+        return pd.DataFrame()
+    numeric_cols = ["player_id", "team_id", "points"]
+    for col in numeric_cols:
+        logs_df[col] = pd.to_numeric(logs_df[col], errors="coerce")
+    logs_df = logs_df.dropna(subset=["player_id", "team_id", "points"])
+    grouped = (
+        logs_df.groupby(["team_id", "player_id", "player_name"])["points"]
+        .agg(
+            games_played="count",
+            avg_points="mean",
+            median_points="median",
+            max_points="max",
+        )
+        .reset_index()
+    )
+    team_names = run_query(
+        db_path,
+        "SELECT team_id, full_name FROM teams",
+    )
+    team_names["team_id"] = pd.to_numeric(team_names["team_id"], errors="coerce")
+    grouped = grouped.merge(team_names, on="team_id", how="left")
+    return grouped
+
+
+def prepare_weighted_scores(
+    stats_df: pd.DataFrame,
+    min_games: int,
+    weights: Dict[str, float],
+) -> pd.DataFrame:
+    if stats_df.empty:
+        return pd.DataFrame()
+    filtered = stats_df[stats_df["games_played"] >= max(1, min_games)].copy()
+    if filtered.empty:
+        return filtered
+    for weight_key, column in WEIGHT_METRIC_MAP.items():
+        z_col = f"z_{weight_key}"
+        col_values = filtered[column]
+        std = col_values.std(ddof=0)
+        if std == 0 or pd.isna(std):
+            filtered[z_col] = 0.0
+        else:
+            filtered[z_col] = (col_values - col_values.mean()) / std
+    weighted_score = 0.0
+    for weight_key, weight_value in weights.items():
+        z_col = f"z_{weight_key}"
+        weighted_score += weight_value * filtered.get(z_col, 0.0)
+    filtered["weighted_score"] = weighted_score
+    filtered["team_rank"] = filtered.groupby("team_id")["weighted_score"].rank(
+        method="first", ascending=False
+    )
+    return filtered.sort_values("weighted_score", ascending=False)
 
 
 def default_game_date() -> date:
@@ -257,6 +344,9 @@ def build_games_table(
         home_ctx = get_context(home_id)
         rows.append(
             {
+                "game_id": game["GAME_ID"],
+                "away_team_id": away_id,
+                "home_team_id": home_id,
                 "sort_ts": tipoff_ts,
                 "Start (ET)": tipoff_display,
                 "Status": str(game.get("GAME_STATUS_TEXT") or ""),
@@ -519,6 +609,49 @@ with games_tab:
         index=0,
         key="scoreboard_context_season_type",
     )
+    with st.expander("Matchup leader settings", expanded=False):
+        min_games_input = st.number_input(
+            "Minimum games played",
+            min_value=1,
+            max_value=82,
+            value=DEFAULT_MIN_GAMES,
+            step=1,
+            key="leader_min_games",
+        )
+        weight_cols = st.columns(3)
+        weight_inputs = {
+            "avg": weight_cols[0].number_input(
+                "Weight: Avg PPG",
+                min_value=0.0,
+                max_value=5.0,
+                value=DEFAULT_WEIGHTS["avg"],
+                step=0.1,
+                key="weight_avg_ppg",
+            ),
+            "median": weight_cols[1].number_input(
+                "Weight: Median PPG",
+                min_value=0.0,
+                max_value=5.0,
+                value=DEFAULT_WEIGHTS["median"],
+                step=0.1,
+                key="weight_median_ppg",
+            ),
+            "max": weight_cols[2].number_input(
+                "Weight: Max PPG",
+                min_value=0.0,
+                max_value=5.0,
+                value=DEFAULT_WEIGHTS["max"],
+                step=0.1,
+                key="weight_max_ppg",
+            ),
+        }
+        normalized_weights = normalize_weight_map(weight_inputs)
+        st.caption(
+            "Normalized weights → "
+            f"Avg: {normalized_weights['avg']:.2f}, "
+            f"Median: {normalized_weights['median']:.2f}, "
+            f"Max: {normalized_weights['max']:.2f}"
+        )
     try:
         games_df = build_games_table(
             str(db_path),
@@ -529,10 +662,63 @@ with games_tab:
         if games_df.empty:
             st.info("No NBA games scheduled for this date per the official scoreboard.")
         else:
-            render_dataframe(games_df)
+            display_df = games_df.drop(columns=MATCHUP_INTERNAL_COLUMNS, errors="ignore")
+            render_dataframe(display_df)
             st.caption(
                 "Data source: nba_api ScoreboardV2 + standings context from the local SQLite database."
             )
+            base_stats = aggregate_player_scoring(
+                str(db_path),
+                context_season,
+                context_season_type,
+            )
+            leaders_df = prepare_weighted_scores(
+                base_stats,
+                int(min_games_input),
+                normalized_weights,
+            )
+            st.subheader("Top scorers per matchup")
+            if leaders_df.empty:
+                st.info(
+                    "No qualifying player scoring data yet for the selected season/type. "
+                    "Rebuild the database or adjust the minimum games threshold."
+                )
+            else:
+                for _, matchup in games_df.iterrows():
+                    away_id = matchup.get("away_team_id")
+                    home_id = matchup.get("home_team_id")
+                    if pd.isna(away_id) or pd.isna(home_id):
+                        continue
+                    away_id = int(away_id)
+                    home_id = int(home_id)
+                    matchup_rows: list[Dict[str, Any]] = []
+                    for team_label, team_id, team_name in [
+                        ("Away", away_id, matchup["Away"]),
+                        ("Home", home_id, matchup["Home"]),
+                    ]:
+                        team_leaders = leaders_df[leaders_df["team_id"] == team_id].nlargest(
+                            2, "weighted_score"
+                        )
+                        if team_leaders.empty:
+                            continue
+                        for _, player in team_leaders.iterrows():
+                            matchup_rows.append(
+                                {
+                                    "Team": f"{team_label}: {team_name}",
+                                    "Player": player["player_name"],
+                                    "Games": int(player["games_played"]),
+                                    "Avg PPG": f"{player['avg_points']:.1f}",
+                                    "Median PPG": f"{player['median_points']:.1f}",
+                                    "Max PPG": f"{player['max_points']:.1f}",
+                                    "Score": f"{player['weighted_score']:.2f}",
+                                }
+                            )
+                    st.markdown(f"**{matchup['Away']} at {matchup['Home']}**")
+                    if matchup_rows:
+                        matchup_df = pd.DataFrame(matchup_rows)
+                        st.dataframe(matchup_df, use_container_width=True)
+                    else:
+                        st.caption("No qualified players for this matchup yet.")
     except Exception as exc:  # noqa: BLE001
         st.error(f"Unable to load today's games: {exc}")
 
