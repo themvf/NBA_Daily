@@ -288,31 +288,40 @@ def load_team_defense_stats(
     season_type: str,
 ) -> pd.DataFrame:
     query = """
-        SELECT team_id, opp_pts, game_date
-        FROM team_game_logs
-        WHERE season = ?
-          AND season_type = ?
+        SELECT t.team_id,
+               t.game_date,
+               opp.pts AS allowed_pts
+        FROM team_game_logs AS t
+        JOIN team_game_logs AS opp
+          ON opp.game_id = t.game_id
+         AND opp.team_id <> t.team_id
+        WHERE t.season = ?
+          AND t.season_type = ?
     """
     df = run_query(db_path, query, params=(season, season_type))
     if df.empty:
         return df
     df["team_id"] = pd.to_numeric(df["team_id"], errors="coerce")
-    df["opp_pts"] = pd.to_numeric(df["opp_pts"], errors="coerce")
+    df["allowed_pts"] = pd.to_numeric(df["allowed_pts"], errors="coerce")
     df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
-    df = df.dropna(subset=["team_id", "opp_pts"])
+    df = df.dropna(subset=["team_id", "allowed_pts"])
     aggregates = (
         df.groupby("team_id")
         .agg(
-            games_played=("opp_pts", "count"),
-            total_allowed_pts=("opp_pts", "sum"),
-            avg_allowed_pts=("opp_pts", "mean"),
-            median_allowed_pts=("opp_pts", "median"),
+            games_played=("allowed_pts", "count"),
+            total_allowed_pts=("allowed_pts", "sum"),
+            avg_allowed_pts=("allowed_pts", "mean"),
+            median_allowed_pts=("allowed_pts", "median"),
         )
         .reset_index()
     )
 
     def compute_recent(team_df: pd.DataFrame, window: int) -> float | None:
-        subset = team_df.sort_values("game_date", ascending=False).head(window)["opp_pts"].dropna()
+        subset = (
+            team_df.sort_values("game_date", ascending=False)
+            .head(window)["allowed_pts"]
+            .dropna()
+        )
         if subset.empty:
             return None
         return subset.mean()
