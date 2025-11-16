@@ -582,7 +582,7 @@ def load_team_game_logs(
                 "opp_fg3m": data.get("opp_fg3m"),
                 "opp_fg3a": data.get("opp_fg3a"),
                 "pts": data.get("pts"),
-                "opp_pts": data.get("opp_pts"),
+                "opp_pts": data.get("opp_pts") or data.get("opp_pts"),
                 "ast": data.get("ast"),
                 "reb": data.get("reb"),
                 "opp_ast": data.get("opp_ast"),

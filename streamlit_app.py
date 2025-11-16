@@ -809,6 +809,8 @@ tabs = st.tabs(tab_titles)
 ) = tabs
 
 matchup_spotlight_rows: list[Dict[str, Any]] = []
+daily_power_rows_points: list[Dict[str, Any]] = []
+daily_power_rows_3pm: list[Dict[str, Any]] = []
 
 # Today's games tab --------------------------------------------------------
 with games_tab:
@@ -874,6 +876,8 @@ with games_tab:
         )
     try:
         matchup_spotlight_rows.clear()
+        daily_power_rows_points.clear()
+        daily_power_rows_3pm.clear()
         games_df = build_games_table(
             str(db_path),
             selected_date,
@@ -989,6 +993,34 @@ with games_tab:
                                     "Matchup Score": matchup_score,
                                 }
                             )
+                            daily_power_rows_points.append(
+                                {
+                                    "Matchup": f"{matchup['Away']} at {matchup['Home']}",
+                                    "Player": player["player_name"],
+                                    "Team": team_name,
+                                    "Season Avg PPG": season_avg_pts,
+                                    "Last5 Avg PPG": avg_pts_last5,
+                                    "Opp Avg Allowed PPG": opp_avg_allowed,
+                                    "Opp Last5 Avg Allowed": opp_recent_allowed,
+                                    "Matchup Score": matchup_score,
+                                }
+                            )
+                            daily_power_rows_3pm.append(
+                                {
+                                    "Matchup": f"{matchup['Away']} at {matchup['Home']}",
+                                    "Player": player["player_name"],
+                                    "Team": team_name,
+                                    "Season Avg 3PM": safe_float(player.get("avg_fg3m")),
+                                    "Last5 Avg 3PM": avg_fg3_last5,
+                                    "Opp Avg Allowed PPG": opp_avg_allowed,
+                                    "Opp Last5 Avg Allowed": opp_recent_allowed,
+                                    "Matchup Score": (
+                                        (avg_fg3_last5 or safe_float(player.get("avg_fg3m")) or 0.0) * 0.6
+                                        + (avg_fg3_last3 or safe_float(player.get("avg_fg3m")) or 0.0) * 0.3
+                                        + (opp_recent_allowed or opp_avg_allowed or 0.0) * 0.1
+                                    ),
+                                }
+                            )
                     st.markdown(f"**{matchup['Away']} at {matchup['Home']}**")
                     if matchup_rows:
                         matchup_df = pd.DataFrame(matchup_rows)
@@ -1024,6 +1056,22 @@ with matchup_spotlight_tab:
             .reset_index(drop=True)
         )
         st.dataframe(display_df, use_container_width=True)
+        st.subheader("Daily Power Rankings")
+        col_points, col_3pm = st.columns(2)
+        if daily_power_rows_points:
+            points_df = pd.DataFrame(daily_power_rows_points)
+            points_top = points_df.sort_values("Matchup Score", ascending=False).head(10)
+            col_points.markdown("**Top 10 Players by Matchup Score (Points)**")
+            col_points.dataframe(points_top, use_container_width=True)
+        else:
+            col_points.info("No scoring data yet. Refresh Today's Games.")
+        if daily_power_rows_3pm:
+            threes_df = pd.DataFrame(daily_power_rows_3pm)
+            threes_top = threes_df.sort_values("Matchup Score", ascending=False).head(10)
+            col_3pm.markdown("**Top 10 Players by Matchup Score (3PM)**")
+            col_3pm.dataframe(threes_top, use_container_width=True)
+        else:
+            col_3pm.info("No three-point data yet. Refresh Today's Games.")
 
 # Standings tab -------------------------------------------------------------
 with standings_tab:
