@@ -490,10 +490,12 @@ def build_games_table(
         if label:
             team_label_map[int(row["team_id"])] = label
 
+    scoring_map: Dict[int, Mapping[str, Any]] = {}
     scoring_df = load_team_scoring_stats(db_path, context_season, context_season_type)
-    scoring_map: Dict[int, Mapping[str, Any]] = {
-        int(row["team_id"]): row.to_dict() for _, row in scoring_df.iterrows()
-    }
+    if not scoring_df.empty:
+        scoring_map = {
+            int(row["team_id"]): row.to_dict() for _, row in scoring_df.iterrows()
+        }
 
     def get_context(team_id: int) -> Mapping[str, Any]:
         return context_map.get(team_id, {})
