@@ -454,7 +454,7 @@ def build_games_table(
     game_date: date,
     context_season: str,
     context_season_type: str,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, Dict[int, Mapping[str, Any]]]:
     header_df, line_df = fetch_scoreboard_frames(format_game_date_str(game_date))
     if header_df.empty:
         return pd.DataFrame()
@@ -598,7 +598,7 @@ def build_games_table(
     games_df = pd.DataFrame(rows)
     if "sort_ts" in games_df.columns:
         games_df = games_df.sort_values("sort_ts").drop(columns=["sort_ts"])
-    return games_df
+    return games_df, scoring_map
 
 
 def normalize_optional(text: str | None) -> str | None:
@@ -889,7 +889,7 @@ with games_tab:
         matchup_spotlight_rows.clear()
         daily_power_rows_points.clear()
         daily_power_rows_3pm.clear()
-        games_df = build_games_table(
+        games_df, scoring_map = build_games_table(
             str(db_path),
             selected_date,
             context_season,
