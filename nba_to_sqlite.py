@@ -234,6 +234,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             rebounds REAL,
             assists REAL,
             points REAL,
+            usg_pct REAL,
             PRIMARY KEY (season, season_type, player_id),
             FOREIGN KEY (player_id) REFERENCES players(player_id) ON DELETE CASCADE,
             FOREIGN KEY (team_id) REFERENCES teams(team_id) ON DELETE SET NULL
@@ -297,6 +298,13 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         except sqlite3.OperationalError as exc:
             if "duplicate column name" in str(exc).lower():
                 continue
+            raise
+    try:
+        conn.execute(
+            "ALTER TABLE player_season_totals ADD COLUMN usg_pct REAL"
+        )
+    except sqlite3.OperationalError as exc:
+        if "duplicate column name" not in str(exc).lower():
             raise
     conn.commit()
 
@@ -496,6 +504,43 @@ def load_player_shooting_totals(
         rows,
         ["season", "season_type", "player_id"],
     )
+
+
+def update_player_usage(
+    conn: sqlite3.Connection,
+    season: str,
+    season_type: str,
+) -> int:
+    endpoint = leaguedashplayerstats.LeagueDashPlayerStats(
+        season=season,
+        season_type_all_star=season_type,
+        measure_type_detailed_defense="Advanced",
+        per_mode_detailed="Totals",
+    )
+    df: pd.DataFrame = endpoint.get_data_frames()[0]
+    records = df.to_dict(orient="records")
+    updates: List[tuple[float | None, int, str, str]] = []
+    for record in records:
+        data = lower_keys(record)
+        player_id = safe_int(data.get("player_id"))
+        if player_id is None:
+            continue
+        usg_pct = normalize_float(data.get("usg_pct"))
+        updates.append((usg_pct, player_id, season, season_type))
+    if not updates:
+        return 0
+    conn.executemany(
+        """
+        UPDATE player_season_totals
+        SET usg_pct = ?
+        WHERE player_id = ?
+          AND season = ?
+          AND season_type = ?
+        """,
+        updates,
+    )
+    conn.commit()
+    return len(updates)
 
 
 def load_player_game_logs(
@@ -1279,6 +1324,15 @@ def build_database(
             print(
                 f"Upserted {shooting_count} player shooting rows "
                 f"for {season} ({season_type})."
+            )
+            usage_count = update_player_usage(
+                conn,
+                season,
+                season_type,
+            )
+            print(
+                f"Updated usage% for {usage_count} players "
+                f"in {season} ({season_type})."
             )
 
         player_log_targets: List[tuple[str, str]] = []

@@ -185,6 +185,19 @@ def aggregate_player_scoring(
     )
     team_names["team_id"] = pd.to_numeric(team_names["team_id"], errors="coerce")
     grouped = grouped.merge(team_names, on="team_id", how="left")
+    usage_df = run_query(
+        db_path,
+        """
+        SELECT player_id, usg_pct
+        FROM player_season_totals
+        WHERE season = ?
+          AND season_type = ?
+        """,
+        params=(season, season_type),
+    )
+    if not usage_df.empty:
+        usage_df["player_id"] = pd.to_numeric(usage_df["player_id"], errors="coerce")
+        grouped = grouped.merge(usage_df, on="player_id", how="left")
     return grouped
 
 
@@ -968,6 +981,7 @@ with games_tab:
                             weighted_score = safe_float(player.get("weighted_score")) or 0.0
                             season_avg_pts = safe_float(player.get("avg_points")) or 0.0
                             defense_factor = opp_recent_allowed or opp_avg_allowed or 0.0
+                            usage_pct = safe_float(player.get("usg_pct"))
                             if team_avg_pts and team_avg_pts > 0:
                                 opportunity_index = defense_factor * (season_avg_pts / team_avg_pts)
                             else:
@@ -993,6 +1007,7 @@ with games_tab:
                                     "Last3 Avg 3PM": format_number(player.get("avg_fg3m_last3"), 1),
                                     "Last5 Avg Pts": format_number(player.get("avg_pts_last5"), 1),
                                     "Last5 Avg 3PM": format_number(player.get("avg_fg3m_last5"), 1),
+                                    "Usage %": format_number((usage_pct * 100.0) if usage_pct is not None else None, 1),
                                     "Score": f"{player['weighted_score']:.2f}",
                                 }
                             )
@@ -1010,6 +1025,7 @@ with games_tab:
                                     "Opponent": opponent_name,
                                     "Opp Avg Allowed PPG": opp_avg_allowed,
                                     "Opp Last5 Avg Allowed": opp_recent_allowed,
+                                    "Usage %": (usage_pct * 100.0) if usage_pct is not None else None,
                                     "Weighted Score": weighted_score,
                                     "Matchup Score": matchup_score,
                                 }
@@ -1024,6 +1040,7 @@ with games_tab:
                                     "Opp Avg Allowed PPG": opp_avg_allowed,
                                     "Opp Last5 Avg Allowed": opp_recent_allowed,
                                     "Opportunity Index": opportunity_index,
+                                    "Usage %": (usage_pct * 100.0) if usage_pct is not None else None,
                                     "Matchup Score": matchup_score,
                                 }
                             )
@@ -1037,6 +1054,7 @@ with games_tab:
                                     "Opp Avg Allowed PPG": opp_avg_allowed,
                                     "Opp Last5 Avg Allowed": opp_recent_allowed,
                                     "Opportunity Index": opportunity_index,
+                                    "Usage %": (usage_pct * 100.0) if usage_pct is not None else None,
                                     "Matchup Score": (
                                         (avg_fg3_last5 or safe_float(player.get("avg_fg3m")) or 0.0) * 0.6
                                         + (avg_fg3_last3 or safe_float(player.get("avg_fg3m")) or 0.0) * 0.3
@@ -1078,6 +1096,8 @@ with matchup_spotlight_tab:
             .head(top_n)
             .reset_index(drop=True)
         )
+        if "Usage %" in display_df.columns:
+            display_df["Usage %"] = display_df["Usage %"].map(lambda v: format_number(v, 1))
         st.dataframe(display_df, use_container_width=True)
         st.subheader("Daily Power Rankings")
         col_points, col_3pm = st.columns(2)
@@ -1089,6 +1109,7 @@ with matchup_spotlight_tab:
                     "Opp Avg Allowed PPG": points_top["Opp Avg Allowed PPG"].map(lambda v: format_number(v, 1)),
                     "Opp Last5 Avg Allowed": points_top["Opp Last5 Avg Allowed"].map(lambda v: format_number(v, 1)),
                     "Opportunity Index": points_top["Opportunity Index"].map(lambda v: format_number(v, 2)),
+                    "Usage %": points_top["Usage %"].map(lambda v: format_number(v, 1)),
                 }
             )
             col_points.markdown("**Top 10 Players by Matchup Score (Points)**")
@@ -1103,6 +1124,7 @@ with matchup_spotlight_tab:
                     "Opp Avg Allowed PPG": threes_top["Opp Avg Allowed PPG"].map(lambda v: format_number(v, 1)),
                     "Opp Last5 Avg Allowed": threes_top["Opp Last5 Avg Allowed"].map(lambda v: format_number(v, 1)),
                     "Opportunity Index": threes_top["Opportunity Index"].map(lambda v: format_number(v, 2)),
+                    "Usage %": threes_top["Usage %"].map(lambda v: format_number(v, 1)),
                 }
             )
             col_3pm.markdown("**Top 10 Players by Matchup Score (3PM)**")
