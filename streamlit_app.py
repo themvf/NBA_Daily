@@ -945,11 +945,17 @@ with games_tab:
                             continue
                         opponent_id = home_id if team_label == "Away" else away_id
                         opponent_name = matchup["Home"] if team_label == "Away" else matchup["Away"]
-                        opponent_stats = defense_map.get(int(opponent_id)) if opponent_id is not None else None
+                        opponent_stats = (
+                            defense_map.get(int(opponent_id))
+                            if opponent_id is not None
+                            else None
+                        )
                         opp_avg_allowed = safe_float(opponent_stats.get("avg_allowed_pts")) if opponent_stats else None
                         opp_recent_allowed = safe_float(
                             opponent_stats.get("avg_allowed_pts_last5")
                         ) if opponent_stats else None
+                        team_stats = scoring_map.get(team_id)
+                        team_avg_pts = safe_float(team_stats.get("avg_pts")) if team_stats else None
                         for _, player in team_leaders.iterrows():
                             avg_pts_last5 = safe_float(player.get("avg_pts_last5")) or safe_float(
                                 player.get("avg_points")
@@ -960,6 +966,10 @@ with games_tab:
                             weighted_score = safe_float(player.get("weighted_score")) or 0.0
                             season_avg_pts = safe_float(player.get("avg_points")) or 0.0
                             defense_factor = opp_recent_allowed or opp_avg_allowed or 0.0
+                            if team_avg_pts and team_avg_pts > 0:
+                                opportunity_index = defense_factor * (season_avg_pts / team_avg_pts)
+                            else:
+                                opportunity_index = defense_factor
                             matchup_score = (
                                 season_avg_pts * 0.4
                                 + (avg_pts_last5 or season_avg_pts) * 0.3
@@ -1011,6 +1021,7 @@ with games_tab:
                                     "Last5 Avg PPG": avg_pts_last5,
                                     "Opp Avg Allowed PPG": opp_avg_allowed,
                                     "Opp Last5 Avg Allowed": opp_recent_allowed,
+                                    "Opportunity Index": opportunity_index,
                                     "Matchup Score": matchup_score,
                                 }
                             )
@@ -1023,6 +1034,7 @@ with games_tab:
                                     "Last5 Avg 3PM": avg_fg3_last5,
                                     "Opp Avg Allowed PPG": opp_avg_allowed,
                                     "Opp Last5 Avg Allowed": opp_recent_allowed,
+                                    "Opportunity Index": opportunity_index,
                                     "Matchup Score": (
                                         (avg_fg3_last5 or safe_float(player.get("avg_fg3m")) or 0.0) * 0.6
                                         + (avg_fg3_last3 or safe_float(player.get("avg_fg3m")) or 0.0) * 0.3
@@ -1070,6 +1082,13 @@ with matchup_spotlight_tab:
         if daily_power_rows_points:
             points_df = pd.DataFrame(daily_power_rows_points)
             points_top = points_df.sort_values("Matchup Score", ascending=False).head(10)
+            points_top = points_top.assign(
+                **{
+                    "Opp Avg Allowed PPG": points_top["Opp Avg Allowed PPG"].map(lambda v: format_number(v, 1)),
+                    "Opp Last5 Avg Allowed": points_top["Opp Last5 Avg Allowed"].map(lambda v: format_number(v, 1)),
+                    "Opportunity Index": points_top["Opportunity Index"].map(lambda v: format_number(v, 2)),
+                }
+            )
             col_points.markdown("**Top 10 Players by Matchup Score (Points)**")
             col_points.dataframe(points_top, use_container_width=True)
         else:
@@ -1077,6 +1096,13 @@ with matchup_spotlight_tab:
         if daily_power_rows_3pm:
             threes_df = pd.DataFrame(daily_power_rows_3pm)
             threes_top = threes_df.sort_values("Matchup Score", ascending=False).head(10)
+            threes_top = threes_top.assign(
+                **{
+                    "Opp Avg Allowed PPG": threes_top["Opp Avg Allowed PPG"].map(lambda v: format_number(v, 1)),
+                    "Opp Last5 Avg Allowed": threes_top["Opp Last5 Avg Allowed"].map(lambda v: format_number(v, 1)),
+                    "Opportunity Index": threes_top["Opportunity Index"].map(lambda v: format_number(v, 2)),
+                }
+            )
             col_3pm.markdown("**Top 10 Players by Matchup Score (3PM)**")
             col_3pm.dataframe(threes_top, use_container_width=True)
         else:
