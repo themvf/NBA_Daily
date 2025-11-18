@@ -185,17 +185,20 @@ def aggregate_player_scoring(
     )
     team_names["team_id"] = pd.to_numeric(team_names["team_id"], errors="coerce")
     grouped = grouped.merge(team_names, on="team_id", how="left")
-    usage_df = run_query(
-        db_path,
-        """
-        SELECT player_id, usg_pct
-        FROM player_season_totals
-        WHERE season = ?
-          AND season_type = ?
-        """,
-        params=(season, season_type),
-    )
-    if not usage_df.empty:
+    try:
+        usage_df = run_query(
+            db_path,
+            """
+            SELECT player_id, usg_pct
+            FROM player_season_totals
+            WHERE season = ?
+              AND season_type = ?
+            """,
+            params=(season, season_type),
+        )
+    except Exception:
+        usage_df = pd.DataFrame()
+    if not usage_df.empty and "usg_pct" in usage_df.columns:
         usage_df["player_id"] = pd.to_numeric(usage_df["player_id"], errors="coerce")
         grouped = grouped.merge(usage_df, on="player_id", how="left")
     return grouped
