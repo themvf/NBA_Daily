@@ -456,6 +456,43 @@ def safe_float(value: Any) -> float | None:
         return None
 
 
+def derive_home_away(team_name: str, matchup: str) -> tuple[str, str]:
+    if not matchup:
+        return team_name, ""
+    if " vs. " in matchup:
+        parts = matchup.split(" vs. ")
+        home_team = team_name
+        away_team = parts[1].strip()
+    elif " @ " in matchup:
+        parts = matchup.split(" @ ")
+        away_team = team_name
+        home_team = parts[1].strip()
+    else:
+        home_team = team_name
+        away_team = ""
+    return home_team, away_team
+
+
+def minutes_str_to_float(value: object) -> float | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    value_str = str(value)
+    if ":" in value_str:
+        parts = value_str.split(":")
+        try:
+            minutes = int(parts[0])
+            seconds = int(parts[1])
+            return minutes + seconds / 60.0
+        except ValueError:
+            return None
+    try:
+        return float(value_str)
+    except ValueError:
+        return None
+
+
 @st.cache_data(ttl=300)
 def fetch_scoreboard_frames(game_date_str: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     scoreboard = scoreboardv2.ScoreboardV2(game_date=game_date_str, league_id="00")
@@ -814,6 +851,7 @@ for metric_col, (label, query) in zip(metric_cols, summary_queries.items()):
 tab_titles = [
     "Today's Games",
     "Matchup Spotlight",
+    "Daily Leaders",
     "Standings",
     "3PT Leaders",
     "Scoring Leaders",
@@ -826,6 +864,7 @@ tabs = st.tabs(tab_titles)
 (
     games_tab,
     matchup_spotlight_tab,
+    daily_leaders_tab,
     standings_tab,
     three_pt_tab,
     scoring_tab,
@@ -838,6 +877,7 @@ tabs = st.tabs(tab_titles)
 matchup_spotlight_rows: list[Dict[str, Any]] = []
 daily_power_rows_points: list[Dict[str, Any]] = []
 daily_power_rows_3pm: list[Dict[str, Any]] = []
+daily_top_scorers_rows: list[Dict[str, Any]] = []
 
 # Today's games tab --------------------------------------------------------
 with games_tab:
@@ -1134,6 +1174,102 @@ with matchup_spotlight_tab:
             col_3pm.dataframe(threes_top, use_container_width=True)
         else:
             col_3pm.info("No three-point data yet. Refresh Today's Games.")
+
+        top_scorers_query = """
+            WITH ranked AS (
+                SELECT
+                    player_id,
+                    player_name,
+                    team_name,
+                    game_date,
+                    matchup,
+                    points,
+                    minutes,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY game_date
+                        ORDER BY points DESC
+                    ) AS rn
+                FROM player_game_logs
+                WHERE season = ?
+                  AND season_type = ?
+                  AND points IS NOT NULL
+            )
+            SELECT
+                r.game_date,
+                r.player_name,
+                r.team_name,
+                r.matchup,
+                r.points,
+                r.minutes,
+                pst.usg_pct
+            FROM ranked AS r
+            LEFT JOIN player_season_totals AS pst
+              ON pst.player_id = r.player_id
+             AND pst.season = ?
+             AND pst.season_type = ?
+            WHERE r.rn <= 3
+            ORDER BY r.game_date DESC, r.points DESC
+        """
+        try:
+            top_df = run_query(
+                str(db_path),
+                top_scorers_query,
+                params=(
+                    context_season,
+                    context_season_type,
+                    context_season,
+                    context_season_type,
+                ),
+            )
+            daily_top_scorers_rows.clear()
+            for _, row in top_df.iterrows():
+                game_date = pd.to_datetime(row["game_date"]).date()
+                home_team, away_team = derive_home_away(row["team_name"], row["matchup"])
+                minutes_float = minutes_str_to_float(row["minutes"])
+                usage_pct = safe_float(row["usg_pct"])
+                daily_top_scorers_rows.append(
+                    {
+                        "Date": game_date.isoformat(),
+                        "Player": row["player_name"],
+                        "Home Team": home_team,
+                        "Away Team": away_team,
+                        "Total Points": row["points"],
+                        "Minutes": minutes_float,
+                        "Usage %": (usage_pct * 100.0) if usage_pct is not None else None,
+                    }
+                )
+        except Exception as exc:
+            st.warning(f"Unable to load daily top scorers: {exc}")
+
+# Daily leaders tab --------------------------------------------------------
+with daily_leaders_tab:
+    st.subheader("Daily Top Scorers (Top 3 per day)")
+    if not daily_top_scorers_rows:
+        st.info("Run the Today's Games tab to populate the leaders table.")
+    else:
+        leaders_df = pd.DataFrame(daily_top_scorers_rows)
+        leaders_df["Date"] = pd.to_datetime(leaders_df["Date"])
+        available_dates = sorted(leaders_df["Date"].dt.date.unique(), reverse=True)
+        selected_date = st.selectbox(
+            "Select date",
+            options=available_dates,
+            index=0,
+        )
+        filtered_df = leaders_df[leaders_df["Date"].dt.date == selected_date].copy()
+        filtered_df["Minutes"] = filtered_df["Minutes"].map(lambda v: format_number(v, 1))
+        filtered_df["Usage %"] = filtered_df["Usage %"].map(lambda v: format_number(v, 1))
+        display_df = filtered_df[
+            [
+                "Date",
+                "Player",
+                "Home Team",
+                "Away Team",
+                "Total Points",
+                "Minutes",
+                "Usage %",
+            ]
+        ].reset_index(drop=True)
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
 
 # Standings tab -------------------------------------------------------------
 with standings_tab:
