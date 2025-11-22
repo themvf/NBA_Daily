@@ -1061,7 +1061,6 @@ with games_tab:
                             avg_fg3_last5 = safe_float(player.get("avg_fg3m_last5"))
                             weighted_score = safe_float(player.get("weighted_score")) or 0.0
                             season_avg_pts = safe_float(player.get("avg_points")) or 0.0
-                            defense_factor = opp_recent_allowed or opp_avg_allowed or 0.0
                             usage_pct = safe_float(player.get("usg_pct"))
                             defense_factor = (
                                 opp_recent_allowed
