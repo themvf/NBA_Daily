@@ -457,6 +457,17 @@ def safe_float(value: Any) -> float | None:
         return None
 
 
+def safe_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
 def derive_home_away(team_name: str, matchup: str) -> tuple[str, str]:
     if not matchup:
         return team_name, ""
