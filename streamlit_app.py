@@ -358,6 +358,22 @@ def load_team_defense_stats(
             columns=["team_id", "avg_allowed_pts_last3", "avg_allowed_pts_last5"]
         )
     aggregates = aggregates.merge(recent_df, on="team_id", how="left")
+    std_df = (
+        df.groupby("team_id")["allowed_pts"]
+        .std(ddof=0)
+        .reset_index(name="std_allowed_pts")
+    )
+    aggregates = aggregates.merge(std_df, on="team_id", how="left")
+    avg_allowed = aggregates["avg_allowed_pts"].fillna(0.0)
+    recent5 = aggregates["avg_allowed_pts_last5"].fillna(avg_allowed)
+    recent3 = aggregates["avg_allowed_pts_last3"].fillna(avg_allowed)
+    std_allowed = aggregates["std_allowed_pts"].fillna(avg_allowed).replace(0, 1.0)
+    aggregates["def_composite_score"] = (
+        0.4 * avg_allowed
+        + 0.3 * recent5
+        + 0.2 * recent3
+        + 0.1 * (avg_allowed / (std_allowed + 1.0))
+    )
     return aggregates
 
 
@@ -1033,6 +1049,9 @@ with games_tab:
                         ) if opponent_stats else None
                         team_stats = scoring_map.get(team_id)
                         team_avg_pts = safe_float(team_stats.get("avg_pts")) if team_stats else None
+                        opp_composite = safe_float(
+                            opponent_stats.get("def_composite_score")
+                        ) if opponent_stats else None
                         for _, player in team_leaders.iterrows():
                             avg_pts_last5 = safe_float(player.get("avg_pts_last5")) or safe_float(
                                 player.get("avg_points")
@@ -1044,7 +1063,16 @@ with games_tab:
                             season_avg_pts = safe_float(player.get("avg_points")) or 0.0
                             defense_factor = opp_recent_allowed or opp_avg_allowed or 0.0
                             usage_pct = safe_float(player.get("usg_pct"))
-                            if team_avg_pts and team_avg_pts > 0:
+                            defense_factor = (
+                                opp_recent_allowed
+                                if opp_recent_allowed is not None
+                                else opp_composite
+                                if opp_composite is not None
+                                else opp_avg_allowed
+                                if opp_avg_allowed is not None
+                                else 0.0
+                            )
+                            if team_avg_pts and team_avg_pts > 0 and defense_factor is not None:
                                 opportunity_index = defense_factor * (season_avg_pts / team_avg_pts)
                             else:
                                 opportunity_index = defense_factor
@@ -1087,6 +1115,7 @@ with games_tab:
                                     "Opponent": opponent_name,
                                     "Opp Avg Allowed PPG": opp_avg_allowed,
                                     "Opp Last5 Avg Allowed": opp_recent_allowed,
+                                    "Opp Def Composite": opp_composite,
                                     "Usage %": (usage_pct * 100.0) if usage_pct is not None else None,
                                     "Weighted Score": weighted_score,
                                     "Matchup Score": matchup_score,
@@ -1101,6 +1130,7 @@ with games_tab:
                                     "Last5 Avg PPG": avg_pts_last5,
                                     "Opp Avg Allowed PPG": opp_avg_allowed,
                                     "Opp Last5 Avg Allowed": opp_recent_allowed,
+                                    "Opp Def Composite": opp_composite,
                                     "Opportunity Index": opportunity_index,
                                     "Usage %": (usage_pct * 100.0) if usage_pct is not None else None,
                                     "Matchup Score": matchup_score,
@@ -1115,6 +1145,7 @@ with games_tab:
                                     "Last5 Avg 3PM": avg_fg3_last5,
                                     "Opp Avg Allowed PPG": opp_avg_allowed,
                                     "Opp Last5 Avg Allowed": opp_recent_allowed,
+                                    "Opp Def Composite": opp_composite,
                                     "Opportunity Index": opportunity_index,
                                     "Usage %": (usage_pct * 100.0) if usage_pct is not None else None,
                                     "Matchup Score": (
@@ -1160,6 +1191,10 @@ with matchup_spotlight_tab:
         )
         if "Usage %" in display_df.columns:
             display_df["Usage %"] = display_df["Usage %"].map(lambda v: format_number(v, 1))
+        if "Opp Def Composite" in display_df.columns:
+            display_df["Opp Def Composite"] = display_df["Opp Def Composite"].map(
+                lambda v: format_number(v, 1)
+            )
         st.dataframe(display_df, use_container_width=True)
         st.subheader("Daily Power Rankings")
         col_points, col_3pm = st.columns(2)
@@ -1171,6 +1206,7 @@ with matchup_spotlight_tab:
                     "Opp Avg Allowed PPG": points_top["Opp Avg Allowed PPG"].map(lambda v: format_number(v, 1)),
                     "Opp Last5 Avg Allowed": points_top["Opp Last5 Avg Allowed"].map(lambda v: format_number(v, 1)),
                     "Opportunity Index": points_top["Opportunity Index"].map(lambda v: format_number(v, 2)),
+                    "Opp Def Composite": points_top["Opp Def Composite"].map(lambda v: format_number(v, 1)),
                     "Usage %": points_top["Usage %"].map(lambda v: format_number(v, 1)),
                 }
             )
@@ -1186,6 +1222,7 @@ with matchup_spotlight_tab:
                     "Opp Avg Allowed PPG": threes_top["Opp Avg Allowed PPG"].map(lambda v: format_number(v, 1)),
                     "Opp Last5 Avg Allowed": threes_top["Opp Last5 Avg Allowed"].map(lambda v: format_number(v, 1)),
                     "Opportunity Index": threes_top["Opportunity Index"].map(lambda v: format_number(v, 2)),
+                    "Opp Def Composite": threes_top["Opp Def Composite"].map(lambda v: format_number(v, 1)),
                     "Usage %": threes_top["Usage %"].map(lambda v: format_number(v, 1)),
                 }
             )
