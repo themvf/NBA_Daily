@@ -36,6 +36,7 @@ WEIGHT_METRIC_MAP = {
 DEFAULT_WEIGHTS = {"avg": 0.4, "median": 0.4, "max": 0.2}
 DEFAULT_MIN_GAMES = 10
 TOP_LEADERS_COUNT = 5
+DAILY_LEADERS_MAX = 10
 
 
 def _resolve_eastern_zone() -> timezone:
@@ -878,6 +879,7 @@ matchup_spotlight_rows: list[Dict[str, Any]] = []
 daily_power_rows_points: list[Dict[str, Any]] = []
 daily_power_rows_3pm: list[Dict[str, Any]] = []
 daily_top_scorers_rows: list[Dict[str, Any]] = []
+player_season_stats_map: Dict[int, Mapping[str, Any]] = {}
 
 # Today's games tab --------------------------------------------------------
 with games_tab:
@@ -969,6 +971,12 @@ with games_tab:
                 int(min_games_input),
                 normalized_weights,
             )
+            player_season_stats_map.clear()
+            for _, row in leaders_df.iterrows():
+                player_id = safe_int(row.get("player_id"))
+                if player_id is None:
+                    continue
+                player_season_stats_map[player_id] = row.to_dict()
             defense_stats = load_team_defense_stats(
                 str(db_path),
                 context_season,
@@ -1196,6 +1204,7 @@ with matchup_spotlight_tab:
             )
             SELECT
                 r.game_date,
+                r.player_id,
                 r.player_name,
                 r.team_name,
                 r.matchup,
@@ -1207,7 +1216,7 @@ with matchup_spotlight_tab:
               ON pst.player_id = r.player_id
              AND pst.season = ?
              AND pst.season_type = ?
-            WHERE r.rn <= 3
+            WHERE r.rn <= ?
             ORDER BY r.game_date DESC, r.points DESC
         """
         try:
@@ -1219,6 +1228,7 @@ with matchup_spotlight_tab:
                     context_season_type,
                     context_season,
                     context_season_type,
+                    DAILY_LEADERS_MAX,
                 ),
             )
             daily_top_scorers_rows.clear()
@@ -1227,6 +1237,10 @@ with matchup_spotlight_tab:
                 home_team, away_team = derive_home_away(row["team_name"], row["matchup"])
                 minutes_float = minutes_str_to_float(row["minutes"])
                 usage_pct = safe_float(row["usg_pct"])
+                player_id = safe_int(row.get("player_id"))
+                season_stats = player_season_stats_map.get(player_id) if player_id is not None else {}
+                season_avg_pts = safe_float((season_stats or {}).get("avg_points"))
+                season_median_pts = safe_float((season_stats or {}).get("median_points"))
                 daily_top_scorers_rows.append(
                     {
                         "Date": game_date.isoformat(),
@@ -1236,6 +1250,8 @@ with matchup_spotlight_tab:
                         "Total Points": row["points"],
                         "Minutes": minutes_float,
                         "Usage %": (usage_pct * 100.0) if usage_pct is not None else None,
+                        "Season Avg Pts": season_avg_pts,
+                        "Season Median Pts": season_median_pts,
                     }
                 )
         except Exception as exc:
@@ -1255,9 +1271,19 @@ with daily_leaders_tab:
             options=available_dates,
             index=0,
         )
+        max_players = st.slider(
+            "Players shown per day",
+            min_value=1,
+            max_value=DAILY_LEADERS_MAX,
+            value=5,
+            step=1,
+        )
         filtered_df = leaders_df[leaders_df["Date"].dt.date == selected_date].copy()
+        filtered_df = filtered_df.sort_values("Total Points", ascending=False).head(max_players)
         filtered_df["Minutes"] = filtered_df["Minutes"].map(lambda v: format_number(v, 1))
         filtered_df["Usage %"] = filtered_df["Usage %"].map(lambda v: format_number(v, 1))
+        filtered_df["Season Avg Pts"] = filtered_df["Season Avg Pts"].map(lambda v: format_number(v, 1))
+        filtered_df["Season Median Pts"] = filtered_df["Season Median Pts"].map(lambda v: format_number(v, 1))
         display_df = filtered_df[
             [
                 "Date",
@@ -1267,6 +1293,8 @@ with daily_leaders_tab:
                 "Total Points",
                 "Minutes",
                 "Usage %",
+                "Season Avg Pts",
+                "Season Median Pts",
             ]
         ].reset_index(drop=True)
         st.dataframe(display_df, use_container_width=True, hide_index=True)
