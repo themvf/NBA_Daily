@@ -43,6 +43,8 @@ Key options:
 | `--defense-pts-view-season` / `--defense-pts-view-season-type` | Control the season powering the `teams_2025_defense_pts` scoring-allowed view (defaults to the defensive 3PT season). |
 | `--defense-mix-view-season` / `--defense-mix-view-season-type` | Control the season powering the `teams_2026_defense_mix` scoring breakdown view (defaults to `2025-26`). |
 
+Matchup leaderboards now expose a composite scorer rating that blends average/median/max points with last-3/last-5 scoring trends plus last-5 minutes and usage to spotlight daily high-volume options.
+
 The script prints progress as it upserts each dataset. Re-running it is idempotent thanks to SQLite upserts.
 
 ## Database Layout

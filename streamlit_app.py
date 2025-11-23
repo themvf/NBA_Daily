@@ -32,8 +32,20 @@ WEIGHT_METRIC_MAP = {
     "avg": "avg_points",
     "median": "median_points",
     "max": "max_points",
+    "last3": "avg_pts_last3",
+    "last5": "avg_pts_last5",
+    "minutes5": "avg_minutes_last5",
+    "usage5": "avg_usg_last5",
 }
-DEFAULT_WEIGHTS = {"avg": 0.4, "median": 0.4, "max": 0.2}
+DEFAULT_WEIGHTS = {
+    "avg": 0.2,
+    "median": 0.15,
+    "max": 0.1,
+    "last3": 0.2,
+    "last5": 0.15,
+    "minutes5": 0.1,
+    "usage5": 0.1,
+}
 DEFAULT_MIN_GAMES = 10
 TOP_LEADERS_COUNT = 5
 DAILY_LEADERS_MAX = 10
@@ -115,17 +127,39 @@ def aggregate_player_scoring(
                team_id,
                points,
                fg3m,
-               game_date
+               game_date,
+               minutes,
+               usg_pct
         FROM player_game_logs
         WHERE season = ?
           AND season_type = ?
     """
-    logs_df = run_query(db_path, query, params=(season, season_type))
+    try:
+        logs_df = run_query(db_path, query, params=(season, season_type))
+    except Exception as exc:  # noqa: BLE001
+        if "no such column: usg_pct" in str(exc).lower():
+            fallback_query = """
+                SELECT player_id,
+                       player_name,
+                       team_id,
+                       points,
+                       fg3m,
+                       game_date,
+                       minutes
+                FROM player_game_logs
+                WHERE season = ?
+                  AND season_type = ?
+            """
+            logs_df = run_query(db_path, fallback_query, params=(season, season_type))
+            logs_df["usg_pct"] = None
+        else:
+            raise
     if logs_df.empty:
         return pd.DataFrame()
-    numeric_cols = ["player_id", "team_id", "points", "fg3m"]
+    numeric_cols = ["player_id", "team_id", "points", "fg3m", "usg_pct"]
     for col in numeric_cols:
         logs_df[col] = pd.to_numeric(logs_df[col], errors="coerce")
+    logs_df["minutes_float"] = logs_df["minutes"].apply(minutes_str_to_float)
     logs_df["game_date"] = pd.to_datetime(logs_df["game_date"], errors="coerce")
     logs_df = logs_df.dropna(subset=["player_id", "team_id", "points", "game_date"])
     grouped = (
@@ -137,6 +171,8 @@ def aggregate_player_scoring(
             max_points=("points", "max"),
             avg_fg3m=("fg3m", "mean"),
             median_fg3m=("fg3m", "median"),
+            avg_minutes=("minutes_float", "mean"),
+            median_minutes=("minutes_float", "median"),
         )
         .reset_index()
     )
@@ -164,6 +200,8 @@ def aggregate_player_scoring(
                 "avg_pts_last5": calc_recent(5, "points"),
                 "avg_fg3m_last3": calc_recent(3, "fg3m"),
                 "avg_fg3m_last5": calc_recent(5, "fg3m"),
+                "avg_minutes_last5": calc_recent(5, "minutes_float"),
+                "avg_usg_last5": calc_recent(5, "usg_pct"),
             }
         )
 
@@ -176,6 +214,8 @@ def aggregate_player_scoring(
                 "avg_pts_last5",
                 "avg_fg3m_last3",
                 "avg_fg3m_last5",
+                "avg_minutes_last5",
+                "avg_usg_last5",
             ]
         )
     grouped = grouped.merge(latest_team, on="player_id", how="left")
@@ -217,21 +257,26 @@ def prepare_weighted_scores(
         return filtered
     for weight_key, column in WEIGHT_METRIC_MAP.items():
         z_col = f"z_{weight_key}"
-        col_values = filtered[column]
+        if column not in filtered.columns:
+            filtered[column] = 0.0
+        col_values = pd.to_numeric(filtered[column], errors="coerce")
+        mean = col_values.mean()
         std = col_values.std(ddof=0)
         if std == 0 or pd.isna(std):
             filtered[z_col] = 0.0
         else:
-            filtered[z_col] = (col_values - col_values.mean()) / std
-    weighted_score = 0.0
+            filtered[z_col] = (col_values.fillna(mean) - mean) / std
+    score_series = pd.Series(0.0, index=filtered.index, dtype=float)
     for weight_key, weight_value in weights.items():
         z_col = f"z_{weight_key}"
-        weighted_score += weight_value * filtered.get(z_col, 0.0)
-    filtered["weighted_score"] = weighted_score
+        if z_col in filtered:
+            score_series += weight_value * filtered[z_col]
+    filtered["composite_score"] = score_series
+    filtered["weighted_score"] = score_series
     filtered["team_rank"] = filtered.groupby("team_id")["weighted_score"].rank(
         method="first", ascending=False
     )
-    return filtered.sort_values("weighted_score", ascending=False)
+    return filtered.sort_values("composite_score", ascending=False)
 
 
 @st.cache_data(ttl=300)
@@ -936,9 +981,10 @@ with games_tab:
             step=1,
             key="leader_min_games",
         )
-        weight_cols = st.columns(3)
+        weight_cols_top = st.columns(3)
+        weight_cols_bottom = st.columns(4)
         weight_inputs = {
-            "avg": weight_cols[0].number_input(
+            "avg": weight_cols_top[0].number_input(
                 "Weight: Avg PPG",
                 min_value=0.0,
                 max_value=5.0,
@@ -946,7 +992,7 @@ with games_tab:
                 step=0.1,
                 key="weight_avg_ppg",
             ),
-            "median": weight_cols[1].number_input(
+            "median": weight_cols_top[1].number_input(
                 "Weight: Median PPG",
                 min_value=0.0,
                 max_value=5.0,
@@ -954,7 +1000,7 @@ with games_tab:
                 step=0.1,
                 key="weight_median_ppg",
             ),
-            "max": weight_cols[2].number_input(
+            "max": weight_cols_top[2].number_input(
                 "Weight: Max PPG",
                 min_value=0.0,
                 max_value=5.0,
@@ -962,14 +1008,52 @@ with games_tab:
                 step=0.1,
                 key="weight_max_ppg",
             ),
+            "last3": weight_cols_bottom[0].number_input(
+                "Weight: Last 3 Avg Pts",
+                min_value=0.0,
+                max_value=5.0,
+                value=DEFAULT_WEIGHTS["last3"],
+                step=0.1,
+                key="weight_last3_pts",
+            ),
+            "last5": weight_cols_bottom[1].number_input(
+                "Weight: Last 5 Avg Pts",
+                min_value=0.0,
+                max_value=5.0,
+                value=DEFAULT_WEIGHTS["last5"],
+                step=0.1,
+                key="weight_last5_pts",
+            ),
+            "minutes5": weight_cols_bottom[2].number_input(
+                "Weight: Last 5 Avg Minutes",
+                min_value=0.0,
+                max_value=5.0,
+                value=DEFAULT_WEIGHTS["minutes5"],
+                step=0.1,
+                key="weight_last5_minutes",
+            ),
+            "usage5": weight_cols_bottom[3].number_input(
+                "Weight: Last 5 Usage %",
+                min_value=0.0,
+                max_value=5.0,
+                value=DEFAULT_WEIGHTS["usage5"],
+                step=0.1,
+                key="weight_last5_usage",
+            ),
         }
         normalized_weights = normalize_weight_map(weight_inputs)
-        st.caption(
-            "Normalized weights → "
-            f"Avg: {normalized_weights['avg']:.2f}, "
-            f"Median: {normalized_weights['median']:.2f}, "
-            f"Max: {normalized_weights['max']:.2f}"
+        weights_display = ", ".join(
+            [
+                f"Avg: {normalized_weights.get('avg', 0.0):.2f}",
+                f"Median: {normalized_weights.get('median', 0.0):.2f}",
+                f"Max: {normalized_weights.get('max', 0.0):.2f}",
+                f"Last3: {normalized_weights.get('last3', 0.0):.2f}",
+                f"Last5: {normalized_weights.get('last5', 0.0):.2f}",
+                f"Min(L5): {normalized_weights.get('minutes5', 0.0):.2f}",
+                f"Usage(L5): {normalized_weights.get('usage5', 0.0):.2f}",
+            ]
         )
+        st.caption(f"Normalized weights -> {weights_display}")
     try:
         matchup_spotlight_rows.clear()
         daily_power_rows_points.clear()
@@ -1012,6 +1096,24 @@ with games_tab:
             defense_map: Dict[int, Mapping[str, Any]] = {
                 int(row["team_id"]): row.to_dict() for _, row in defense_stats.iterrows()
             }
+            def_score_series = defense_stats["def_composite_score"].dropna() if not defense_stats.empty else pd.Series(dtype=float)
+            if not def_score_series.empty:
+                low_thresh = def_score_series.quantile(0.33)
+                mid_thresh = def_score_series.quantile(0.66)
+            else:
+                low_thresh = mid_thresh = None
+
+            def classify_difficulty(score: float | None) -> str:
+                if score is None or pd.isna(score):
+                    return "Unknown"
+                if low_thresh is None or mid_thresh is None:
+                    return "Neutral"
+                if score <= low_thresh:
+                    return "Hard"
+                if score <= mid_thresh:
+                    return "Neutral"
+                return "Favorable"
+
             st.subheader("Top scorers per matchup")
             if leaders_df.empty:
                 st.info(
@@ -1019,6 +1121,9 @@ with games_tab:
                     "Rebuild the database or adjust the minimum games threshold."
                 )
             else:
+                score_column = (
+                    "composite_score" if "composite_score" in leaders_df.columns else "weighted_score"
+                )
                 for _, matchup in games_df.iterrows():
                     away_id = matchup.get("away_team_id")
                     home_id = matchup.get("home_team_id")
@@ -1032,7 +1137,7 @@ with games_tab:
                         ("Home", home_id, matchup["Home"]),
                     ]:
                         team_leaders = leaders_df[leaders_df["team_id"] == team_id].nlargest(
-                            TOP_LEADERS_COUNT, "weighted_score"
+                            TOP_LEADERS_COUNT, score_column
                         )
                         if team_leaders.empty:
                             continue
@@ -1052,6 +1157,7 @@ with games_tab:
                         opp_composite = safe_float(
                             opponent_stats.get("def_composite_score")
                         ) if opponent_stats else None
+                        opp_difficulty = classify_difficulty(opp_composite)
                         for _, player in team_leaders.iterrows():
                             avg_pts_last5 = safe_float(player.get("avg_pts_last5")) or safe_float(
                                 player.get("avg_points")
@@ -1059,9 +1165,19 @@ with games_tab:
                             avg_pts_last3 = safe_float(player.get("avg_pts_last3")) or avg_pts_last5
                             avg_fg3_last3 = safe_float(player.get("avg_fg3m_last3"))
                             avg_fg3_last5 = safe_float(player.get("avg_fg3m_last5"))
-                            weighted_score = safe_float(player.get("weighted_score")) or 0.0
+                            avg_minutes_last5 = safe_float(player.get("avg_minutes_last5"))
+                            avg_usg_last5 = safe_float(player.get("avg_usg_last5"))
+                            composite_score = safe_float(player.get(score_column)) or 0.0
                             season_avg_pts = safe_float(player.get("avg_points")) or 0.0
-                            usage_pct = safe_float(player.get("usg_pct"))
+                            season_avg_minutes = safe_float(player.get("avg_minutes"))
+                            usage_pct = (
+                                avg_usg_last5
+                                if avg_usg_last5 is not None
+                                else safe_float(player.get("usg_pct"))
+                            )
+                            usage_pct_display = (
+                                usage_pct * 100.0 if usage_pct is not None and usage_pct <= 1.0 else usage_pct
+                            )
                             defense_factor = (
                                 opp_recent_allowed
                                 if opp_recent_allowed is not None
@@ -1078,8 +1194,23 @@ with games_tab:
                             matchup_score = (
                                 season_avg_pts * 0.4
                                 + (avg_pts_last5 or season_avg_pts) * 0.3
-                                + weighted_score * 10.0 * 0.2
+                                + composite_score * 10.0 * 0.2
                                 + defense_factor * 0.1
+                            )
+                            pts_delta = (
+                                (avg_pts_last5 - season_avg_pts)
+                                if avg_pts_last5 is not None and season_avg_pts is not None
+                                else None
+                            )
+                            min_delta = (
+                                (avg_minutes_last5 - season_avg_minutes)
+                                if avg_minutes_last5 is not None and season_avg_minutes is not None
+                                else None
+                            )
+                            usage_delta = (
+                                (avg_usg_last5 - usage_pct)
+                                if avg_usg_last5 is not None and usage_pct is not None
+                                else None
                             )
                             matchup_rows.append(
                                 {
@@ -1096,8 +1227,19 @@ with games_tab:
                                     "Last3 Avg 3PM": format_number(player.get("avg_fg3m_last3"), 1),
                                     "Last5 Avg Pts": format_number(player.get("avg_pts_last5"), 1),
                                     "Last5 Avg 3PM": format_number(player.get("avg_fg3m_last5"), 1),
-                                    "Usage %": format_number((usage_pct * 100.0) if usage_pct is not None else None, 1),
-                                    "Score": f"{player['weighted_score']:.2f}",
+                                    "Last5 Avg Minutes": format_number(avg_minutes_last5, 1),
+                                    "Last5 Usage %": format_number(usage_pct_display, 1),
+                                    "Usage %": format_number(usage_pct_display, 1),
+                                    "Composite Score": format_number(composite_score, 2),
+                                    "Comp Z Avg": format_number(player.get("z_avg"), 2),
+                                    "Comp Z Last3": format_number(player.get("z_last3"), 2),
+                                    "Comp Z Last5": format_number(player.get("z_last5"), 2),
+                                    "Comp Z Min5": format_number(player.get("z_minutes5"), 2),
+                                    "Comp Z Usg5": format_number(player.get("z_usage5"), 2),
+                                    "Last5 vs Season Pts": format_number(pts_delta, 1),
+                                    "Last5 vs Season Min": format_number(min_delta, 1),
+                                    "Last5 vs Season Usage": format_number(usage_delta, 1),
+                                    "Opp Difficulty": opp_difficulty,
                                 }
                             )
                             matchup_spotlight_rows.append(
@@ -1115,8 +1257,19 @@ with games_tab:
                                     "Opp Avg Allowed PPG": opp_avg_allowed,
                                     "Opp Last5 Avg Allowed": opp_recent_allowed,
                                     "Opp Def Composite": opp_composite,
-                                    "Usage %": (usage_pct * 100.0) if usage_pct is not None else None,
-                                    "Weighted Score": weighted_score,
+                                    "Last5 Avg Minutes": avg_minutes_last5,
+                                    "Last5 Usage %": usage_pct_display,
+                                    "Usage %": usage_pct_display,
+                                    "Composite Score": composite_score,
+                                    "Comp Z Avg": player.get("z_avg"),
+                                    "Comp Z Last3": player.get("z_last3"),
+                                    "Comp Z Last5": player.get("z_last5"),
+                                    "Comp Z Min5": player.get("z_minutes5"),
+                                    "Comp Z Usg5": player.get("z_usage5"),
+                                    "Last5 vs Season Pts": pts_delta,
+                                    "Last5 vs Season Min": min_delta,
+                                    "Last5 vs Season Usage": usage_delta,
+                                    "Opp Difficulty": opp_difficulty,
                                     "Matchup Score": matchup_score,
                                 }
                             )
@@ -1131,7 +1284,8 @@ with games_tab:
                                     "Opp Last5 Avg Allowed": opp_recent_allowed,
                                     "Opp Def Composite": opp_composite,
                                     "Opportunity Index": opportunity_index,
-                                    "Usage %": (usage_pct * 100.0) if usage_pct is not None else None,
+                                    "Usage %": usage_pct_display,
+                                    "Opp Difficulty": opp_difficulty,
                                     "Matchup Score": matchup_score,
                                 }
                             )
@@ -1146,7 +1300,8 @@ with games_tab:
                                     "Opp Last5 Avg Allowed": opp_recent_allowed,
                                     "Opp Def Composite": opp_composite,
                                     "Opportunity Index": opportunity_index,
-                                    "Usage %": (usage_pct * 100.0) if usage_pct is not None else None,
+                                    "Usage %": usage_pct_display,
+                                    "Opp Difficulty": opp_difficulty,
                                     "Matchup Score": (
                                         (avg_fg3_last5 or safe_float(player.get("avg_fg3m")) or 0.0) * 0.6
                                         + (avg_fg3_last3 or safe_float(player.get("avg_fg3m")) or 0.0) * 0.3
@@ -1177,7 +1332,7 @@ with matchup_spotlight_tab:
                 "Season Avg PPG",
                 "Last5 Avg PPG",
                 "Opp Avg Allowed PPG",
-                "Weighted Score",
+                "Composite Score",
             ],
             index=0,
         )
@@ -1188,8 +1343,16 @@ with matchup_spotlight_tab:
             .head(top_n)
             .reset_index(drop=True)
         )
+        if "Composite Score" in display_df.columns:
+            display_df["Composite Score"] = display_df["Composite Score"].map(lambda v: format_number(v, 2))
+        if "Opp Difficulty" in display_df.columns:
+            display_df["Opp Difficulty"] = display_df["Opp Difficulty"].fillna("Unknown")
         if "Usage %" in display_df.columns:
             display_df["Usage %"] = display_df["Usage %"].map(lambda v: format_number(v, 1))
+        if "Last5 Usage %" in display_df.columns:
+            display_df["Last5 Usage %"] = display_df["Last5 Usage %"].map(lambda v: format_number(v, 1))
+        if "Last5 Avg Minutes" in display_df.columns:
+            display_df["Last5 Avg Minutes"] = display_df["Last5 Avg Minutes"].map(lambda v: format_number(v, 1))
         if "Opp Def Composite" in display_df.columns:
             display_df["Opp Def Composite"] = display_df["Opp Def Composite"].map(
                 lambda v: format_number(v, 1)

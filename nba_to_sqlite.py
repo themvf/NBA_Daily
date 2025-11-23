@@ -254,6 +254,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             fg3m REAL,
             fg3a REAL,
             minutes TEXT,
+            usg_pct REAL,
             points REAL,
             PRIMARY KEY (season, season_type, player_id, game_id)
         );
@@ -289,6 +290,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         ("team_game_logs", "reb", "REAL"),
         ("team_game_logs", "opp_ast", "REAL"),
         ("team_game_logs", "opp_reb", "REAL"),
+        ("player_game_logs", "usg_pct", "REAL"),
     ]
     for table, column, col_type in alter_columns:
         try:
@@ -577,6 +579,7 @@ def load_player_game_logs(
                 "fg3m": data.get("fg3m"),
                 "fg3a": data.get("fg3a"),
                 "minutes": data.get("min"),
+                "usg_pct": normalize_float(data.get("usg_pct")),
                 "points": data.get("pts"),
             }
         )
