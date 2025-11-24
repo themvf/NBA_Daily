@@ -1313,8 +1313,13 @@ with games_tab:
                                 avg_vs_style = player_style_splits.get(player_id_val, {}).get(
                                     opp_style
                                 )
+                            avg_vs_style_filled = (
+                                avg_vs_style if avg_vs_style is not None else season_avg_pts
+                            )
                             avg_vs_style_display = (
-                                format_number(avg_vs_style, 1) if avg_vs_style is not None else "N/A"
+                                format_number(avg_vs_style_filled, 1)
+                                if avg_vs_style_filled is not None
+                                else "N/A"
                             )
                             matchup_rows.append(
                                 {
