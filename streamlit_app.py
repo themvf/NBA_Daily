@@ -1909,11 +1909,11 @@ with defense_styles_tab:
                 context_season,
                 context_season_type,
                 def_style_map,
-                min_games=2,
-                top_n=10,
+                min_games=1,
+                top_n=15,
             )
             if style_leaders.empty:
-                st.info("No player vs style splits yet. Rebuild the database or lower the min games.")
+                st.info("No player vs style splits yet. Rebuild the database or adjust the season/type.")
             else:
                 style_leaders = style_leaders.rename(
                     columns={
