@@ -467,6 +467,8 @@ def build_player_style_splits(
     """
     Compute average points per player against each defense style.
     """
+    if not style_map:
+        return {}
     query = """
         SELECT p.player_id,
                p.points,
@@ -1311,6 +1313,9 @@ with games_tab:
                                 avg_vs_style = player_style_splits.get(player_id_val, {}).get(
                                     opp_style
                                 )
+                            avg_vs_style_display = (
+                                format_number(avg_vs_style, 1) if avg_vs_style is not None else "N/A"
+                            )
                             matchup_rows.append(
                                 {
                                     "Side": team_label,
@@ -1340,7 +1345,7 @@ with games_tab:
                                     "Last5 vs Season Usage": format_number(usage_delta, 1),
                                     "Opp Defense Style": opp_style,
                                     "Opp Difficulty": opp_difficulty,
-                                    "Avg Pts vs Opp Style": format_number(avg_vs_style, 1),
+                                    "Avg Pts vs Opp Style": avg_vs_style_display,
                                 }
                             )
                             matchup_spotlight_rows.append(
@@ -1372,7 +1377,7 @@ with games_tab:
                                     "Last5 vs Season Min": min_delta,
                                     "Last5 vs Season Usage": usage_delta,
                                     "Opp Difficulty": opp_difficulty,
-                                    "Avg Pts vs Opp Style": avg_vs_style,
+                                    "Avg Pts vs Opp Style": avg_vs_style_display,
                                     "Matchup Score": matchup_score,
                                 }
                             )
