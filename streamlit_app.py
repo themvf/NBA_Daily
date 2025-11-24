@@ -441,21 +441,24 @@ def load_team_defense_stats(
     for col in ["avg_allowed_pts", "avg_allowed_fg3m", "avg_allowed_reb"]:
         if col not in aggregates.columns:
             aggregates[col] = None
-        aggregates[f"{col}_pct"] = aggregates[col].fillna(0.0).rank(pct=True)
+        filled = aggregates[col].fillna(aggregates[col].median())
+        aggregates[f"{col}_pct"] = filled.rank(pct=True)
 
     def classify_style(row: pd.Series) -> str:
         fg3m_pct = safe_float(row.get("avg_allowed_fg3m_pct"))
         reb_pct = safe_float(row.get("avg_allowed_reb_pct"))
         pts_pct = safe_float(row.get("avg_allowed_pts_pct"))
-        if fg3m_pct is not None and fg3m_pct >= 0.75:
+        if fg3m_pct is None and reb_pct is None and pts_pct is None:
+            return "Neutral"
+        if fg3m_pct is not None and fg3m_pct >= 0.65:
             return "Perimeter Leak"
-        if reb_pct is not None and reb_pct >= 0.75:
+        if reb_pct is not None and reb_pct >= 0.65:
             return "Board-Soft"
         if (
             fg3m_pct is not None
             and pts_pct is not None
-            and fg3m_pct <= 0.30
-            and pts_pct <= 0.30
+            and fg3m_pct <= 0.35
+            and pts_pct <= 0.35
         ):
             return "Clamp"
         return "Neutral"
