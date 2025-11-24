@@ -1304,6 +1304,12 @@ with games_tab:
                                 if avg_usg_last5 is not None and usage_pct is not None
                                 else None
                             )
+                            avg_vs_style = None
+                            player_id_val = safe_int(player.get("player_id"))
+                            if player_id_val is not None:
+                                avg_vs_style = player_style_splits.get(player_id_val, {}).get(
+                                    opp_style
+                                )
                             matchup_rows.append(
                                 {
                                     "Side": team_label,
