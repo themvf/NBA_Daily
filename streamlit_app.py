@@ -348,6 +348,7 @@ def load_team_defense_stats(
     db_path: str,
     season: str,
     season_type: str,
+    rolling_window: int | None = None,
 ) -> pd.DataFrame:
     query = """
         SELECT t.team_id,
@@ -374,6 +375,12 @@ def load_team_defense_stats(
             df[col] = pd.to_numeric(df[col], errors="coerce")
     df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
     df = df.dropna(subset=["team_id", "allowed_pts"])
+    if rolling_window and rolling_window > 0:
+        df = (
+            df.sort_values("game_date")
+            .groupby("team_id")
+            .tail(rolling_window)
+        )
     aggregates = (
         df.groupby("team_id")
         .agg(
@@ -1234,6 +1241,7 @@ with games_tab:
                 str(db_path),
                 context_season,
                 context_season_type,
+                rolling_window=10,
             )
             defense_map: Dict[int, Mapping[str, Any]] = {
                 int(row["team_id"]): row.to_dict() for _, row in defense_stats.iterrows()
@@ -1850,6 +1858,7 @@ with defense_styles_tab:
             str(db_path),
             context_season,
             context_season_type,
+            rolling_window=10,
         )
         if styles_df.empty:
             st.info("No defense data available. Rebuild the database for the selected season/type.")
