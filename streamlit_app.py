@@ -1822,6 +1822,19 @@ with defense_styles_tab:
                 display_df.sort_values("Defense Style"),
                 use_container_width=True,
             )
+            grouped = (
+                styles_df.groupby("defense_style")["avg_allowed_pts"]
+                .mean()
+                .reset_index()
+                .rename(
+                    columns={
+                        "defense_style": "Defense Style",
+                        "avg_allowed_pts": "Avg Points Allowed",
+                    }
+                )
+            )
+            st.markdown("**Average points allowed by style**")
+            st.dataframe(grouped, use_container_width=True, hide_index=True)
     except Exception as exc:  # noqa: BLE001
         st.warning(f"Unable to load defense styles: {exc}")
 
