@@ -352,7 +352,11 @@ def load_team_defense_stats(
     query = """
         SELECT t.team_id,
                t.game_date,
-               opp.pts AS allowed_pts
+               opp.pts AS allowed_pts,
+               opp.fg3m AS allowed_fg3m,
+               opp.fg3a AS allowed_fg3a,
+               opp.reb AS allowed_reb,
+               opp.ast AS allowed_ast
         FROM team_game_logs AS t
         JOIN team_game_logs AS opp
           ON opp.game_id = t.game_id
@@ -365,6 +369,9 @@ def load_team_defense_stats(
         return df
     df["team_id"] = pd.to_numeric(df["team_id"], errors="coerce")
     df["allowed_pts"] = pd.to_numeric(df["allowed_pts"], errors="coerce")
+    for col in ["allowed_fg3m", "allowed_fg3a", "allowed_reb", "allowed_ast"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
     df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
     df = df.dropna(subset=["team_id", "allowed_pts"])
     aggregates = (
@@ -374,6 +381,10 @@ def load_team_defense_stats(
             total_allowed_pts=("allowed_pts", "sum"),
             avg_allowed_pts=("allowed_pts", "mean"),
             median_allowed_pts=("allowed_pts", "median"),
+            avg_allowed_fg3m=("allowed_fg3m", "mean"),
+            avg_allowed_fg3a=("allowed_fg3a", "mean"),
+            avg_allowed_reb=("allowed_reb", "mean"),
+            avg_allowed_ast=("allowed_ast", "mean"),
         )
         .reset_index()
     )
@@ -419,6 +430,30 @@ def load_team_defense_stats(
         + 0.2 * recent3
         + 0.1 * (avg_allowed / (std_allowed + 1.0))
     )
+    # Percentiles for style classification
+    for col in ["avg_allowed_pts", "avg_allowed_fg3m", "avg_allowed_reb"]:
+        if col not in aggregates.columns:
+            aggregates[col] = None
+        aggregates[f"{col}_pct"] = aggregates[col].rank(pct=True)
+
+    def classify_style(row: pd.Series) -> str:
+        fg3m_pct = safe_float(row.get("avg_allowed_fg3m_pct"))
+        reb_pct = safe_float(row.get("avg_allowed_reb_pct"))
+        pts_pct = safe_float(row.get("avg_allowed_pts_pct"))
+        if fg3m_pct is not None and fg3m_pct >= 0.75:
+            return "Perimeter Leak"
+        if reb_pct is not None and reb_pct >= 0.75:
+            return "Board-Soft"
+        if (
+            fg3m_pct is not None
+            and pts_pct is not None
+            and fg3m_pct <= 0.30
+            and pts_pct <= 0.30
+        ):
+            return "Clamp"
+        return "Neutral"
+
+    aggregates["defense_style"] = aggregates.apply(classify_style, axis=1)
     return aggregates
 
 
@@ -1096,6 +1131,10 @@ with games_tab:
             defense_map: Dict[int, Mapping[str, Any]] = {
                 int(row["team_id"]): row.to_dict() for _, row in defense_stats.iterrows()
             }
+            def_style_map: Dict[int, str] = {
+                int(row["team_id"]): str(row.get("defense_style") or "")
+                for _, row in defense_stats.iterrows()
+            }
             def_score_series = defense_stats["def_composite_score"].dropna() if not defense_stats.empty else pd.Series(dtype=float)
             if not def_score_series.empty:
                 low_thresh = def_score_series.quantile(0.33)
@@ -1157,6 +1196,11 @@ with games_tab:
                         opp_composite = safe_float(
                             opponent_stats.get("def_composite_score")
                         ) if opponent_stats else None
+                        opp_style = (
+                            def_style_map.get(int(opponent_id), "Neutral")
+                            if opponent_id is not None
+                            else "Neutral"
+                        )
                         opp_difficulty = classify_difficulty(opp_composite)
                         for _, player in team_leaders.iterrows():
                             avg_pts_last5 = safe_float(player.get("avg_pts_last5")) or safe_float(
@@ -1257,6 +1301,7 @@ with games_tab:
                                     "Opp Avg Allowed PPG": opp_avg_allowed,
                                     "Opp Last5 Avg Allowed": opp_recent_allowed,
                                     "Opp Def Composite": opp_composite,
+                                    "Opp Defense Style": opp_style,
                                     "Last5 Avg Minutes": avg_minutes_last5,
                                     "Last5 Usage %": usage_pct_display,
                                     "Usage %": usage_pct_display,
@@ -1285,6 +1330,7 @@ with games_tab:
                                     "Opp Def Composite": opp_composite,
                                     "Opportunity Index": opportunity_index,
                                     "Usage %": usage_pct_display,
+                                    "Opp Defense Style": opp_style,
                                     "Opp Difficulty": opp_difficulty,
                                     "Matchup Score": matchup_score,
                                 }
@@ -1301,6 +1347,7 @@ with games_tab:
                                     "Opp Def Composite": opp_composite,
                                     "Opportunity Index": opportunity_index,
                                     "Usage %": usage_pct_display,
+                                    "Opp Defense Style": opp_style,
                                     "Opp Difficulty": opp_difficulty,
                                     "Matchup Score": (
                                         (avg_fg3_last5 or safe_float(player.get("avg_fg3m")) or 0.0) * 0.6
