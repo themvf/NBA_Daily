@@ -1012,6 +1012,7 @@ tab_titles = [
     "Points Allowed",
     "Defense Mix",
     "Prediction Log",
+    "Defense Styles",
 ]
 tabs = st.tabs(tab_titles)
 (
@@ -1025,7 +1026,9 @@ tabs = st.tabs(tab_titles)
     defense_pts_tab,
     defense_mix_tab,
     predictions_tab,
+    defense_styles_tab,
 ) = tabs
+defense_style_tab = st.tabs(["Defense Styles"])[0]
 
 matchup_spotlight_rows: list[Dict[str, Any]] = []
 daily_power_rows_points: list[Dict[str, Any]] = []
@@ -1779,6 +1782,48 @@ with defense_mix_tab:
         render_dataframe(mix_df)
     except Exception as exc:  # noqa: BLE001
         st.warning(f"Defense mix view not available: {exc}")
+
+# Defense styles tab -------------------------------------------------------
+with defense_styles_tab:
+    st.subheader("Team Defense Styles")
+    try:
+        styles_df = load_team_defense_stats(
+            str(db_path),
+            context_season,
+            context_season_type,
+        )
+        if styles_df.empty:
+            st.info("No defense data available. Rebuild the database for the selected season/type.")
+        else:
+            team_lookup_df = run_query(
+                str(db_path),
+                "SELECT team_id, full_name FROM teams",
+            )
+            team_lookup_df["team_id"] = pd.to_numeric(team_lookup_df["team_id"], errors="coerce")
+            styles_df = styles_df.merge(team_lookup_df, on="team_id", how="left")
+            display_cols = [
+                "full_name",
+                "defense_style",
+                "avg_allowed_pts",
+                "avg_allowed_fg3m",
+                "avg_allowed_reb",
+                "def_composite_score",
+            ]
+            rename_map = {
+                "full_name": "Team",
+                "defense_style": "Defense Style",
+                "avg_allowed_pts": "Avg Pts Allowed",
+                "avg_allowed_fg3m": "Avg 3PM Allowed",
+                "avg_allowed_reb": "Avg Reb Allowed",
+                "def_composite_score": "Def Composite",
+            }
+            display_df = styles_df[display_cols].rename(columns=rename_map)
+            st.dataframe(
+                display_df.sort_values("Defense Style"),
+                use_container_width=True,
+            )
+    except Exception as exc:  # noqa: BLE001
+        st.warning(f"Unable to load defense styles: {exc}")
 
 # Prediction tab -----------------------------------------------------------
 with predictions_tab:
