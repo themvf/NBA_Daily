@@ -502,6 +502,65 @@ def build_player_style_splits(
     return splits
 
 
+def build_player_style_leaders(
+    db_path: str,
+    season: str,
+    season_type: str,
+    style_map: Dict[int, str],
+    min_games: int = 1,
+    top_n: int = 10,
+) -> pd.DataFrame:
+    """
+    Return top players by average points vs each defense style.
+    """
+    if not style_map:
+        return pd.DataFrame()
+    query = """
+        SELECT p.player_id,
+               p.player_name,
+               p.team_id,
+               p.points,
+               t.opp_team_id
+        FROM player_game_logs AS p
+        JOIN team_game_logs AS t
+          ON p.game_id = t.game_id
+         AND p.team_id = t.team_id
+        WHERE p.season = ?
+          AND p.season_type = ?
+          AND p.points IS NOT NULL
+    """
+    df = run_query(db_path, query, params=(season, season_type))
+    if df.empty:
+        return pd.DataFrame()
+    df["player_id"] = pd.to_numeric(df["player_id"], errors="coerce")
+    df["team_id"] = pd.to_numeric(df["team_id"], errors="coerce")
+    df["points"] = pd.to_numeric(df["points"], errors="coerce")
+    df["opp_team_id"] = pd.to_numeric(df["opp_team_id"], errors="coerce")
+    df = df.dropna(subset=["player_id", "team_id", "points", "opp_team_id"])
+    df["defense_style"] = df["opp_team_id"].map(style_map).fillna("Neutral")
+    grouped = (
+        df.groupby(["defense_style", "player_id", "player_name", "team_id"])["points"]
+        .agg(["count", "mean"])
+        .reset_index()
+        .rename(columns={"count": "games_vs_style", "mean": "avg_pts_vs_style"})
+    )
+    grouped = grouped[grouped["games_vs_style"] >= max(1, min_games)]
+    if grouped.empty:
+        return grouped
+    grouped = (
+        grouped.sort_values(["defense_style", "avg_pts_vs_style"], ascending=[True, False])
+        .groupby("defense_style")
+        .head(top_n)
+    )
+    team_lookup = run_query(
+        db_path,
+        "SELECT team_id, full_name FROM teams",
+    )
+    team_lookup["team_id"] = pd.to_numeric(team_lookup["team_id"], errors="coerce")
+    grouped = grouped.merge(team_lookup, on="team_id", how="left")
+    return grouped
+
+
 def default_game_date() -> date:
     return datetime.now(EASTERN_TZ).date()
 
@@ -1835,6 +1894,31 @@ with defense_styles_tab:
             )
             st.markdown("**Average points allowed by style**")
             st.dataframe(grouped, use_container_width=True, hide_index=True)
+            st.markdown("**Top players vs each defense style (by avg points)**")
+            style_leaders = build_player_style_leaders(
+                str(db_path),
+                context_season,
+                context_season_type,
+                def_style_map,
+                min_games=2,
+                top_n=10,
+            )
+            if style_leaders.empty:
+                st.info("No player vs style splits yet. Rebuild the database or lower the min games.")
+            else:
+                style_leaders = style_leaders.rename(
+                    columns={
+                        "defense_style": "Defense Style",
+                        "player_name": "Player",
+                        "full_name": "Team",
+                        "games_vs_style": "Games vs Style",
+                        "avg_pts_vs_style": "Avg Pts vs Style",
+                    }
+                )
+                style_leaders["Avg Pts vs Style"] = style_leaders["Avg Pts vs Style"].map(
+                    lambda v: format_number(v, 1)
+                )
+                st.dataframe(style_leaders, use_container_width=True, hide_index=True)
     except Exception as exc:  # noqa: BLE001
         st.warning(f"Unable to load defense styles: {exc}")
 
