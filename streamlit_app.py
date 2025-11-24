@@ -494,7 +494,7 @@ def build_player_style_splits(
     df["player_id"] = pd.to_numeric(df["player_id"], errors="coerce")
     df["points"] = pd.to_numeric(df["points"], errors="coerce")
     df["opp_team_id"] = pd.to_numeric(df["opp_team_id"], errors="coerce")
-    df = df.dropna(subset=["player_id", "points", "opp_team_id"])
+    df = df.dropna(subset=["player_id", "points"])
     df["defense_style"] = df["opp_team_id"].map(style_map).fillna("Neutral")
     grouped = (
         df.groupby(["player_id", "defense_style"])["points"]
@@ -543,7 +543,7 @@ def build_player_style_leaders(
     df["team_id"] = pd.to_numeric(df["team_id"], errors="coerce")
     df["points"] = pd.to_numeric(df["points"], errors="coerce")
     df["opp_team_id"] = pd.to_numeric(df["opp_team_id"], errors="coerce")
-    df = df.dropna(subset=["player_id", "team_id", "points", "opp_team_id"])
+    df = df.dropna(subset=["player_id", "team_id", "points"])
     df["defense_style"] = df["opp_team_id"].map(style_map).fillna("Neutral")
     grouped = (
         df.groupby(["defense_style", "player_id", "player_name", "team_id"])["points"]
