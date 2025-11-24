@@ -1243,7 +1243,7 @@ with games_tab:
                 str(db_path),
                 context_season,
                 context_season_type,
-                rolling_window=10,
+                rolling_window=None,
             )
             defense_map: Dict[int, Mapping[str, Any]] = {
                 int(row["team_id"]): row.to_dict() for _, row in defense_stats.iterrows()
@@ -1860,7 +1860,7 @@ with defense_styles_tab:
             str(db_path),
             context_season,
             context_season_type,
-            rolling_window=10,
+            rolling_window=None,
         )
         if styles_df.empty:
             st.info("No defense data available. Rebuild the database for the selected season/type.")
