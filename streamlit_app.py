@@ -494,8 +494,9 @@ def build_player_style_splits(
     df["player_id"] = pd.to_numeric(df["player_id"], errors="coerce")
     df["points"] = pd.to_numeric(df["points"], errors="coerce")
     df["opp_team_id"] = pd.to_numeric(df["opp_team_id"], errors="coerce")
-    df = df.dropna(subset=["player_id", "points"])
+    df = df.dropna(subset=["player_id", "points", "opp_team_id"])
     df["defense_style"] = df["opp_team_id"].map(style_map).fillna("Neutral")
+    df = df[df["defense_style"] != "Neutral"]
     grouped = (
         df.groupby(["player_id", "defense_style"])["points"]
         .mean()
@@ -543,8 +544,9 @@ def build_player_style_leaders(
     df["team_id"] = pd.to_numeric(df["team_id"], errors="coerce")
     df["points"] = pd.to_numeric(df["points"], errors="coerce")
     df["opp_team_id"] = pd.to_numeric(df["opp_team_id"], errors="coerce")
-    df = df.dropna(subset=["player_id", "team_id", "points"])
+    df = df.dropna(subset=["player_id", "team_id", "points", "opp_team_id"])
     df["defense_style"] = df["opp_team_id"].map(style_map).fillna("Neutral")
+    df = df[df["defense_style"] != "Neutral"]
     grouped = (
         df.groupby(["defense_style", "player_id", "player_name", "team_id"])["points"]
         .agg(["count", "mean"])
@@ -1913,7 +1915,10 @@ with defense_styles_tab:
                 top_n=15,
             )
             if style_leaders.empty:
-                st.info("No player vs style splits yet. Rebuild the database or adjust the season/type.")
+                st.info(
+                    "No player vs style splits yet for the current styles. "
+                    "Try another season/type or wait for more non-neutral style samples."
+                )
             else:
                 style_leaders = style_leaders.rename(
                     columns={
