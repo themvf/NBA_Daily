@@ -457,6 +457,48 @@ def load_team_defense_stats(
     return aggregates
 
 
+def build_player_style_splits(
+    db_path: str,
+    season: str,
+    season_type: str,
+    style_map: Dict[int, str],
+) -> Dict[int, Dict[str, float]]:
+    """
+    Compute average points per player against each defense style.
+    """
+    query = """
+        SELECT p.player_id,
+               p.points,
+               t.opp_team_id
+        FROM player_game_logs AS p
+        JOIN team_game_logs AS t
+          ON p.game_id = t.game_id
+         AND p.team_id = t.team_id
+        WHERE p.season = ?
+          AND p.season_type = ?
+          AND p.points IS NOT NULL
+    """
+    df = run_query(db_path, query, params=(season, season_type))
+    if df.empty:
+        return {}
+    df["player_id"] = pd.to_numeric(df["player_id"], errors="coerce")
+    df["points"] = pd.to_numeric(df["points"], errors="coerce")
+    df["opp_team_id"] = pd.to_numeric(df["opp_team_id"], errors="coerce")
+    df = df.dropna(subset=["player_id", "points", "opp_team_id"])
+    df["defense_style"] = df["opp_team_id"].map(style_map).fillna("Neutral")
+    grouped = (
+        df.groupby(["player_id", "defense_style"])["points"]
+        .mean()
+        .reset_index()
+    )
+    splits: Dict[int, Dict[str, float]] = {}
+    for _, row in grouped.iterrows():
+        pid = int(row["player_id"])
+        style = str(row["defense_style"])
+        splits.setdefault(pid, {})[style] = float(row["points"])
+    return splits
+
+
 def default_game_date() -> date:
     return datetime.now(EASTERN_TZ).date()
 
@@ -1135,6 +1177,12 @@ with games_tab:
                 int(row["team_id"]): str(row.get("defense_style") or "")
                 for _, row in defense_stats.iterrows()
             }
+            player_style_splits = build_player_style_splits(
+                str(db_path),
+                context_season,
+                context_season_type,
+                def_style_map,
+            )
             def_score_series = defense_stats["def_composite_score"].dropna() if not defense_stats.empty else pd.Series(dtype=float)
             if not def_score_series.empty:
                 low_thresh = def_score_series.quantile(0.33)
@@ -1283,7 +1331,9 @@ with games_tab:
                                     "Last5 vs Season Pts": format_number(pts_delta, 1),
                                     "Last5 vs Season Min": format_number(min_delta, 1),
                                     "Last5 vs Season Usage": format_number(usage_delta, 1),
+                                    "Opp Defense Style": opp_style,
                                     "Opp Difficulty": opp_difficulty,
+                                    "Avg Pts vs Opp Style": format_number(avg_vs_style, 1),
                                 }
                             )
                             matchup_spotlight_rows.append(
@@ -1315,6 +1365,7 @@ with games_tab:
                                     "Last5 vs Season Min": min_delta,
                                     "Last5 vs Season Usage": usage_delta,
                                     "Opp Difficulty": opp_difficulty,
+                                    "Avg Pts vs Opp Style": avg_vs_style,
                                     "Matchup Score": matchup_score,
                                 }
                             )
