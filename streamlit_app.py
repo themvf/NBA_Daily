@@ -434,7 +434,7 @@ def load_team_defense_stats(
     for col in ["avg_allowed_pts", "avg_allowed_fg3m", "avg_allowed_reb"]:
         if col not in aggregates.columns:
             aggregates[col] = None
-        aggregates[f"{col}_pct"] = aggregates[col].rank(pct=True)
+        aggregates[f"{col}_pct"] = aggregates[col].fillna(0.0).rank(pct=True)
 
     def classify_style(row: pd.Series) -> str:
         fg3m_pct = safe_float(row.get("avg_allowed_fg3m_pct"))
@@ -454,6 +454,7 @@ def load_team_defense_stats(
         return "Neutral"
 
     aggregates["defense_style"] = aggregates.apply(classify_style, axis=1)
+    aggregates["defense_style"] = aggregates["defense_style"].replace("", "Neutral")
     return aggregates
 
 
@@ -1174,7 +1175,7 @@ with games_tab:
                 int(row["team_id"]): row.to_dict() for _, row in defense_stats.iterrows()
             }
             def_style_map: Dict[int, str] = {
-                int(row["team_id"]): str(row.get("defense_style") or "")
+                int(row["team_id"]): (str(row.get("defense_style") or "Neutral"))
                 for _, row in defense_stats.iterrows()
             }
             player_style_splits = build_player_style_splits(
