@@ -176,25 +176,45 @@ def calculate_team_impact(
 
     # Calculate team stats WITH player
     if not games_with.empty:
-        # Determine wins/losses (assuming pts > opp_pts means win)
-        games_with['is_win'] = games_with['pts'] > games_with['opp_pts']
-        wins_with = games_with['is_win'].sum()
-        losses_with = len(games_with) - wins_with
-        win_pct_with = wins_with / len(games_with) if len(games_with) > 0 else 0.0
-        avg_pts_with = games_with['pts'].mean()
-        avg_pts_allowed_with = games_with['opp_pts'].mean()
+        # Filter out games with null scores and convert to numeric
+        games_with_clean = games_with.copy()
+        games_with_clean['pts'] = pd.to_numeric(games_with_clean['pts'], errors='coerce')
+        games_with_clean['opp_pts'] = pd.to_numeric(games_with_clean['opp_pts'], errors='coerce')
+        games_with_clean = games_with_clean.dropna(subset=['pts', 'opp_pts'])
+
+        if not games_with_clean.empty:
+            # Determine wins/losses (assuming pts > opp_pts means win)
+            games_with_clean['is_win'] = games_with_clean['pts'] > games_with_clean['opp_pts']
+            wins_with = games_with_clean['is_win'].sum()
+            losses_with = len(games_with_clean) - wins_with
+            win_pct_with = wins_with / len(games_with_clean) if len(games_with_clean) > 0 else 0.0
+            avg_pts_with = games_with_clean['pts'].mean()
+            avg_pts_allowed_with = games_with_clean['opp_pts'].mean()
+        else:
+            wins_with = losses_with = 0
+            win_pct_with = avg_pts_with = avg_pts_allowed_with = 0.0
     else:
         wins_with = losses_with = 0
         win_pct_with = avg_pts_with = avg_pts_allowed_with = 0.0
 
     # Calculate team stats WITHOUT player
     if not games_without.empty:
-        games_without['is_win'] = games_without['pts'] > games_without['opp_pts']
-        wins_without = games_without['is_win'].sum()
-        losses_without = len(games_without) - wins_without
-        win_pct_without = wins_without / len(games_without) if len(games_without) > 0 else 0.0
-        avg_pts_without = games_without['pts'].mean()
-        avg_pts_allowed_without = games_without['opp_pts'].mean()
+        # Filter out games with null scores and convert to numeric
+        games_without_clean = games_without.copy()
+        games_without_clean['pts'] = pd.to_numeric(games_without_clean['pts'], errors='coerce')
+        games_without_clean['opp_pts'] = pd.to_numeric(games_without_clean['opp_pts'], errors='coerce')
+        games_without_clean = games_without_clean.dropna(subset=['pts', 'opp_pts'])
+
+        if not games_without_clean.empty:
+            games_without_clean['is_win'] = games_without_clean['pts'] > games_without_clean['opp_pts']
+            wins_without = games_without_clean['is_win'].sum()
+            losses_without = len(games_without_clean) - wins_without
+            win_pct_without = wins_without / len(games_without_clean) if len(games_without_clean) > 0 else 0.0
+            avg_pts_without = games_without_clean['pts'].mean()
+            avg_pts_allowed_without = games_without_clean['opp_pts'].mean()
+        else:
+            wins_without = losses_without = 0
+            win_pct_without = avg_pts_without = avg_pts_allowed_without = 0.0
     else:
         wins_without = losses_without = 0
         win_pct_without = avg_pts_without = avg_pts_allowed_without = 0.0
@@ -354,12 +374,18 @@ def calculate_opponent_impact(
 
     # Calculate opponent stats WITH player
     if not games_with.empty:
-        avg_opp_pts_with = games_with['opp_pts'].mean()
-        avg_opp_fg3m_with = games_with['opp_fg3m'].mean()
+        # Convert to numeric and handle nulls
+        games_with_clean = games_with.copy()
+        games_with_clean['opp_pts'] = pd.to_numeric(games_with_clean['opp_pts'], errors='coerce')
+        games_with_clean['opp_fg3m'] = pd.to_numeric(games_with_clean['opp_fg3m'], errors='coerce')
+
+        avg_opp_pts_with = games_with_clean['opp_pts'].mean() if not games_with_clean['opp_pts'].isna().all() else 0.0
+        avg_opp_fg3m_with = games_with_clean['opp_fg3m'].mean() if not games_with_clean['opp_fg3m'].isna().all() else 0.0
 
         # Calculate opponent FG% (if data available)
-        if 'opp_fga' in games_with.columns:
-            games_with_fga = games_with[games_with['opp_fga'] > 0].copy()
+        if 'opp_fga' in games_with_clean.columns:
+            games_with_clean['opp_fga'] = pd.to_numeric(games_with_clean['opp_fga'], errors='coerce')
+            games_with_fga = games_with_clean[(games_with_clean['opp_fga'] > 0) & (games_with_clean['opp_fga'].notna())].copy()
             if not games_with_fga.empty:
                 avg_opp_fg_pct_with = (games_with_fga['opp_pts'].sum() /
                                        (2 * games_with_fga['opp_fga'].sum()) * 100)
@@ -372,11 +398,17 @@ def calculate_opponent_impact(
 
     # Calculate opponent stats WITHOUT player
     if not games_without.empty:
-        avg_opp_pts_without = games_without['opp_pts'].mean()
-        avg_opp_fg3m_without = games_without['opp_fg3m'].mean()
+        # Convert to numeric and handle nulls
+        games_without_clean = games_without.copy()
+        games_without_clean['opp_pts'] = pd.to_numeric(games_without_clean['opp_pts'], errors='coerce')
+        games_without_clean['opp_fg3m'] = pd.to_numeric(games_without_clean['opp_fg3m'], errors='coerce')
 
-        if 'opp_fga' in games_without.columns:
-            games_without_fga = games_without[games_without['opp_fga'] > 0].copy()
+        avg_opp_pts_without = games_without_clean['opp_pts'].mean() if not games_without_clean['opp_pts'].isna().all() else 0.0
+        avg_opp_fg3m_without = games_without_clean['opp_fg3m'].mean() if not games_without_clean['opp_fg3m'].isna().all() else 0.0
+
+        if 'opp_fga' in games_without_clean.columns:
+            games_without_clean['opp_fga'] = pd.to_numeric(games_without_clean['opp_fga'], errors='coerce')
+            games_without_fga = games_without_clean[(games_without_clean['opp_fga'] > 0) & (games_without_clean['opp_fga'].notna())].copy()
             if not games_without_fga.empty:
                 avg_opp_fg_pct_without = (games_without_fga['opp_pts'].sum() /
                                           (2 * games_without_fga['opp_fga'].sum()) * 100)
