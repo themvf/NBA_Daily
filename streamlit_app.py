@@ -2016,6 +2016,48 @@ with games_tab:
                                 std_vs_opp,
                             )
 
+                            # Get opponent correlation/matchup advantage indicator
+                            matchup_indicator = ""
+                            matchup_advantage_text = ""
+                            if player_id_val is not None:
+                                try:
+                                    # Calculate opponent correlations for this player
+                                    opponent_corrs = pca.calculate_opponent_correlations(
+                                        sqlite3.connect(str(db_path)),
+                                        player_id_val,
+                                        context_season,
+                                        context_season_type,
+                                        min_games_vs=1
+                                    )
+
+                                    # Find this specific opponent in the correlations
+                                    if opponent_corrs and opponent_id is not None:
+                                        for opp_corr in opponent_corrs:
+                                            if opp_corr.opponent_team_id == int(opponent_id):
+                                                # Found the matchup!
+                                                score = opp_corr.matchup_score
+                                                delta = opp_corr.pts_delta
+
+                                                if score >= 60:
+                                                    matchup_indicator = "✅✅"  # Excellent matchup
+                                                    matchup_advantage_text = f"Elite matchup ({delta:+.1f} PPG)"
+                                                elif score >= 55:
+                                                    matchup_indicator = "✅"  # Good matchup
+                                                    matchup_advantage_text = f"Favorable ({delta:+.1f} PPG)"
+                                                elif score <= 40:
+                                                    matchup_indicator = "❌❌"  # Very poor matchup
+                                                    matchup_advantage_text = f"Struggles ({delta:+.1f} PPG)"
+                                                elif score <= 45:
+                                                    matchup_indicator = "❌"  # Poor matchup
+                                                    matchup_advantage_text = f"Tough ({delta:+.1f} PPG)"
+                                                else:
+                                                    matchup_indicator = "➖"  # Neutral
+                                                    matchup_advantage_text = f"Neutral ({delta:+.1f} PPG)"
+                                                break
+                                except Exception:
+                                    # Silently fail - don't break the display if correlation calc fails
+                                    pass
+
                             # Display string for vs opponent
                             if avg_vs_opp is not None and games_vs_opp >= 2:
                                 vs_opp_display = f"{avg_vs_opp:.1f} ({games_vs_opp}G)"
@@ -2057,6 +2099,7 @@ with games_tab:
                                     "Side": team_label,
                                     "Team": team_name,
                                     "Player": player["player_name"],
+                                    "Matchup": matchup_indicator,  # NEW: Matchup advantage indicator
                                     "DFS Score": f"{daily_pick_score:.1f}",
                                     "Grade": f"{pick_grade}\n{pick_explanation}",
                                     "Games": int(player["games_played"]),
@@ -2089,6 +2132,7 @@ with games_tab:
                                     "Vs This Team": vs_opp_display,
                                     "Vs This Style": avg_vs_style_display,
                                     "Matchup Rating": matchup_rating,
+                                    "Matchup Adv": matchup_advantage_text,  # NEW: Detailed matchup text
                                     "Warning": matchup_warning,
                                     "Confidence": f"{matchup_confidence:.0%}" if matchup_confidence > 0 else "Low",
                                 }
@@ -2099,6 +2143,7 @@ with games_tab:
                                     "Side": team_label,
                                     "Team": team_name,
                                     "Player": player["player_name"],
+                                    "Matchup Ind": matchup_indicator,  # NEW: Matchup indicator
                                     "DFS Score": daily_pick_score,
                                     "Pick Grade": f"{pick_grade}: {pick_explanation}",
                                     "Season Avg PPG": season_avg_pts,
@@ -2131,6 +2176,7 @@ with games_tab:
                                     "Vs This Team": vs_opp_display,
                                     "Vs This Style": avg_vs_style_display,
                                     "Matchup Rating": matchup_rating,
+                                    "Matchup Adv": matchup_advantage_text,  # NEW: Matchup advantage text
                                     "Warning": matchup_warning,
                                     "Matchup Score": matchup_score,
                                 }
@@ -2140,6 +2186,7 @@ with games_tab:
                                     "Matchup": f"{matchup['Away']} at {matchup['Home']}",
                                     "Player": player["player_name"],
                                     "Team": team_name,
+                                    "Ind": matchup_indicator,  # NEW: Matchup indicator (shorter column name)
                                     "DFS Score": daily_pick_score,
                                     "Grade": f"{pick_grade}: {pick_explanation}",
                                     "Projected PPG": projection,
