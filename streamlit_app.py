@@ -2816,7 +2816,7 @@ with injury_impact_tab:
             # TEAMMATE CORRELATIONS
             with corr_col1:
                 st.markdown("#### 🤝 Teammate Synergy")
-                st.caption("How does this player perform with specific teammates?")
+                st.caption("How do teammates perform when this player is in/out of the lineup?")
 
                 try:
                     with st.spinner("Analyzing teammate correlations..."):
@@ -2867,17 +2867,17 @@ with injury_impact_tab:
                         if best_teammate.correlation_score >= 55:
                             st.success(
                                 f"💡 **DFS Stack Opportunity:** {selected_player_name} + {best_teammate.teammate_name}\n\n"
-                                f"{selected_player_name} averages **{best_teammate.pts_delta:+.1f} more points** "
-                                f"when playing with {best_teammate.teammate_name} "
-                                f"({best_teammate.avg_pts_together:.1f} vs {best_teammate.avg_pts_apart:.1f} PPG)."
+                                f"{best_teammate.teammate_name} averages **{best_teammate.pts_delta:+.1f} more points** "
+                                f"when playing WITH {selected_player_name} "
+                                f"({best_teammate.avg_pts_together:.1f} vs {best_teammate.avg_pts_apart:.1f} PPG without)."
                             )
                     else:
                         st.info(
                             f"📊 **Not enough data for teammate correlation analysis**\n\n"
-                            f"To analyze how {selected_player_name} performs with/without specific teammates, we need:\n"
-                            f"- At least 2 games where they played together\n"
-                            f"- At least 1 game where {selected_player_name} played but the teammate was absent\n\n"
-                            f"This analysis becomes available as the season progresses and lineup rotations/injuries create natural comparison groups."
+                            f"To analyze how teammates perform with/without {selected_player_name}, we need:\n"
+                            f"- At least 2 games where {selected_player_name} played\n"
+                            f"- At least 1 game where {selected_player_name} was absent (so teammates have comparison data)\n\n"
+                            f"This analysis becomes available when {selected_player_name} misses games due to rest/injury."
                         )
 
                 except Exception as exc:
