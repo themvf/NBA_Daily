@@ -324,7 +324,7 @@ def calculate_teammate_redistribution(
     # Merge and calculate deltas
     teammate_impacts = []
 
-    if not teammates_without.empty:
+    if not teammates_without.empty and not teammates_with.empty:
         merged = teammates_with.merge(
             teammates_without,
             on='player_id',

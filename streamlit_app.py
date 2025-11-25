@@ -2801,6 +2801,13 @@ with injury_impact_tab:
                 # Display key metrics
                 st.markdown(f"### Team Performance: {team_impact.team_name}")
 
+                # Warning if data looks incomplete
+                if team_impact.games_absent > 0 and team_impact.team_avg_pts_without == 0.0:
+                    st.warning(
+                        f"⚠️ The game(s) {selected_player_name} missed may not have final scores yet "
+                        "(scheduled future game or incomplete data). Impact metrics may show as 0.0."
+                    )
+
                 metric_cols = st.columns(4)
                 with metric_cols[0]:
                     st.metric(
@@ -2928,7 +2935,15 @@ with injury_impact_tab:
                     else:
                         st.info("No teammates showed increased scoring when player was absent.")
                 else:
-                    st.info("Not enough data to analyze teammate redistribution (need at least 1 game in each scenario).")
+                    if team_impact.games_absent > 0:
+                        st.info(
+                            f"Unable to analyze teammate redistribution. This usually means:\n"
+                            f"- The game(s) {selected_player_name} missed may not have complete data yet (scheduled/in-progress)\n"
+                            f"- Teammates who played when {selected_player_name} was out didn't have enough overlapping games\n"
+                            f"- Try selecting a different season or player with more complete absence data"
+                        )
+                    else:
+                        st.info(f"{selected_player_name} has not missed any games this season (perfect attendance).")
 
                 # Opponent impact analysis
                 if opponent_impact:
