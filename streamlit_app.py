@@ -578,6 +578,128 @@ def build_player_style_splits(
     return splits
 
 
+def build_player_vs_team_history(
+    db_path: str,
+    season: str,
+    season_type: str,
+) -> Dict[int, Dict[int, Dict[str, Any]]]:
+    """
+    Build comprehensive player vs specific team history.
+    Returns: {player_id: {opponent_team_id: {stats}}}
+    """
+    query = """
+        SELECT p.player_id,
+               p.player_name,
+               p.points,
+               p.fg3m,
+               p.minutes,
+               t.opp_team_id,
+               p.game_date
+        FROM player_game_logs AS p
+        JOIN team_game_logs AS t
+          ON p.game_id = t.game_id
+         AND p.team_id = t.team_id
+        WHERE p.season = ?
+          AND p.season_type = ?
+          AND p.points IS NOT NULL
+        ORDER BY p.player_id, t.opp_team_id, p.game_date
+    """
+    df = run_query(db_path, query, params=(season, season_type))
+    if df.empty:
+        return {}
+
+    df["player_id"] = pd.to_numeric(df["player_id"], errors="coerce")
+    df["opp_team_id"] = pd.to_numeric(df["opp_team_id"], errors="coerce")
+    df["points"] = pd.to_numeric(df["points"], errors="coerce")
+    df["fg3m"] = pd.to_numeric(df["fg3m"], errors="coerce")
+    df = df.dropna(subset=["player_id", "opp_team_id", "points"])
+
+    # Group by player and opponent team
+    grouped = df.groupby(["player_id", "opp_team_id"])["points"].agg([
+        "count", "mean", "median", "std", "min", "max"
+    ]).reset_index()
+    grouped.columns = ["player_id", "opp_team_id", "games", "avg_pts",
+                       "median_pts", "std_pts", "min_pts", "max_pts"]
+
+    # Build nested dictionary
+    history: Dict[int, Dict[int, Dict[str, Any]]] = {}
+    for _, row in grouped.iterrows():
+        pid = int(row["player_id"])
+        opp_id = int(row["opp_team_id"])
+
+        if pid not in history:
+            history[pid] = {}
+
+        history[pid][opp_id] = {
+            "games": int(row["games"]),
+            "avg_pts": float(row["avg_pts"]),
+            "median_pts": float(row["median_pts"]),
+            "std_pts": float(row["std_pts"]) if pd.notna(row["std_pts"]) else 0.0,
+            "min_pts": float(row["min_pts"]),
+            "max_pts": float(row["max_pts"]),
+        }
+
+    return history
+
+
+def evaluate_matchup_quality(
+    player_avg: float,
+    player_vs_opp_avg: float | None,
+    player_vs_style_avg: float | None,
+    games_vs_opp: int,
+    games_vs_style: int,
+    std_vs_opp: float | None,
+) -> tuple[str, str, float]:
+    """
+    Evaluate matchup quality and return (rating, warning, confidence).
+
+    Returns:
+        rating: "Excellent", "Good", "Neutral", "Difficult", "Avoid"
+        warning: Human-readable warning message or empty string
+        confidence: 0.0 to 1.0 confidence score
+    """
+    # Calculate confidence based on sample size
+    confidence = min(1.0, (games_vs_opp * 0.15) + (games_vs_style * 0.05))
+
+    # If we have specific team history, use it (weighted heavily)
+    if player_vs_opp_avg is not None and games_vs_opp >= 2:
+        diff_pct = (player_vs_opp_avg - player_avg) / player_avg if player_avg > 0 else 0
+
+        # Check for high variance (inconsistent matchup)
+        is_volatile = std_vs_opp is not None and std_vs_opp > (player_avg * 0.4)
+
+        if diff_pct <= -0.25:  # 25%+ worse
+            warning = f"Struggles vs this team (avg {player_vs_opp_avg:.1f} vs season {player_avg:.1f})"
+            if is_volatile:
+                warning += " - Inconsistent"
+            return ("Avoid", warning, confidence)
+        elif diff_pct <= -0.15:  # 15-25% worse
+            warning = f"Below average vs this team ({player_vs_opp_avg:.1f} vs {player_avg:.1f})"
+            return ("Difficult", warning, confidence)
+        elif diff_pct >= 0.20:  # 20%+ better
+            warning = f"Excels vs this team (avg {player_vs_opp_avg:.1f} vs season {player_avg:.1f})"
+            return ("Excellent", warning, confidence)
+        elif diff_pct >= 0.10:  # 10-20% better
+            return ("Good", "", confidence)
+        else:
+            return ("Neutral", "", confidence)
+
+    # Fall back to defense style if no team history
+    if player_vs_style_avg is not None and games_vs_style >= 3:
+        diff_pct = (player_vs_style_avg - player_avg) / player_avg if player_avg > 0 else 0
+
+        if diff_pct <= -0.20:
+            warning = f"Struggles vs this defense style ({player_vs_style_avg:.1f} vs {player_avg:.1f})"
+            return ("Difficult", warning, confidence * 0.7)  # Lower confidence
+        elif diff_pct >= 0.15:
+            return ("Good", "", confidence * 0.7)
+        else:
+            return ("Neutral", "", confidence * 0.5)
+
+    # No meaningful history
+    return ("Neutral", "", 0.0)
+
+
 def build_player_style_leaders(
     db_path: str,
     season: str,
@@ -1326,6 +1448,11 @@ with games_tab:
                 context_season_type,
                 def_style_map,
             )
+            player_vs_team_history = build_player_vs_team_history(
+                str(db_path),
+                context_season,
+                context_season_type,
+            )
             def_score_series = defense_stats["def_composite_score"].dropna() if not defense_stats.empty else pd.Series(dtype=float)
             if not def_score_series.empty:
                 low_thresh = def_score_series.quantile(0.33)
@@ -1447,19 +1574,49 @@ with games_tab:
                                 if avg_usg_last5 is not None and usage_pct is not None
                                 else None
                             )
-                            avg_vs_style = None
+                            # Get player history vs this opponent
                             player_id_val = safe_int(player.get("player_id"))
+                            vs_opp_history = None
+                            avg_vs_opp = None
+                            games_vs_opp = 0
+                            std_vs_opp = None
+
+                            if player_id_val is not None and opponent_id is not None:
+                                vs_opp_history = player_vs_team_history.get(player_id_val, {}).get(int(opponent_id))
+                                if vs_opp_history:
+                                    avg_vs_opp = vs_opp_history["avg_pts"]
+                                    games_vs_opp = vs_opp_history["games"]
+                                    std_vs_opp = vs_opp_history["std_pts"]
+
+                            # Get player history vs this defense style
+                            avg_vs_style = None
+                            games_vs_style = 0
                             if player_id_val is not None:
-                                avg_vs_style = player_style_splits.get(player_id_val, {}).get(
-                                    opp_style
-                                )
-                            avg_vs_style_filled = (
-                                avg_vs_style if avg_vs_style is not None else season_avg_pts
+                                style_data = player_style_splits.get(player_id_val, {})
+                                avg_vs_style = style_data.get(opp_style)
+                                # Estimate games from all teams with this style
+                                if avg_vs_style is not None:
+                                    games_vs_style = 5  # Conservative estimate
+
+                            # Evaluate matchup quality
+                            matchup_rating, matchup_warning, matchup_confidence = evaluate_matchup_quality(
+                                season_avg_pts,
+                                avg_vs_opp,
+                                avg_vs_style,
+                                games_vs_opp,
+                                games_vs_style,
+                                std_vs_opp,
                             )
+
+                            # Display string for vs opponent
+                            if avg_vs_opp is not None and games_vs_opp >= 2:
+                                vs_opp_display = f"{avg_vs_opp:.1f} ({games_vs_opp}G)"
+                            else:
+                                vs_opp_display = "N/A"
+
+                            # Display string for vs style
                             avg_vs_style_display = (
-                                format_number(avg_vs_style_filled, 1)
-                                if avg_vs_style_filled is not None
-                                else "N/A"
+                                format_number(avg_vs_style, 1) if avg_vs_style is not None else "N/A"
                             )
                             matchup_rows.append(
                                 {
@@ -1490,7 +1647,11 @@ with games_tab:
                                     "Last5 vs Season Usage": format_number(usage_delta, 1),
                                     "Opp Defense Style": opp_style,
                                     "Opp Difficulty": opp_difficulty,
-                                    "Avg Pts vs Opp Style": avg_vs_style_display,
+                                    "Vs This Team": vs_opp_display,
+                                    "Vs This Style": avg_vs_style_display,
+                                    "Matchup Rating": matchup_rating,
+                                    "Warning": matchup_warning,
+                                    "Confidence": f"{matchup_confidence:.0%}" if matchup_confidence > 0 else "Low",
                                 }
                             )
                             matchup_spotlight_rows.append(
@@ -1522,7 +1683,10 @@ with games_tab:
                                     "Last5 vs Season Min": min_delta,
                                     "Last5 vs Season Usage": usage_delta,
                                     "Opp Difficulty": opp_difficulty,
-                                    "Avg Pts vs Opp Style": avg_vs_style_display,
+                                    "Vs This Team": vs_opp_display,
+                                    "Vs This Style": avg_vs_style_display,
+                                    "Matchup Rating": matchup_rating,
+                                    "Warning": matchup_warning,
                                     "Matchup Score": matchup_score,
                                 }
                             )
@@ -1567,7 +1731,43 @@ with games_tab:
                     st.markdown(f"**{matchup['Away']} at {matchup['Home']}**")
                     if matchup_rows:
                         matchup_df = pd.DataFrame(matchup_rows)
-                        st.dataframe(matchup_df, use_container_width=True)
+
+                        # Apply styling based on matchup rating
+                        def style_matchup_rating(val):
+                            if val == "Excellent":
+                                return "background-color: #d4edda; color: #155724"  # Green
+                            elif val == "Good":
+                                return "background-color: #d1ecf1; color: #0c5460"  # Blue
+                            elif val == "Difficult":
+                                return "background-color: #fff3cd; color: #856404"  # Yellow
+                            elif val == "Avoid":
+                                return "background-color: #f8d7da; color: #721c24"  # Red
+                            return ""
+
+                        def style_warning(val):
+                            if val and isinstance(val, str) and len(val) > 0:
+                                return "background-color: #fff3cd; font-weight: bold"
+                            return ""
+
+                        styled_df = matchup_df.style.applymap(
+                            style_matchup_rating, subset=["Matchup Rating"]
+                        ).applymap(
+                            style_warning, subset=["Warning"]
+                        )
+
+                        st.dataframe(styled_df, use_container_width=True)
+
+                        # Show warnings prominently
+                        warnings = matchup_df[matchup_df["Warning"].notna() & (matchup_df["Warning"] != "")]
+                        if not warnings.empty:
+                            with st.expander("⚠️ Matchup Warnings", expanded=True):
+                                for _, row in warnings.iterrows():
+                                    if row["Matchup Rating"] == "Avoid":
+                                        st.error(f"**{row['Player']} ({row['Team']})**: {row['Warning']}")
+                                    elif row["Matchup Rating"] == "Difficult":
+                                        st.warning(f"**{row['Player']} ({row['Team']})**: {row['Warning']}")
+                                    elif row["Matchup Rating"] == "Excellent":
+                                        st.success(f"**{row['Player']} ({row['Team']})**: {row['Warning']}")
                     else:
                         st.caption("No qualified players for this matchup yet.")
     except Exception as exc:  # noqa: BLE001
