@@ -834,22 +834,61 @@ def calculate_daily_pick_score(
     final_score = base_score + matchup_bonus + defense_adjustment + confidence_bonus
     final_score = max(0, min(100, final_score))
 
+    # Build contextual explanation based on what's driving the score
+    factors = []
+
+    # Projection factor
+    if player_projection >= 30:
+        factors.append("elite scorer")
+    elif player_projection >= 25:
+        factors.append("strong scorer")
+    elif player_projection >= 18:
+        factors.append("solid volume")
+    else:
+        factors.append("limited volume")
+
+    # Matchup factor
+    if matchup_rating == "Excellent":
+        factors.append("excels vs this matchup")
+    elif matchup_rating == "Good":
+        factors.append("favorable matchup")
+    elif matchup_rating == "Difficult":
+        factors.append("struggles vs this defense")
+    elif matchup_rating == "Avoid":
+        factors.append("historically poor vs opponent")
+
+    # Defense factor (only mention if significant)
+    if opp_def_rating is not None:
+        if opp_def_rating >= 118:
+            factors.append("weak defense")
+        elif opp_def_rating <= 106:
+            factors.append("elite defense")
+
+    # Confidence factor
+    if projection_confidence >= 0.75:
+        factors.append("high confidence")
+    elif projection_confidence < 0.50:
+        factors.append("limited data")
+
+    # Build explanation sentence
+    explanation = ", ".join(factors)
+
     # Grade the score with clear tiers
     if final_score >= 80:
         grade = "🔥 Elite"
-        explanation = "Exceptional opportunity"
+        explanation = f"Elite pick: {explanation}"
     elif final_score >= 65:
         grade = "⭐ Excellent"
-        explanation = "Strong opportunity"
+        explanation = f"Strong pick: {explanation}"
     elif final_score >= 50:
         grade = "✓ Solid"
-        explanation = "Reliable pick"
+        explanation = f"Reliable: {explanation}"
     elif final_score >= 35:
         grade = "⚠️ Risky"
-        explanation = "Below average"
+        explanation = f"Caution: {explanation}"
     else:
         grade = "❌ Avoid"
-        explanation = "Poor opportunity"
+        explanation = f"Avoid: {explanation}"
 
     return (final_score, grade, explanation)
 
@@ -1987,7 +2026,7 @@ with games_tab:
                                     "Team": team_name,
                                     "Player": player["player_name"],
                                     "Pick Score": f"{daily_pick_score:.1f}",
-                                    "Grade": pick_grade,
+                                    "Grade": f"{pick_grade}\n{pick_explanation}",
                                     "Games": int(player["games_played"]),
                                     "Projected PPG": f"{projection:.1f}",
                                     "Proj Conf": f"{proj_confidence:.0%}",
@@ -2029,7 +2068,7 @@ with games_tab:
                                     "Team": team_name,
                                     "Player": player["player_name"],
                                     "Daily Pick Score": daily_pick_score,
-                                    "Pick Grade": pick_grade,
+                                    "Pick Grade": f"{pick_grade}: {pick_explanation}",
                                     "Season Avg PPG": season_avg_pts,
                                     "Projected PPG": projection,
                                     "Proj Floor": proj_floor,
@@ -2070,7 +2109,7 @@ with games_tab:
                                     "Player": player["player_name"],
                                     "Team": team_name,
                                     "Pick Score": daily_pick_score,
-                                    "Grade": pick_grade,
+                                    "Grade": f"{pick_grade}: {pick_explanation}",
                                     "Projected PPG": projection,
                                     "Season Avg PPG": season_avg_pts,
                                     "Proj Conf": f"{proj_confidence:.0%}",
