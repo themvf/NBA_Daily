@@ -2825,7 +2825,7 @@ with injury_impact_tab:
                             selected_player_id,
                             impact_season,
                             impact_season_type,
-                            min_games_together=3
+                            min_games_together=2
                         )
 
                     if teammate_correlations:
@@ -2873,9 +2873,11 @@ with injury_impact_tab:
                             )
                     else:
                         st.info(
-                            f"Not enough data to analyze teammate correlations for {selected_player_name}. "
-                            "This usually means the player hasn't missed enough games to create comparison groups, "
-                            "or teammates haven't had sufficient overlap."
+                            f"📊 **Not enough data for teammate correlation analysis**\n\n"
+                            f"To analyze how {selected_player_name} performs with/without specific teammates, we need:\n"
+                            f"- At least 2 games where they played together\n"
+                            f"- At least 1 game where {selected_player_name} played but the teammate was absent\n\n"
+                            f"This analysis becomes available as the season progresses and lineup rotations/injuries create natural comparison groups."
                         )
 
                 except Exception as exc:
