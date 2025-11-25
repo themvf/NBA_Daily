@@ -802,9 +802,10 @@ def calculate_daily_pick_score(
     Returns:
         (score 0-100, grade, explanation)
     """
-    # 1. Base score from projected points (0-50 range)
-    # Scale typical 0-45 PPG range to 0-50 points
-    base_score = min(50, (player_projection / 45.0) * 50)
+    # 1. Base score from projected points (0-60 range)
+    # Scale typical 5-40 PPG range to reasonable scores
+    # Formula: (proj - 5) * 1.5 gives 5PPG=0, 40PPG=52.5
+    base_score = max(0, (player_projection - 5) * 1.5)
 
     # 2. Matchup quality bonus/penalty (-20 to +20)
     matchup_adjustments = {
@@ -824,13 +825,14 @@ def calculate_daily_pick_score(
     else:
         defense_adjustment = 0
 
-    # 4. Confidence multiplier (0.5 to 1.0)
-    # Low confidence = reduce the score significantly
-    confidence_multiplier = 0.5 + (projection_confidence * 0.5)
+    # 4. Confidence bonus (0 to +15)
+    # High confidence = bonus points, low confidence = no bonus (not penalty)
+    # Formula: confidence * 15 gives 0-15 point bonus
+    confidence_bonus = projection_confidence * 15
 
-    # Calculate final score
-    raw_score = base_score + matchup_bonus + defense_adjustment
-    final_score = max(0, min(100, raw_score * confidence_multiplier))
+    # Calculate final score (all additive, no crushing multiplier)
+    final_score = base_score + matchup_bonus + defense_adjustment + confidence_bonus
+    final_score = max(0, min(100, final_score))
 
     # Grade the score with clear tiers
     if final_score >= 80:
