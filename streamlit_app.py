@@ -23,6 +23,7 @@ from nba_api.stats.endpoints import scoreboardv2
 from nba_to_sqlite import build_database
 import injury_impact_analytics as iia
 import player_correlation_analytics as pca
+import defense_type_analytics as dta
 
 DEFAULT_DB_PATH = Path(__file__).with_name("nba_stats.db")
 DEFAULT_PREDICTIONS_PATH = Path(__file__).with_name("predictions.csv")
@@ -2841,10 +2842,157 @@ with injury_impact_tab:
     # VS DEFENSE TYPES TAB
     with defense_types_tab:
         st.markdown("### Performance vs Different Defense Types")
-        if selected_player_id:
-            st.info("Defense type analysis coming soon! This will show performance against fast/slow pace teams and strong/weak defenses.")
+        st.markdown(
+            "Analyze how this player performs against different defensive styles: "
+            "fast vs slow pace teams, and elite vs weak defenses."
+        )
+
+        if not selected_player_id:
+            st.warning("Select a player above to view defense type analysis.")
         else:
-            st.warning("Select a player above to view defense matchup analysis.")
+            try:
+                with st.spinner(f"Analyzing {selected_player_name}'s performance vs defense types..."):
+                    defense_splits = dta.calculate_defense_type_splits(
+                        conn_impact,
+                        selected_player_id,
+                        impact_season,
+                        impact_season_type,
+                        min_games=2
+                    )
+
+                if defense_splits:
+                    # Create two columns for pace vs defense quality
+                    def_col1, def_col2 = st.columns(2)
+
+                    # PACE SPLITS
+                    with def_col1:
+                        st.markdown("#### ⚡ Pace-Based Splits")
+                        st.caption("Performance against fast vs slow tempo teams")
+
+                        pace_splits = [s for s in defense_splits if 'Pace' in s.defense_type]
+
+                        if pace_splits:
+                            pace_data = []
+                            for split in pace_splits:
+                                # Indicator based on performance delta
+                                if split.pts_vs_average >= 3:
+                                    indicator = "🟢🟢"  # Excels
+                                elif split.pts_vs_average >= 1:
+                                    indicator = "🟢"  # Good
+                                elif split.pts_vs_average <= -3:
+                                    indicator = "🔴🔴"  # Struggles
+                                elif split.pts_vs_average <= -1:
+                                    indicator = "🔴"  # Below average
+                                else:
+                                    indicator = "🟡"  # Neutral
+
+                                pace_data.append({
+                                    "": indicator,
+                                    "Pace Type": split.defense_type,
+                                    "Games": split.games_played,
+                                    "PPG": f"{split.avg_pts:.1f}",
+                                    "vs Avg": f"{split.pts_vs_average:+.1f}",
+                                    "3PM": f"{split.avg_fg3m:.1f}",
+                                    "3PM Δ": f"{split.fg3m_vs_average:+.1f}",
+                                    "Min": f"{split.avg_minutes:.1f}",
+                                    "Sample Teams": ", ".join(split.sample_teams[:2])
+                                })
+
+                            pace_df = pd.DataFrame(pace_data)
+                            st.dataframe(pace_df, use_container_width=True, hide_index=True)
+
+                            st.caption(
+                                "🟢🟢 Excels (+3 PPG) | 🟢 Above avg (+1 PPG) | 🟡 Neutral | "
+                                "🔴 Below avg (-1 PPG) | 🔴🔴 Struggles (-3 PPG)"
+                            )
+
+                            # Highlight best pace matchup
+                            best_pace = max(pace_splits, key=lambda x: x.pts_vs_average)
+                            if best_pace.pts_vs_average >= 2:
+                                st.success(
+                                    f"💡 **Pace Advantage**: {selected_player_name} performs best against "
+                                    f"**{best_pace.defense_type}** teams, averaging **{best_pace.pts_vs_average:+.1f} more PPG** "
+                                    f"than usual ({best_pace.avg_pts:.1f} vs {best_pace.avg_pts - best_pace.pts_vs_average:.1f} PPG)."
+                                )
+                        else:
+                            st.info("Not enough games against different pace types yet.")
+
+                    # DEFENSE QUALITY SPLITS
+                    with def_col2:
+                        st.markdown("#### 🛡️ Defense Quality Splits")
+                        st.caption("Performance against elite vs weak defenses")
+
+                        def_quality_splits = [s for s in defense_splits if 'Defense' in s.defense_type]
+
+                        if def_quality_splits:
+                            def_data = []
+                            for split in def_quality_splits:
+                                # Indicator based on performance delta
+                                if split.pts_vs_average >= 3:
+                                    indicator = "🟢🟢"
+                                elif split.pts_vs_average >= 1:
+                                    indicator = "🟢"
+                                elif split.pts_vs_average <= -3:
+                                    indicator = "🔴🔴"
+                                elif split.pts_vs_average <= -1:
+                                    indicator = "🔴"
+                                else:
+                                    indicator = "🟡"
+
+                                def_data.append({
+                                    "": indicator,
+                                    "Defense Type": split.defense_type,
+                                    "Games": split.games_played,
+                                    "PPG": f"{split.avg_pts:.1f}",
+                                    "vs Avg": f"{split.pts_vs_average:+.1f}",
+                                    "3PM": f"{split.avg_fg3m:.1f}",
+                                    "3PM Δ": f"{split.fg3m_vs_average:+.1f}",
+                                    "Min": f"{split.avg_minutes:.1f}",
+                                    "Sample Teams": ", ".join(split.sample_teams[:2])
+                                })
+
+                            def_df = pd.DataFrame(def_data)
+                            st.dataframe(def_df, use_container_width=True, hide_index=True)
+
+                            st.caption(
+                                "🟢🟢 Excels (+3 PPG) | 🟢 Above avg (+1 PPG) | 🟡 Neutral | "
+                                "🔴 Below avg (-1 PPG) | 🔴🔴 Struggles (-3 PPG)"
+                            )
+
+                            # Highlight against weak defenses
+                            weak_def = next((s for s in def_quality_splits if s.defense_type == 'Weak Defense'), None)
+                            elite_def = next((s for s in def_quality_splits if s.defense_type == 'Elite Defense'), None)
+
+                            if weak_def and weak_def.pts_vs_average >= 2:
+                                st.success(
+                                    f"💡 **Exploits Weak Defenses**: {selected_player_name} averages "
+                                    f"**{weak_def.pts_vs_average:+.1f} more PPG** against weak defenses "
+                                    f"({weak_def.avg_pts:.1f} PPG in {weak_def.games_played} games)."
+                                )
+                            elif elite_def and elite_def.pts_vs_average >= 1:
+                                st.success(
+                                    f"💡 **Elite Defense Buster**: {selected_player_name} still scores well against "
+                                    f"elite defenses, averaging {elite_def.avg_pts:.1f} PPG "
+                                    f"({elite_def.pts_vs_average:+.1f} vs season average)."
+                                )
+                        else:
+                            st.info("Not enough games against different defense quality levels yet.")
+
+                else:
+                    st.info(
+                        f"📊 **Not enough data for defense type analysis**\n\n"
+                        f"To analyze {selected_player_name}'s performance vs different defense types, we need:\n"
+                        f"- At least 2 games against fast pace teams\n"
+                        f"- At least 2 games against slow pace teams\n"
+                        f"- At least 2 games against elite defenses\n"
+                        f"- At least 2 games against weak defenses\n\n"
+                        f"This analysis becomes more reliable as the season progresses."
+                    )
+
+            except Exception as exc:
+                st.error(f"Error analyzing defense type performance: {exc}")
+                import traceback
+                st.code(traceback.format_exc())
 
     # PLAYER CORRELATIONS TAB
     with correlations_tab:
