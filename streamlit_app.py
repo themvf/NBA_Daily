@@ -357,7 +357,11 @@ def load_team_defense_stats(
                opp.fg3m AS allowed_fg3m,
                opp.fg3a AS allowed_fg3a,
                opp.reb AS allowed_reb,
-               opp.ast AS allowed_ast
+               opp.ast AS allowed_ast,
+               opp.fga AS opp_fga,
+               opp.fta AS opp_fta,
+               opp.oreb AS opp_oreb,
+               opp.tov AS opp_tov
         FROM team_game_logs AS t
         JOIN team_game_logs AS opp
           ON opp.game_id = t.game_id
@@ -370,9 +374,22 @@ def load_team_defense_stats(
         return df
     df["team_id"] = pd.to_numeric(df["team_id"], errors="coerce")
     df["allowed_pts"] = pd.to_numeric(df["allowed_pts"], errors="coerce")
-    for col in ["allowed_fg3m", "allowed_fg3a", "allowed_reb", "allowed_ast"]:
+    for col in ["allowed_fg3m", "allowed_fg3a", "allowed_reb", "allowed_ast",
+                "opp_fga", "opp_fta", "opp_oreb", "opp_tov"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Calculate 2PT points allowed (total points - 3PT points)
+    df["allowed_2pt_pts"] = df["allowed_pts"] - (df["allowed_fg3m"] * 3)
+
+    # Estimate opponent possessions: FGA + 0.44*FTA - ORB + TOV
+    df["opp_possessions"] = (
+        df["opp_fga"] +
+        0.44 * df["opp_fta"].fillna(0) -
+        df["opp_oreb"].fillna(0) +
+        df["opp_tov"].fillna(0)
+    )
+
     df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
     df = df.dropna(subset=["team_id", "allowed_pts"])
     if rolling_window and rolling_window > 0:
@@ -392,9 +409,22 @@ def load_team_defense_stats(
             avg_allowed_fg3a=("allowed_fg3a", "mean"),
             avg_allowed_reb=("allowed_reb", "mean"),
             avg_allowed_ast=("allowed_ast", "mean"),
+            avg_allowed_2pt_pts=("allowed_2pt_pts", "mean"),
+            avg_opp_possessions=("opp_possessions", "mean"),
         )
         .reset_index()
     )
+
+    # Calculate pace-adjusted defensive rating (points allowed per 100 possessions)
+    aggregates["def_rating"] = (
+        aggregates["avg_allowed_pts"] / aggregates["avg_opp_possessions"].replace(0, 1)
+    ) * 100
+    aggregates["def_3pm_per100"] = (
+        aggregates["avg_allowed_fg3m"] / aggregates["avg_opp_possessions"].replace(0, 1)
+    ) * 100
+    aggregates["def_2pt_pts_per100"] = (
+        aggregates["avg_allowed_2pt_pts"] / aggregates["avg_opp_possessions"].replace(0, 1)
+    ) * 100
 
     def compute_recent(team_df: pd.DataFrame, window: int) -> float | None:
         subset = (
@@ -437,34 +467,69 @@ def load_team_defense_stats(
         + 0.2 * recent3
         + 0.1 * (avg_allowed / (std_allowed + 1.0))
     )
-    # Percentiles for style classification
-    for col in ["avg_allowed_pts", "avg_allowed_fg3m", "avg_allowed_reb"]:
+    # Percentiles for multi-label style classification
+    for col in ["def_rating", "avg_allowed_pts", "avg_allowed_fg3m", "avg_allowed_reb",
+                "def_2pt_pts_per100", "def_3pm_per100"]:
         if col not in aggregates.columns:
             aggregates[col] = None
         filled = aggregates[col].fillna(aggregates[col].median())
         aggregates[f"{col}_pct"] = filled.rank(pct=True)
 
-    def classify_style(row: pd.Series) -> str:
-        fg3m_pct = safe_float(row.get("avg_allowed_fg3m_pct"))
-        reb_pct = safe_float(row.get("avg_allowed_reb_pct"))
-        pts_pct = safe_float(row.get("avg_allowed_pts_pct"))
-        if fg3m_pct is None and reb_pct is None and pts_pct is None:
-            return "Neutral"
-        if fg3m_pct is not None and fg3m_pct >= 0.65:
-            return "Perimeter Leak"
-        if reb_pct is not None and reb_pct >= 0.65:
-            return "Board-Soft"
-        if (
-            fg3m_pct is not None
-            and pts_pct is not None
-            and fg3m_pct <= 0.35
-            and pts_pct <= 0.35
-        ):
-            return "Clamp"
-        return "Neutral"
+    def classify_styles_multi_label(row: pd.Series) -> list[str]:
+        """Returns list of defensive style tags"""
+        styles = []
 
-    aggregates["defense_style"] = aggregates.apply(classify_style, axis=1)
-    aggregates["defense_style"] = aggregates["defense_style"].replace("", "Neutral")
+        # Overall tier based on pace-adjusted defensive rating
+        def_rating_pct = safe_float(row.get("def_rating_pct"))
+        if def_rating_pct is not None:
+            if def_rating_pct <= 0.20:
+                styles.append("🔒 Elite")
+            elif def_rating_pct >= 0.80:
+                styles.append("⚠️ Vulnerable")
+
+        # Perimeter defense (3PT)
+        fg3m_pct = safe_float(row.get("def_3pm_per100_pct"))
+        if fg3m_pct is not None:
+            if fg3m_pct >= 0.65:
+                styles.append("🎯 Perimeter Leak")
+            elif fg3m_pct <= 0.35:
+                styles.append("🛡️ Perimeter Lock")
+
+        # Paint defense (2PT points)
+        paint_pct = safe_float(row.get("def_2pt_pts_per100_pct"))
+        if paint_pct is not None:
+            if paint_pct <= 0.35:
+                styles.append("🏰 Rim Protector")
+            elif paint_pct >= 0.65:
+                styles.append("🚪 Paint Vulnerable")
+
+        # Rebounding
+        reb_pct = safe_float(row.get("avg_allowed_reb_pct"))
+        if reb_pct is not None:
+            if reb_pct >= 0.65:
+                styles.append("🏀 Board-Soft")
+            elif reb_pct <= 0.35:
+                styles.append("💪 Glass Cleaner")
+
+        return styles if styles else ["⚖️ Balanced"]
+
+    aggregates["defense_styles"] = aggregates.apply(classify_styles_multi_label, axis=1)
+    aggregates["style_tags"] = aggregates["defense_styles"].apply(lambda x: " | ".join(x))
+
+    # Keep single legacy style for backwards compatibility
+    def classify_style_legacy(row: pd.Series) -> str:
+        styles = row.get("defense_styles", [])
+        if "🔒 Elite" in str(styles):
+            return "Elite"
+        if "🎯 Perimeter Leak" in str(styles):
+            return "Perimeter Leak"
+        if "🏀 Board-Soft" in str(styles):
+            return "Board-Soft"
+        if "🏰 Rim Protector" in str(styles):
+            return "Rim Protector"
+        return "Balanced"
+
+    aggregates["defense_style"] = aggregates.apply(classify_style_legacy, axis=1)
     return aggregates
 
 
@@ -1876,23 +1941,32 @@ with defense_styles_tab:
             styles_df = styles_df.merge(team_lookup_df, on="team_id", how="left")
             display_cols = [
                 "full_name",
-                "defense_style",
+                "style_tags",
+                "def_rating",
                 "avg_allowed_pts",
-                "avg_allowed_fg3m",
+                "def_3pm_per100",
+                "def_2pt_pts_per100",
                 "avg_allowed_reb",
                 "def_composite_score",
             ]
             rename_map = {
                 "full_name": "Team",
-                "defense_style": "Defense Style",
+                "style_tags": "Defense Styles",
+                "def_rating": "Def Rating (per 100)",
                 "avg_allowed_pts": "Avg Pts Allowed",
-                "avg_allowed_fg3m": "Avg 3PM Allowed",
+                "def_3pm_per100": "3PM Allowed (per 100)",
+                "def_2pt_pts_per100": "2PT Pts Allowed (per 100)",
                 "avg_allowed_reb": "Avg Reb Allowed",
                 "def_composite_score": "Def Composite",
             }
             display_df = styles_df[display_cols].rename(columns=rename_map)
+            # Format numeric columns
+            for col in ["Def Rating (per 100)", "Avg Pts Allowed", "3PM Allowed (per 100)",
+                       "2PT Pts Allowed (per 100)", "Avg Reb Allowed", "Def Composite"]:
+                if col in display_df.columns:
+                    display_df[col] = display_df[col].map(lambda v: format_number(v, 1))
             st.dataframe(
-                display_df.sort_values("Defense Style"),
+                display_df.sort_values("Defense Styles"),
                 use_container_width=True,
             )
             grouped = (

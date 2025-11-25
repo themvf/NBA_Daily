@@ -281,6 +281,14 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             reb REAL,
             opp_ast REAL,
             opp_reb REAL,
+            fga REAL,
+            fta REAL,
+            oreb REAL,
+            tov REAL,
+            opp_fga REAL,
+            opp_fta REAL,
+            opp_oreb REAL,
+            opp_tov REAL,
             PRIMARY KEY (season, season_type, team_id, game_id)
         );
         """
@@ -290,6 +298,14 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         ("team_game_logs", "reb", "REAL"),
         ("team_game_logs", "opp_ast", "REAL"),
         ("team_game_logs", "opp_reb", "REAL"),
+        ("team_game_logs", "fga", "REAL"),
+        ("team_game_logs", "fta", "REAL"),
+        ("team_game_logs", "oreb", "REAL"),
+        ("team_game_logs", "tov", "REAL"),
+        ("team_game_logs", "opp_fga", "REAL"),
+        ("team_game_logs", "opp_fta", "REAL"),
+        ("team_game_logs", "opp_oreb", "REAL"),
+        ("team_game_logs", "opp_tov", "REAL"),
         ("player_game_logs", "usg_pct", "REAL"),
     ]
     for table, column, col_type in alter_columns:
@@ -635,6 +651,14 @@ def load_team_game_logs(
                 "reb": data.get("reb"),
                 "opp_ast": data.get("opp_ast"),
                 "opp_reb": data.get("opp_reb"),
+                "fga": data.get("fga"),
+                "fta": data.get("fta"),
+                "oreb": data.get("oreb"),
+                "tov": data.get("tov"),
+                "opp_fga": data.get("opp_fga"),
+                "opp_fta": data.get("opp_fta"),
+                "opp_oreb": data.get("opp_oreb"),
+                "opp_tov": data.get("opp_tov"),
             }
         )
     return upsert_rows(
