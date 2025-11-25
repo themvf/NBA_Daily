@@ -652,6 +652,18 @@ def load_team_game_logs(
         opp_abbrev = parse_opponent_abbreviation(matchup)
         opp_team_id = abbrev_to_id.get(opp_abbrev) if opp_abbrev else None
 
+        # Calculate opponent points from team points and plus/minus
+        # opp_pts = team_pts - plus_minus
+        team_pts = data.get("pts")
+        plus_minus = data.get("plus_minus")
+        if team_pts is not None and plus_minus is not None:
+            try:
+                opp_pts = float(team_pts) - float(plus_minus)
+            except (TypeError, ValueError):
+                opp_pts = None
+        else:
+            opp_pts = None
+
         rows.append(
             {
                 "season": season,
@@ -670,7 +682,7 @@ def load_team_game_logs(
                 "opp_fg3m": data.get("opp_fg3m"),
                 "opp_fg3a": data.get("opp_fg3a"),
                 "pts": data.get("pts"),
-                "opp_pts": data.get("opp_pts"),
+                "opp_pts": opp_pts,
                 "ast": data.get("ast"),
                 "reb": data.get("reb"),
                 "opp_ast": data.get("opp_ast"),
