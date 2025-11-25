@@ -607,6 +607,21 @@ def load_player_game_logs(
     )
 
 
+def parse_opponent_abbreviation(matchup: str) -> str | None:
+    """
+    Parse opponent abbreviation from matchup string.
+    Examples: "ATL @ IND" -> "IND", "ATL vs. TOR" -> "TOR"
+    """
+    if not matchup:
+        return None
+    # Format is "TEAM @ OPP" or "TEAM vs. OPP"
+    if " @ " in matchup:
+        return matchup.split(" @ ")[-1].strip()
+    elif " vs. " in matchup:
+        return matchup.split(" vs. ")[-1].strip()
+    return None
+
+
 def load_team_game_logs(
     conn: sqlite3.Connection,
     season: str,
@@ -619,6 +634,11 @@ def load_team_game_logs(
     )
     df: pd.DataFrame = endpoint.get_data_frames()[0]
     records = df.to_dict(orient="records")
+
+    # Build abbreviation -> team_id lookup
+    cursor = conn.execute("SELECT team_id, abbreviation FROM teams WHERE is_nba_team = 1")
+    abbrev_to_id = {row[1]: row[0] for row in cursor.fetchall() if row[1]}
+
     rows: List[Dict[str, object]] = []
     for record in records:
         data = lower_keys(record)
@@ -626,6 +646,12 @@ def load_team_game_logs(
         game_id = data.get("game_id")
         if team_id is None or not game_id:
             continue
+
+        # Parse opponent from matchup string
+        matchup = data.get("matchup")
+        opp_abbrev = parse_opponent_abbreviation(matchup)
+        opp_team_id = abbrev_to_id.get(opp_abbrev) if opp_abbrev else None
+
         rows.append(
             {
                 "season": season,
@@ -635,12 +661,10 @@ def load_team_game_logs(
                 "team_abbreviation": data.get("team_abbreviation"),
                 "game_id": game_id,
                 "game_date": data.get("game_date"),
-                "matchup": data.get("matchup"),
-                "opp_team_id": safe_int(
-                    data.get("opp_team_id") or data.get("opp_teamid")
-                ),
+                "matchup": matchup,
+                "opp_team_id": opp_team_id,
                 "opp_team_name": data.get("opp_team_name"),
-                "opp_team_abbreviation": data.get("opp_team_abbreviation"),
+                "opp_team_abbreviation": opp_abbrev,
                 "fg3m": data.get("fg3m"),
                 "fg3a": data.get("fg3a"),
                 "opp_fg3m": data.get("opp_fg3m"),
