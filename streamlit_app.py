@@ -2785,7 +2785,7 @@ with injury_impact_tab:
                     selected_player_id,
                     injury_season,
                     injury_season_type,
-                    min_games=3,
+                    min_games=1,
                 )
 
                 opponent_impact = iia.calculate_opponent_impact(
@@ -2928,7 +2928,7 @@ with injury_impact_tab:
                     else:
                         st.info("No teammates showed increased scoring when player was absent.")
                 else:
-                    st.info("Not enough data to analyze teammate redistribution (need at least 3 games in each scenario).")
+                    st.info("Not enough data to analyze teammate redistribution (need at least 1 game in each scenario).")
 
                 # Opponent impact analysis
                 if opponent_impact:
