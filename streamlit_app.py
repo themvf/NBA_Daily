@@ -883,24 +883,57 @@ def calculate_smart_ppg_projection(
         if components[k] is not None and weights[k] > 0
     )
 
-    # Calculate confidence (0-100%)
+    # Calculate confidence (0-100%) with more granular scoring
     confidence_score = 0.0
-    # Base confidence from season sample
-    confidence_score += 0.30  # Base 30% from season average
 
-    # Add confidence from matchup data
-    if vs_opp_team_games >= 2:
-        confidence_score += min(0.40, vs_opp_team_games * 0.10)  # Up to 40% from team history
+    # 1. Base confidence from season data (20-30% based on sample size)
+    # Assume typical player has played 15-25 games in early season
+    base_conf = 0.25  # Middle ground
+    confidence_score += base_conf
+
+    # 2. Matchup-specific confidence (most important for differentiation)
+    if vs_opp_team_games >= 5:
+        # Strong team history - very confident
+        confidence_score += 0.40
+    elif vs_opp_team_games >= 3:
+        # Good team history - confident
+        confidence_score += 0.30
+    elif vs_opp_team_games >= 2:
+        # Some team history - moderately confident
+        confidence_score += 0.20
+    elif vs_defense_style_games >= 8:
+        # Extensive style data - decent fallback
+        confidence_score += 0.18
+    elif vs_defense_style_games >= 5:
+        # Good style data - moderate fallback
+        confidence_score += 0.12
     elif vs_defense_style_games >= 3:
-        confidence_score += min(0.20, vs_defense_style_games * 0.03)  # Up to 20% from style
+        # Some style data - weak fallback
+        confidence_score += 0.08
 
-    # Add confidence from recent form
-    if recent_avg_3 is not None:
-        confidence_score += 0.15
-
-    # Add confidence from opponent data
-    if opp_def_rating is not None:
+    # 3. Recent form confidence (varies by recency and volatility)
+    if recent_avg_3 is not None and recent_avg_5 is not None:
+        # Have both L3 and L5 - check consistency
+        if abs(recent_avg_3 - recent_avg_5) / season_avg < 0.15:
+            # Consistent recent form - more confident
+            confidence_score += 0.15
+        else:
+            # Volatile recent form - less confident
+            confidence_score += 0.10
+    elif recent_avg_3 is not None:
+        # Only L3 - moderate confidence
         confidence_score += 0.10
+    elif recent_avg_5 is not None:
+        # Only L5 - lower confidence
+        confidence_score += 0.08
+
+    # 4. Opponent data confidence (granular based on quality)
+    if opp_def_rating is not None and opp_pace is not None:
+        # Have both def rating and pace - good opponent intel
+        confidence_score += 0.12
+    elif opp_def_rating is not None:
+        # Only def rating - moderate intel
+        confidence_score += 0.08
 
     # Cap at 95% (never 100% certain)
     confidence_score = min(0.95, confidence_score)
