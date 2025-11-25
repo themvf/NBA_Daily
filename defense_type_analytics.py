@@ -57,20 +57,25 @@ def categorize_teams_by_defense(
             team_id,
             MAX(team_name) as team_name,
             COUNT(*) as games,
-            AVG(opp_pts) as avg_pts_allowed,
+            AVG(CAST(opp_pts AS FLOAT)) as avg_pts_allowed,
             -- Estimate pace using possessions formula
             -- Poss ≈ FGA + 0.44*FTA - OREB + TOV
             AVG(
-                CAST(fga AS FLOAT) + 0.44 * CAST(fta AS FLOAT) -
-                CAST(oreb AS FLOAT) + CAST(tov AS FLOAT)
+                COALESCE(CAST(fga AS FLOAT), 0.0) +
+                0.44 * COALESCE(CAST(fta AS FLOAT), 0.0) -
+                COALESCE(CAST(oreb AS FLOAT), 0.0) +
+                COALESCE(CAST(tov AS FLOAT), 0.0)
             ) as team_pace,
             AVG(
-                CAST(opp_fga AS FLOAT) + 0.44 * CAST(opp_fta AS FLOAT) -
-                CAST(opp_oreb AS FLOAT) + CAST(opp_tov AS FLOAT)
+                COALESCE(CAST(opp_fga AS FLOAT), 0.0) +
+                0.44 * COALESCE(CAST(opp_fta AS FLOAT), 0.0) -
+                COALESCE(CAST(opp_oreb AS FLOAT), 0.0) +
+                COALESCE(CAST(opp_tov AS FLOAT), 0.0)
             ) as opp_pace
         FROM team_game_logs
         WHERE season = ?
           AND season_type = ?
+          AND opp_pts IS NOT NULL
         GROUP BY team_id
         HAVING COUNT(*) >= 5
     )
@@ -80,9 +85,18 @@ def categorize_teams_by_defense(
         avg_pts_allowed as def_rating,
         (team_pace + opp_pace) / 2.0 as pace
     FROM team_stats
+    WHERE avg_pts_allowed IS NOT NULL
+      AND team_pace IS NOT NULL
+      AND opp_pace IS NOT NULL
     """
 
     df = pd.read_sql_query(query, conn, params=[season, season_type])
+
+    if df.empty:
+        return {}
+
+    # Filter out rows with NULL values
+    df = df.dropna(subset=['def_rating', 'pace'])
 
     if df.empty:
         return {}
@@ -99,6 +113,10 @@ def categorize_teams_by_defense(
         team_id = int(row['team_id'])
         def_rating = row['def_rating']
         pace = row['pace']
+
+        # Skip if still somehow NULL (defensive programming)
+        if pd.isna(def_rating) or pd.isna(pace):
+            continue
 
         # Categorize pace (higher = faster)
         if pace >= pace_67:
