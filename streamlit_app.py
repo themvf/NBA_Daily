@@ -350,7 +350,8 @@ def load_team_defense_stats(
     season_type: str,
     rolling_window: int | None = None,
 ) -> pd.DataFrame:
-    query = """
+    # Try query with new columns first (pace-adjusted stats)
+    query_new = """
         SELECT t.team_id,
                t.game_date,
                opp.pts AS allowed_pts,
@@ -369,7 +370,35 @@ def load_team_defense_stats(
         WHERE t.season = ?
           AND t.season_type = ?
     """
-    df = run_query(db_path, query, params=(season, season_type))
+
+    # Fallback query for old database schema (without pace stats)
+    query_old = """
+        SELECT t.team_id,
+               t.game_date,
+               opp.pts AS allowed_pts,
+               opp.fg3m AS allowed_fg3m,
+               opp.fg3a AS allowed_fg3a,
+               opp.reb AS allowed_reb,
+               opp.ast AS allowed_ast
+        FROM team_game_logs AS t
+        JOIN team_game_logs AS opp
+          ON opp.game_id = t.game_id
+         AND opp.team_id <> t.team_id
+        WHERE t.season = ?
+          AND t.season_type = ?
+    """
+
+    try:
+        df = run_query(db_path, query_new, params=(season, season_type))
+    except Exception:
+        # Fall back to old schema if new columns don't exist
+        df = run_query(db_path, query_old, params=(season, season_type))
+        # Add placeholder columns for missing data
+        df["opp_fga"] = None
+        df["opp_fta"] = None
+        df["opp_oreb"] = None
+        df["opp_tov"] = None
+
     if df.empty:
         return df
     df["team_id"] = pd.to_numeric(df["team_id"], errors="coerce")
@@ -382,13 +411,20 @@ def load_team_defense_stats(
     # Calculate 2PT points allowed (total points - 3PT points)
     df["allowed_2pt_pts"] = df["allowed_pts"] - (df["allowed_fg3m"] * 3)
 
-    # Estimate opponent possessions: FGA + 0.44*FTA - ORB + TOV
-    df["opp_possessions"] = (
-        df["opp_fga"] +
-        0.44 * df["opp_fta"].fillna(0) -
-        df["opp_oreb"].fillna(0) +
-        df["opp_tov"].fillna(0)
-    )
+    # Check if pace data is available
+    has_pace_data = df["opp_fga"].notna().any()
+
+    if has_pace_data:
+        # Estimate opponent possessions: FGA + 0.44*FTA - ORB + TOV
+        df["opp_possessions"] = (
+            df["opp_fga"] +
+            0.44 * df["opp_fta"].fillna(0) -
+            df["opp_oreb"].fillna(0) +
+            df["opp_tov"].fillna(0)
+        )
+    else:
+        # No pace data available - use placeholder
+        df["opp_possessions"] = None
 
     df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
     df = df.dropna(subset=["team_id", "allowed_pts"])
@@ -416,15 +452,23 @@ def load_team_defense_stats(
     )
 
     # Calculate pace-adjusted defensive rating (points allowed per 100 possessions)
-    aggregates["def_rating"] = (
-        aggregates["avg_allowed_pts"] / aggregates["avg_opp_possessions"].replace(0, 1)
-    ) * 100
-    aggregates["def_3pm_per100"] = (
-        aggregates["avg_allowed_fg3m"] / aggregates["avg_opp_possessions"].replace(0, 1)
-    ) * 100
-    aggregates["def_2pt_pts_per100"] = (
-        aggregates["avg_allowed_2pt_pts"] / aggregates["avg_opp_possessions"].replace(0, 1)
-    ) * 100
+    # Only if pace data is available
+    if has_pace_data and aggregates["avg_opp_possessions"].notna().any():
+        aggregates["def_rating"] = (
+            aggregates["avg_allowed_pts"] / aggregates["avg_opp_possessions"].replace(0, 1)
+        ) * 100
+        aggregates["def_3pm_per100"] = (
+            aggregates["avg_allowed_fg3m"] / aggregates["avg_opp_possessions"].replace(0, 1)
+        ) * 100
+        aggregates["def_2pt_pts_per100"] = (
+            aggregates["avg_allowed_2pt_pts"] / aggregates["avg_opp_possessions"].replace(0, 1)
+        ) * 100
+    else:
+        # Fallback: use raw averages (not pace-adjusted)
+        # Scale to roughly match pace-adjusted range for compatibility
+        aggregates["def_rating"] = aggregates["avg_allowed_pts"]
+        aggregates["def_3pm_per100"] = aggregates["avg_allowed_fg3m"]
+        aggregates["def_2pt_pts_per100"] = aggregates["avg_allowed_2pt_pts"]
 
     def compute_recent(team_df: pd.DataFrame, window: int) -> float | None:
         subset = (
