@@ -777,6 +777,81 @@ def evaluate_matchup_quality(
     return ("Neutral", "", 0.0)
 
 
+def calculate_daily_pick_score(
+    player_season_avg: float,
+    player_projection: float,
+    projection_confidence: float,
+    matchup_rating: str,
+    opp_def_rating: float | None,
+    league_avg_def_rating: float = 112.0,
+) -> tuple[float, str, str]:
+    """
+    Calculate unified Daily Pick Score (0-100) combining all analytics.
+
+    This score answers: "How good is this player as a pick TODAY?"
+    Combines: projection, matchup history, opponent defense, confidence.
+
+    Args:
+        player_season_avg: Player's season average PPG
+        player_projection: Smart projection for today
+        projection_confidence: Confidence in projection (0-1)
+        matchup_rating: Player-specific matchup quality
+        opp_def_rating: Opponent's defensive rating
+        league_avg_def_rating: League average for comparison
+
+    Returns:
+        (score 0-100, grade, explanation)
+    """
+    # 1. Base score from projected points (0-50 range)
+    # Scale typical 0-45 PPG range to 0-50 points
+    base_score = min(50, (player_projection / 45.0) * 50)
+
+    # 2. Matchup quality bonus/penalty (-20 to +20)
+    matchup_adjustments = {
+        "Excellent": 20,
+        "Good": 10,
+        "Neutral": 0,
+        "Difficult": -10,
+        "Avoid": -20,
+    }
+    matchup_bonus = matchup_adjustments.get(matchup_rating, 0)
+
+    # 3. Opponent defense adjustment (-10 to +10)
+    # Weaker defense = bonus, stronger defense = penalty
+    if opp_def_rating is not None:
+        def_diff = (league_avg_def_rating - opp_def_rating) / league_avg_def_rating
+        defense_adjustment = def_diff * 10  # Scale to ±10
+    else:
+        defense_adjustment = 0
+
+    # 4. Confidence multiplier (0.5 to 1.0)
+    # Low confidence = reduce the score significantly
+    confidence_multiplier = 0.5 + (projection_confidence * 0.5)
+
+    # Calculate final score
+    raw_score = base_score + matchup_bonus + defense_adjustment
+    final_score = max(0, min(100, raw_score * confidence_multiplier))
+
+    # Grade the score with clear tiers
+    if final_score >= 80:
+        grade = "🔥 Elite"
+        explanation = "Exceptional opportunity"
+    elif final_score >= 65:
+        grade = "⭐ Excellent"
+        explanation = "Strong opportunity"
+    elif final_score >= 50:
+        grade = "✓ Solid"
+        explanation = "Reliable pick"
+    elif final_score >= 35:
+        grade = "⚠️ Risky"
+        explanation = "Below average"
+    else:
+        grade = "❌ Avoid"
+        explanation = "Poor opportunity"
+
+    return (final_score, grade, explanation)
+
+
 def calculate_smart_ppg_projection(
     season_avg: float,
     recent_avg_5: float | None,
@@ -1895,18 +1970,29 @@ with games_tab:
                                 opp_pace=opp_pace,
                             )
 
+                            # Calculate unified Daily Pick Score
+                            daily_pick_score, pick_grade, pick_explanation = calculate_daily_pick_score(
+                                player_season_avg=season_avg_pts,
+                                player_projection=projection,
+                                projection_confidence=proj_confidence,
+                                matchup_rating=matchup_rating,
+                                opp_def_rating=opp_def_rating,
+                            )
+
                             matchup_rows.append(
                                 {
                                     "Side": team_label,
                                     "Team": team_name,
                                     "Player": player["player_name"],
+                                    "Pick Score": f"{daily_pick_score:.1f}",
+                                    "Grade": pick_grade,
                                     "Games": int(player["games_played"]),
+                                    "Projected PPG": f"{projection:.1f}",
+                                    "Proj Conf": f"{proj_confidence:.0%}",
                                     "Avg PPG": f"{player['avg_points']:.1f}",
                                     "Median PPG": f"{player['median_points']:.1f}",
                                     "Max PPG": f"{player['max_points']:.1f}",
-                                    "Projected PPG": f"{projection:.1f}",
                                     "Proj Range": f"{proj_floor:.1f}-{proj_ceiling:.1f}",
-                                    "Proj Conf": f"{proj_confidence:.0%}",
                                     "Avg 3PM": f"{player['avg_fg3m']:.1f}",
                                     "Median 3PM": f"{player['median_fg3m']:.1f}",
                                     "Last3 Avg Pts": format_number(player.get("avg_pts_last3"), 1),
@@ -1940,6 +2026,8 @@ with games_tab:
                                     "Side": team_label,
                                     "Team": team_name,
                                     "Player": player["player_name"],
+                                    "Daily Pick Score": daily_pick_score,
+                                    "Pick Grade": pick_grade,
                                     "Season Avg PPG": season_avg_pts,
                                     "Projected PPG": projection,
                                     "Proj Floor": proj_floor,
@@ -1979,8 +2067,10 @@ with games_tab:
                                     "Matchup": f"{matchup['Away']} at {matchup['Home']}",
                                     "Player": player["player_name"],
                                     "Team": team_name,
-                                    "Season Avg PPG": season_avg_pts,
+                                    "Pick Score": daily_pick_score,
+                                    "Grade": pick_grade,
                                     "Projected PPG": projection,
+                                    "Season Avg PPG": season_avg_pts,
                                     "Proj Conf": f"{proj_confidence:.0%}",
                                     "Last5 Avg PPG": avg_pts_last5,
                                     "Opp Avg Allowed PPG": opp_avg_allowed,
@@ -2122,9 +2212,10 @@ with matchup_spotlight_tab:
         col_points, col_3pm = st.columns(2)
         if daily_power_rows_points:
             points_df = pd.DataFrame(daily_power_rows_points)
-            points_top = points_df.sort_values("Matchup Score", ascending=False).head(10)
+            points_top = points_df.sort_values("Pick Score", ascending=False).head(10)
             points_top = points_top.assign(
                 **{
+                    "Pick Score": points_top["Pick Score"].map(lambda v: format_number(v, 1)),
                     "Projected PPG": points_top["Projected PPG"].map(lambda v: format_number(v, 1)),
                     "Opp Avg Allowed PPG": points_top["Opp Avg Allowed PPG"].map(lambda v: format_number(v, 1)),
                     "Opp Last5 Avg Allowed": points_top["Opp Last5 Avg Allowed"].map(lambda v: format_number(v, 1)),
@@ -2150,7 +2241,7 @@ with matchup_spotlight_tab:
                     return ""
 
             styled_points = points_top.style.applymap(style_proj_conf, subset=["Proj Conf"])
-            col_points.markdown("**Top 10 Players by Matchup Score (Points)**")
+            col_points.markdown("**🎯 Top 10 Daily Picks (by Pick Score)**")
             col_points.dataframe(styled_points, use_container_width=True)
         else:
             col_points.info("No scoring data yet. Refresh Today's Games.")
