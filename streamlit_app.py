@@ -777,6 +777,156 @@ def evaluate_matchup_quality(
     return ("Neutral", "", 0.0)
 
 
+def calculate_smart_ppg_projection(
+    season_avg: float,
+    recent_avg_5: float | None,
+    recent_avg_3: float | None,
+    vs_opp_team_avg: float | None,
+    vs_opp_team_games: int,
+    vs_defense_style_avg: float | None,
+    vs_defense_style_games: int,
+    opp_def_rating: float | None,
+    opp_pace: float | None,
+    league_avg_def_rating: float = 112.0,
+    league_avg_pace: float = 99.0,
+) -> tuple[float, float, float, dict]:
+    """
+    Calculate smart PPG projection using multi-factor weighted model.
+
+    Args:
+        season_avg: Player's season average PPG
+        recent_avg_5: Last 5 games average
+        recent_avg_3: Last 3 games average
+        vs_opp_team_avg: Historical average vs this specific opponent
+        vs_opp_team_games: Games played vs this opponent
+        vs_defense_style_avg: Average vs this defense style
+        vs_defense_style_games: Games vs this defense style
+        opp_def_rating: Opponent's defensive rating (per 100 possessions)
+        opp_pace: Opponent's pace (possessions per game)
+        league_avg_def_rating: League average defensive rating
+        league_avg_pace: League average pace
+
+    Returns:
+        (projection, confidence, floor, ceiling, breakdown_dict)
+    """
+    # Initialize components
+    components = {}
+    weights = {}
+
+    # 1. Season Average (Baseline - 25% weight)
+    components["season"] = season_avg
+    weights["season"] = 0.25
+
+    # 2. Recent Form (20% weight, higher if trending)
+    if recent_avg_3 is not None and recent_avg_5 is not None:
+        # Weight more recent games higher
+        components["recent"] = (recent_avg_3 * 0.6) + (recent_avg_5 * 0.4)
+        weights["recent"] = 0.20
+    elif recent_avg_5 is not None:
+        components["recent"] = recent_avg_5
+        weights["recent"] = 0.15
+    else:
+        components["recent"] = season_avg
+        weights["recent"] = 0.10
+
+    # 3. Team-Specific Matchup (30% weight if available - HIGHEST)
+    if vs_opp_team_avg is not None and vs_opp_team_games >= 2:
+        # Higher weight for more games
+        confidence_factor = min(1.0, vs_opp_team_games / 5.0)
+        components["vs_team"] = vs_opp_team_avg
+        weights["vs_team"] = 0.30 * confidence_factor
+    else:
+        components["vs_team"] = None
+        weights["vs_team"] = 0.0
+
+    # 4. Defense Style Matchup (15% weight if no team history)
+    if weights["vs_team"] < 0.15 and vs_defense_style_avg is not None and vs_defense_style_games >= 3:
+        components["vs_style"] = vs_defense_style_avg
+        weights["vs_style"] = 0.15
+    else:
+        components["vs_style"] = None
+        weights["vs_style"] = 0.0
+
+    # 5. Opponent Defense Quality (10% adjustment)
+    if opp_def_rating is not None:
+        # Better defense = lower projection, worse defense = higher projection
+        def_adjustment = (league_avg_def_rating - opp_def_rating) / league_avg_def_rating
+        # Clamp adjustment to ±15%
+        def_adjustment = max(-0.15, min(0.15, def_adjustment))
+        components["def_quality"] = season_avg * (1 + def_adjustment)
+        weights["def_quality"] = 0.10
+    else:
+        components["def_quality"] = season_avg
+        weights["def_quality"] = 0.0
+
+    # 6. Pace Adjustment (5% adjustment)
+    if opp_pace is not None:
+        # Faster pace = more possessions = more points
+        pace_adjustment = (opp_pace - league_avg_pace) / league_avg_pace
+        # Clamp adjustment to ±10%
+        pace_adjustment = max(-0.10, min(0.10, pace_adjustment))
+        components["pace"] = season_avg * (1 + pace_adjustment)
+        weights["pace"] = 0.05
+    else:
+        components["pace"] = season_avg
+        weights["pace"] = 0.0
+
+    # Normalize weights to sum to 1.0
+    total_weight = sum(weights.values())
+    if total_weight > 0:
+        weights = {k: v / total_weight for k, v in weights.items()}
+
+    # Calculate weighted projection
+    projection = sum(
+        components[k] * weights[k]
+        for k in components
+        if components[k] is not None and weights[k] > 0
+    )
+
+    # Calculate confidence (0-100%)
+    confidence_score = 0.0
+    # Base confidence from season sample
+    confidence_score += 0.30  # Base 30% from season average
+
+    # Add confidence from matchup data
+    if vs_opp_team_games >= 2:
+        confidence_score += min(0.40, vs_opp_team_games * 0.10)  # Up to 40% from team history
+    elif vs_defense_style_games >= 3:
+        confidence_score += min(0.20, vs_defense_style_games * 0.03)  # Up to 20% from style
+
+    # Add confidence from recent form
+    if recent_avg_3 is not None:
+        confidence_score += 0.15
+
+    # Add confidence from opponent data
+    if opp_def_rating is not None:
+        confidence_score += 0.10
+
+    # Cap at 95% (never 100% certain)
+    confidence_score = min(0.95, confidence_score)
+
+    # Calculate floor and ceiling (confidence intervals)
+    # Wider intervals for lower confidence
+    interval_width = season_avg * 0.30 * (1 - confidence_score)
+    floor = max(0, projection - interval_width)
+    ceiling = projection + interval_width
+
+    # Build breakdown for transparency
+    breakdown = {
+        "projection": projection,
+        "confidence": confidence_score,
+        "floor": floor,
+        "ceiling": ceiling,
+        "components": {
+            k: {"value": components[k], "weight": weights[k] * 100}
+            for k in components
+            if components[k] is not None and weights[k] > 0
+        }
+    }
+
+    return projection, confidence_score, floor, ceiling, breakdown
+
+
 def build_player_style_leaders(
     db_path: str,
     season: str,
@@ -1695,6 +1845,23 @@ with games_tab:
                             avg_vs_style_display = (
                                 format_number(avg_vs_style, 1) if avg_vs_style is not None else "N/A"
                             )
+
+                            # Calculate smart PPG projection
+                            opp_def_rating = safe_float(opponent_stats.get("def_rating")) if opponent_stats else None
+                            opp_pace = safe_float(opponent_stats.get("avg_opp_possessions")) if opponent_stats else None
+
+                            projection, proj_confidence, proj_floor, proj_ceiling, breakdown = calculate_smart_ppg_projection(
+                                season_avg=season_avg_pts,
+                                recent_avg_5=avg_pts_last5,
+                                recent_avg_3=avg_pts_last3,
+                                vs_opp_team_avg=avg_vs_opp,
+                                vs_opp_team_games=games_vs_opp,
+                                vs_defense_style_avg=avg_vs_style,
+                                vs_defense_style_games=games_vs_style,
+                                opp_def_rating=opp_def_rating,
+                                opp_pace=opp_pace,
+                            )
+
                             matchup_rows.append(
                                 {
                                     "Side": team_label,
@@ -1704,6 +1871,9 @@ with games_tab:
                                     "Avg PPG": f"{player['avg_points']:.1f}",
                                     "Median PPG": f"{player['median_points']:.1f}",
                                     "Max PPG": f"{player['max_points']:.1f}",
+                                    "Projected PPG": f"{projection:.1f}",
+                                    "Proj Range": f"{proj_floor:.1f}-{proj_ceiling:.1f}",
+                                    "Proj Conf": f"{proj_confidence:.0%}",
                                     "Avg 3PM": f"{player['avg_fg3m']:.1f}",
                                     "Median 3PM": f"{player['median_fg3m']:.1f}",
                                     "Last3 Avg Pts": format_number(player.get("avg_pts_last3"), 1),
@@ -1738,6 +1908,10 @@ with games_tab:
                                     "Team": team_name,
                                     "Player": player["player_name"],
                                     "Season Avg PPG": season_avg_pts,
+                                    "Projected PPG": projection,
+                                    "Proj Floor": proj_floor,
+                                    "Proj Ceiling": proj_ceiling,
+                                    "Proj Confidence": proj_confidence,
                                     "Last5 Avg PPG": avg_pts_last5,
                                     "Last3 Avg PPG": avg_pts_last3,
                                     "Last5 Avg 3PM": avg_fg3_last5,
@@ -1826,10 +2000,29 @@ with games_tab:
                                 return "background-color: #fff3cd; font-weight: bold"
                             return ""
 
+                        def style_projection_confidence(val):
+                            """Style projection confidence - green for high, yellow for medium, gray for low"""
+                            if not val or val == "N/A":
+                                return ""
+                            try:
+                                # Remove % sign and convert to float
+                                conf_str = val.replace("%", "").strip()
+                                conf_val = float(conf_str) / 100.0
+                                if conf_val >= 0.75:
+                                    return "background-color: #d4edda; color: #155724; font-weight: bold"  # High confidence - Green
+                                elif conf_val >= 0.50:
+                                    return "background-color: #fff3cd; color: #856404"  # Medium confidence - Yellow
+                                else:
+                                    return "background-color: #e2e3e5; color: #383d41"  # Low confidence - Gray
+                            except (ValueError, AttributeError):
+                                return ""
+
                         styled_df = matchup_df.style.applymap(
                             style_matchup_rating, subset=["Matchup Rating"]
                         ).applymap(
                             style_warning, subset=["Warning"]
+                        ).applymap(
+                            style_projection_confidence, subset=["Proj Conf"]
                         )
 
                         st.dataframe(styled_df, use_container_width=True)
