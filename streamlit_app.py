@@ -730,16 +730,55 @@ def evaluate_matchup_quality(
     """
     Evaluate matchup quality and return (rating, warning, confidence).
 
+    PRIORITY ORDER (revised to emphasize defensive style):
+    1. Defense style matchups (larger sample, more predictive)
+    2. Head-to-head history (only if significant sample and strong signal)
+    3. Neutral default
+
     Returns:
         rating: "Excellent", "Good", "Neutral", "Difficult", "Avoid"
         warning: Human-readable warning message or empty string
         confidence: 0.0 to 1.0 confidence score
     """
-    # Calculate confidence based on sample size
-    confidence = min(1.0, (games_vs_opp * 0.15) + (games_vs_style * 0.05))
+    # Calculate confidence: style data weighted MORE than head-to-head
+    # Style: 10% per "game", Head-to-head: 5% per game
+    confidence = min(1.0, (games_vs_style * 0.10) + (games_vs_opp * 0.05))
 
-    # If we have specific team history, use it (weighted heavily)
-    if player_vs_opp_avg is not None and games_vs_opp >= 2:
+    # PRIMARY: Check defense style matchup (if available, use this first)
+    if player_vs_style_avg is not None and games_vs_style >= 3:
+        diff_pct = (player_vs_style_avg - player_avg) / player_avg if player_avg > 0 else 0
+
+        if diff_pct <= -0.18:  # 18%+ worse vs this defense style
+            warning = f"Struggles vs this defense style ({player_vs_style_avg:.1f} vs {player_avg:.1f})"
+            # Only override if head-to-head strongly contradicts
+            if player_vs_opp_avg is not None and games_vs_opp >= 4:
+                opp_diff = (player_vs_opp_avg - player_avg) / player_avg
+                if opp_diff >= 0.25:  # Strong positive head-to-head overrides
+                    return ("Good", f"Excels vs this team despite tough style", confidence)
+            return ("Difficult", warning, confidence)
+
+        elif diff_pct >= 0.12:  # 12%+ better vs this defense style
+            # Check if head-to-head contradicts strongly
+            if player_vs_opp_avg is not None and games_vs_opp >= 4:
+                opp_diff = (player_vs_opp_avg - player_avg) / player_avg
+                if opp_diff <= -0.25:  # Strong negative head-to-head overrides
+                    warning = f"Historically struggles vs this team ({player_vs_opp_avg:.1f})"
+                    return ("Difficult", warning, confidence)
+            return ("Good", f"Performs well vs this defense style", confidence)
+
+        else:
+            # Neutral style matchup - check head-to-head for tie-breaker
+            if player_vs_opp_avg is not None and games_vs_opp >= 3:
+                opp_diff = (player_vs_opp_avg - player_avg) / player_avg
+                if opp_diff >= 0.20:
+                    return ("Good", f"Solid history vs this team", confidence)
+                elif opp_diff <= -0.20:
+                    warning = f"Below average vs this team ({player_vs_opp_avg:.1f})"
+                    return ("Difficult", warning, confidence)
+            return ("Neutral", "", max(0.3, confidence))
+
+    # SECONDARY: Head-to-head only (no style data available)
+    if player_vs_opp_avg is not None and games_vs_opp >= 3:
         diff_pct = (player_vs_opp_avg - player_avg) / player_avg if player_avg > 0 else 0
 
         # Check for high variance (inconsistent matchup)
@@ -759,19 +798,7 @@ def evaluate_matchup_quality(
         elif diff_pct >= 0.10:  # 10-20% better
             return ("Good", "", confidence)
         else:
-            return ("Neutral", "", confidence)
-
-    # Fall back to defense style if no team history
-    if player_vs_style_avg is not None and games_vs_style >= 3:
-        diff_pct = (player_vs_style_avg - player_avg) / player_avg if player_avg > 0 else 0
-
-        if diff_pct <= -0.20:
-            warning = f"Struggles vs this defense style ({player_vs_style_avg:.1f} vs {player_avg:.1f})"
-            return ("Difficult", warning, confidence * 0.7)  # Lower confidence
-        elif diff_pct >= 0.15:
-            return ("Good", "", confidence * 0.7)
-        else:
-            return ("Neutral", "", confidence * 0.5)
+            return ("Neutral", "", confidence * 0.6)
 
     # No meaningful history
     return ("Neutral", "", 0.0)
@@ -802,10 +829,11 @@ def calculate_daily_pick_score(
     Returns:
         (score 0-100, grade, explanation)
     """
-    # 1. Base score from projected points (0-60 range)
+    # 1. Base score from projected points (0-70 range)
     # Scale typical 5-40 PPG range to reasonable scores
-    # Formula: (proj - 5) * 1.5 gives 5PPG=0, 40PPG=52.5
-    base_score = max(0, (player_projection - 5) * 1.5)
+    # Formula: (proj - 3) * 1.8 gives 5PPG=3.6, 30PPG=48.6, 40PPG=66.6
+    # More generous to reward elite scorers even with neutral matchups
+    base_score = max(0, (player_projection - 3) * 1.8)
 
     # 2. Matchup quality bonus/penalty (-20 to +20)
     matchup_adjustments = {
