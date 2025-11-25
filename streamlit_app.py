@@ -22,6 +22,7 @@ from nba_api.stats.endpoints import scoreboardv2
 
 from nba_to_sqlite import build_database
 import injury_impact_analytics as iia
+import player_correlation_analytics as pca
 
 DEFAULT_DB_PATH = Path(__file__).with_name("nba_stats.db")
 DEFAULT_PREDICTIONS_PATH = Path(__file__).with_name("predictions.csv")
@@ -2801,10 +2802,160 @@ with injury_impact_tab:
     # PLAYER CORRELATIONS TAB
     with correlations_tab:
         st.markdown("### Player Correlations & Lineup Combinations")
-        if selected_player_id:
-            st.info("Correlation analysis coming soon! This will show which teammates boost this player's performance (key for DFS stacks).")
-        else:
+        st.markdown(
+            "Discover which teammates boost this player's performance (ideal for DFS stacks) "
+            "and which opponent teams they excel against (matchup advantages)."
+        )
+
+        if not selected_player_id:
             st.warning("Select a player above to view player correlations.")
+        else:
+            # Create sub-sections for teammates vs opponents
+            corr_col1, corr_col2 = st.columns(2)
+
+            # TEAMMATE CORRELATIONS
+            with corr_col1:
+                st.markdown("#### 🤝 Teammate Synergy")
+                st.caption("How does this player perform with specific teammates?")
+
+                try:
+                    with st.spinner("Analyzing teammate correlations..."):
+                        teammate_correlations = pca.calculate_teammate_correlations(
+                            conn_impact,
+                            selected_player_id,
+                            impact_season,
+                            impact_season_type,
+                            min_games_together=3
+                        )
+
+                    if teammate_correlations:
+                        # Show top 10 correlations
+                        st.markdown(f"**Top Synergies for {selected_player_name}**")
+
+                        teammate_data = []
+                        for tc in teammate_correlations[:10]:
+                            # Color code based on correlation strength
+                            if tc.correlation_score >= 60:
+                                indicator = "🟢"  # Strong positive
+                            elif tc.correlation_score >= 50:
+                                indicator = "🟡"  # Neutral/slight positive
+                            else:
+                                indicator = "🔴"  # Negative
+
+                            teammate_data.append({
+                                "": indicator,
+                                "Teammate": tc.teammate_name,
+                                "PPG Together": f"{tc.avg_pts_together:.1f}",
+                                "PPG Apart": f"{tc.avg_pts_apart:.1f}",
+                                "Δ PPG": f"{tc.pts_delta:+.1f}",
+                                "3PM Δ": f"{tc.fg3m_delta:+.1f}",
+                                "Games": f"{tc.games_together}/{tc.games_apart}",
+                                "Score": f"{tc.correlation_score:.0f}"
+                            })
+
+                        teammate_df = pd.DataFrame(teammate_data)
+                        st.dataframe(teammate_df, use_container_width=True, hide_index=True)
+
+                        # Explanation
+                        st.caption(
+                            "🟢 Strong synergy (60+) | 🟡 Moderate synergy (50-60) | 🔴 Negative synergy (<50)\n\n"
+                            "**Score** combines PPG boost, 3PM boost, and sample size. Higher = better for DFS stacks."
+                        )
+
+                        # Highlight best stack
+                        best_teammate = teammate_correlations[0]
+                        if best_teammate.correlation_score >= 55:
+                            st.success(
+                                f"💡 **DFS Stack Opportunity:** {selected_player_name} + {best_teammate.teammate_name}\n\n"
+                                f"{selected_player_name} averages **{best_teammate.pts_delta:+.1f} more points** "
+                                f"when playing with {best_teammate.teammate_name} "
+                                f"({best_teammate.avg_pts_together:.1f} vs {best_teammate.avg_pts_apart:.1f} PPG)."
+                            )
+                    else:
+                        st.info(
+                            f"Not enough data to analyze teammate correlations for {selected_player_name}. "
+                            "This usually means the player hasn't missed enough games to create comparison groups, "
+                            "or teammates haven't had sufficient overlap."
+                        )
+
+                except Exception as exc:
+                    st.error(f"Error analyzing teammate correlations: {exc}")
+                    import traceback
+                    st.code(traceback.format_exc())
+
+            # OPPONENT CORRELATIONS
+            with corr_col2:
+                st.markdown("#### 🎯 Matchup Advantages")
+                st.caption("Which opposing teams does this player excel against?")
+
+                try:
+                    with st.spinner("Analyzing opponent matchups..."):
+                        opponent_correlations = pca.calculate_opponent_correlations(
+                            conn_impact,
+                            selected_player_id,
+                            impact_season,
+                            impact_season_type,
+                            min_games_vs=1
+                        )
+
+                    if opponent_correlations:
+                        # Show top/bottom matchups
+                        st.markdown(f"**Best/Worst Matchups for {selected_player_name}**")
+
+                        # Get top 5 and bottom 5
+                        top_matchups = opponent_correlations[:5]
+                        bottom_matchups = opponent_correlations[-5:][::-1]  # Reverse to show worst first
+
+                        opponent_data = []
+
+                        # Add top matchups
+                        for oc in top_matchups:
+                            if oc.matchup_score >= 55:
+                                indicator = "✅"  # Favorable matchup
+                            elif oc.matchup_score >= 50:
+                                indicator = "➖"  # Neutral
+                            else:
+                                indicator = "❌"  # Unfavorable
+
+                            opponent_data.append({
+                                "": indicator,
+                                "Opponent": oc.opponent_team_name,
+                                "PPG vs": f"{oc.avg_pts_vs:.1f}",
+                                "PPG vs Others": f"{oc.avg_pts_vs_others:.1f}",
+                                "Δ PPG": f"{oc.pts_delta:+.1f}",
+                                "3PM Δ": f"{oc.fg3m_delta:+.1f}",
+                                "Games": oc.games_vs_opponent,
+                                "Score": f"{oc.matchup_score:.0f}"
+                            })
+
+                        opponent_df = pd.DataFrame(opponent_data)
+                        st.dataframe(opponent_df, use_container_width=True, hide_index=True)
+
+                        # Explanation
+                        st.caption(
+                            "✅ Favorable matchup (55+) | ➖ Neutral (45-55) | ❌ Unfavorable (<45)\n\n"
+                            "**Score** shows matchup advantage. Higher = player performs better vs this opponent."
+                        )
+
+                        # Highlight best matchup
+                        best_matchup = opponent_correlations[0]
+                        if best_matchup.matchup_score >= 55 and best_matchup.pts_delta > 2:
+                            st.success(
+                                f"💡 **Matchup Advantage:** {selected_player_name} vs {best_matchup.opponent_team_name}\n\n"
+                                f"{selected_player_name} averages **{best_matchup.pts_delta:+.1f} more points** "
+                                f"against {best_matchup.opponent_team_name} "
+                                f"({best_matchup.avg_pts_vs:.1f} vs {best_matchup.avg_pts_vs_others:.1f} PPG vs others)."
+                            )
+                    else:
+                        st.info(
+                            f"Not enough data to analyze opponent matchups for {selected_player_name}. "
+                            "Player needs at least 1 game against multiple different opponents."
+                        )
+
+                except Exception as exc:
+                    st.error(f"Error analyzing opponent matchups: {exc}")
+                    import traceback
+                    st.code(traceback.format_exc())
 
     # ABSENCE IMPACT TAB (existing injury analysis)
     with absence_tab:
