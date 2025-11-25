@@ -601,8 +601,23 @@ def build_player_style_splits(
           AND p.points IS NOT NULL
     """
     df = run_query(db_path, query, params=(season, season_type))
+
+    # Fallback to most recent season if requested season has no data
     if df.empty:
-        return {}
+        try:
+            debug_query = "SELECT DISTINCT season FROM player_game_logs ORDER BY season DESC LIMIT 1"
+            available_seasons = run_query(db_path, debug_query)
+            if not available_seasons.empty:
+                fallback_season = available_seasons.iloc[0]["season"]
+                print(f"[INFO] No player style data for season '{season}'. Using fallback: {fallback_season}")
+                df = run_query(db_path, query, params=(fallback_season, season_type))
+                if df.empty:
+                    return {}
+            else:
+                return {}
+        except Exception:
+            return {}
+
     df["player_id"] = pd.to_numeric(df["player_id"], errors="coerce")
     df["points"] = pd.to_numeric(df["points"], errors="coerce")
     df["opp_team_id"] = pd.to_numeric(df["opp_team_id"], errors="coerce")
@@ -649,8 +664,26 @@ def build_player_vs_team_history(
         ORDER BY p.player_id, t.opp_team_id, p.game_date
     """
     df = run_query(db_path, query, params=(season, season_type))
+
+    # Debug: Check if we got any data
     if df.empty:
-        return {}
+        # Try to find what seasons are actually available and use most recent
+        try:
+            debug_query = "SELECT DISTINCT season FROM player_game_logs ORDER BY season DESC LIMIT 1"
+            available_seasons = run_query(db_path, debug_query)
+            if not available_seasons.empty:
+                fallback_season = available_seasons.iloc[0]["season"]
+                print(f"[INFO] No data for season '{season}'. Using fallback season: {fallback_season}")
+
+                # Try query again with fallback season
+                df = run_query(db_path, query, params=(fallback_season, season_type))
+                if df.empty:
+                    return {}
+            else:
+                return {}
+        except Exception as e:
+            print(f"[ERROR] Failed to build player vs team history: {e}")
+            return {}
 
     df["player_id"] = pd.to_numeric(df["player_id"], errors="coerce")
     df["opp_team_id"] = pd.to_numeric(df["opp_team_id"], errors="coerce")
