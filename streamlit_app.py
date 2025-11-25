@@ -814,7 +814,7 @@ def calculate_daily_pick_score(
     league_avg_def_rating: float = 112.0,
 ) -> tuple[float, str, str]:
     """
-    Calculate unified Daily Pick Score (0-100) combining all analytics.
+    Calculate unified DFS Score (0-100) combining all analytics.
 
     This score answers: "How good is this player as a pick TODAY?"
     Combines: projection, matchup history, opponent defense, confidence.
@@ -2042,7 +2042,7 @@ with games_tab:
                                 opp_pace=opp_pace,
                             )
 
-                            # Calculate unified Daily Pick Score
+                            # Calculate unified DFS Score
                             daily_pick_score, pick_grade, pick_explanation = calculate_daily_pick_score(
                                 player_season_avg=season_avg_pts,
                                 player_projection=projection,
@@ -2056,7 +2056,7 @@ with games_tab:
                                     "Side": team_label,
                                     "Team": team_name,
                                     "Player": player["player_name"],
-                                    "Pick Score": f"{daily_pick_score:.1f}",
+                                    "DFS Score": f"{daily_pick_score:.1f}",
                                     "Grade": f"{pick_grade}\n{pick_explanation}",
                                     "Games": int(player["games_played"]),
                                     "Projected PPG": f"{projection:.1f}",
@@ -2098,7 +2098,7 @@ with games_tab:
                                     "Side": team_label,
                                     "Team": team_name,
                                     "Player": player["player_name"],
-                                    "Daily Pick Score": daily_pick_score,
+                                    "DFS Score": daily_pick_score,
                                     "Pick Grade": f"{pick_grade}: {pick_explanation}",
                                     "Season Avg PPG": season_avg_pts,
                                     "Projected PPG": projection,
@@ -2139,7 +2139,7 @@ with games_tab:
                                     "Matchup": f"{matchup['Away']} at {matchup['Home']}",
                                     "Player": player["player_name"],
                                     "Team": team_name,
-                                    "Pick Score": daily_pick_score,
+                                    "DFS Score": daily_pick_score,
                                     "Grade": f"{pick_grade}: {pick_explanation}",
                                     "Projected PPG": projection,
                                     "Season Avg PPG": season_avg_pts,
@@ -2284,10 +2284,10 @@ with matchup_spotlight_tab:
         col_points, col_3pm = st.columns(2)
         if daily_power_rows_points:
             points_df = pd.DataFrame(daily_power_rows_points)
-            points_top = points_df.sort_values("Pick Score", ascending=False).head(10)
+            points_top = points_df.sort_values("DFS Score", ascending=False).head(10)
             points_top = points_top.assign(
                 **{
-                    "Pick Score": points_top["Pick Score"].map(lambda v: format_number(v, 1)),
+                    "DFS Score": points_top["DFS Score"].map(lambda v: format_number(v, 1)),
                     "Projected PPG": points_top["Projected PPG"].map(lambda v: format_number(v, 1)),
                     "Opp Avg Allowed PPG": points_top["Opp Avg Allowed PPG"].map(lambda v: format_number(v, 1)),
                     "Opp Last5 Avg Allowed": points_top["Opp Last5 Avg Allowed"].map(lambda v: format_number(v, 1)),
@@ -2313,7 +2313,7 @@ with matchup_spotlight_tab:
                     return ""
 
             styled_points = points_top.style.applymap(style_proj_conf, subset=["Proj Conf"])
-            col_points.markdown("**🎯 Top 10 Daily Picks (by Pick Score)**")
+            col_points.markdown("**🎯 Top 10 Daily Picks (by DFS Score)**")
             col_points.dataframe(styled_points, use_container_width=True)
         else:
             col_points.info("No scoring data yet. Refresh Today's Games.")
