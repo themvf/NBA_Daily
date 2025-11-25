@@ -1980,6 +1980,8 @@ with games_tab:
                                     "Player": player["player_name"],
                                     "Team": team_name,
                                     "Season Avg PPG": season_avg_pts,
+                                    "Projected PPG": projection,
+                                    "Proj Conf": f"{proj_confidence:.0%}",
                                     "Last5 Avg PPG": avg_pts_last5,
                                     "Opp Avg Allowed PPG": opp_avg_allowed,
                                     "Opp Last5 Avg Allowed": opp_recent_allowed,
@@ -2123,6 +2125,7 @@ with matchup_spotlight_tab:
             points_top = points_df.sort_values("Matchup Score", ascending=False).head(10)
             points_top = points_top.assign(
                 **{
+                    "Projected PPG": points_top["Projected PPG"].map(lambda v: format_number(v, 1)),
                     "Opp Avg Allowed PPG": points_top["Opp Avg Allowed PPG"].map(lambda v: format_number(v, 1)),
                     "Opp Last5 Avg Allowed": points_top["Opp Last5 Avg Allowed"].map(lambda v: format_number(v, 1)),
                     "Opportunity Index": points_top["Opportunity Index"].map(lambda v: format_number(v, 2)),
@@ -2130,8 +2133,25 @@ with matchup_spotlight_tab:
                     "Usage %": points_top["Usage %"].map(lambda v: format_number(v, 1)),
                 }
             )
+
+            # Apply confidence styling
+            def style_proj_conf(val):
+                if not val or val == "N/A":
+                    return ""
+                try:
+                    conf_val = float(val.replace("%", "").strip()) / 100.0
+                    if conf_val >= 0.70:
+                        return "background-color: #d4edda; color: #155724; font-weight: bold"
+                    elif conf_val >= 0.50:
+                        return "background-color: #fff3cd; color: #856404"
+                    else:
+                        return "background-color: #e2e3e5; color: #383d41"
+                except (ValueError, AttributeError):
+                    return ""
+
+            styled_points = points_top.style.applymap(style_proj_conf, subset=["Proj Conf"])
             col_points.markdown("**Top 10 Players by Matchup Score (Points)**")
-            col_points.dataframe(points_top, use_container_width=True)
+            col_points.dataframe(styled_points, use_container_width=True)
         else:
             col_points.info("No scoring data yet. Refresh Today's Games.")
         if daily_power_rows_3pm:
