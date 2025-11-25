@@ -2817,7 +2817,7 @@ with injury_impact_tab:
                     win_pct_delta_display = f"{team_impact.win_pct_delta:+.1%}"
                     st.metric(
                         "Win % Impact",
-                        f"{team_impact.win_pct_with:.1%}",
+                        f"{team_impact.team_win_pct_with:.1%}",
                         win_pct_delta_display,
                         delta_color="normal" if team_impact.win_pct_delta >= 0 else "inverse",
                     )
