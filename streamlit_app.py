@@ -21,6 +21,7 @@ except Exception:  # pragma: no cover - fallback for Windows builds without tzda
 from nba_api.stats.endpoints import scoreboardv2
 
 from nba_to_sqlite import build_database
+import injury_impact_analytics as iia
 
 DEFAULT_DB_PATH = Path(__file__).with_name("nba_stats.db")
 DEFAULT_PREDICTIONS_PATH = Path(__file__).with_name("predictions.csv")
@@ -1667,6 +1668,7 @@ tab_titles = [
     "Today's Games",
     "Matchup Spotlight",
     "Daily Leaders",
+    "Injury Impact",
     "Standings",
     "3PT Leaders",
     "Scoring Leaders",
@@ -1681,6 +1683,7 @@ tabs = st.tabs(tab_titles)
     games_tab,
     matchup_spotlight_tab,
     daily_leaders_tab,
+    injury_impact_tab,
     standings_tab,
     three_pt_tab,
     scoring_tab,
@@ -2695,6 +2698,297 @@ with defense_styles_tab:
                 st.dataframe(style_leaders, use_container_width=True, hide_index=True)
     except Exception as exc:  # noqa: BLE001
         st.warning(f"Unable to load defense styles: {exc}")
+
+# Injury Impact tab --------------------------------------------------------
+with injury_impact_tab:
+    st.subheader("Injury Impact Analysis")
+    st.markdown(
+        "Analyze how player absences affect team performance, teammate usage, "
+        "and opponent performance. Player absences are inferred from missing game logs."
+    )
+
+    # Season selection for injury analysis
+    injury_col1, injury_col2 = st.columns(2)
+    with injury_col1:
+        injury_season = st.text_input(
+            "Season for injury analysis",
+            value=builder_config["season"],
+            key="injury_season",
+        ).strip() or builder_config["season"]
+    with injury_col2:
+        injury_season_type = st.selectbox(
+            "Season type",
+            options=[DEFAULT_SEASON_TYPE, "Playoffs", "Pre Season"],
+            index=0,
+            key="injury_season_type",
+        )
+
+    # Get significant players
+    try:
+        conn_injury = get_connection(str(db_path))
+
+        min_games_injury = st.slider(
+            "Minimum games played (to qualify as significant player)",
+            min_value=5,
+            max_value=30,
+            value=10,
+            key="min_games_injury",
+        )
+
+        min_ppg = st.slider(
+            "Minimum points per game",
+            min_value=5.0,
+            max_value=20.0,
+            value=10.0,
+            step=1.0,
+            key="min_ppg_injury",
+        )
+
+        significant_players = iia.get_significant_players(
+            conn_injury,
+            season=injury_season,
+            season_type=injury_season_type,
+            min_games=min_games_injury,
+            min_avg_points=min_ppg,
+        )
+
+        if significant_players.empty:
+            st.warning("No significant players found for the selected criteria. Try adjusting the filters.")
+        else:
+            # Player selection
+            player_options = {
+                f"{row['player_name']} ({row['team_name']}) - {row['avg_points']} PPG": row['player_id']
+                for _, row in significant_players.iterrows()
+            }
+
+            selected_player_display = st.selectbox(
+                "Select player to analyze",
+                options=list(player_options.keys()),
+                key="injury_player_select",
+            )
+
+            selected_player_id = player_options[selected_player_display]
+            selected_player_name = selected_player_display.split(" (")[0]
+
+            # Calculate impact metrics
+            with st.spinner(f"Analyzing impact of {selected_player_name}'s absences..."):
+                team_impact = iia.calculate_team_impact(
+                    conn_injury,
+                    selected_player_id,
+                    selected_player_name,
+                    injury_season,
+                    injury_season_type,
+                )
+
+                teammate_impacts = iia.calculate_teammate_redistribution(
+                    conn_injury,
+                    selected_player_id,
+                    injury_season,
+                    injury_season_type,
+                    min_games=3,
+                )
+
+                opponent_impact = iia.calculate_opponent_impact(
+                    conn_injury,
+                    selected_player_id,
+                    injury_season,
+                    injury_season_type,
+                )
+
+            if team_impact is None:
+                st.warning(f"No data found for {selected_player_name} in {injury_season}.")
+            else:
+                # Display key metrics
+                st.markdown(f"### Team Performance: {team_impact.team_name}")
+
+                metric_cols = st.columns(4)
+                with metric_cols[0]:
+                    st.metric(
+                        "Games with Player",
+                        team_impact.games_played,
+                        f"{team_impact.total_team_games} total team games",
+                    )
+                with metric_cols[1]:
+                    st.metric(
+                        "Games without Player",
+                        team_impact.games_absent,
+                    )
+                with metric_cols[2]:
+                    win_pct_delta_display = f"{team_impact.win_pct_delta:+.1%}"
+                    st.metric(
+                        "Win % Impact",
+                        f"{team_impact.win_pct_with:.1%}",
+                        win_pct_delta_display,
+                        delta_color="normal" if team_impact.win_pct_delta >= 0 else "inverse",
+                    )
+                with metric_cols[3]:
+                    pts_delta_display = f"{team_impact.offensive_rating_delta:+.1f}"
+                    st.metric(
+                        "Offensive Impact (PPG)",
+                        f"{team_impact.team_avg_pts_with:.1f}",
+                        pts_delta_display,
+                        delta_color="normal" if team_impact.offensive_rating_delta >= 0 else "inverse",
+                    )
+
+                # Detailed comparison table
+                st.markdown("#### Detailed Team Performance Comparison")
+                comparison_data = {
+                    "Metric": [
+                        "Record",
+                        "Win %",
+                        "Avg Points Scored",
+                        "Avg Points Allowed",
+                        "Point Differential",
+                    ],
+                    "With Player": [
+                        f"{team_impact.team_wins_with}-{team_impact.team_losses_with}",
+                        f"{team_impact.team_win_pct_with:.1%}",
+                        f"{team_impact.team_avg_pts_with:.1f}",
+                        f"{team_impact.team_avg_pts_allowed_with:.1f}",
+                        f"{team_impact.team_avg_pts_with - team_impact.team_avg_pts_allowed_with:+.1f}",
+                    ],
+                    "Without Player": [
+                        f"{team_impact.team_wins_without}-{team_impact.team_losses_without}",
+                        f"{team_impact.team_win_pct_without:.1%}",
+                        f"{team_impact.team_avg_pts_without:.1f}",
+                        f"{team_impact.team_avg_pts_allowed_without:.1f}",
+                        f"{team_impact.team_avg_pts_without - team_impact.team_avg_pts_allowed_without:+.1f}",
+                    ],
+                    "Delta": [
+                        "",
+                        f"{team_impact.win_pct_delta:+.1%}",
+                        f"{team_impact.offensive_rating_delta:+.1f}",
+                        f"{team_impact.defensive_rating_delta:+.1f}",
+                        f"{(team_impact.offensive_rating_delta - team_impact.defensive_rating_delta):+.1f}",
+                    ],
+                }
+                comparison_df = pd.DataFrame(comparison_data)
+                st.dataframe(comparison_df, use_container_width=True, hide_index=True)
+
+                # Teammate redistribution analysis
+                if teammate_impacts:
+                    st.markdown("#### Teammate Usage & Scoring Redistribution")
+                    st.markdown(
+                        f"How do teammates perform when **{selected_player_name}** is absent? "
+                        "Positive deltas indicate increased production."
+                    )
+
+                    teammate_data = []
+                    for tm in teammate_impacts[:10]:  # Top 10 most affected
+                        teammate_data.append({
+                            "Teammate": tm.teammate_name,
+                            "PPG With": f"{tm.avg_pts_with:.1f}",
+                            "PPG Without": f"{tm.avg_pts_without:.1f}",
+                            "Pts Δ": f"{tm.pts_delta:+.1f}",
+                            "USG% With": f"{tm.avg_usg_with:.1f}",
+                            "USG% Without": f"{tm.avg_usg_without:.1f}",
+                            "USG Δ": f"{tm.usg_delta:+.1f}",
+                            "Min Δ": f"{tm.minutes_delta:+.1f}",
+                            "Games Together": tm.games_together,
+                            "Games Apart": tm.games_apart,
+                        })
+
+                    teammate_df = pd.DataFrame(teammate_data)
+                    st.dataframe(teammate_df, use_container_width=True, hide_index=True)
+
+                    # Visualization: Top beneficiaries
+                    st.markdown("##### Top Beneficiaries (Biggest PPG Increase)")
+                    top_beneficiaries = [tm for tm in teammate_impacts if tm.pts_delta > 0][:5]
+                    if top_beneficiaries:
+                        import plotly.graph_objects as go
+
+                        fig = go.Figure()
+                        teammate_names = [tm.teammate_name for tm in top_beneficiaries]
+                        pts_with = [tm.avg_pts_with for tm in top_beneficiaries]
+                        pts_without = [tm.avg_pts_without for tm in top_beneficiaries]
+
+                        fig.add_trace(go.Bar(
+                            name=f'With {selected_player_name}',
+                            x=teammate_names,
+                            y=pts_with,
+                            text=[f"{v:.1f}" for v in pts_with],
+                            textposition='auto',
+                        ))
+                        fig.add_trace(go.Bar(
+                            name=f'Without {selected_player_name}',
+                            x=teammate_names,
+                            y=pts_without,
+                            text=[f"{v:.1f}" for v in pts_without],
+                            textposition='auto',
+                        ))
+
+                        fig.update_layout(
+                            title="Points Per Game: With vs Without Key Player",
+                            xaxis_title="Teammate",
+                            yaxis_title="Points Per Game",
+                            barmode='group',
+                            height=400,
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                    else:
+                        st.info("No teammates showed increased scoring when player was absent.")
+                else:
+                    st.info("Not enough data to analyze teammate redistribution (need at least 3 games in each scenario).")
+
+                # Opponent impact analysis
+                if opponent_impact:
+                    st.markdown("#### Opponent Performance Impact")
+                    st.markdown(
+                        f"How do opposing teams perform when **{selected_player_name}** is absent? "
+                        "Positive deltas indicate opponents perform better without the player."
+                    )
+
+                    opp_metric_cols = st.columns(3)
+                    with opp_metric_cols[0]:
+                        st.metric(
+                            "Opp PPG (with player)",
+                            f"{opponent_impact.avg_opp_pts_with:.1f}",
+                            f"{opponent_impact.opp_pts_delta:+.1f} without",
+                            delta_color="inverse" if opponent_impact.opp_pts_delta > 0 else "normal",
+                        )
+                    with opp_metric_cols[1]:
+                        st.metric(
+                            "Opp 3PM (with player)",
+                            f"{opponent_impact.avg_opp_fg3m_with:.1f}",
+                            f"{opponent_impact.opp_fg3m_delta:+.1f} without",
+                            delta_color="inverse" if opponent_impact.opp_fg3m_delta > 0 else "normal",
+                        )
+                    with opp_metric_cols[2]:
+                        if opponent_impact.avg_opp_fg_pct_with > 0:
+                            st.metric(
+                                "Opp Efficiency (with)",
+                                f"{opponent_impact.avg_opp_fg_pct_with:.1f}%",
+                                f"{opponent_impact.opp_fg_pct_delta:+.1f}% without",
+                                delta_color="inverse" if opponent_impact.opp_fg_pct_delta > 0 else "normal",
+                            )
+                        else:
+                            st.metric("Opp Efficiency", "N/A")
+
+                    opp_comparison_data = {
+                        "Metric": [
+                            "Opponent Avg Points",
+                            "Opponent Avg 3PM",
+                        ],
+                        "With Player": [
+                            f"{opponent_impact.avg_opp_pts_with:.1f}",
+                            f"{opponent_impact.avg_opp_fg3m_with:.1f}",
+                        ],
+                        "Without Player": [
+                            f"{opponent_impact.avg_opp_pts_without:.1f}",
+                            f"{opponent_impact.avg_opp_fg3m_without:.1f}",
+                        ],
+                        "Delta": [
+                            f"{opponent_impact.opp_pts_delta:+.1f}",
+                            f"{opponent_impact.opp_fg3m_delta:+.1f}",
+                        ],
+                    }
+                    opp_comparison_df = pd.DataFrame(opp_comparison_data)
+                    st.dataframe(opp_comparison_df, use_container_width=True, hide_index=True)
+
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Error loading injury impact data: {exc}")
+        import traceback
+        st.code(traceback.format_exc())
 
 # Prediction tab -----------------------------------------------------------
 with predictions_tab:
