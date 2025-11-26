@@ -1769,6 +1769,9 @@ with games_tab:
     predictions_logged = 0
     predictions_failed = 0
 
+    # Collect predictions for CSV export
+    predictions_for_export = []
+
     st.subheader("Today's Games (Scoreboard)")
     selected_date = st.date_input(
         "Game date",
@@ -2277,6 +2280,30 @@ with games_tab:
                                     dfs_score=daily_pick_score,
                                     dfs_grade=pick_grade
                                 )
+
+                                # Add to export list
+                                predictions_for_export.append({
+                                    'game_date': matchup["Date"],
+                                    'player_name': player["player_name"],
+                                    'team_name': team_name,
+                                    'opponent_name': opponent_name,
+                                    'projected_ppg': projection,
+                                    'proj_confidence': proj_confidence,
+                                    'proj_floor': proj_floor,
+                                    'proj_ceiling': proj_ceiling,
+                                    'season_avg_ppg': season_avg_pts,
+                                    'recent_avg_3': avg_pts_last3,
+                                    'recent_avg_5': avg_pts_last5,
+                                    'vs_opponent_avg': avg_vs_opp,
+                                    'vs_opponent_games': games_vs_opp,
+                                    'analytics_used': analytics_indicators,
+                                    'opponent_def_rating': opp_def_rating,
+                                    'opponent_pace': opp_pace,
+                                    'dfs_score': daily_pick_score,
+                                    'dfs_grade': pick_grade
+                                })
+
+                                # Try to log to database (optional, won't break if it fails)
                                 pt.log_prediction(games_conn, prediction)
                                 predictions_logged += 1
                             except Exception as e:
@@ -2441,6 +2468,32 @@ with games_tab:
         st.sidebar.success(f"✅ Logged {predictions_logged} predictions")
         if predictions_failed > 0:
             st.sidebar.error(f"❌ Failed to log {predictions_failed} predictions")
+
+    # CSV Export Button
+    if predictions_for_export:
+        st.divider()
+        st.subheader("📥 Export Today's Predictions")
+
+        # Convert to DataFrame
+        export_df = pd.DataFrame(predictions_for_export)
+
+        # Sort by DFS score descending
+        export_df = export_df.sort_values('dfs_score', ascending=False).reset_index(drop=True)
+
+        # Show summary
+        st.caption(f"Total predictions: {len(export_df)} | Top DFS Score: {export_df['dfs_score'].max():.1f} | Date: {export_df['game_date'].iloc[0]}")
+
+        # Convert to CSV
+        csv = export_df.to_csv(index=False)
+
+        # Download button
+        st.download_button(
+            label="📥 Download Predictions CSV",
+            data=csv,
+            file_name=f"nba_predictions_{export_df['game_date'].iloc[0]}.csv",
+            mime="text/csv",
+            help="Download all predictions from this page as CSV"
+        )
 
 # Matchup spotlight tab ----------------------------------------------------
 with matchup_spotlight_tab:
