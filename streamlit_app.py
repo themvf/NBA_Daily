@@ -3547,6 +3547,9 @@ with predictions_tab:
     with col1:
         # Get available dates with predictions
         try:
+            # Ensure predictions table exists
+            pt.create_predictions_table(conn)
+
             cursor = conn.cursor()
             cursor.execute("""
                 SELECT DISTINCT game_date
@@ -3565,8 +3568,10 @@ with predictions_tab:
             else:
                 st.info("No predictions logged yet. They will appear after viewing Daily Games.")
                 selected_date = None
-        except Exception:
-            st.warning("Predictions table not initialized. Run: `python init_predictions_table.py`")
+        except Exception as e:
+            st.error(f"Error loading predictions: {e}")
+            import traceback
+            st.code(traceback.format_exc())
             selected_date = None
 
     with col2:
