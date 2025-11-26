@@ -24,6 +24,7 @@ from nba_to_sqlite import build_database
 import injury_impact_analytics as iia
 import player_correlation_analytics as pca
 import defense_type_analytics as dta
+import prediction_tracking as pt
 
 DEFAULT_DB_PATH = Path(__file__).with_name("nba_stats.db")
 DEFAULT_PREDICTIONS_PATH = Path(__file__).with_name("predictions.csv")
@@ -2239,6 +2240,39 @@ with games_tab:
                                     "Confidence": f"{matchup_confidence:.0%}" if matchup_confidence > 0 else "Low",
                                 }
                             )
+
+                            # NEW: Log prediction for tracking
+                            try:
+                                prediction = pt.Prediction(
+                                    prediction_id=None,
+                                    prediction_date=str(date.today()),
+                                    game_date=matchup["Date"],
+                                    player_id=player_id_val,
+                                    player_name=player["player_name"],
+                                    team_id=team_id,
+                                    team_name=team_name,
+                                    opponent_id=opponent_id if opponent_id else 0,
+                                    opponent_name=opponent_name,
+                                    projected_ppg=projection,
+                                    proj_confidence=proj_confidence,
+                                    proj_floor=proj_floor,
+                                    proj_ceiling=proj_ceiling,
+                                    season_avg_ppg=season_avg_pts,
+                                    recent_avg_3=avg_pts_last3,
+                                    recent_avg_5=avg_pts_last5,
+                                    vs_opponent_avg=avg_vs_opp,
+                                    vs_opponent_games=games_vs_opp,
+                                    analytics_used=analytics_indicators,
+                                    opponent_def_rating=opp_def_rating,
+                                    opponent_pace=opp_pace,
+                                    dfs_score=daily_pick_score,
+                                    dfs_grade=pick_grade
+                                )
+                                pt.log_prediction(conn, prediction)
+                            except Exception:
+                                # Silently fail - don't break display if logging fails
+                                pass
+
                             matchup_spotlight_rows.append(
                                 {
                                     "Matchup": f"{matchup['Away']} at {matchup['Home']}",
@@ -3504,23 +3538,213 @@ with injury_impact_tab:
 
 # Prediction tab -----------------------------------------------------------
 with predictions_tab:
-    st.subheader("3PT Leader Predictions")
-    predictions_path = Path(st.session_state["predictions_path_input"]).expanduser()
-    if not predictions_path.exists():
-        st.info("No predictions CSV detected. Run `predict_top_3pm.py` with `--output-predictions`.")
-    else:
+    st.subheader("📊 Prediction Accuracy Tracker")
+    st.caption("Track projection accuracy vs actual performance to improve the model")
+
+    # Date selector for viewing predictions
+    col1, col2 = st.columns([1, 1])
+
+    with col1:
+        # Get available dates with predictions
         try:
-            predictions_df = pd.read_csv(predictions_path)
-            sort_col = st.selectbox(
-                "Sort by",
-                options=["pred_prob", "correct", "season", "team_id"],
-                index=0,
-            )
-            ascending = st.checkbox("Sort ascending", value=False)
-            display_df = predictions_df.sort_values(sort_col, ascending=ascending)
-            render_dataframe(display_df)
-        except Exception as exc:  # noqa: BLE001
-            st.warning(f"Unable to read predictions CSV: {exc}")
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT DISTINCT game_date
+                FROM predictions
+                ORDER BY game_date DESC
+                LIMIT 30
+            """)
+            available_dates = [row[0] for row in cursor.fetchall()]
+
+            if available_dates:
+                selected_date = st.selectbox(
+                    "Game Date",
+                    options=available_dates,
+                    index=0
+                )
+            else:
+                st.info("No predictions logged yet. They will appear after viewing Daily Games.")
+                selected_date = None
+        except Exception:
+            st.warning("Predictions table not initialized. Run: `python init_predictions_table.py`")
+            selected_date = None
+
+    with col2:
+        if selected_date:
+            # Button to update actuals for selected date
+            if st.button("🔄 Update Actuals from Game Logs"):
+                with st.spinner(f"Updating actuals for {selected_date}..."):
+                    updated = pt.bulk_update_actuals_from_game_logs(conn, selected_date)
+                    st.success(f"Updated {updated} predictions with actual performance!")
+                    st.rerun()
+
+    if selected_date:
+        st.divider()
+
+        # Summary metrics for the selected date
+        try:
+            cursor.execute("""
+                SELECT
+                    COUNT(*) as total,
+                    COUNT(actual_ppg) as with_actuals,
+                    AVG(CASE WHEN actual_ppg IS NOT NULL THEN abs_error ELSE NULL END) as avg_error,
+                    AVG(CASE WHEN hit_floor_ceiling = 1 THEN 1.0 ELSE 0.0 END) as hit_rate,
+                    SUM(CASE WHEN error < 0 THEN 1 ELSE 0 END) as over_proj,
+                    SUM(CASE WHEN error > 0 THEN 1 ELSE 0 END) as under_proj
+                FROM predictions
+                WHERE game_date = ?
+            """, (selected_date,))
+
+            result = cursor.fetchone()
+            total, with_actuals, avg_error, hit_rate, over_proj, under_proj = result
+
+            # Display metrics in columns
+            metric_cols = st.columns(5)
+
+            with metric_cols[0]:
+                st.metric("Total Predictions", total)
+
+            with metric_cols[1]:
+                st.metric("With Actuals", with_actuals or 0)
+
+            with metric_cols[2]:
+                if avg_error:
+                    st.metric("Avg Error (MAE)", f"{avg_error:.2f} PPG")
+                else:
+                    st.metric("Avg Error (MAE)", "N/A")
+
+            with metric_cols[3]:
+                if with_actuals and with_actuals > 0:
+                    st.metric("Hit Rate", f"{hit_rate:.1%}")
+                else:
+                    st.metric("Hit Rate", "N/A")
+
+            with metric_cols[4]:
+                if with_actuals:
+                    bias = f"{over_proj or 0} over, {under_proj or 0} under"
+                    st.metric("Projection Bias", bias)
+                else:
+                    st.metric("Projection Bias", "N/A")
+
+        except Exception as e:
+            st.error(f"Error calculating metrics: {e}")
+
+        st.divider()
+
+        # Predictions vs Actuals table
+        st.subheader(f"Predictions for {selected_date}")
+
+        try:
+            df = pt.get_predictions_vs_actuals(conn, selected_date)
+
+            if not df.empty:
+                # Add helpful columns
+                df['Status'] = df['actual_ppg'].apply(
+                    lambda x: '✅ Complete' if pd.notna(x) else '⏳ Pending'
+                )
+                df['Accuracy'] = df.apply(
+                    lambda row: '🎯 Hit Range' if row['hit_floor_ceiling'] == 1
+                    else '📉 Outside Range' if pd.notna(row['actual_ppg'])
+                    else '',
+                    axis=1
+                )
+
+                # Format numeric columns
+                display_df = df[['player_name', 'team_name', 'opponent_name', 'Status',
+                                 'projected_ppg', 'actual_ppg', 'error', 'abs_error',
+                                 'proj_confidence', 'proj_floor', 'proj_ceiling', 'Accuracy',
+                                 'dfs_score', 'dfs_grade', 'analytics_used']].copy()
+
+                display_df.columns = ['Player', 'Team', 'Opponent', 'Status',
+                                      'Proj PPG', 'Actual PPG', 'Error', 'Abs Error',
+                                      'Confidence', 'Floor', 'Ceiling', 'Accuracy',
+                                      'DFS Score', 'Grade', 'Analytics']
+
+                # Sort by DFS Score descending
+                display_df = display_df.sort_values('DFS Score', ascending=False)
+
+                # Filter options
+                filter_col1, filter_col2 = st.columns(2)
+                with filter_col1:
+                    show_only_actuals = st.checkbox("Show only predictions with actuals", value=False)
+                with filter_col2:
+                    min_dfs = st.slider("Min DFS Score", 0.0, 100.0, 0.0, 5.0)
+
+                if show_only_actuals:
+                    display_df = display_df[display_df['Status'] == '✅ Complete']
+
+                if min_dfs > 0:
+                    display_df = display_df[display_df['DFS Score'] >= min_dfs]
+
+                # Display
+                st.dataframe(
+                    display_df,
+                    use_container_width=True,
+                    height=600
+                )
+
+                # Download button
+                csv = display_df.to_csv(index=False)
+                st.download_button(
+                    label="📥 Download as CSV",
+                    data=csv,
+                    file_name=f"predictions_{selected_date}.csv",
+                    mime="text/csv"
+                )
+
+            else:
+                st.info(f"No predictions found for {selected_date}")
+
+        except Exception as e:
+            st.error(f"Error loading predictions: {e}")
+            import traceback
+            st.code(traceback.format_exc())
+
+        st.divider()
+
+        # Best and worst predictions
+        if with_actuals and with_actuals > 0:
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.subheader("🏆 Best Predictions")
+                try:
+                    cursor.execute("""
+                        SELECT player_name, projected_ppg, actual_ppg, error, abs_error, analytics_used
+                        FROM predictions
+                        WHERE game_date = ? AND actual_ppg IS NOT NULL
+                        ORDER BY abs_error ASC
+                        LIMIT 5
+                    """, (selected_date,))
+
+                    best = cursor.fetchall()
+                    if best:
+                        for player_name, proj, actual, error, abs_err, analytics in best:
+                            st.write(f"**{player_name}** {analytics}")
+                            st.write(f"Proj: {proj:.1f}, Actual: {actual:.1f} ({error:+.1f}, MAE: {abs_err:.1f})")
+                            st.write("---")
+                except Exception as e:
+                    st.error(f"Error: {e}")
+
+            with col2:
+                st.subheader("❌ Worst Predictions")
+                try:
+                    cursor.execute("""
+                        SELECT player_name, projected_ppg, actual_ppg, error, abs_error, analytics_used
+                        FROM predictions
+                        WHERE game_date = ? AND actual_ppg IS NOT NULL
+                        ORDER BY abs_error DESC
+                        LIMIT 5
+                    """, (selected_date,))
+
+                    worst = cursor.fetchall()
+                    if worst:
+                        for player_name, proj, actual, error, abs_err, analytics in worst:
+                            st.write(f"**{player_name}** {analytics}")
+                            st.write(f"Proj: {proj:.1f}, Actual: {actual:.1f} ({error:+.1f}, MAE: {abs_err:.1f})")
+                            st.write("---")
+                except Exception as e:
+                    st.error(f"Error: {e}")
 
 st.divider()
 st.caption(
