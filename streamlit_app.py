@@ -3541,6 +3541,9 @@ with predictions_tab:
     st.subheader("📊 Prediction Accuracy Tracker")
     st.caption("Track projection accuracy vs actual performance to improve the model")
 
+    # Get database connection
+    pred_conn = get_connection(str(db_path))
+
     # Date selector for viewing predictions
     col1, col2 = st.columns([1, 1])
 
@@ -3548,9 +3551,9 @@ with predictions_tab:
         # Get available dates with predictions
         try:
             # Ensure predictions table exists
-            pt.create_predictions_table(conn)
+            pt.create_predictions_table(pred_conn)
 
-            cursor = conn.cursor()
+            cursor = pred_conn.cursor()
             cursor.execute("""
                 SELECT DISTINCT game_date
                 FROM predictions
@@ -3579,7 +3582,7 @@ with predictions_tab:
             # Button to update actuals for selected date
             if st.button("🔄 Update Actuals from Game Logs"):
                 with st.spinner(f"Updating actuals for {selected_date}..."):
-                    updated = pt.bulk_update_actuals_from_game_logs(conn, selected_date)
+                    updated = pt.bulk_update_actuals_from_game_logs(pred_conn, selected_date)
                     st.success(f"Updated {updated} predictions with actual performance!")
                     st.rerun()
 
@@ -3640,7 +3643,7 @@ with predictions_tab:
         st.subheader(f"Predictions for {selected_date}")
 
         try:
-            df = pt.get_predictions_vs_actuals(conn, selected_date)
+            df = pt.get_predictions_vs_actuals(pred_conn, selected_date)
 
             if not df.empty:
                 # Add helpful columns
