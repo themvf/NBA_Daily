@@ -1765,6 +1765,10 @@ with games_tab:
     # Ensure predictions table exists
     pt.create_predictions_table(games_conn)
 
+    # Track prediction logging for debugging
+    predictions_logged = 0
+    predictions_failed = 0
+
     st.subheader("Today's Games (Scoreboard)")
     selected_date = st.date_input(
         "Game date",
@@ -2274,9 +2278,12 @@ with games_tab:
                                     dfs_grade=pick_grade
                                 )
                                 pt.log_prediction(games_conn, prediction)
+                                predictions_logged += 1
                             except Exception as e:
-                                # Log errors to help debug, but don't break display
-                                pass  # Could add: st.sidebar.error(f"Prediction logging error: {e}")
+                                # Show error in sidebar to help debug without breaking main display
+                                predictions_failed += 1
+                                if predictions_failed <= 3:  # Only show first 3 errors to avoid spam
+                                    st.sidebar.warning(f"⚠️ Prediction logging error: {str(e)[:100]}")
 
                             matchup_spotlight_rows.append(
                                 {
@@ -2428,6 +2435,12 @@ with games_tab:
                         st.caption("No qualified players for this matchup yet.")
     except Exception as exc:  # noqa: BLE001
         st.error(f"Unable to load today's games: {exc}")
+
+    # Show prediction logging status
+    if predictions_logged > 0 or predictions_failed > 0:
+        st.sidebar.success(f"✅ Logged {predictions_logged} predictions")
+        if predictions_failed > 0:
+            st.sidebar.error(f"❌ Failed to log {predictions_failed} predictions")
 
 # Matchup spotlight tab ----------------------------------------------------
 with matchup_spotlight_tab:
