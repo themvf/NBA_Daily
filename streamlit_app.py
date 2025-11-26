@@ -1760,6 +1760,11 @@ player_season_stats_map: Dict[int, Mapping[str, Any]] = {}
 
 # Today's games tab --------------------------------------------------------
 with games_tab:
+    # Get database connection for logging predictions
+    games_conn = get_connection(str(db_path))
+    # Ensure predictions table exists
+    pt.create_predictions_table(games_conn)
+
     st.subheader("Today's Games (Scoreboard)")
     selected_date = st.date_input(
         "Game date",
@@ -2268,10 +2273,10 @@ with games_tab:
                                     dfs_score=daily_pick_score,
                                     dfs_grade=pick_grade
                                 )
-                                pt.log_prediction(conn, prediction)
-                            except Exception:
-                                # Silently fail - don't break display if logging fails
-                                pass
+                                pt.log_prediction(games_conn, prediction)
+                            except Exception as e:
+                                # Log errors to help debug, but don't break display
+                                pass  # Could add: st.sidebar.error(f"Prediction logging error: {e}")
 
                             matchup_spotlight_rows.append(
                                 {
