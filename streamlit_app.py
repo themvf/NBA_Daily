@@ -1,5 +1,6 @@
 """
 Streamlit dashboard for exploring locally built NBA stats.
+Version: 2025-11-26 (CSV Export Feature)
 """
 
 from __future__ import annotations
