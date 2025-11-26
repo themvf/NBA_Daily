@@ -26,6 +26,7 @@ import injury_impact_analytics as iia
 import player_correlation_analytics as pca
 import defense_type_analytics as dta
 import prediction_tracking as pt
+import s3_storage
 
 DEFAULT_DB_PATH = Path(__file__).with_name("nba_stats.db")
 DEFAULT_PREDICTIONS_PATH = Path(__file__).with_name("predictions.csv")
@@ -73,6 +74,68 @@ st.caption(
     "Explore league standings, leaderboards, and prediction outputs produced "
     "by the local NBA SQLite builder."
 )
+
+
+# S3 Database Sync on Startup
+@st.cache_resource
+def sync_database_from_s3() -> tuple[bool, str]:
+    """
+    Download database from S3 on app startup.
+    Only runs once per session due to cache_resource.
+    """
+    storage = s3_storage.S3PredictionStorage()
+
+    if not storage.is_connected():
+        return False, "S3 not configured (running in local mode)"
+
+    db_path = DEFAULT_DB_PATH
+
+    # If database already exists locally, don't overwrite it
+    # (this preserves local development workflows)
+    if db_path.exists():
+        # But check if S3 has a newer version
+        s3_info = storage.get_backup_info()
+        if s3_info.get('exists'):
+            local_mtime = datetime.fromtimestamp(db_path.stat().st_mtime, tz=timezone.utc)
+            s3_mtime = s3_info['last_modified']
+
+            if s3_mtime > local_mtime:
+                # S3 version is newer, download it
+                success, message = storage.download_database(db_path)
+                if success:
+                    return True, f"✅ Restored database from S3 ({message})"
+                else:
+                    return False, f"⚠️ Failed to download newer S3 backup: {message}"
+            else:
+                return True, "Using local database (newer than S3 backup)"
+        else:
+            return True, "Using existing local database (no S3 backup found)"
+
+    # No local database, try to download from S3
+    success, message = storage.download_database(db_path)
+
+    if success:
+        return True, f"✅ Restored database from S3 ({message})"
+    else:
+        # No backup exists (normal for first run)
+        if "No backup found" in message or "404" in message:
+            return True, "No S3 backup yet (this is normal for first run)"
+        return False, f"⚠️ S3 restore failed: {message}"
+
+
+# Run S3 sync on startup
+s3_sync_status, s3_sync_message = sync_database_from_s3()
+
+# Show S3 sync status in sidebar
+with st.sidebar:
+    st.markdown("### ☁️ Cloud Backup Status")
+    if "S3 not configured" in s3_sync_message:
+        st.info("💻 Running in local mode")
+    elif s3_sync_status:
+        st.success(s3_sync_message)
+    else:
+        st.warning(s3_sync_message)
+    st.divider()
 
 
 @st.cache_resource
@@ -2470,6 +2533,16 @@ with games_tab:
         if predictions_failed > 0:
             st.sidebar.error(f"❌ Failed to log {predictions_failed} predictions")
 
+        # Auto-backup to S3 after logging predictions
+        if predictions_logged > 0:
+            storage = s3_storage.S3PredictionStorage()
+            if storage.is_connected():
+                success, message = storage.upload_database(db_path)
+                if success:
+                    st.sidebar.info(f"☁️ {message}")
+                else:
+                    st.sidebar.warning(f"⚠️ S3 backup failed: {message}")
+
     # CSV Export Button
     if predictions_for_export:
         st.divider()
@@ -2488,13 +2561,36 @@ with games_tab:
         csv = export_df.to_csv(index=False)
 
         # Download button
-        st.download_button(
-            label="📥 Download Predictions CSV",
-            data=csv,
-            file_name=f"nba_predictions_{export_df['game_date'].iloc[0]}.csv",
-            mime="text/csv",
-            help="Download all predictions from this page as CSV"
-        )
+        col1, col2 = st.columns([2, 1])
+
+        with col1:
+            st.download_button(
+                label="📥 Download Predictions CSV",
+                data=csv,
+                file_name=f"nba_predictions_{export_df['game_date'].iloc[0]}.csv",
+                mime="text/csv",
+                help="Download all predictions from this page as CSV"
+            )
+
+        with col2:
+            # Manual S3 backup button
+            storage = s3_storage.S3PredictionStorage()
+            if storage.is_connected():
+                if st.button("☁️ Backup to S3", help="Manually backup database to S3"):
+                    with st.spinner("Uploading to S3..."):
+                        success, message = storage.upload_database(db_path)
+                        if success:
+                            st.success(f"✅ {message}")
+                        else:
+                            st.error(f"❌ {message}")
+
+                # Show S3 backup status
+                backup_info = storage.get_backup_info()
+                if backup_info.get('exists'):
+                    last_backup = backup_info['last_modified'].strftime("%Y-%m-%d %H:%M:%S UTC")
+                    st.caption(f"Last S3 backup: {last_backup}")
+            else:
+                st.caption("S3 backup not configured")
 
 # Matchup spotlight tab ----------------------------------------------------
 with matchup_spotlight_tab:

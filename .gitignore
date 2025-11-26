@@ -7,3 +7,5 @@ nba_stats.db
 predictions.csv
 .env
 *.log
+.streamlit/secrets.toml
+prediction_exports/
