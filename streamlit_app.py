@@ -2259,7 +2259,7 @@ with games_tab:
                                 prediction = pt.Prediction(
                                     prediction_id=None,
                                     prediction_date=str(date.today()),
-                                    game_date=matchup["Date"],
+                                    game_date=str(selected_date),
                                     player_id=player_id_val,
                                     player_name=player["player_name"],
                                     team_id=team_id,
@@ -2284,7 +2284,7 @@ with games_tab:
 
                                 # Add to export list
                                 predictions_for_export.append({
-                                    'game_date': matchup["Date"],
+                                    'game_date': str(selected_date),
                                     'player_name': player["player_name"],
                                     'team_name': team_name,
                                     'opponent_name': opponent_name,
