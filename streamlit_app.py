@@ -8,7 +8,7 @@ import sqlite3
 import tempfile
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Mapping, Tuple
+from typing import Any, Dict, Iterable, Mapping, Tuple, Optional
 
 import pandas as pd
 import streamlit as st
@@ -936,7 +936,11 @@ def calculate_smart_ppg_projection(
     opp_pace: float | None,
     league_avg_def_rating: float = 112.0,
     league_avg_pace: float = 99.0,
-) -> tuple[float, float, float, dict]:
+    # NEW: Enhanced analytics parameters
+    opponent_correlation: Optional[pca.OpponentCorrelation] = None,
+    pace_split: Optional[dta.DefenseTypePerformance] = None,
+    defense_quality_split: Optional[dta.DefenseTypePerformance] = None,
+) -> tuple[float, float, float, float, dict, str]:
     """
     Calculate smart PPG projection using multi-factor weighted model.
 
@@ -976,9 +980,32 @@ def calculate_smart_ppg_projection(
         components["recent"] = season_avg
         weights["recent"] = 0.10
 
-    # 3. Team-Specific Matchup (30% weight if available - HIGHEST)
-    if vs_opp_team_avg is not None and vs_opp_team_games >= 2:
-        # Higher weight for more games
+    # 3. Team-Specific Matchup (25-35% weight - HIGHEST PRIORITY)
+    # ENHANCED: Use opponent correlation if available for better accuracy
+    analytics_used = []
+
+    if opponent_correlation is not None and opponent_correlation.games_vs_opponent >= 2:
+        # Use correlation data (more sophisticated than simple average)
+        # Correlation score (0-100) indicates matchup quality
+        correlation_confidence = opponent_correlation.matchup_score / 100.0
+
+        # Use PPG delta from correlation (accounts for sample size + consistency)
+        components["vs_team"] = season_avg + opponent_correlation.pts_delta
+
+        # Weight increases with better correlation scores (55-70 = good data)
+        base_weight = 0.25
+        if opponent_correlation.matchup_score >= 60:
+            base_weight = 0.35  # Elite matchup = higher confidence
+        elif opponent_correlation.matchup_score >= 55:
+            base_weight = 0.30  # Good matchup
+        elif opponent_correlation.matchup_score <= 40:
+            base_weight = 0.20  # Poor matchup but still use data
+
+        weights["vs_team"] = base_weight * min(1.0, opponent_correlation.games_vs_opponent / 5.0)
+        analytics_used.append("🎯")  # Correlation indicator
+
+    elif vs_opp_team_avg is not None and vs_opp_team_games >= 2:
+        # Fallback to simple historical average
         confidence_factor = min(1.0, vs_opp_team_games / 5.0)
         components["vs_team"] = vs_opp_team_avg
         weights["vs_team"] = 0.30 * confidence_factor
@@ -986,7 +1013,7 @@ def calculate_smart_ppg_projection(
         components["vs_team"] = None
         weights["vs_team"] = 0.0
 
-    # 4. Defense Style Matchup (15% weight if no team history)
+    # 4. Defense Style Matchup (10-15% weight - only if team matchup weak)
     if weights["vs_team"] < 0.15 and vs_defense_style_avg is not None and vs_defense_style_games >= 3:
         components["vs_style"] = vs_defense_style_avg
         weights["vs_style"] = 0.15
@@ -994,11 +1021,17 @@ def calculate_smart_ppg_projection(
         components["vs_style"] = None
         weights["vs_style"] = 0.0
 
-    # 5. Opponent Defense Quality (10% adjustment)
-    if opp_def_rating is not None:
-        # Better defense = lower projection, worse defense = higher projection
+    # 5. Opponent Defense Quality (10-15% adjustment)
+    # ENHANCED: Use player-specific defense quality split if available
+    if defense_quality_split is not None and defense_quality_split.games_played >= 2:
+        # Player-specific performance vs this defense quality level
+        components["def_quality"] = season_avg + defense_quality_split.pts_vs_average
+        weights["def_quality"] = 0.15  # Higher weight with real data
+        analytics_used.append("🛡️")  # Defense split indicator
+
+    elif opp_def_rating is not None:
+        # Fallback to generic adjustment
         def_adjustment = (league_avg_def_rating - opp_def_rating) / league_avg_def_rating
-        # Clamp adjustment to ±15%
         def_adjustment = max(-0.15, min(0.15, def_adjustment))
         components["def_quality"] = season_avg * (1 + def_adjustment)
         weights["def_quality"] = 0.10
@@ -1006,17 +1039,26 @@ def calculate_smart_ppg_projection(
         components["def_quality"] = season_avg
         weights["def_quality"] = 0.0
 
-    # 6. Pace Adjustment (5% adjustment)
-    if opp_pace is not None:
-        # Faster pace = more possessions = more points
+    # 6. Pace Adjustment (5-15% adjustment)
+    # ENHANCED: Use player-specific pace split if available
+    if pace_split is not None and pace_split.games_played >= 2:
+        # Player-specific performance vs this pace type
+        components["pace"] = season_avg + pace_split.pts_vs_average
+        weights["pace"] = 0.15  # Significantly higher weight with real data
+        analytics_used.append("⚡")  # Pace split indicator
+
+    elif opp_pace is not None:
+        # Fallback to generic adjustment
         pace_adjustment = (opp_pace - league_avg_pace) / league_avg_pace
-        # Clamp adjustment to ±10%
         pace_adjustment = max(-0.10, min(0.10, pace_adjustment))
         components["pace"] = season_avg * (1 + pace_adjustment)
         weights["pace"] = 0.05
     else:
         components["pace"] = season_avg
         weights["pace"] = 0.0
+
+    # Track which analytics were used
+    analytics_indicators = "".join(analytics_used) if analytics_used else "📊"
 
     # Normalize weights to sum to 1.0
     total_weight = sum(weights.values())
@@ -1082,6 +1124,17 @@ def calculate_smart_ppg_projection(
         # Only def rating - moderate intel
         confidence_score += 0.08
 
+    # 5. Enhanced analytics confidence boosts
+    if opponent_correlation is not None and opponent_correlation.games_vs_opponent >= 2:
+        # High-quality player-specific matchup data
+        confidence_score += 0.15
+    if pace_split is not None and pace_split.games_played >= 2:
+        # Player-specific pace performance data
+        confidence_score += 0.08
+    if defense_quality_split is not None and defense_quality_split.games_played >= 2:
+        # Player-specific defense quality performance data
+        confidence_score += 0.08
+
     # Cap at 95% (never 100% certain)
     confidence_score = min(0.95, confidence_score)
 
@@ -1101,10 +1154,11 @@ def calculate_smart_ppg_projection(
             k: {"value": components[k], "weight": weights[k] * 100}
             for k in components
             if components[k] is not None and weights[k] > 0
-        }
+        },
+        "analytics_used": analytics_indicators
     }
 
-    return projection, confidence_score, floor, ceiling, breakdown
+    return projection, confidence_score, floor, ceiling, breakdown, analytics_indicators
 
 
 def build_player_style_leaders(
@@ -2018,8 +2072,10 @@ with games_tab:
                             )
 
                             # Get opponent correlation/matchup advantage indicator
+                            # NEW: Also store the correlation object for enhanced projection
                             matchup_indicator = ""
                             matchup_advantage_text = ""
+                            opponent_correlation_obj = None
                             if player_id_val is not None:
                                 try:
                                     # Calculate opponent correlations for this player
@@ -2036,6 +2092,7 @@ with games_tab:
                                         for opp_corr in opponent_corrs:
                                             if opp_corr.opponent_team_id == int(opponent_id):
                                                 # Found the matchup!
+                                                opponent_correlation_obj = opp_corr  # Store for projection
                                                 score = opp_corr.matchup_score
                                                 delta = opp_corr.pts_delta
 
@@ -2059,6 +2116,45 @@ with games_tab:
                                     # Silently fail - don't break the display if correlation calc fails
                                     pass
 
+                            # NEW: Calculate pace and defense quality splits for enhanced projection
+                            pace_split_obj = None
+                            defense_quality_split_obj = None
+                            if player_id_val is not None and opponent_id is not None:
+                                try:
+                                    conn_for_splits = sqlite3.connect(str(db_path))
+
+                                    # Get all defense type splits for this player
+                                    defense_splits = dta.calculate_defense_type_splits(
+                                        conn_for_splits,
+                                        player_id_val,
+                                        context_season,
+                                        context_season_type,
+                                        min_games=2
+                                    )
+
+                                    # Also need to categorize the opponent team to know which split to use
+                                    team_categories = dta.categorize_teams_by_defense(
+                                        conn_for_splits,
+                                        context_season,
+                                        context_season_type
+                                    )
+
+                                    if int(opponent_id) in team_categories:
+                                        opp_pace_cat = team_categories[int(opponent_id)]['pace_category']
+                                        opp_def_cat = team_categories[int(opponent_id)]['defense_category']
+
+                                        # Find matching splits
+                                        for split in defense_splits:
+                                            if split.defense_type == f"{opp_pace_cat} Pace":
+                                                pace_split_obj = split
+                                            elif split.defense_type == f"{opp_def_cat} Defense":
+                                                defense_quality_split_obj = split
+
+                                    conn_for_splits.close()
+                                except Exception:
+                                    # Silently fail - don't break the display
+                                    pass
+
                             # Display string for vs opponent
                             if avg_vs_opp is not None and games_vs_opp >= 2:
                                 vs_opp_display = f"{avg_vs_opp:.1f} ({games_vs_opp}G)"
@@ -2070,11 +2166,11 @@ with games_tab:
                                 format_number(avg_vs_style, 1) if avg_vs_style is not None else "N/A"
                             )
 
-                            # Calculate smart PPG projection
+                            # Calculate smart PPG projection with enhanced analytics
                             opp_def_rating = safe_float(opponent_stats.get("def_rating")) if opponent_stats else None
                             opp_pace = safe_float(opponent_stats.get("avg_opp_possessions")) if opponent_stats else None
 
-                            projection, proj_confidence, proj_floor, proj_ceiling, breakdown = calculate_smart_ppg_projection(
+                            projection, proj_confidence, proj_floor, proj_ceiling, breakdown, analytics_indicators = calculate_smart_ppg_projection(
                                 season_avg=season_avg_pts,
                                 recent_avg_5=avg_pts_last5,
                                 recent_avg_3=avg_pts_last3,
@@ -2084,6 +2180,10 @@ with games_tab:
                                 vs_defense_style_games=games_vs_style,
                                 opp_def_rating=opp_def_rating,
                                 opp_pace=opp_pace,
+                                # NEW: Enhanced analytics parameters
+                                opponent_correlation=opponent_correlation_obj,
+                                pace_split=pace_split_obj,
+                                defense_quality_split=defense_quality_split_obj,
                             )
 
                             # Calculate unified DFS Score
@@ -2101,6 +2201,7 @@ with games_tab:
                                     "Team": team_name,
                                     "Player": player["player_name"],
                                     "Matchup": matchup_indicator,  # NEW: Matchup advantage indicator
+                                    "Analytics": analytics_indicators,  # NEW: Analytics quality indicators
                                     "DFS Score": f"{daily_pick_score:.1f}",
                                     "Grade": f"{pick_grade}\n{pick_explanation}",
                                     "Games": int(player["games_played"]),
