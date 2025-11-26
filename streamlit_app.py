@@ -3059,52 +3059,47 @@ with injury_impact_tab:
         "Home/Away splits, defense matchups, teammate correlations, and absence impact."
     )
 
-    # Create sub-tabs for different impact analyses
-    impact_subtabs = st.tabs([
-        "🏠 Home/Away Splits",
-        "🛡️ vs Defense Types",
-        "👥 Player Correlations",
-        "🚑 Absence Impact"
-    ])
-
-    home_away_tab, defense_types_tab, correlations_tab, absence_tab = impact_subtabs
-
-    # Common player/season selection (shared across all subtabs)
-    impact_col1, impact_col2 = st.columns(2)
-    with impact_col1:
-        impact_season = st.text_input(
-            "Season for analysis",
-            value=builder_config["season"],
-            key="impact_season",
-        ).strip() or builder_config["season"]
-    with impact_col2:
-        impact_season_type = st.selectbox(
-            "Season type",
-            options=[DEFAULT_SEASON_TYPE, "Playoffs", "Pre Season"],
-            index=0,
-            key="impact_season_type",
-        )
-
+    # PLAYER SELECTION AT TOP (moved from below)
     # Get significant players for selection
     try:
         conn_impact = get_connection(str(db_path))
 
-        min_games_impact = st.slider(
-            "Minimum games played",
-            min_value=5,
-            max_value=30,
-            value=10,
-            key="min_games_impact",
-        )
+        # Season selection in one row
+        impact_col1, impact_col2 = st.columns(2)
+        with impact_col1:
+            impact_season = st.text_input(
+                "Season for analysis",
+                value=builder_config["season"],
+                key="impact_season",
+            ).strip() or builder_config["season"]
+        with impact_col2:
+            impact_season_type = st.selectbox(
+                "Season type",
+                options=[DEFAULT_SEASON_TYPE, "Playoffs", "Pre Season"],
+                index=0,
+                key="impact_season_type",
+            )
 
-        min_ppg_impact = st.slider(
-            "Minimum points per game",
-            min_value=5.0,
-            max_value=20.0,
-            value=10.0,
-            step=1.0,
-            key="min_ppg_impact",
-        )
+        # Filters in expander to keep UI clean
+        with st.expander("🔍 Player Filters", expanded=False):
+            filter_col1, filter_col2 = st.columns(2)
+            with filter_col1:
+                min_games_impact = st.slider(
+                    "Minimum games played",
+                    min_value=5,
+                    max_value=30,
+                    value=10,
+                    key="min_games_impact",
+                )
+            with filter_col2:
+                min_ppg_impact = st.slider(
+                    "Minimum points per game",
+                    min_value=5.0,
+                    max_value=20.0,
+                    value=10.0,
+                    step=1.0,
+                    key="min_ppg_impact",
+                )
 
         significant_players = iia.get_significant_players(
             conn_impact,
@@ -3120,10 +3115,12 @@ with injury_impact_tab:
                 for _, row in significant_players.iterrows()
             }
 
+            # PLAYER SELECTOR - Prominent at top
             selected_player_display = st.selectbox(
-                "Select player to analyze",
+                "👤 Select Player to Analyze",
                 options=list(player_options.keys()),
                 key="impact_player_select",
+                help="Choose a player to see their performance across different scenarios"
             )
 
             selected_player_id = player_options[selected_player_display]
@@ -3133,6 +3130,18 @@ with injury_impact_tab:
         st.error(f"Error loading player list: {exc}")
         selected_player_id = None
         selected_player_name = None
+
+    st.divider()
+
+    # Create sub-tabs for different impact analyses (moved below player selection)
+    impact_subtabs = st.tabs([
+        "🏠 Home/Away Splits",
+        "🛡️ vs Defense Types",
+        "👥 Player Correlations",
+        "🚑 Absence Impact"
+    ])
+
+    home_away_tab, defense_types_tab, correlations_tab, absence_tab = impact_subtabs
 
     # HOME/AWAY SPLITS TAB
     with home_away_tab:
