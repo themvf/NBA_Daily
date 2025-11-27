@@ -1447,7 +1447,7 @@ def build_games_table(
 ) -> tuple[pd.DataFrame, Dict[int, Mapping[str, Any]]]:
     header_df, line_df = fetch_scoreboard_frames(format_game_date_str(game_date))
     if header_df.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), {}
 
     line_lookup: Dict[int, Mapping[str, Any]] = {}
     for _, line in line_df.iterrows():
