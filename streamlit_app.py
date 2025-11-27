@@ -3868,14 +3868,31 @@ with predictions_tab:
                     height=600
                 )
 
-                # Download button
-                csv = display_df.to_csv(index=False)
-                st.download_button(
-                    label="📥 Download as CSV",
-                    data=csv,
-                    file_name=f"predictions_{selected_date}.csv",
-                    mime="text/csv"
-                )
+                # Action buttons
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    # Download button
+                    csv = display_df.to_csv(index=False)
+                    st.download_button(
+                        label="📥 Download as CSV",
+                        data=csv,
+                        file_name=f"predictions_{selected_date}.csv",
+                        mime="text/csv"
+                    )
+
+                with col2:
+                    # S3 Backup button
+                    storage = s3_storage.S3PredictionStorage()
+                    if storage.is_connected():
+                        if st.button("☁️ Sync to Cloud", help="Upload scored predictions to S3 for Streamlit Cloud"):
+                            with st.spinner("Uploading to S3..."):
+                                success, message = storage.upload_database(db_path)
+                                if success:
+                                    st.success(f"✅ {message}")
+                                    st.info("💡 Restart your Streamlit Cloud app to see the updated predictions!")
+                                else:
+                                    st.error(f"❌ {message}")
 
             else:
                 st.info(f"No predictions found for {selected_date}")
