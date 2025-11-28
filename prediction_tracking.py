@@ -138,6 +138,15 @@ def create_predictions_table(conn: sqlite3.Connection) -> None:
             abs_error REAL,
             hit_floor_ceiling BOOLEAN,
 
+            -- Injury adjustment tracking
+            injury_adjusted BOOLEAN DEFAULT 0,
+            injury_adjustment_amount REAL DEFAULT 0.0,
+            injured_player_ids TEXT DEFAULT NULL,
+            original_projected_ppg REAL DEFAULT NULL,
+            original_proj_floor REAL DEFAULT NULL,
+            original_proj_ceiling REAL DEFAULT NULL,
+            original_proj_confidence REAL DEFAULT NULL,
+
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
             -- Indexes for common queries
@@ -162,6 +171,64 @@ def create_predictions_table(conn: sqlite3.Connection) -> None:
     """)
 
     conn.commit()
+
+
+def upgrade_predictions_table_for_injuries(conn: sqlite3.Connection) -> None:
+    """Add injury adjustment fields to existing predictions table if they don't exist."""
+    cursor = conn.cursor()
+
+    # Check which columns already exist
+    cursor.execute("PRAGMA table_info(predictions)")
+    existing_columns = {row[1] for row in cursor.fetchall()}
+
+    # Define new columns to add
+    new_columns = {
+        'injury_adjusted': 'BOOLEAN DEFAULT 0',
+        'injury_adjustment_amount': 'REAL DEFAULT 0.0',
+        'injured_player_ids': 'TEXT DEFAULT NULL',
+        'original_projected_ppg': 'REAL DEFAULT NULL',
+        'original_proj_floor': 'REAL DEFAULT NULL',
+        'original_proj_ceiling': 'REAL DEFAULT NULL',
+        'original_proj_confidence': 'REAL DEFAULT NULL',
+    }
+
+    # Add missing columns
+    for col_name, col_type in new_columns.items():
+        if col_name not in existing_columns:
+            cursor.execute(f"ALTER TABLE predictions ADD COLUMN {col_name} {col_type}")
+            print(f"Added column: {col_name}")
+
+    conn.commit()
+
+
+def get_predictions_for_date(
+    conn: sqlite3.Connection,
+    game_date: str
+) -> List[Dict]:
+    """
+    Get all predictions for a specific date as a list of dictionaries.
+
+    Args:
+        conn: Database connection
+        game_date: Date in YYYY-MM-DD format
+
+    Returns:
+        List of prediction dictionaries with all fields
+    """
+    query = """
+        SELECT
+            prediction_id, player_id, player_name, team_id, team_name,
+            opponent_id, opponent_name, projected_ppg, proj_confidence,
+            proj_floor, proj_ceiling, season_avg_ppg,
+            injury_adjusted, injury_adjustment_amount, injured_player_ids,
+            original_projected_ppg, original_proj_floor,
+            original_proj_ceiling, original_proj_confidence
+        FROM predictions
+        WHERE game_date = ?
+    """
+
+    df = pd.read_sql_query(query, conn, params=[game_date])
+    return df.to_dict('records')
 
 
 def log_prediction(conn: sqlite3.Connection, pred: Prediction) -> int:

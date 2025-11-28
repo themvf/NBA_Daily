@@ -23,6 +23,7 @@ from nba_api.stats.endpoints import scoreboardv2
 
 from nba_to_sqlite import build_database
 import injury_impact_analytics as iia
+import injury_adjustment as ia
 import player_correlation_analytics as pca
 import defense_type_analytics as dta
 import prediction_tracking as pt
@@ -2544,6 +2545,89 @@ with games_tab:
                     st.sidebar.info(f"☁️ {message}")
                 else:
                     st.sidebar.warning(f"⚠️ S3 backup failed: {message}")
+
+    # Injury Adjustments Section
+    st.divider()
+    with st.expander("🚑 Injury Adjustments", expanded=False):
+        st.markdown("### Adjust Predictions for Injured Players")
+        st.caption("Mark players as OUT to boost teammate projections based on historical data")
+
+        # Build list of all players playing today
+        today_player_options = []
+        if not games_df.empty and not leaders_df.empty:
+            for _, matchup in games_df.iterrows():
+                away_id, home_id = matchup['away_team_id'], matchup['home_team_id']
+                away_name, home_name = matchup['Away'], matchup['Home']
+
+                # Get players from both teams
+                for team_id, team_name in [(away_id, away_name), (home_id, home_name)]:
+                    team_players = leaders_df[leaders_df['team_id'] == team_id]
+                    for _, player in team_players.iterrows():
+                        today_player_options.append((
+                            player['player_id'],
+                            f"{team_name} - {player['player_name']}"
+                        ))
+
+        if today_player_options:
+            # Injured player selector
+            injured_players = st.multiselect(
+                "Select players who are OUT today",
+                options=today_player_options,
+                format_func=lambda x: x[1],
+                key="injured_players_selector"
+            )
+
+            if injured_players:
+                injured_ids = [p[0] for p in injured_players]
+
+                # Preview adjustments
+                st.markdown("### Preview Adjustments")
+                preview_df = ia.preview_adjustments(
+                    injured_ids,
+                    str(selected_date),
+                    games_conn,
+                    min_historical_games=3
+                )
+
+                if not preview_df.empty:
+                    st.dataframe(preview_df, use_container_width=True)
+
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        if st.button("✅ Apply Injury Adjustments", type="primary"):
+                            with st.spinner("Applying adjustments..."):
+                                adjusted, skipped, records = ia.apply_injury_adjustments(
+                                    injured_ids,
+                                    str(selected_date),
+                                    games_conn
+                                )
+                            st.success(f"✅ Adjusted {adjusted} predictions ({skipped} skipped)")
+                            st.rerun()
+
+                    with col2:
+                        if st.button("🔄 Reset Adjustments"):
+                            with st.spinner("Resetting..."):
+                                reset_count = ia.reset_adjustments(str(selected_date), games_conn)
+                            st.success(f"🔄 Reset {reset_count} predictions to original values")
+                            st.rerun()
+                else:
+                    st.info("No teammates found with historical data when these players are absent (need 3+ games).")
+
+            # Show comparison if adjustments exist
+            adjusted_summary = ia.get_adjusted_predictions_summary(str(selected_date), games_conn)
+            if not adjusted_summary.empty:
+                st.markdown("### Before/After Comparison")
+
+                comparison_cols = st.columns(2)
+                with comparison_cols[0]:
+                    st.markdown("#### Original")
+                    st.dataframe(adjusted_summary[['Player', 'Team', 'Original PPG', 'Original Range']], use_container_width=True)
+
+                with comparison_cols[1]:
+                    st.markdown("#### Adjusted")
+                    st.dataframe(adjusted_summary[['Player', 'Team', 'Adjusted PPG', 'New Range', 'Boost']], use_container_width=True)
+        else:
+            st.info("Load today's games first to see available players")
 
     # CSV Export Button
     if predictions_for_export:
