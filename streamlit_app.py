@@ -4016,6 +4016,10 @@ with admin_tab:
                         if "S3" in result.stdout and "SUCCESS" in result.stdout:
                             st.info("💡 Database uploaded to S3! Restart Streamlit Cloud to see updates.")
 
+                        # Auto-refresh the app to show new data
+                        st.info("🔄 Refreshing app to show updated predictions...")
+                        st.rerun()
+
                     else:
                         st.error("❌ Update failed")
                         st.code(result.stderr, language="text")
