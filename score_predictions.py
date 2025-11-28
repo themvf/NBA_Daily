@@ -269,6 +269,45 @@ def score_date_range(start_date: str, end_date: str):
         current += timedelta(days=1)
 
 
+def score_all_unscored():
+    """Score all predictions that don't have actual results yet."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    print("\n" + "="*70)
+    print("SCORING ALL UNSCORED PREDICTIONS")
+    print("="*70 + "\n")
+
+    # Find all dates with unscored predictions
+    cursor.execute('''
+        SELECT DISTINCT game_date
+        FROM predictions
+        WHERE did_play IS NULL OR actual_ppg IS NULL
+        ORDER BY game_date DESC
+    ''')
+
+    unscored_dates = [row[0] for row in cursor.fetchall()]
+    conn.close()
+
+    if not unscored_dates:
+        print("No unscored predictions found. All predictions are up to date!")
+        return
+
+    print(f"Found {len(unscored_dates)} date(s) with unscored predictions:")
+    for date in unscored_dates:
+        print(f"  - {date}")
+    print()
+
+    # Score each date
+    for date in unscored_dates:
+        score_predictions_for_date(date)
+        print()  # Add spacing between dates
+
+    print("="*70)
+    print("ALL UNSCORED PREDICTIONS PROCESSED")
+    print("="*70)
+
+
 if __name__ == "__main__":
     print("\n" + "="*70)
     print("NBA PREDICTION SCORER")

@@ -134,8 +134,8 @@ def main():
 
     # Step 2: Score predictions
     step2_success = run_command(
-        'python score_predictions.py',
-        "STEP 2: Scoring Yesterday's Predictions"
+        'python -c "from score_predictions import score_all_unscored; score_all_unscored()"',
+        "STEP 2: Scoring All Unscored Predictions"
     )
 
     if not step2_success:

@@ -3992,7 +3992,7 @@ with admin_tab:
         st.subheader("🚀 One-Click Update")
         st.write("This button will:")
         st.write("1. Fetch latest NBA game data")
-        st.write("2. Score yesterday's predictions")
+        st.write("2. Score all unscored predictions")
         st.write("3. Upload to S3 (if configured)")
 
         if st.button("▶️ Run Daily Update", type="primary", use_container_width=True):
@@ -4019,14 +4019,14 @@ with admin_tab:
                         nba_to_sqlite.main()
 
                         # Step 2: Score predictions
-                        st.info("Step 2/3: Scoring yesterday's predictions...")
+                        st.info("Step 2/3: Scoring all unscored predictions...")
                         print("\n" + "="*70)
-                        print("STEP 2: Scoring Yesterday's Predictions")
+                        print("STEP 2: Scoring All Unscored Predictions")
                         print("="*70)
 
                         # Import and run score_predictions
                         import score_predictions
-                        score_predictions.score_yesterday()
+                        score_predictions.score_all_unscored()
 
                         # Step 3: Upload to S3
                         st.info("Step 3/3: Uploading to S3...")
