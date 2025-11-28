@@ -4018,14 +4018,14 @@ with injury_admin_tab:
             st.markdown("##### Mark Player as Returned")
             returned_player = st.selectbox(
                 "Select player to mark as returned",
-                options=[(inj['injury_id'], inj['player_name']) for inj in injury_list],
+                options=[(inj['player_id'], inj['player_name']) for inj in injury_list],
                 format_func=lambda x: x[1],
                 key="mark_returned_selector"
             )
 
             if st.button("✅ Mark as Returned", key="mark_returned_btn"):
-                injury_id = returned_player[0]
-                success = ia.remove_from_injury_list(injury_conn, injury_id)
+                player_id = returned_player[0]
+                success = ia.remove_from_injury_list(injury_conn, player_id)
                 if success:
                     st.success(f"✅ {returned_player[1]} marked as returned")
                     st.rerun()
