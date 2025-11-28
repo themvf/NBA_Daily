@@ -3967,6 +3967,9 @@ with injury_admin_tab:
 
     injury_conn = get_connection(str(db_path))
 
+    # Ensure injury_list table exists
+    ia.create_injury_list_table(injury_conn)
+
     st.divider()
 
     # Two-column layout
@@ -4037,12 +4040,6 @@ with injury_admin_tab:
                     key="add_injured_player_selector"
                 )
 
-                injury_date = st.date_input(
-                    "Injury date",
-                    value=datetime.now().date(),
-                    key="injury_date_input"
-                )
-
                 return_date = st.date_input(
                     "Expected return date (optional)",
                     value=None,
@@ -4063,7 +4060,6 @@ with injury_admin_tab:
                         player_id=player_id,
                         player_name=player_name,
                         team_name=team_name,
-                        injury_date=str(injury_date),
                         expected_return_date=str(return_date) if return_date else None,
                         notes=notes if notes else None
                     )
