@@ -1798,6 +1798,7 @@ tab_titles = [
     "Defense Mix",
     "Prediction Log",
     "Defense Styles",
+    "Admin Panel",
 ]
 tabs = st.tabs(tab_titles)
 (
@@ -1813,6 +1814,7 @@ tabs = st.tabs(tab_titles)
     defense_mix_tab,
     predictions_tab,
     defense_styles_tab,
+    admin_tab,
 ) = tabs
 defense_style_tab = st.tabs(["Defense Styles"])[0]
 
@@ -3947,6 +3949,81 @@ with predictions_tab:
                             st.write("---")
                 except Exception as e:
                     st.error(f"Error: {e}")
+
+# Admin Panel tab --------------------------------------------------------
+with admin_tab:
+    st.header("🔧 Admin Panel")
+    st.write("One-click data updates and prediction scoring")
+
+    st.divider()
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("📊 Database Status")
+
+        try:
+            admin_conn = get_connection(str(db_path))
+            cursor = admin_conn.cursor()
+
+            # Get yesterday's date
+            from datetime import datetime, timedelta
+            yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+
+            # Check predictions
+            cursor.execute('SELECT COUNT(*) FROM predictions WHERE game_date = ?', (yesterday,))
+            pred_count = cursor.fetchone()[0]
+
+            cursor.execute('SELECT COUNT(*) FROM predictions WHERE game_date = ? AND actual_ppg IS NOT NULL', (yesterday,))
+            scored_count = cursor.fetchone()[0]
+
+            # Check game logs
+            cursor.execute(f"SELECT COUNT(DISTINCT game_id) FROM player_game_logs WHERE game_date LIKE '{yesterday}%'")
+            games_count = cursor.fetchone()[0]
+
+            st.metric("Yesterday's Predictions", pred_count)
+            st.metric("Scored Predictions", f"{scored_count}/{pred_count}")
+            st.metric("Games Available", games_count)
+
+        except Exception as e:
+            st.error(f"Error checking status: {e}")
+
+    with col2:
+        st.subheader("🚀 One-Click Update")
+        st.write("This button will:")
+        st.write("1. Fetch latest NBA game data")
+        st.write("2. Score yesterday's predictions")
+        st.write("3. Upload to S3 (if configured)")
+
+        if st.button("▶️ Run Daily Update", type="primary", use_container_width=True):
+            with st.spinner("Running daily update..."):
+                import subprocess
+
+                try:
+                    # Run the daily_update.py script
+                    result = subprocess.run(
+                        ["python", "daily_update.py"],
+                        capture_output=True,
+                        text=True,
+                        timeout=300  # 5 minute timeout
+                    )
+
+                    if result.returncode == 0:
+                        st.success("✅ Daily update completed successfully!")
+                        st.code(result.stdout, language="text")
+
+                        # Show S3 upload status
+                        if "S3" in result.stdout and "SUCCESS" in result.stdout:
+                            st.info("💡 Database uploaded to S3! Restart Streamlit Cloud to see updates.")
+
+                    else:
+                        st.error("❌ Update failed")
+                        st.code(result.stderr, language="text")
+
+                except subprocess.TimeoutExpired:
+                    st.error("❌ Update timed out (took longer than 5 minutes)")
+                except Exception as e:
+                    st.error(f"❌ Error running update: {e}")
 
 st.divider()
 st.caption(
