@@ -2033,6 +2033,11 @@ with games_tab:
                 score_column = (
                     "composite_score" if "composite_score" in leaders_df.columns else "weighted_score"
                 )
+
+                # Get list of injured player IDs for today to exclude from predictions
+                active_injuries = ia.get_active_injuries(games_conn, check_return_dates=True)
+                injured_player_ids = {inj['player_id'] for inj in active_injuries}
+
                 for _, matchup in games_df.iterrows():
                     away_id = matchup.get("away_team_id")
                     home_id = matchup.get("home_team_id")
@@ -2048,6 +2053,11 @@ with games_tab:
                         team_leaders = leaders_df[leaders_df["team_id"] == team_id].nlargest(
                             TOP_LEADERS_COUNT, score_column
                         )
+
+                        # Filter out injured players from predictions
+                        if injured_player_ids:
+                            team_leaders = team_leaders[~team_leaders['player_id'].isin(injured_player_ids)]
+
                         if team_leaders.empty:
                             continue
                         opponent_id = home_id if team_label == "Away" else away_id
@@ -2544,6 +2554,22 @@ with games_tab:
         st.sidebar.success(f"✅ Logged {predictions_logged} predictions")
         if predictions_failed > 0:
             st.sidebar.error(f"❌ Failed to log {predictions_failed} predictions")
+
+        # Auto-apply injury adjustments if there are active injuries
+        if predictions_logged > 0 and injured_player_ids:
+            try:
+                adjusted, skipped, records = ia.apply_injury_adjustments(
+                    list(injured_player_ids),
+                    str(selected_date),
+                    games_conn,
+                    min_historical_games=3
+                )
+                if adjusted > 0:
+                    st.sidebar.info(f"🚑 Auto-adjusted {adjusted} predictions for {len(injured_player_ids)} injuries")
+                    if skipped > 0:
+                        st.sidebar.caption(f"({skipped} skipped - insufficient data)")
+            except Exception as e:
+                st.sidebar.warning(f"⚠️ Injury adjustment failed: {e}")
 
         # Auto-backup to S3 after logging predictions
         if predictions_logged > 0:
