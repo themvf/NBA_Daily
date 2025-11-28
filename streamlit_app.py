@@ -143,6 +143,13 @@ with st.sidebar:
 def get_connection(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+
+    # Auto-upgrade database schema for injury adjustments (one-time migration)
+    try:
+        pt.upgrade_predictions_table_for_injuries(conn)
+    except Exception:
+        pass  # Schema already upgraded or predictions table doesn't exist yet
+
     return conn
 
 
