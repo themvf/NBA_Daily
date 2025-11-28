@@ -3998,19 +3998,35 @@ with admin_tab:
         if st.button("▶️ Run Daily Update", type="primary", use_container_width=True):
             with st.spinner("Running daily update..."):
                 import subprocess
+                import os
 
                 try:
-                    # Run the daily_update.py script
+                    # Get the script directory to ensure we run from the right location
+                    script_dir = os.path.dirname(os.path.abspath(__file__))
+                    daily_update_path = os.path.join(script_dir, "daily_update.py")
+
+                    # Show diagnostic info
+                    with st.expander("🔍 Debug Info", expanded=False):
+                        st.write(f"Script directory: {script_dir}")
+                        st.write(f"Daily update path: {daily_update_path}")
+                        st.write(f"File exists: {os.path.exists(daily_update_path)}")
+                        st.write(f"Python executable: {subprocess.run(['python', '--version'], capture_output=True, text=True).stdout}")
+
+                    # Run the daily_update.py script from the correct directory
                     result = subprocess.run(
-                        ["python", "daily_update.py"],
+                        ["python", daily_update_path],
                         capture_output=True,
                         text=True,
-                        timeout=300  # 5 minute timeout
+                        timeout=300,  # 5 minute timeout
+                        cwd=script_dir  # Ensure we run from the script directory
                     )
 
                     if result.returncode == 0:
                         st.success("✅ Daily update completed successfully!")
-                        st.code(result.stdout, language="text")
+
+                        # Show output in expandable section
+                        with st.expander("📋 Update Log", expanded=True):
+                            st.code(result.stdout, language="text")
 
                         # Show S3 upload status
                         if "S3" in result.stdout and "SUCCESS" in result.stdout:
@@ -4021,13 +4037,27 @@ with admin_tab:
                         st.rerun()
 
                     else:
-                        st.error("❌ Update failed")
-                        st.code(result.stderr, language="text")
+                        st.error(f"❌ Update failed (exit code: {result.returncode})")
+
+                        # Show both stdout and stderr
+                        if result.stdout:
+                            with st.expander("📋 Standard Output", expanded=True):
+                                st.code(result.stdout, language="text")
+
+                        if result.stderr:
+                            with st.expander("❌ Error Output", expanded=True):
+                                st.code(result.stderr, language="text")
+
+                        if not result.stdout and not result.stderr:
+                            st.warning("No output captured from the process")
 
                 except subprocess.TimeoutExpired:
                     st.error("❌ Update timed out (took longer than 5 minutes)")
                 except Exception as e:
                     st.error(f"❌ Error running update: {e}")
+                    import traceback
+                    with st.expander("🔍 Full Error Traceback", expanded=True):
+                        st.code(traceback.format_exc(), language="python")
 
 st.divider()
 st.caption(
