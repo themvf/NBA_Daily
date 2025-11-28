@@ -3996,65 +3996,104 @@ with admin_tab:
         st.write("3. Upload to S3 (if configured)")
 
         if st.button("▶️ Run Daily Update", type="primary", use_container_width=True):
+            import sys
+            import io
+            from contextlib import redirect_stdout, redirect_stderr
+
+            # Create string buffers to capture output
+            stdout_buffer = io.StringIO()
+            stderr_buffer = io.StringIO()
+
             with st.spinner("Running daily update..."):
-                import subprocess
-                import os
-
                 try:
-                    # Get the script directory to ensure we run from the right location
-                    script_dir = os.path.dirname(os.path.abspath(__file__))
-                    daily_update_path = os.path.join(script_dir, "daily_update.py")
+                    with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
+                        # Step 1: Fetch latest NBA game data
+                        st.info("Step 1/3: Fetching latest NBA game data...")
+                        print("="*70)
+                        print("STEP 1: Fetching Latest NBA Game Data")
+                        print("="*70)
 
-                    # Show diagnostic info
-                    with st.expander("🔍 Debug Info", expanded=False):
-                        st.write(f"Script directory: {script_dir}")
-                        st.write(f"Daily update path: {daily_update_path}")
-                        st.write(f"File exists: {os.path.exists(daily_update_path)}")
-                        st.write(f"Python executable: {subprocess.run(['python', '--version'], capture_output=True, text=True).stdout}")
+                        # Import and run nba_to_sqlite
+                        sys.argv = ["nba_to_sqlite.py", "--season", "2025-26", "--season-type", "Regular Season", "--no-include-rosters"]
+                        import nba_to_sqlite
+                        nba_to_sqlite.main()
 
-                    # Run the daily_update.py script from the correct directory
-                    result = subprocess.run(
-                        ["python", daily_update_path],
-                        capture_output=True,
-                        text=True,
-                        timeout=300,  # 5 minute timeout
-                        cwd=script_dir  # Ensure we run from the script directory
-                    )
+                        # Step 2: Score predictions
+                        st.info("Step 2/3: Scoring yesterday's predictions...")
+                        print("\n" + "="*70)
+                        print("STEP 2: Scoring Yesterday's Predictions")
+                        print("="*70)
 
-                    if result.returncode == 0:
-                        st.success("✅ Daily update completed successfully!")
+                        # Import and run score_predictions
+                        import score_predictions
+                        score_predictions.score_yesterday()
 
-                        # Show output in expandable section
+                        # Step 3: Upload to S3
+                        st.info("Step 3/3: Uploading to S3...")
+                        print("\n" + "="*70)
+                        print("STEP 3: Uploading to S3")
+                        print("="*70)
+
+                        # Import and run S3 upload
+                        import s3_storage
+                        from pathlib import Path
+
+                        storage = s3_storage.S3PredictionStorage()
+                        if storage.is_connected():
+                            success, message = storage.upload_database(Path("nba_stats.db"))
+                            if success:
+                                print(f"\n[SUCCESS] {message}")
+                                s3_success = True
+                            else:
+                                print(f"\n[ERROR] S3 upload failed: {message}")
+                                s3_success = False
+                        else:
+                            print("\nWARNING: S3 not configured. Skipping upload.")
+                            s3_success = False
+
+                    # Get captured output
+                    output = stdout_buffer.getvalue()
+                    errors = stderr_buffer.getvalue()
+
+                    # Show success message
+                    st.success("✅ Daily update completed successfully!")
+
+                    # Show output in expandable section
+                    if output:
                         with st.expander("📋 Update Log", expanded=True):
-                            st.code(result.stdout, language="text")
+                            st.code(output, language="text")
 
-                        # Show S3 upload status
-                        if "S3" in result.stdout and "SUCCESS" in result.stdout:
-                            st.info("💡 Database uploaded to S3! Restart Streamlit Cloud to see updates.")
+                    if errors:
+                        with st.expander("⚠️ Warnings/Errors", expanded=False):
+                            st.code(errors, language="text")
 
-                        # Auto-refresh the app to show new data
-                        st.info("🔄 Refreshing app to show updated predictions...")
-                        st.rerun()
-
+                    # Show S3 upload status
+                    if s3_success:
+                        st.info("💡 Database uploaded to S3! The app will now refresh to show updates.")
                     else:
-                        st.error(f"❌ Update failed (exit code: {result.returncode})")
+                        st.warning("⚠️ S3 upload was skipped or failed. Local database updated only.")
 
-                        # Show both stdout and stderr
-                        if result.stdout:
-                            with st.expander("📋 Standard Output", expanded=True):
-                                st.code(result.stdout, language="text")
+                    # Auto-refresh the app to show new data
+                    st.info("🔄 Refreshing app in 2 seconds...")
+                    import time
+                    time.sleep(2)
+                    st.rerun()
 
-                        if result.stderr:
-                            with st.expander("❌ Error Output", expanded=True):
-                                st.code(result.stderr, language="text")
-
-                        if not result.stdout and not result.stderr:
-                            st.warning("No output captured from the process")
-
-                except subprocess.TimeoutExpired:
-                    st.error("❌ Update timed out (took longer than 5 minutes)")
                 except Exception as e:
-                    st.error(f"❌ Error running update: {e}")
+                    # Get any captured output before the error
+                    output = stdout_buffer.getvalue()
+                    errors = stderr_buffer.getvalue()
+
+                    st.error(f"❌ Update failed: {str(e)}")
+
+                    if output:
+                        with st.expander("📋 Output Before Error", expanded=True):
+                            st.code(output, language="text")
+
+                    if errors:
+                        with st.expander("❌ Error Output", expanded=True):
+                            st.code(errors, language="text")
+
                     import traceback
                     with st.expander("🔍 Full Error Traceback", expanded=True):
                         st.code(traceback.format_exc(), language="python")
