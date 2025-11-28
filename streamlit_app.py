@@ -4012,12 +4012,15 @@ with injury_admin_tab:
         st.subheader("➕ Add Injured Player")
 
         # Build player options from database
-        # Query all players (not just today's games, since we want to track long-term injuries)
+        # Query all players from player_game_logs (most recent games for current season)
         player_query = """
-            SELECT DISTINCT player_id, player_name, team_name
-            FROM player_season_stats_v
-            WHERE season = ?
-            ORDER BY team_name, player_name
+            SELECT DISTINCT
+                p.player_id,
+                p.player_name,
+                p.team_name
+            FROM player_game_logs p
+            WHERE p.season = ?
+            ORDER BY p.team_name, p.player_name
         """
 
         try:
