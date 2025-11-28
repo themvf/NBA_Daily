@@ -15,12 +15,26 @@ Key features:
 
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict
+from datetime import date, datetime
 import sqlite3
 import pandas as pd
 import json
 
 # Import existing injury impact analytics module
 import injury_impact_analytics as iia
+
+
+@dataclass
+class InjuryRecord:
+    """Record of a player on the injury list."""
+    injury_id: Optional[int]
+    player_id: int
+    player_name: str
+    team_name: str
+    injury_date: str
+    expected_return_date: Optional[str]
+    status: str  # 'active', 'returned', 'questionable'
+    notes: Optional[str]
 
 
 @dataclass
@@ -427,3 +441,190 @@ def get_adjusted_predictions_summary(
     # Select final columns
     return df[['Player', 'Team', 'Original PPG', 'Adjusted PPG',
                'Original Range', 'New Range', 'Boost', 'Injured Players']]
+
+
+# ============================================================================
+# PERSISTENT INJURY LIST MANAGEMENT
+# ============================================================================
+
+def create_injury_list_table(conn: sqlite3.Connection) -> None:
+    """Create the injury_list table if it doesn't exist."""
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS injury_list (
+            injury_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            player_id INTEGER NOT NULL,
+            player_name TEXT NOT NULL,
+            team_name TEXT NOT NULL,
+            injury_date TEXT NOT NULL,
+            expected_return_date TEXT,
+            status TEXT NOT NULL DEFAULT 'active',
+            notes TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+            UNIQUE(player_id, status)
+        )
+    """)
+
+    # Create index for quick lookups
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_injury_list_status
+        ON injury_list(status)
+    """)
+
+    conn.commit()
+
+
+def add_to_injury_list(
+    conn: sqlite3.Connection,
+    player_id: int,
+    player_name: str,
+    team_name: str,
+    expected_return_date: Optional[str] = None,
+    notes: Optional[str] = None
+) -> int:
+    """
+    Add a player to the injury list.
+
+    Args:
+        conn: Database connection
+        player_id: Player ID
+        player_name: Player full name
+        team_name: Team name
+        expected_return_date: Expected return date (YYYY-MM-DD) or None for indefinite
+        notes: Optional notes about the injury
+
+    Returns:
+        injury_id of the created record
+    """
+    cursor = conn.cursor()
+    today = date.today().strftime('%Y-%m-%d')
+
+    # Insert or replace (handles re-adding previously returned players)
+    cursor.execute("""
+        INSERT OR REPLACE INTO injury_list (
+            player_id, player_name, team_name, injury_date,
+            expected_return_date, status, notes
+        ) VALUES (?, ?, ?, ?, ?, 'active', ?)
+    """, (player_id, player_name, team_name, today, expected_return_date, notes))
+
+    conn.commit()
+    return cursor.lastrowid
+
+
+def remove_from_injury_list(
+    conn: sqlite3.Connection,
+    player_id: int
+) -> bool:
+    """
+    Mark a player as returned (status = 'returned').
+
+    Args:
+        conn: Database connection
+        player_id: Player ID to mark as returned
+
+    Returns:
+        True if player was found and updated, False otherwise
+    """
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        UPDATE injury_list
+        SET status = 'returned',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE player_id = ? AND status = 'active'
+    """, (player_id,))
+
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def get_active_injuries(
+    conn: sqlite3.Connection,
+    check_return_dates: bool = True
+) -> List[Dict]:
+    """
+    Get all currently injured players (status = 'active').
+
+    Args:
+        conn: Database connection
+        check_return_dates: If True, filter out players past their return date
+
+    Returns:
+        List of injury records as dictionaries
+    """
+    query = """
+        SELECT injury_id, player_id, player_name, team_name,
+               injury_date, expected_return_date, status, notes
+        FROM injury_list
+        WHERE status = 'active'
+    """
+
+    df = pd.read_sql_query(query, conn)
+
+    if df.empty:
+        return []
+
+    # Filter by return date if requested
+    if check_return_dates:
+        today = date.today().strftime('%Y-%m-%d')
+        # Keep players with no return date (indefinite) or return date >= today
+        df = df[(df['expected_return_date'].isna()) | (df['expected_return_date'] >= today)]
+
+    return df.to_dict('records')
+
+
+def update_injury_return_date(
+    conn: sqlite3.Connection,
+    player_id: int,
+    new_return_date: Optional[str]
+) -> bool:
+    """
+    Update the expected return date for an injured player.
+
+    Args:
+        conn: Database connection
+        player_id: Player ID
+        new_return_date: New return date (YYYY-MM-DD) or None for indefinite
+
+    Returns:
+        True if updated successfully
+    """
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        UPDATE injury_list
+        SET expected_return_date = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE player_id = ? AND status = 'active'
+    """, (new_return_date, player_id))
+
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def get_injury_list_summary(conn: sqlite3.Connection) -> pd.DataFrame:
+    """
+    Get formatted summary of injury list for display.
+
+    Returns:
+        DataFrame with columns: Player, Team, Injury Date, Return Date, Status, Notes
+    """
+    query = """
+        SELECT
+            player_name as Player,
+            team_name as Team,
+            injury_date as "Injury Date",
+            COALESCE(expected_return_date, 'Indefinite') as "Return Date",
+            status as Status,
+            COALESCE(notes, '') as Notes,
+            player_id
+        FROM injury_list
+        WHERE status IN ('active', 'questionable')
+        ORDER BY injury_date DESC
+    """
+
+    df = pd.read_sql_query(query, conn)
+    return df
