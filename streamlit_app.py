@@ -1806,6 +1806,7 @@ tab_titles = [
     "Defense Mix",
     "Prediction Log",
     "Defense Styles",
+    "Injury Admin",
     "Admin Panel",
 ]
 tabs = st.tabs(tab_titles)
@@ -1822,6 +1823,7 @@ tabs = st.tabs(tab_titles)
     defense_mix_tab,
     predictions_tab,
     defense_styles_tab,
+    injury_admin_tab,
     admin_tab,
 ) = tabs
 defense_style_tab = st.tabs(["Defense Styles"])[0]
@@ -2552,89 +2554,6 @@ with games_tab:
                     st.sidebar.info(f"☁️ {message}")
                 else:
                     st.sidebar.warning(f"⚠️ S3 backup failed: {message}")
-
-    # Injury Adjustments Section
-    st.divider()
-    with st.expander("🚑 Injury Adjustments", expanded=False):
-        st.markdown("### Adjust Predictions for Injured Players")
-        st.caption("Mark players as OUT to boost teammate projections based on historical data")
-
-        # Build list of all players playing today
-        today_player_options = []
-        if not games_df.empty and not leaders_df.empty:
-            for _, matchup in games_df.iterrows():
-                away_id, home_id = matchup['away_team_id'], matchup['home_team_id']
-                away_name, home_name = matchup['Away'], matchup['Home']
-
-                # Get players from both teams
-                for team_id, team_name in [(away_id, away_name), (home_id, home_name)]:
-                    team_players = leaders_df[leaders_df['team_id'] == team_id]
-                    for _, player in team_players.iterrows():
-                        today_player_options.append((
-                            player['player_id'],
-                            f"{team_name} - {player['player_name']}"
-                        ))
-
-        if today_player_options:
-            # Injured player selector
-            injured_players = st.multiselect(
-                "Select players who are OUT today",
-                options=today_player_options,
-                format_func=lambda x: x[1],
-                key="injured_players_selector"
-            )
-
-            if injured_players:
-                injured_ids = [p[0] for p in injured_players]
-
-                # Preview adjustments
-                st.markdown("### Preview Adjustments")
-                preview_df = ia.preview_adjustments(
-                    injured_ids,
-                    str(selected_date),
-                    games_conn,
-                    min_historical_games=3
-                )
-
-                if not preview_df.empty:
-                    st.dataframe(preview_df, use_container_width=True)
-
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        if st.button("✅ Apply Injury Adjustments", type="primary"):
-                            with st.spinner("Applying adjustments..."):
-                                adjusted, skipped, records = ia.apply_injury_adjustments(
-                                    injured_ids,
-                                    str(selected_date),
-                                    games_conn
-                                )
-                            st.success(f"✅ Adjusted {adjusted} predictions ({skipped} skipped)")
-                            st.rerun()
-
-                    with col2:
-                        if st.button("🔄 Reset Adjustments"):
-                            with st.spinner("Resetting..."):
-                                reset_count = ia.reset_adjustments(str(selected_date), games_conn)
-                            st.success(f"🔄 Reset {reset_count} predictions to original values")
-                            st.rerun()
-                else:
-                    st.info("No teammates found with historical data when these players are absent (need 3+ games).")
-
-            # Show comparison if adjustments exist
-            adjusted_summary = ia.get_adjusted_predictions_summary(str(selected_date), games_conn)
-            if not adjusted_summary.empty:
-                st.markdown("### Before/After Comparison")
-
-                comparison_cols = st.columns(2)
-                with comparison_cols[0]:
-                    st.markdown("#### Original")
-                    st.dataframe(adjusted_summary[['Player', 'Team', 'Original PPG', 'Original Range']], use_container_width=True)
-
-                with comparison_cols[1]:
-                    st.markdown("#### Adjusted")
-                    st.dataframe(adjusted_summary[['Player', 'Team', 'Adjusted PPG', 'New Range', 'Boost']], use_container_width=True)
-        else:
-            st.info("Load today's games first to see available players")
 
     # CSV Export Button
     if predictions_for_export:
@@ -4040,6 +3959,207 @@ with predictions_tab:
                             st.write("---")
                 except Exception as e:
                     st.error(f"Error: {e}")
+
+# Injury Admin Tab --------------------------------------------------------
+with injury_admin_tab:
+    st.header("🚑 Injury Administration")
+    st.write("Manage injured players and adjust predictions for teammate impacts")
+
+    injury_conn = get_connection(str(db_path))
+
+    st.divider()
+
+    # Two-column layout
+    col1, col2 = st.columns([1, 1])
+
+    with col1:
+        st.subheader("📋 Active Injury List")
+
+        # Display current injury list
+        injury_list = ia.get_active_injuries(injury_conn, check_return_dates=True)
+
+        if injury_list:
+            # Convert to DataFrame for display
+            injury_df = pd.DataFrame(injury_list)
+            display_df = injury_df[['player_name', 'team_name', 'injury_date', 'expected_return_date', 'notes']]
+            display_df.columns = ['Player', 'Team', 'Injury Date', 'Expected Return', 'Notes']
+            st.dataframe(display_df, use_container_width=True)
+
+            # Mark as Returned functionality
+            st.markdown("##### Mark Player as Returned")
+            returned_player = st.selectbox(
+                "Select player to mark as returned",
+                options=[(inj['injury_id'], inj['player_name']) for inj in injury_list],
+                format_func=lambda x: x[1],
+                key="mark_returned_selector"
+            )
+
+            if st.button("✅ Mark as Returned", key="mark_returned_btn"):
+                injury_id = returned_player[0]
+                success = ia.remove_from_injury_list(injury_conn, injury_id)
+                if success:
+                    st.success(f"✅ {returned_player[1]} marked as returned")
+                    st.rerun()
+                else:
+                    st.error("Failed to update injury status")
+        else:
+            st.info("No active injuries. Add players using the form on the right.")
+
+    with col2:
+        st.subheader("➕ Add Injured Player")
+
+        # Build player options from database
+        # Query all players (not just today's games, since we want to track long-term injuries)
+        player_query = """
+            SELECT DISTINCT player_id, player_name, team_name
+            FROM player_season_stats_v
+            WHERE season = ?
+            ORDER BY team_name, player_name
+        """
+
+        try:
+            all_players_df = pd.read_sql_query(
+                player_query,
+                injury_conn,
+                params=[DEFAULT_SEASON]
+            )
+
+            if not all_players_df.empty:
+                player_options = [
+                    (row['player_id'], row['player_name'], row['team_name'])
+                    for _, row in all_players_df.iterrows()
+                ]
+
+                selected_player = st.selectbox(
+                    "Select injured player",
+                    options=player_options,
+                    format_func=lambda x: f"{x[2]} - {x[1]}",  # "LAL - LeBron James"
+                    key="add_injured_player_selector"
+                )
+
+                injury_date = st.date_input(
+                    "Injury date",
+                    value=datetime.now().date(),
+                    key="injury_date_input"
+                )
+
+                return_date = st.date_input(
+                    "Expected return date (optional)",
+                    value=None,
+                    key="return_date_input"
+                )
+
+                notes = st.text_area(
+                    "Notes (e.g., injury type, severity)",
+                    placeholder="Sprained ankle, day-to-day",
+                    key="injury_notes_input"
+                )
+
+                if st.button("➕ Add to Injury List", type="primary", key="add_injury_btn"):
+                    player_id, player_name, team_name = selected_player
+
+                    injury_id = ia.add_to_injury_list(
+                        injury_conn,
+                        player_id=player_id,
+                        player_name=player_name,
+                        team_name=team_name,
+                        injury_date=str(injury_date),
+                        expected_return_date=str(return_date) if return_date else None,
+                        notes=notes if notes else None
+                    )
+
+                    if injury_id:
+                        st.success(f"✅ Added {player_name} to injury list")
+                        st.rerun()
+                    else:
+                        st.warning(f"⚠️ {player_name} is already on the active injury list")
+            else:
+                st.error("No players found in database")
+
+        except Exception as e:
+            st.error(f"Error loading players: {e}")
+
+    st.divider()
+
+    # Apply Adjustments Section
+    st.subheader("⚙️ Apply Injury Adjustments to Predictions")
+    st.caption("Use active injury list to automatically adjust predictions for a specific game date")
+
+    adjustment_date = st.date_input(
+        "Game date to adjust",
+        value=default_game_date(),
+        key="adjustment_game_date"
+    )
+
+    # Get active injuries for preview
+    active_injuries = ia.get_active_injuries(injury_conn, check_return_dates=True)
+
+    if active_injuries:
+        st.markdown(f"**Active injuries:** {len(active_injuries)} players")
+        injured_names = [inj['player_name'] for inj in active_injuries]
+        st.write(", ".join(injured_names))
+
+        # Preview adjustments
+        injured_ids = [inj['player_id'] for inj in active_injuries]
+
+        if st.button("🔍 Preview Adjustments", key="preview_adj_btn"):
+            with st.spinner("Calculating adjustments..."):
+                preview_df = ia.preview_adjustments(
+                    injured_ids,
+                    str(adjustment_date),
+                    injury_conn,
+                    min_historical_games=3
+                )
+
+            if not preview_df.empty:
+                st.dataframe(preview_df, use_container_width=True)
+
+                # Apply/Reset buttons
+                adj_col1, adj_col2 = st.columns(2)
+
+                with adj_col1:
+                    if st.button("✅ Apply Adjustments", type="primary", key="apply_adj_btn"):
+                        with st.spinner("Applying..."):
+                            adjusted, skipped, records = ia.apply_injury_adjustments(
+                                injured_ids,
+                                str(adjustment_date),
+                                injury_conn
+                            )
+                        st.success(f"✅ Adjusted {adjusted} predictions ({skipped} skipped)")
+                        st.rerun()
+
+                with adj_col2:
+                    if st.button("🔄 Reset Adjustments", key="reset_adj_btn"):
+                        with st.spinner("Resetting..."):
+                            reset_count = ia.reset_adjustments(str(adjustment_date), injury_conn)
+                        st.success(f"🔄 Reset {reset_count} predictions")
+                        st.rerun()
+            else:
+                st.info("No teammates found with historical data for these injuries (need 3+ games)")
+
+        # Show before/after if adjustments exist
+        adjusted_summary = ia.get_adjusted_predictions_summary(str(adjustment_date), injury_conn)
+        if not adjusted_summary.empty:
+            st.divider()
+            st.markdown("### Before/After Comparison")
+
+            comp_col1, comp_col2 = st.columns(2)
+
+            with comp_col1:
+                st.markdown("#### Original")
+                st.dataframe(
+                    adjusted_summary[['Player', 'Team', 'Original PPG', 'Original Range']],
+                    use_container_width=True
+                )
+
+            with comp_col2:
+                st.markdown("#### Adjusted")
+                st.dataframe(
+                    adjusted_summary[['Player', 'Team', 'Adjusted PPG', 'New Range', 'Boost']],
+                    use_container_width=True
+                )
+    else:
+        st.info("No active injuries. Add players using the form above.")
 
 # Admin Panel tab --------------------------------------------------------
 with admin_tab:
