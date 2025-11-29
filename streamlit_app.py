@@ -3814,27 +3814,29 @@ with predictions_tab:
 
                     # Step 2: Score predictions
                     with st.spinner("Step 2/3: Scoring predictions..."):
-                        # Reconnect to database to see new data
-                        pred_conn.close()
-                        pred_conn = get_connection(str(db_path))
-
-                        # Score all unscored predictions
-                        import score_predictions as sp
+                        # Create a new connection for querying unscored dates
+                        import sqlite3
+                        temp_conn = sqlite3.connect(str(db_path))
+                        temp_cursor = temp_conn.cursor()
 
                         # Get unscored dates
-                        cursor = pred_conn.cursor()
-                        cursor.execute('''
+                        temp_cursor.execute('''
                             SELECT DISTINCT game_date
                             FROM predictions
                             WHERE did_play IS NULL OR actual_ppg IS NULL
                             ORDER BY game_date DESC
                         ''')
-                        unscored_dates = [row[0] for row in cursor.fetchall()]
+                        unscored_dates = [row[0] for row in temp_cursor.fetchall()]
+                        temp_conn.close()
 
                         if unscored_dates:
                             st.info(f"Found {len(unscored_dates)} date(s) with unscored predictions")
+
+                            # Score predictions (score_predictions creates its own connection)
+                            import score_predictions as sp
                             for date_to_score in unscored_dates:
                                 sp.score_predictions_for_date(date_to_score)
+
                             st.success(f"✅ Predictions scored for {len(unscored_dates)} date(s)!")
                         else:
                             st.info("✅ All predictions are already scored!")
