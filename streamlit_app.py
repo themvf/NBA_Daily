@@ -1145,75 +1145,87 @@ def calculate_smart_ppg_projection(
         if components[k] is not None and weights[k] > 0
     )
 
-    # Calculate confidence (0-100%) with more granular scoring
-    confidence_score = 0.0
+    # FIX 2: Add regression to mean for high scorers (22+ PPG)
+    # High scorers are over-projected by ~3.5 PPG on average
+    if projection >= 22.0:
+        regression_factor = 0.93  # Reduce by 7%
+        projection = projection * regression_factor
 
-    # 1. Base confidence from season data (20-30% based on sample size)
-    # Assume typical player has played 15-25 games in early season
-    base_conf = 0.25  # Middle ground
-    confidence_score += base_conf
+    # Calculate VARIANCE (uncertainty) metric - INVERTED from old "confidence"
+    # Higher variance = less certain, wider ranges
+    # Lower variance = more certain, tighter ranges
+    variance_score = 0.0
 
-    # 2. Matchup-specific confidence (most important for differentiation)
+    # 1. Base variance from limited season data
+    # Start with moderate uncertainty
+    base_variance = 0.25
+    variance_score += base_variance
+
+    # 2. Matchup-specific data REDUCES variance (more data = less uncertainty)
     if vs_opp_team_games >= 5:
-        # Strong team history - very confident
-        confidence_score += 0.40
+        # Strong team history - VERY CERTAIN (low variance)
+        variance_score -= 0.15
     elif vs_opp_team_games >= 3:
-        # Good team history - confident
-        confidence_score += 0.30
+        # Good team history - CERTAIN (low variance)
+        variance_score -= 0.10
     elif vs_opp_team_games >= 2:
-        # Some team history - moderately confident
-        confidence_score += 0.20
+        # Some team history - moderately certain
+        variance_score -= 0.05
     elif vs_defense_style_games >= 8:
         # Extensive style data - decent fallback
-        confidence_score += 0.18
+        variance_score -= 0.04
     elif vs_defense_style_games >= 5:
         # Good style data - moderate fallback
-        confidence_score += 0.12
+        variance_score -= 0.02
     elif vs_defense_style_games >= 3:
         # Some style data - weak fallback
-        confidence_score += 0.08
+        variance_score -= 0.01
 
-    # 3. Recent form confidence (varies by recency and volatility)
+    # 3. Recent form VOLATILITY increases variance
     if recent_avg_3 is not None and recent_avg_5 is not None:
-        # Have both L3 and L5 - check consistency
-        if abs(recent_avg_3 - recent_avg_5) / season_avg < 0.15:
-            # Consistent recent form - more confident
-            confidence_score += 0.15
+        # Check volatility of recent form
+        volatility = abs(recent_avg_3 - recent_avg_5) / max(season_avg, 1)
+        if volatility > 0.25:
+            # High volatility - LESS CERTAIN (high variance)
+            variance_score += 0.15
+        elif volatility > 0.15:
+            # Moderate volatility - uncertain
+            variance_score += 0.08
         else:
-            # Volatile recent form - less confident
-            confidence_score += 0.10
-    elif recent_avg_3 is not None:
-        # Only L3 - moderate confidence
-        confidence_score += 0.10
-    elif recent_avg_5 is not None:
-        # Only L5 - lower confidence
-        confidence_score += 0.08
+            # Consistent recent form - MORE CERTAIN (low variance)
+            variance_score -= 0.05
 
-    # 4. Opponent data confidence (granular based on quality)
+    # 4. Opponent data availability REDUCES variance
     if opp_def_rating is not None and opp_pace is not None:
-        # Have both def rating and pace - good opponent intel
-        confidence_score += 0.12
+        # Have both def rating and pace - more certain
+        variance_score -= 0.05
     elif opp_def_rating is not None:
-        # Only def rating - moderate intel
-        confidence_score += 0.08
+        # Only def rating - slightly more certain
+        variance_score -= 0.02
 
-    # 5. Enhanced analytics confidence boosts
+    # 5. Enhanced analytics REDUCE variance (more data = more certain)
     if opponent_correlation is not None and opponent_correlation.games_vs_opponent >= 2:
         # High-quality player-specific matchup data
-        confidence_score += 0.15
+        variance_score -= 0.08
     if pace_split is not None and pace_split.games_played >= 2:
         # Player-specific pace performance data
-        confidence_score += 0.08
+        variance_score -= 0.04
     if defense_quality_split is not None and defense_quality_split.games_played >= 2:
         # Player-specific defense quality performance data
-        confidence_score += 0.08
+        variance_score -= 0.04
 
-    # Cap at 95% (never 100% certain)
-    confidence_score = min(0.95, confidence_score)
+    # Keep variance in reasonable bounds [0.05, 0.50]
+    variance_score = max(0.05, min(0.50, variance_score))
 
-    # Calculate floor and ceiling (confidence intervals)
-    # Wider intervals for lower confidence
-    interval_width = season_avg * 0.30 * (1 - confidence_score)
+    # FIX 3: Convert variance to "confidence" for display (inverted for user-friendliness)
+    # High variance (0.5) = Low confidence (50%)
+    # Low variance (0.05) = High confidence (95%)
+    confidence_score = 1.0 - variance_score
+
+    # FIX 1: Calculate floor and ceiling with WIDER ranges (20% increase)
+    # Base interval on variance (higher variance = wider interval)
+    # Increased from 0.30 to 0.36 (20% wider)
+    interval_width = season_avg * 0.36 * variance_score
     floor = max(0, projection - interval_width)
     ceiling = projection + interval_width
 
