@@ -3796,56 +3796,68 @@ with predictions_tab:
         if selected_date:
             # Button to fetch latest game data and update actuals
             if st.button("🔄 Fetch & Score Latest Games", help="Download latest NBA game data and update prediction actuals"):
-                with st.spinner("Step 1/3: Fetching latest game data from NBA API..."):
-                    try:
-                        # Import and run the database builder
-                        import subprocess
-                        result = subprocess.run(
-                            ['python', 'nba_to_sqlite.py', '--season', '2025-26', '--season-type', 'Regular Season', '--no-include-rosters'],
-                            capture_output=True,
-                            text=True,
-                            timeout=300,
-                            cwd=Path(__file__).parent
+                try:
+                    # Step 1: Fetch latest game data
+                    with st.spinner("Step 1/3: Fetching latest game data from NBA API..."):
+                        # Import and run the database builder directly
+                        from nba_to_sqlite import build_database
+
+                        build_database(
+                            db_path=db_path,
+                            season="2025-26",
+                            season_type="Regular Season",
+                            include_rosters=False,
+                            throttle_seconds=0.6
                         )
 
-                        if result.returncode != 0:
-                            st.error(f"Failed to fetch game data: {result.stderr}")
+                        st.success("✅ Game data fetched successfully!")
+
+                    # Step 2: Score predictions
+                    with st.spinner("Step 2/3: Scoring predictions..."):
+                        # Reconnect to database to see new data
+                        pred_conn.close()
+                        pred_conn = get_connection(str(db_path))
+
+                        # Score all unscored predictions
+                        import score_predictions as sp
+
+                        # Get unscored dates
+                        cursor = pred_conn.cursor()
+                        cursor.execute('''
+                            SELECT DISTINCT game_date
+                            FROM predictions
+                            WHERE did_play IS NULL OR actual_ppg IS NULL
+                            ORDER BY game_date DESC
+                        ''')
+                        unscored_dates = [row[0] for row in cursor.fetchall()]
+
+                        if unscored_dates:
+                            st.info(f"Found {len(unscored_dates)} date(s) with unscored predictions")
+                            for date_to_score in unscored_dates:
+                                sp.score_predictions_for_date(date_to_score)
+                            st.success(f"✅ Predictions scored for {len(unscored_dates)} date(s)!")
                         else:
-                            st.success("✅ Game data fetched successfully!")
+                            st.info("✅ All predictions are already scored!")
 
-                            # Step 2: Score predictions
-                            with st.spinner("Step 2/3: Scoring predictions..."):
-                                # Reconnect to database to see new data
-                                pred_conn.close()
-                                pred_conn = get_connection(str(db_path))
+                    # Step 3: Upload to S3
+                    with st.spinner("Step 3/3: Syncing to cloud..."):
+                        storage = s3_storage.S3PredictionStorage()
+                        if storage.is_connected():
+                            success, message = storage.upload_database(db_path)
+                            if success:
+                                st.success(f"✅ {message}")
+                                st.info("💡 Restart your Streamlit Cloud app to see the updates!")
+                            else:
+                                st.warning(f"⚠️ S3 upload: {message}")
+                        else:
+                            st.info("ℹ️ S3 not configured - updates saved locally only")
 
-                                # Score all unscored predictions
-                                from score_predictions import score_all_unscored
-                                score_all_unscored()
+                    st.rerun()
 
-                                st.success("✅ Predictions scored!")
-
-                            # Step 3: Upload to S3
-                            with st.spinner("Step 3/3: Syncing to cloud..."):
-                                storage = s3_storage.S3PredictionStorage()
-                                if storage.is_connected():
-                                    success, message = storage.upload_database(db_path)
-                                    if success:
-                                        st.success(f"✅ {message}")
-                                        st.info("💡 Restart your Streamlit Cloud app to see the updates!")
-                                    else:
-                                        st.warning(f"⚠️ S3 upload: {message}")
-                                else:
-                                    st.info("ℹ️ S3 not configured - updates saved locally only")
-
-                            st.rerun()
-
-                    except subprocess.TimeoutExpired:
-                        st.error("❌ Request timed out. Try again or run manually.")
-                    except Exception as e:
-                        st.error(f"❌ Error: {e}")
-                        import traceback
-                        st.code(traceback.format_exc())
+                except Exception as e:
+                    st.error(f"❌ Error: {e}")
+                    import traceback
+                    st.code(traceback.format_exc())
 
             # Alternative: Just update actuals from existing game logs (faster)
             if st.button("⚡ Quick Update from Existing Logs", help="Update actuals using game logs already in database (faster)"):
