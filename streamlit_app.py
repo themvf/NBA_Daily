@@ -1845,6 +1845,7 @@ daily_power_rows_points: list[Dict[str, Any]] = []
 daily_power_rows_3pm: list[Dict[str, Any]] = []
 daily_top_scorers_rows: list[Dict[str, Any]] = []
 player_season_stats_map: Dict[int, Mapping[str, Any]] = {}
+game_totals_by_game: Dict[str, Dict[str, Any]] = {}  # Track team totals by game_id
 
 # Today's games tab --------------------------------------------------------
 with games_tab:
@@ -2053,10 +2054,28 @@ with games_tab:
                 for _, matchup in games_df.iterrows():
                     away_id = matchup.get("away_team_id")
                     home_id = matchup.get("home_team_id")
+                    game_id_val = matchup.get("game_id")
                     if pd.isna(away_id) or pd.isna(home_id):
                         continue
                     away_id = int(away_id)
                     home_id = int(home_id)
+
+                    # Initialize game totals tracking for this game
+                    if game_id_val not in game_totals_by_game:
+                        game_totals_by_game[game_id_val] = {
+                            "game_id": game_id_val,
+                            "away_team": matchup["Away"],
+                            "home_team": matchup["Home"],
+                            "away_id": away_id,
+                            "home_id": home_id,
+                            "away_projected_total": 0.0,
+                            "home_projected_total": 0.0,
+                            "away_player_count": 0,
+                            "home_player_count": 0,
+                            "away_top_5_total": 0.0,
+                            "home_top_5_total": 0.0,
+                        }
+
                     matchup_rows: list[Dict[str, Any]] = []
                     for team_label, team_id, team_name in [
                         ("Away", away_id, matchup["Away"]),
@@ -2305,6 +2324,21 @@ with games_tab:
                                 matchup_rating=matchup_rating,
                                 opp_def_rating=opp_def_rating,
                             )
+
+                            # Accumulate game totals for team score projections
+                            if game_id_val in game_totals_by_game:
+                                if team_label == "Away":
+                                    game_totals_by_game[game_id_val]["away_projected_total"] += projection
+                                    game_totals_by_game[game_id_val]["away_player_count"] += 1
+                                    # Track top 5 separately
+                                    if game_totals_by_game[game_id_val]["away_player_count"] <= 5:
+                                        game_totals_by_game[game_id_val]["away_top_5_total"] += projection
+                                else:  # Home
+                                    game_totals_by_game[game_id_val]["home_projected_total"] += projection
+                                    game_totals_by_game[game_id_val]["home_player_count"] += 1
+                                    # Track top 5 separately
+                                    if game_totals_by_game[game_id_val]["home_player_count"] <= 5:
+                                        game_totals_by_game[game_id_val]["home_top_5_total"] += projection
 
                             matchup_rows.append(
                                 {
@@ -2648,6 +2682,51 @@ with matchup_spotlight_tab:
     if not matchup_spotlight_rows:
         st.info("Run the Today's Games tab to populate matchup insights.")
     else:
+        # NEW: Game Totals Summary Section
+        if game_totals_by_game:
+            st.markdown("### 🏀 Projected Game Totals")
+            st.caption("Sum of all player projections for each team")
+
+            totals_data = []
+            for game_id, totals in game_totals_by_game.items():
+                totals_data.append({
+                    "Matchup": f"{totals['away_team']} @ {totals['home_team']}",
+                    "Away Team": totals['away_team'],
+                    "Away Proj": f"{totals['away_projected_total']:.1f}",
+                    "Away Top 5": f"{totals['away_top_5_total']:.1f}",
+                    "Home Team": totals['home_team'],
+                    "Home Proj": f"{totals['home_projected_total']:.1f}",
+                    "Home Top 5": f"{totals['home_top_5_total']:.1f}",
+                    "Game Total": f"{totals['away_projected_total'] + totals['home_projected_total']:.1f}",
+                    "Top 5 Total": f"{totals['away_top_5_total'] + totals['home_top_5_total']:.1f}",
+                })
+
+            totals_df = pd.DataFrame(totals_data)
+
+            # Sort by game total descending
+            totals_df_sorted = totals_df.copy()
+            totals_df_sorted['_game_total_numeric'] = totals_df['Game Total'].astype(float)
+            totals_df_sorted = totals_df_sorted.sort_values('_game_total_numeric', ascending=False)
+            totals_df_sorted = totals_df_sorted.drop(columns=['_game_total_numeric'])
+
+            st.dataframe(totals_df_sorted, use_container_width=True, hide_index=True)
+
+            # Summary metrics
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                avg_game_total = sum(t['away_projected_total'] + t['home_projected_total'] for t in game_totals_by_game.values()) / len(game_totals_by_game)
+                st.metric("Avg Game Total", f"{avg_game_total:.1f}")
+            with col2:
+                max_game = max(game_totals_by_game.values(), key=lambda x: x['away_projected_total'] + x['home_projected_total'])
+                max_total = max_game['away_projected_total'] + max_game['home_projected_total']
+                st.metric("Highest Projected", f"{max_total:.1f}", f"{max_game['away_team']} @ {max_game['home_team']}")
+            with col3:
+                min_game = min(game_totals_by_game.values(), key=lambda x: x['away_projected_total'] + x['home_projected_total'])
+                min_total = min_game['away_projected_total'] + min_game['home_projected_total']
+                st.metric("Lowest Projected", f"{min_total:.1f}", f"{min_game['away_team']} @ {min_game['home_team']}")
+
+            st.divider()
+        # END NEW SECTION
         spotlight_df = pd.DataFrame(matchup_spotlight_rows)
         sort_column = st.selectbox(
             "Sort by",
