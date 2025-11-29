@@ -3854,6 +3854,8 @@ with predictions_tab:
                         else:
                             st.info("ℹ️ S3 not configured - updates saved locally only")
 
+                    # Clear cached database connections and rerun
+                    st.cache_resource.clear()
                     st.rerun()
 
                 except Exception as e:
