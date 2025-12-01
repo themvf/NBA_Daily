@@ -1223,11 +1223,17 @@ def calculate_smart_ppg_projection(
     confidence_score = 1.0 - variance_score
 
     # FIX 1: Calculate floor and ceiling with WIDER ranges
-    # Use (1 - confidence_score) to get proper scale (0.05 to 0.95)
-    # This gives us the same scale as the old system, but with variance-based confidence
-    # Base multiplier of 0.40 (33% wider than original 0.30) to compensate for past narrowness
-    uncertainty = 1.0 - confidence_score  # High confidence → low uncertainty
-    interval_width = season_avg * 0.40 * uncertainty
+    # Use a BASE range that reflects inherent game variance
+    # Then adjust slightly based on data quality (±20% based on uncertainty)
+    # This prevents ranges from collapsing when confidence is high
+    uncertainty = 1.0 - confidence_score  # High confidence → low uncertainty (0.05 to 0.95)
+
+    # Base range: 9% of season avg (inherent game variance, calibrated to ~2.75 avg width)
+    # Uncertainty adjustment: scale between 80% and 120% of base (0.8 + 0.4*uncertainty)
+    base_interval = season_avg * 0.09
+    uncertainty_factor = 0.8 + (0.4 * uncertainty)  # Range: [0.82, 1.18] for uncertainty [0.05, 0.95]
+    interval_width = base_interval * uncertainty_factor
+
     floor = max(0, projection - interval_width)
     ceiling = projection + interval_width
 
