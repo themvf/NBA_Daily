@@ -1222,10 +1222,12 @@ def calculate_smart_ppg_projection(
     # Low variance (0.05) = High confidence (95%)
     confidence_score = 1.0 - variance_score
 
-    # FIX 1: Calculate floor and ceiling with WIDER ranges (20% increase)
-    # Base interval on variance (higher variance = wider interval)
-    # Increased from 0.30 to 0.36 (20% wider)
-    interval_width = season_avg * 0.36 * variance_score
+    # FIX 1: Calculate floor and ceiling with WIDER ranges
+    # Use (1 - confidence_score) to get proper scale (0.05 to 0.95)
+    # This gives us the same scale as the old system, but with variance-based confidence
+    # Base multiplier of 0.40 (33% wider than original 0.30) to compensate for past narrowness
+    uncertainty = 1.0 - confidence_score  # High confidence → low uncertainty
+    interval_width = season_avg * 0.40 * uncertainty
     floor = max(0, projection - interval_width)
     ceiling = projection + interval_width
 
