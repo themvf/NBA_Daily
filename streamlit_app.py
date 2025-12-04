@@ -1797,6 +1797,21 @@ if not db_path.exists():
         )
         st.stop()
 
+# Initialize injury tracking tables -----------------------------------------
+# Ensure injury_list and predictions tables exist with proper schema
+try:
+    games_conn = get_connection(str(db_path))
+
+    # Create injury_list table if it doesn't exist
+    ia.create_injury_list_table(games_conn)
+
+    # Ensure predictions table has injury tracking columns
+    pt.create_predictions_table(games_conn)
+    pt.upgrade_predictions_table_for_injuries(games_conn)
+
+except Exception as init_exc:
+    st.warning(f"Could not initialize injury tracking tables: {init_exc}")
+
 # Key metrics ---------------------------------------------------------------
 summary_queries = {
     "Teams": "SELECT COUNT(*) AS total FROM teams",
