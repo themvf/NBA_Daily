@@ -147,6 +147,11 @@ def create_predictions_table(conn: sqlite3.Connection) -> None:
             original_proj_ceiling REAL DEFAULT NULL,
             original_proj_confidence REAL DEFAULT NULL,
 
+            -- Refresh audit trail
+            last_refreshed_at TEXT DEFAULT NULL,
+            refresh_count INTEGER DEFAULT 0,
+            refresh_reason TEXT DEFAULT NULL,
+
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
             -- Indexes for common queries
@@ -190,6 +195,30 @@ def upgrade_predictions_table_for_injuries(conn: sqlite3.Connection) -> None:
         'original_proj_floor': 'REAL DEFAULT NULL',
         'original_proj_ceiling': 'REAL DEFAULT NULL',
         'original_proj_confidence': 'REAL DEFAULT NULL',
+    }
+
+    # Add missing columns
+    for col_name, col_type in new_columns.items():
+        if col_name not in existing_columns:
+            cursor.execute(f"ALTER TABLE predictions ADD COLUMN {col_name} {col_type}")
+            print(f"Added column: {col_name}")
+
+    conn.commit()
+
+
+def upgrade_predictions_table_for_refresh(conn: sqlite3.Connection) -> None:
+    """Add refresh audit trail fields to existing predictions table if they don't exist."""
+    cursor = conn.cursor()
+
+    # Check which columns already exist
+    cursor.execute("PRAGMA table_info(predictions)")
+    existing_columns = {row[1] for row in cursor.fetchall()}
+
+    # Define new columns to add
+    new_columns = {
+        'last_refreshed_at': 'TEXT DEFAULT NULL',
+        'refresh_count': 'INTEGER DEFAULT 0',
+        'refresh_reason': 'TEXT DEFAULT NULL',
     }
 
     # Add missing columns

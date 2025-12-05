@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Initialize the injury_list table in the database."""
+"""Initialize the injury_list table and upgrade predictions table in the database."""
 
 import sqlite3
 import injury_adjustment as ia
+import prediction_tracking as pt
 
 def init_injury_table(db_path='nba_stats.db'):
-    """Create the injury_list table if it doesn't exist."""
+    """Create the injury_list table and add refresh audit columns if they don't exist."""
     conn = sqlite3.connect(db_path)
 
-    print(f"Initializing injury_list table in {db_path}...")
+    print(f"Initializing injury tracking in {db_path}...")
 
-    # Create the table
+    # Create the injury_list table
     ia.create_injury_list_table(conn)
 
     # Verify it was created
@@ -22,11 +23,16 @@ def init_injury_table(db_path='nba_stats.db'):
         # Show table schema
         cursor.execute("PRAGMA table_info(injury_list)")
         columns = cursor.fetchall()
-        print("\nTable schema:")
+        print("\ninjury_list table schema:")
         for col in columns:
             print(f"  - {col[1]} ({col[2]})")
     else:
         print("ERROR: Failed to create injury_list table")
+
+    # Add refresh audit columns to predictions table
+    print("\nUpgrading predictions table with refresh audit columns...")
+    pt.upgrade_predictions_table_for_refresh(conn)
+    print("SUCCESS: predictions table upgraded!")
 
     conn.close()
 

@@ -27,6 +27,7 @@ import injury_adjustment as ia
 import player_correlation_analytics as pca
 import defense_type_analytics as dta
 import prediction_tracking as pt
+import prediction_refresh as pr
 import s3_storage
 
 DEFAULT_DB_PATH = Path(__file__).with_name("nba_stats.db")
@@ -1808,6 +1809,7 @@ try:
     # Ensure predictions table has injury tracking columns
     pt.create_predictions_table(games_conn)
     pt.upgrade_predictions_table_for_injuries(games_conn)
+    pt.upgrade_predictions_table_for_refresh(games_conn)
 
 except Exception as init_exc:
     st.warning(f"Could not initialize injury tracking tables: {init_exc}")
@@ -4368,6 +4370,112 @@ with injury_admin_tab:
                 )
     else:
         st.info("No active injuries. Add players using the form above.")
+
+    # Refresh Predictions Section
+    st.divider()
+    st.subheader("🔄 Refresh Predictions")
+    st.caption("Remove OUT players from existing predictions and recalculate teammate projections")
+
+    # Get today's date
+    today = date.today().strftime('%Y-%m-%d')
+
+    try:
+        # Get refresh status
+        status = pr.get_refresh_status(today, injury_conn)
+
+        if status['predictions_count'] > 0:
+            col1, col2 = st.columns([2, 1])
+
+            with col1:
+                st.write(f"**{status['predictions_count']} predictions** logged for {today}")
+
+                if status['last_refreshed']:
+                    st.caption(f"Last refreshed: {status['last_refreshed']} ({status['refresh_count']} time(s))")
+
+            with col2:
+                if status['needs_refresh']:
+                    st.metric("OUT players with predictions", len(status['out_players_with_predictions']))
+                else:
+                    st.success("✅ All clean")
+
+            # Show OUT players who still have predictions
+            if status['needs_refresh']:
+                st.warning(f"⚠️ {len(status['out_players_with_predictions'])} OUT player(s) still have predictions")
+
+                out_players_df = pd.DataFrame(status['out_players_with_predictions'])
+                st.dataframe(
+                    out_players_df[['player_name', 'team_name', 'projected_ppg']],
+                    column_config={
+                        'player_name': 'Player',
+                        'team_name': 'Team',
+                        'projected_ppg': st.column_config.NumberColumn('Projected PPG', format="%.1f")
+                    },
+                    hide_index=True,
+                    use_container_width=True
+                )
+
+                # Refresh button
+                if st.button("🔄 Refresh Predictions for Today", type="primary", use_container_width=True):
+                    with st.spinner("Regenerating predictions..."):
+                        try:
+                            result = pr.refresh_predictions_for_date(today, injury_conn)
+
+                            if result['error']:
+                                st.error(f"❌ Refresh failed: {result['error']}")
+                            else:
+                                st.success(f"""
+✅ Predictions refreshed successfully!
+- **{result['removed']}** predictions removed (OUT players)
+- **{result['adjusted']}** predictions adjusted (teammates)
+- **{result['skipped']}** skipped (insufficient data)
+                                """)
+
+                                if result['affected_players']:
+                                    with st.expander("Affected Players"):
+                                        for player in result['affected_players']:
+                                            st.write(f"- {player}")
+
+                                # Upload to S3 after successful refresh
+                                storage = s3_storage.S3PredictionStorage()
+                                if storage.is_connected():
+                                    success, message = storage.upload_database(db_path)
+                                    if success:
+                                        st.info(f"☁️ {message}")
+
+                                st.rerun()  # Refresh UI to show updated status
+
+                        except Exception as e:
+                            st.error(f"❌ Refresh failed: {e}")
+
+                # Show explanation
+                with st.expander("ℹ️ How Refresh Works"):
+                    st.markdown("""
+**What happens when you refresh:**
+
+1. **Delete OUT Player Predictions** - Removes projections for players marked as OUT
+2. **Apply Injury Adjustments** - Redistributes expected points to teammates based on historical data
+3. **Update Audit Trail** - Tracks when and why predictions were refreshed
+
+**When to use refresh:**
+- You generate predictions in the morning with all players healthy
+- Later in the day, injury news comes out (e.g., player ruled OUT at 4 PM)
+- Mark the player as OUT in the injury management section above
+- Click "Refresh Predictions" to update today's projections
+
+**Note:** Teammate boosts are calculated using historical performance when the injured player was absent (min 3 games), capped at 25% increase.
+                    """)
+            else:
+                st.info("✅ No OUT players have predictions. Your projections are current!")
+
+                # Show active injuries for context
+                active_injuries = ia.get_active_injuries(injury_conn, check_return_dates=True)
+                if active_injuries:
+                    st.caption(f"Active injuries: {len(active_injuries)} player(s) (already filtered from predictions)")
+        else:
+            st.info(f"No predictions logged for {today} yet. Generate predictions in the 'Today's Games' tab first.")
+
+    except Exception as e:
+        st.error(f"Could not load refresh status: {e}")
 
 # Admin Panel tab --------------------------------------------------------
 with admin_tab:
