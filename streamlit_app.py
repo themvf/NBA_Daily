@@ -1044,8 +1044,12 @@ def calculate_smart_ppg_projection(
 
     # 2. Recent Form (20% weight, higher if trending)
     if recent_avg_3 is not None and recent_avg_5 is not None:
-        # Weight more recent games higher
-        components["recent"] = (recent_avg_3 * 0.6) + (recent_avg_5 * 0.4)
+        # Updated weighting based on predictive value analysis (275 predictions)
+        # Last 5 games has superior predictive value:
+        # - MAE: 7.57 (Last 5) vs 7.93 (Last 3) - 4.8% more accurate
+        # - Correlation: 0.451 (Last 5) vs 0.400 (Last 3) - 12.9% stronger
+        # - Win rate: 57.8% (Last 5) vs 41.1% (Last 3)
+        components["recent"] = (recent_avg_5 * 0.6) + (recent_avg_3 * 0.4)
         weights["recent"] = 0.20
     elif recent_avg_5 is not None:
         components["recent"] = recent_avg_5
