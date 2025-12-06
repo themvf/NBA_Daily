@@ -5316,6 +5316,265 @@ with tournament_tab:
             grade_summary = " | ".join([f"{grade}: {count}" for grade, count in grade_counts.head(5).items()])
             st.caption(grade_summary)
 
+        st.divider()
+
+        # ========== MULTI-LINEUP CONSTRUCTOR ==========
+        st.subheader("🏗️ Multi-Lineup Portfolio Constructor")
+        st.caption("Build 3 differentiated tournament lineups following optimal portfolio strategy")
+
+        # Create player options list (sorted by GPP Score)
+        player_options = display_df[['Player', 'Team', 'Opponent', 'GPP Score', 'Ceiling', 'Proj PPG']].copy()
+        player_options['Display'] = player_options.apply(
+            lambda x: f"{x['Player']} ({x['Team']}) - GPP {x['GPP Score']:.0f} | Ceiling {x['Ceiling']:.1f}",
+            axis=1
+        )
+        player_list = ['[Select Player]'] + player_options['Display'].tolist()
+
+        # Helper function to extract player name from display string
+        def get_player_name(display_str):
+            if display_str == '[Select Player]':
+                return None
+            return display_str.split(' (')[0]
+
+        # Create 3 lineup builders
+        lineup_cols = st.columns(3)
+
+        # Initialize session state for lineups if needed
+        if 'lineup_a' not in st.session_state:
+            st.session_state.lineup_a = ['[Select Player]', '[Select Player]', '[Select Player]']
+        if 'lineup_b' not in st.session_state:
+            st.session_state.lineup_b = ['[Select Player]', '[Select Player]', '[Select Player]']
+        if 'lineup_c' not in st.session_state:
+            st.session_state.lineup_c = ['[Select Player]', '[Select Player]', '[Select Player]']
+
+        # Lineup A - Balanced Core
+        with lineup_cols[0]:
+            st.markdown("### 🎯 Lineup A: Balanced Core")
+            st.caption("Top GPP scores, 2 from same game, max 1 chalk")
+
+            lineup_a_1 = st.selectbox(
+                "Player 1 (Anchor)",
+                player_list,
+                key='lineup_a_1',
+                index=player_list.index(st.session_state.lineup_a[0]) if st.session_state.lineup_a[0] in player_list else 0
+            )
+            lineup_a_2 = st.selectbox(
+                "Player 2",
+                player_list,
+                key='lineup_a_2',
+                index=player_list.index(st.session_state.lineup_a[1]) if st.session_state.lineup_a[1] in player_list else 0
+            )
+            lineup_a_3 = st.selectbox(
+                "Player 3",
+                player_list,
+                key='lineup_a_3',
+                index=player_list.index(st.session_state.lineup_a[2]) if st.session_state.lineup_a[2] in player_list else 0
+            )
+
+            # Update session state
+            st.session_state.lineup_a = [lineup_a_1, lineup_a_2, lineup_a_3]
+
+        # Lineup B - Contrarian Leverage
+        with lineup_cols[1]:
+            st.markdown("### 🎲 Lineup B: Contrarian")
+            st.caption("0 overlap with A, injury beneficiaries, low owned")
+
+            lineup_b_1 = st.selectbox(
+                "Player 1",
+                player_list,
+                key='lineup_b_1',
+                index=player_list.index(st.session_state.lineup_b[0]) if st.session_state.lineup_b[0] in player_list else 0
+            )
+            lineup_b_2 = st.selectbox(
+                "Player 2",
+                player_list,
+                key='lineup_b_2',
+                index=player_list.index(st.session_state.lineup_b[1]) if st.session_state.lineup_b[1] in player_list else 0
+            )
+            lineup_b_3 = st.selectbox(
+                "Player 3",
+                player_list,
+                key='lineup_b_3',
+                index=player_list.index(st.session_state.lineup_b[2]) if st.session_state.lineup_b[2] in player_list else 0
+            )
+
+            # Update session state
+            st.session_state.lineup_b = [lineup_b_1, lineup_b_2, lineup_b_3]
+
+        # Lineup C - Volatility Play
+        with lineup_cols[2]:
+            st.markdown("### ⚡ Lineup C: Volatility")
+            st.caption("1 overlap with A (anchor), high variance picks")
+
+            lineup_c_1 = st.selectbox(
+                "Player 1",
+                player_list,
+                key='lineup_c_1',
+                index=player_list.index(st.session_state.lineup_c[0]) if st.session_state.lineup_c[0] in player_list else 0
+            )
+            lineup_c_2 = st.selectbox(
+                "Player 2",
+                player_list,
+                key='lineup_c_2',
+                index=player_list.index(st.session_state.lineup_c[1]) if st.session_state.lineup_c[1] in player_list else 0
+            )
+            lineup_c_3 = st.selectbox(
+                "Player 3",
+                player_list,
+                key='lineup_c_3',
+                index=player_list.index(st.session_state.lineup_c[2]) if st.session_state.lineup_c[2] in player_list else 0
+            )
+
+            # Update session state
+            st.session_state.lineup_c = [lineup_c_1, lineup_c_2, lineup_c_3]
+
+        st.divider()
+
+        # ========== LINEUP VALIDATION & METRICS ==========
+        st.subheader("📊 Portfolio Analysis")
+
+        # Extract player names from selections
+        lineup_a_players = [get_player_name(p) for p in [lineup_a_1, lineup_a_2, lineup_a_3]]
+        lineup_b_players = [get_player_name(p) for p in [lineup_b_1, lineup_b_2, lineup_b_3]]
+        lineup_c_players = [get_player_name(p) for p in [lineup_c_1, lineup_c_2, lineup_c_3]]
+
+        # Calculate metrics for each lineup
+        def calculate_lineup_metrics(player_names, display_df):
+            if None in player_names or len(set(player_names)) < 3:
+                return None
+
+            metrics = {
+                'players': [],
+                'total_ceiling': 0,
+                'total_proj': 0,
+                'avg_gpp_score': 0,
+                'teams': [],
+                'opponents': [],
+            }
+
+            for pname in player_names:
+                player_row = display_df[display_df['Player'] == pname]
+                if player_row.empty:
+                    return None
+
+                p = player_row.iloc[0]
+                metrics['players'].append(pname)
+                metrics['total_ceiling'] += p['Ceiling']
+                metrics['total_proj'] += p['Proj PPG']
+                metrics['avg_gpp_score'] += p['GPP Score']
+                metrics['teams'].append(p['Team'])
+                metrics['opponents'].append(p['Opponent'])
+
+            metrics['avg_gpp_score'] /= 3
+            return metrics
+
+        lineup_a_metrics = calculate_lineup_metrics(lineup_a_players, display_df)
+        lineup_b_metrics = calculate_lineup_metrics(lineup_b_players, display_df)
+        lineup_c_metrics = calculate_lineup_metrics(lineup_c_players, display_df)
+
+        # Display lineup summaries
+        summary_cols = st.columns(3)
+
+        with summary_cols[0]:
+            st.markdown("#### Lineup A Summary")
+            if lineup_a_metrics:
+                st.metric("Combined Ceiling", f"{lineup_a_metrics['total_ceiling']:.1f} PPG")
+                st.metric("Combined Proj", f"{lineup_a_metrics['total_proj']:.1f} PPG")
+                st.metric("Avg GPP Score", f"{lineup_a_metrics['avg_gpp_score']:.0f}")
+
+                # Check for game stack
+                opponent_counts = {}
+                for opp in lineup_a_metrics['opponents']:
+                    opponent_counts[opp] = opponent_counts.get(opp, 0) + 1
+                game_stack = any(count >= 2 for count in opponent_counts.values())
+                st.caption(f"{'✅' if game_stack else '⚠️'} Game Stack: {'YES' if game_stack else 'NO'}")
+            else:
+                st.caption("⚠️ Select 3 different players")
+
+        with summary_cols[1]:
+            st.markdown("#### Lineup B Summary")
+            if lineup_b_metrics:
+                st.metric("Combined Ceiling", f"{lineup_b_metrics['total_ceiling']:.1f} PPG")
+                st.metric("Combined Proj", f"{lineup_b_metrics['total_proj']:.1f} PPG")
+                st.metric("Avg GPP Score", f"{lineup_b_metrics['avg_gpp_score']:.0f}")
+
+                # Check for overlap with A
+                overlap_with_a = len(set(lineup_a_players) & set(lineup_b_players)) if lineup_a_metrics else 0
+                st.caption(f"{'✅' if overlap_with_a == 0 else '❌'} Overlap with A: {overlap_with_a} players")
+            else:
+                st.caption("⚠️ Select 3 different players")
+
+        with summary_cols[2]:
+            st.markdown("#### Lineup C Summary")
+            if lineup_c_metrics:
+                st.metric("Combined Ceiling", f"{lineup_c_metrics['total_ceiling']:.1f} PPG")
+                st.metric("Combined Proj", f"{lineup_c_metrics['total_proj']:.1f} PPG")
+                st.metric("Avg GPP Score", f"{lineup_c_metrics['avg_gpp_score']:.0f}")
+
+                # Check for overlap with A (should be exactly 1)
+                overlap_with_a = len(set(lineup_a_players) & set(lineup_c_players)) if lineup_a_metrics else 0
+                st.caption(f"{'✅' if overlap_with_a == 1 else '⚠️'} Overlap with A: {overlap_with_a} players")
+            else:
+                st.caption("⚠️ Select 3 different players")
+
+        st.divider()
+
+        # Portfolio-level validation
+        if lineup_a_metrics and lineup_b_metrics and lineup_c_metrics:
+            st.markdown("### ✅ Portfolio Validation")
+
+            validation_cols = st.columns(2)
+
+            with validation_cols[0]:
+                st.markdown("**Lineup Requirements:**")
+
+                # Lineup A ceiling check
+                a_ceiling_ok = lineup_a_metrics['total_ceiling'] >= 110
+                st.markdown(f"{'✅' if a_ceiling_ok else '⚠️'} Lineup A ceiling ≥110: {lineup_a_metrics['total_ceiling']:.1f}")
+
+                # Lineup B ceiling check
+                b_ceiling_ok = lineup_b_metrics['total_ceiling'] >= 105
+                st.markdown(f"{'✅' if b_ceiling_ok else '⚠️'} Lineup B ceiling ≥105: {lineup_b_metrics['total_ceiling']:.1f}")
+
+                # Lineup C ceiling check
+                c_ceiling_ok = lineup_c_metrics['total_ceiling'] >= 105
+                st.markdown(f"{'✅' if c_ceiling_ok else '⚠️'} Lineup C ceiling ≥105: {lineup_c_metrics['total_ceiling']:.1f}")
+
+                # B has 0 overlap with A
+                b_overlap = len(set(lineup_a_players) & set(lineup_b_players))
+                b_overlap_ok = b_overlap == 0
+                st.markdown(f"{'✅' if b_overlap_ok else '❌'} Lineup B: 0 overlap with A ({b_overlap} found)")
+
+            with validation_cols[1]:
+                st.markdown("**Portfolio Diversity:**")
+
+                # C has exactly 1 overlap with A
+                c_overlap = len(set(lineup_a_players) & set(lineup_c_players))
+                c_overlap_ok = c_overlap == 1
+                st.markdown(f"{'✅' if c_overlap_ok else '⚠️'} Lineup C: 1 overlap with A ({c_overlap} found)")
+
+                # Total unique players
+                all_players = set(lineup_a_players + lineup_b_players + lineup_c_players)
+                unique_count = len(all_players)
+                unique_ok = 7 <= unique_count <= 8
+                st.markdown(f"{'✅' if unique_ok else '⚠️'} Unique players: {unique_count} (target: 7-8)")
+
+                # Combined ceiling across all lineups
+                total_ceiling = lineup_a_metrics['total_ceiling'] + lineup_b_metrics['total_ceiling'] + lineup_c_metrics['total_ceiling']
+                st.markdown(f"📊 **Total Portfolio Ceiling:** {total_ceiling:.1f} PPG")
+
+            # Overall portfolio grade
+            all_checks = [a_ceiling_ok, b_ceiling_ok, c_ceiling_ok, b_overlap_ok, c_overlap_ok, unique_ok]
+            passed_checks = sum(all_checks)
+
+            st.divider()
+            if passed_checks == 6:
+                st.success("🎉 **OPTIMAL PORTFOLIO** - All validation checks passed! Ready for tournament entry.")
+            elif passed_checks >= 4:
+                st.warning(f"⚠️ **GOOD PORTFOLIO** - {passed_checks}/6 checks passed. Review warnings above.")
+            else:
+                st.error(f"❌ **NEEDS IMPROVEMENT** - Only {passed_checks}/6 checks passed. Adjust lineups.")
+
 st.divider()
 st.caption(
     "Need more context? Re-run the builder (`python nba_to_sqlite.py ...`) to refresh "
