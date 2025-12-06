@@ -5449,115 +5449,58 @@ with tournament_tab:
 
         with button_col2:
             if st.button("🔄 Clear All Lineups", use_container_width=True, key='clear_btn'):
-                st.session_state.lineup_a = ['[Select Player]', '[Select Player]', '[Select Player]']
-                st.session_state.lineup_b = ['[Select Player]', '[Select Player]', '[Select Player]']
-                st.session_state.lineup_c = ['[Select Player]', '[Select Player]', '[Select Player]']
+                st.session_state.lineup_a = []
+                st.session_state.lineup_b = []
+                st.session_state.lineup_c = []
                 st.session_state.lineup_refresh_counter += 1
                 st.rerun()
 
         st.divider()
 
-        # Create 3 lineup builders
-        lineup_cols = st.columns(3)
-
         # Initialize session state for lineups if needed
         if 'lineup_a' not in st.session_state:
-            st.session_state.lineup_a = ['[Select Player]', '[Select Player]', '[Select Player]']
+            st.session_state.lineup_a = []
         if 'lineup_b' not in st.session_state:
-            st.session_state.lineup_b = ['[Select Player]', '[Select Player]', '[Select Player]']
+            st.session_state.lineup_b = []
         if 'lineup_c' not in st.session_state:
-            st.session_state.lineup_c = ['[Select Player]', '[Select Player]', '[Select Player]']
+            st.session_state.lineup_c = []
 
-        # Lineup A - Balanced Core
-        with lineup_cols[0]:
-            st.markdown("### 🎯 Lineup A: Balanced Core")
-            st.caption("Top GPP scores, 2 from same game, max 1 chalk")
+        # Display generated lineups
+        if st.session_state.lineup_a and st.session_state.lineup_b and st.session_state.lineup_c:
+            lineup_cols = st.columns(3)
 
-            lineup_a_1 = st.selectbox(
-                "Player 1 (Anchor)",
-                player_list,
-                key='lineup_a_1',
-                index=player_list.index(st.session_state.lineup_a[0]) if st.session_state.lineup_a[0] in player_list else 0
-            )
-            lineup_a_2 = st.selectbox(
-                "Player 2",
-                player_list,
-                key='lineup_a_2',
-                index=player_list.index(st.session_state.lineup_a[1]) if st.session_state.lineup_a[1] in player_list else 0
-            )
-            lineup_a_3 = st.selectbox(
-                "Player 3",
-                player_list,
-                key='lineup_a_3',
-                index=player_list.index(st.session_state.lineup_a[2]) if st.session_state.lineup_a[2] in player_list else 0
-            )
+            # Lineup A - Balanced Core
+            with lineup_cols[0]:
+                st.markdown("### 🎯 Lineup A: Balanced Core")
+                st.caption("Top GPP scores, 2 from same game, max 1 chalk")
+                for i, player in enumerate(st.session_state.lineup_a, 1):
+                    st.markdown(f"**{i}.** {player}")
 
-            # Update session state
-            st.session_state.lineup_a = [lineup_a_1, lineup_a_2, lineup_a_3]
+            # Lineup B - Contrarian Leverage
+            with lineup_cols[1]:
+                st.markdown("### 🎲 Lineup B: Contrarian")
+                st.caption("0 overlap with A, injury beneficiaries, low owned")
+                for i, player in enumerate(st.session_state.lineup_b, 1):
+                    st.markdown(f"**{i}.** {player}")
 
-        # Lineup B - Contrarian Leverage
-        with lineup_cols[1]:
-            st.markdown("### 🎲 Lineup B: Contrarian")
-            st.caption("0 overlap with A, injury beneficiaries, low owned")
-
-            lineup_b_1 = st.selectbox(
-                "Player 1",
-                player_list,
-                key='lineup_b_1',
-                index=player_list.index(st.session_state.lineup_b[0]) if st.session_state.lineup_b[0] in player_list else 0
-            )
-            lineup_b_2 = st.selectbox(
-                "Player 2",
-                player_list,
-                key='lineup_b_2',
-                index=player_list.index(st.session_state.lineup_b[1]) if st.session_state.lineup_b[1] in player_list else 0
-            )
-            lineup_b_3 = st.selectbox(
-                "Player 3",
-                player_list,
-                key='lineup_b_3',
-                index=player_list.index(st.session_state.lineup_b[2]) if st.session_state.lineup_b[2] in player_list else 0
-            )
-
-            # Update session state
-            st.session_state.lineup_b = [lineup_b_1, lineup_b_2, lineup_b_3]
-
-        # Lineup C - Volatility Play
-        with lineup_cols[2]:
-            st.markdown("### ⚡ Lineup C: Volatility")
-            st.caption("1 overlap with A (anchor), high variance picks")
-
-            lineup_c_1 = st.selectbox(
-                "Player 1",
-                player_list,
-                key='lineup_c_1',
-                index=player_list.index(st.session_state.lineup_c[0]) if st.session_state.lineup_c[0] in player_list else 0
-            )
-            lineup_c_2 = st.selectbox(
-                "Player 2",
-                player_list,
-                key='lineup_c_2',
-                index=player_list.index(st.session_state.lineup_c[1]) if st.session_state.lineup_c[1] in player_list else 0
-            )
-            lineup_c_3 = st.selectbox(
-                "Player 3",
-                player_list,
-                key='lineup_c_3',
-                index=player_list.index(st.session_state.lineup_c[2]) if st.session_state.lineup_c[2] in player_list else 0
-            )
-
-            # Update session state
-            st.session_state.lineup_c = [lineup_c_1, lineup_c_2, lineup_c_3]
+            # Lineup C - Volatility Play
+            with lineup_cols[2]:
+                st.markdown("### ⚡ Lineup C: Volatility")
+                st.caption("1 overlap with A (anchor), high variance picks")
+                for i, player in enumerate(st.session_state.lineup_c, 1):
+                    st.markdown(f"**{i}.** {player}")
+        else:
+            st.info("👆 Click **Auto-Generate Optimal Lineups** to build your tournament portfolio")
 
         st.divider()
 
         # ========== LINEUP VALIDATION & METRICS ==========
         st.subheader("📊 Portfolio Analysis")
 
-        # Extract player names from selections
-        lineup_a_players = [get_player_name(p) for p in [lineup_a_1, lineup_a_2, lineup_a_3]]
-        lineup_b_players = [get_player_name(p) for p in [lineup_b_1, lineup_b_2, lineup_b_3]]
-        lineup_c_players = [get_player_name(p) for p in [lineup_c_1, lineup_c_2, lineup_c_3]]
+        # Extract player names from lineup displays
+        lineup_a_players = [get_player_name(p) for p in st.session_state.lineup_a]
+        lineup_b_players = [get_player_name(p) for p in st.session_state.lineup_b]
+        lineup_c_players = [get_player_name(p) for p in st.session_state.lineup_c]
 
         # Calculate metrics for each lineup
         def calculate_lineup_metrics(player_names, display_df):
