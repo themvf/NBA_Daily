@@ -4702,9 +4702,9 @@ with tournament_tab:
             projected_ppg,
             proj_ceiling,
             proj_floor,
-            matchup_rating,
             dfs_score,
             dfs_grade,
+            opponent_def_rating,
             (proj_ceiling - proj_floor) as upside_range,
             ROUND((proj_ceiling - proj_floor) / projected_ppg, 2) as variance_ratio
         FROM predictions
@@ -4749,7 +4749,7 @@ with tournament_tab:
             'projected_ppg': 'Proj PPG',
             'proj_ceiling': 'Ceiling',
             'proj_floor': 'Floor',
-            'matchup_rating': 'Matchup',
+            'opponent_def_rating': 'Opp Def',
             'dfs_score': 'DFS Score',
             'dfs_grade': 'Grade',
             'upside_range': 'Range',
@@ -4760,6 +4760,7 @@ with tournament_tab:
         display_df['Proj PPG'] = display_df['Proj PPG'].round(1)
         display_df['Ceiling'] = display_df['Ceiling'].round(1)
         display_df['Floor'] = display_df['Floor'].round(1)
+        display_df['Opp Def'] = display_df['Opp Def'].round(1)
         display_df['DFS Score'] = display_df['DFS Score'].round(1)
         display_df['Range'] = display_df['Range'].round(1)
 
