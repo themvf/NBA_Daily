@@ -5178,6 +5178,30 @@ if selected_page == "Tournament Strategy":
         st.info("The predictions table may be missing required columns. Please regenerate predictions in the 'Today's Games' tab.")
         st.stop()
 
+    # Debug: Show injured players being filtered out
+    with st.expander("🔍 Debug: Players Filtered by Injury Status", expanded=False):
+        debug_query = """
+            SELECT
+                p.player_name,
+                p.team_name,
+                p.proj_ceiling,
+                il.status as injury_status,
+                il.injury_date
+            FROM predictions p
+            INNER JOIN injury_list il ON p.player_name = il.player_name
+                AND p.team_name = il.team_name
+                AND il.status = 'active'
+            WHERE p.game_date = ?
+                AND p.proj_ceiling >= ?
+            ORDER BY p.proj_ceiling DESC
+        """
+        injured_df = pd.read_sql_query(debug_query, tourn_conn, params=[selected_date, min_ceiling])
+        if injured_df.empty:
+            st.success("✅ No players filtered out due to injury status")
+        else:
+            st.warning(f"⚠️ {len(injured_df)} player(s) excluded due to active injury:")
+            st.dataframe(injured_df, use_container_width=True)
+
     if df.empty:
         st.info(f"No players with ceiling >= {min_ceiling} PPG found for {selected_date}")
     else:
