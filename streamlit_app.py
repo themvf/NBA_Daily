@@ -5336,6 +5336,121 @@ with tournament_tab:
                 return None
             return display_str.split(' (')[0]
 
+        # Auto-generate optimal lineups function
+        def auto_generate_lineups(df):
+            """Generate optimal 3-lineup portfolio based on GPP Score rankings."""
+            if len(df) < 8:
+                return None, "Need at least 8 players to generate lineups"
+
+            # Sort by GPP Score descending
+            sorted_players = df.sort_values('GPP Score', ascending=False).copy()
+
+            # Helper to find game stacks (2 players facing each other)
+            def find_game_stack_partner(player_idx, df, used_players):
+                """Find a player from the same game as player_idx."""
+                player = df.iloc[player_idx]
+                player_opp = player['Opponent']
+
+                # Look for players on the opponent team
+                for idx, candidate in df.iterrows():
+                    if candidate['Player'] in used_players:
+                        continue
+                    if candidate['Team'] == player_opp:
+                        return candidate['Display']
+                return None
+
+            # LINEUP A: Balanced Core
+            # Strategy: Top 3 GPP scores, try to get 2 from same game
+            lineup_a = []
+            used_players_a = set()
+
+            # Player 1: Highest GPP
+            p1_display = sorted_players.iloc[0]['Display']
+            lineup_a.append(p1_display)
+            used_players_a.add(sorted_players.iloc[0]['Player'])
+
+            # Player 2: Try to find game stack partner, else 2nd highest GPP
+            stack_partner = find_game_stack_partner(0, sorted_players, used_players_a)
+            if stack_partner:
+                lineup_a.append(stack_partner)
+                used_players_a.add(get_player_name(stack_partner))
+            else:
+                # No stack available, take 2nd highest GPP
+                p2_display = sorted_players.iloc[1]['Display']
+                lineup_a.append(p2_display)
+                used_players_a.add(sorted_players.iloc[1]['Player'])
+
+            # Player 3: Next highest GPP not in lineup
+            for idx, row in sorted_players.iterrows():
+                if row['Player'] not in used_players_a:
+                    lineup_a.append(row['Display'])
+                    used_players_a.add(row['Player'])
+                    break
+
+            # LINEUP B: Contrarian Leverage
+            # Strategy: 0 overlap with A, players ranked 4-10 in GPP Score
+            lineup_b = []
+            used_players_b = set()
+
+            # Skip players in Lineup A, take next 3 highest GPP
+            for idx, row in sorted_players.iterrows():
+                if row['Player'] in used_players_a:
+                    continue
+                if len(lineup_b) < 3:
+                    lineup_b.append(row['Display'])
+                    used_players_b.add(row['Player'])
+
+            # LINEUP C: Volatility Play
+            # Strategy: 1 overlap with A (highest GPP anchor), 2 different from A/B
+            lineup_c = []
+            used_players_c = set()
+
+            # Player 1: Same as Lineup A's anchor (highest GPP)
+            lineup_c.append(lineup_a[0])
+            used_players_c.add(sorted_players.iloc[0]['Player'])
+
+            # Players 2-3: Next available not in A or B
+            all_used = used_players_a | used_players_b
+            for idx, row in sorted_players.iterrows():
+                if row['Player'] in all_used:
+                    continue
+                if len(lineup_c) < 3:
+                    lineup_c.append(row['Display'])
+                    used_players_c.add(row['Player'])
+
+            # If we couldn't fill Lineup C (not enough players), take from B
+            if len(lineup_c) < 3:
+                for player_display in lineup_b:
+                    player_name = get_player_name(player_display)
+                    if player_name not in used_players_c and len(lineup_c) < 3:
+                        lineup_c.append(player_display)
+                        used_players_c.add(player_name)
+
+            return (lineup_a, lineup_b, lineup_c), None
+
+        # Auto-generate button
+        button_col1, button_col2 = st.columns([1, 3])
+        with button_col1:
+            if st.button("🤖 Auto-Generate Optimal Lineups", type="primary", use_container_width=True):
+                lineups, error = auto_generate_lineups(display_df)
+                if error:
+                    st.error(error)
+                else:
+                    st.session_state.lineup_a = lineups[0]
+                    st.session_state.lineup_b = lineups[1]
+                    st.session_state.lineup_c = lineups[2]
+                    st.success("✅ Lineups auto-generated! Review and adjust below.")
+                    st.rerun()
+
+        with button_col2:
+            if st.button("🔄 Clear All Lineups", use_container_width=True):
+                st.session_state.lineup_a = ['[Select Player]', '[Select Player]', '[Select Player]']
+                st.session_state.lineup_b = ['[Select Player]', '[Select Player]', '[Select Player]']
+                st.session_state.lineup_c = ['[Select Player]', '[Select Player]', '[Select Player]']
+                st.rerun()
+
+        st.divider()
+
         # Create 3 lineup builders
         lineup_cols = st.columns(3)
 
