@@ -128,6 +128,42 @@ def sync_database_from_s3() -> tuple[bool, str]:
 # Run S3 sync on startup
 s3_sync_status, s3_sync_message = sync_database_from_s3()
 
+# Sidebar navigation
+st.sidebar.title("📊 Navigation")
+
+tab_titles = [
+    "Today's Games",
+    "Matchup Spotlight",
+    "Daily Leaders",
+    "Player Impact",
+    "Standings",
+    "3PT Leaders",
+    "Scoring Leaders",
+    "3PT Defense",
+    "Points Allowed",
+    "Defense Mix",
+    "Prediction Log",
+    "Defense Styles",
+    "Injury Admin",
+    "Admin Panel",
+    "Tournament Strategy",
+]
+
+# Initialize selected page in session state
+if 'selected_page' not in st.session_state:
+    st.session_state.selected_page = "Tournament Strategy"
+
+# Sidebar selectbox for navigation
+selected_page = st.sidebar.selectbox(
+    "Select View:",
+    tab_titles,
+    index=tab_titles.index(st.session_state.selected_page) if st.session_state.selected_page in tab_titles else 0,
+    key='page_selector'
+)
+
+# Update session state
+st.session_state.selected_page = selected_page
+
 # Show S3 sync status in sidebar
 with st.sidebar:
     st.markdown("### ☁️ Cloud Backup Status")
@@ -2281,42 +2317,6 @@ for metric_col, (label, query) in zip(metric_cols, summary_queries.items()):
         metric_col.metric(label, f"{int(total_df.iloc[0, 0]):,}")
     except Exception as exc:  # noqa: BLE001 - surface errors to the UI
         metric_col.error(f"{label}: {exc}")
-
-# Sidebar navigation
-st.sidebar.title("📊 Navigation")
-
-tab_titles = [
-    "Today's Games",
-    "Matchup Spotlight",
-    "Daily Leaders",
-    "Player Impact",
-    "Standings",
-    "3PT Leaders",
-    "Scoring Leaders",
-    "3PT Defense",
-    "Points Allowed",
-    "Defense Mix",
-    "Prediction Log",
-    "Defense Styles",
-    "Injury Admin",
-    "Admin Panel",
-    "Tournament Strategy",
-]
-
-# Initialize selected page in session state
-if 'selected_page' not in st.session_state:
-    st.session_state.selected_page = "Tournament Strategy"
-
-# Sidebar selectbox for navigation
-selected_page = st.sidebar.selectbox(
-    "Select View:",
-    tab_titles,
-    index=tab_titles.index(st.session_state.selected_page) if st.session_state.selected_page in tab_titles else 0,
-    key='page_selector'
-)
-
-# Update session state
-st.session_state.selected_page = selected_page
 
 matchup_spotlight_rows: list[Dict[str, Any]] = []
 daily_power_rows_points: list[Dict[str, Any]] = []
