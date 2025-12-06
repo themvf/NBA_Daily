@@ -4641,9 +4641,8 @@ with tournament_tab:
     # Database connection
     tourn_conn = get_connection(str(db_path))
 
-    # Date selector
-    col1, col2 = st.columns([1, 1])
-    with col1:
+    # Check if predictions table exists and has data
+    try:
         cursor = tourn_conn.cursor()
         cursor.execute("""
             SELECT DISTINCT game_date
@@ -4652,11 +4651,29 @@ with tournament_tab:
             LIMIT 30
         """)
         available_dates = [row[0] for row in cursor.fetchall()]
+    except Exception as e:
+        st.warning("⚠️ No predictions table found. Please run the 'Today's Games' tab first to generate predictions.")
+        st.info("""
+        **How to get started:**
+        1. Navigate to the "Today's Games" tab
+        2. Click "Generate Predictions" to analyze today's matchups
+        3. Come back to this tab to see ceiling-ranked players
+        """)
+        st.stop()
 
-        if not available_dates:
-            st.warning("No predictions available. Run 'Today's Games' tab first.")
-            st.stop()
+    if not available_dates:
+        st.warning("📊 No predictions available yet. Run 'Today's Games' tab first.")
+        st.info("""
+        **How to get started:**
+        1. Navigate to the "Today's Games" tab
+        2. Click "Generate Predictions" to analyze today's matchups
+        3. Come back to this tab to see ceiling-ranked players
+        """)
+        st.stop()
 
+    # Date selector
+    col1, col2 = st.columns([1, 1])
+    with col1:
         selected_date = st.selectbox(
             "Game Date",
             options=available_dates,
@@ -4696,7 +4713,12 @@ with tournament_tab:
         ORDER BY proj_ceiling DESC
     """
 
-    df = pd.read_sql_query(query, tourn_conn, params=[selected_date, min_ceiling])
+    try:
+        df = pd.read_sql_query(query, tourn_conn, params=[selected_date, min_ceiling])
+    except Exception as e:
+        st.error(f"❌ Error querying predictions: {str(e)}")
+        st.info("The predictions table may be missing required columns. Please regenerate predictions in the 'Today's Games' tab.")
+        st.stop()
 
     if df.empty:
         st.info(f"No players with ceiling >= {min_ceiling} PPG found for {selected_date}")
