@@ -4667,6 +4667,19 @@ if selected_page == "Injury Admin":
                 success = ia.remove_from_injury_list(injury_conn, player_id)
                 if success:
                     st.success(f"✅ {returned_player[1]} marked as returned")
+
+                    # Backup to S3 after injury status change
+                    try:
+                        storage = s3_storage.S3PredictionStorage()
+                        if storage.is_connected():
+                            backup_success, backup_message = storage.upload_database(db_path)
+                            if backup_success:
+                                st.sidebar.info("☁️ Database backed up to S3")
+                            else:
+                                st.sidebar.warning(f"⚠️ S3 backup failed: {backup_message}")
+                    except Exception as e:
+                        st.sidebar.warning(f"⚠️ S3 backup error: {str(e)}")
+
                     st.rerun()
                 else:
                     st.error("Failed to update injury status")
@@ -4734,6 +4747,19 @@ if selected_page == "Injury Admin":
 
                     if injury_id:
                         st.success(f"✅ Added {player_name} to injury list")
+
+                        # Backup to S3 after injury status change
+                        try:
+                            storage = s3_storage.S3PredictionStorage()
+                            if storage.is_connected():
+                                backup_success, backup_message = storage.upload_database(db_path)
+                                if backup_success:
+                                    st.sidebar.info("☁️ Database backed up to S3")
+                                else:
+                                    st.sidebar.warning(f"⚠️ S3 backup failed: {backup_message}")
+                        except Exception as e:
+                            st.sidebar.warning(f"⚠️ S3 backup error: {str(e)}")
+
                         st.rerun()
                     else:
                         st.warning(f"⚠️ {player_name} is already on the active injury list")
