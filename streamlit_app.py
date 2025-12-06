@@ -998,6 +998,72 @@ def calculate_daily_pick_score(
     return (final_score, grade, explanation)
 
 
+# Cache for opponent defense variance (updated once per season)
+_opponent_defense_variance_cache = {}
+
+def get_opponent_defense_ceiling_factor(opp_team_id: int, season: str = '2024-25') -> float:
+    """
+    Calculate opponent's defense variance ceiling factor for tournament play.
+
+    Ceiling factor = (90th percentile points allowed) / (avg points allowed)
+
+    Teams with high ceiling factors (1.15+) allow explosive scoring games more often,
+    making them ideal matchups for tournament strategy where you need 40-50+ point ceilings.
+
+    Args:
+        opp_team_id: Opponent team ID
+        season: NBA season (default: 2024-25)
+
+    Returns:
+        Ceiling factor (1.0-1.20), where:
+        - 1.15+ = Elite ceiling spot (allow 15%+ more in big games)
+        - 1.12-1.15 = Good ceiling matchup
+        - 1.10-1.12 = Above average variance
+        - <1.10 = Average/tight defense
+    """
+    cache_key = f"{season}_{opp_team_id}"
+
+    # Check cache first
+    if cache_key in _opponent_defense_variance_cache:
+        return _opponent_defense_variance_cache[cache_key]
+
+    try:
+        # Calculate defense variance from game logs
+        conn = sqlite3.connect(str(db_path))
+        cursor = conn.cursor()
+
+        # Get points scored against this team
+        cursor.execute("""
+            SELECT pts
+            FROM team_game_logs
+            WHERE opp_team_id = ?
+              AND season = ?
+        """, (opp_team_id, season))
+
+        pts_against = [row[0] for row in cursor.fetchall() if row[0] is not None]
+        conn.close()
+
+        if len(pts_against) < 15:
+            # Not enough games, return neutral factor
+            return 1.0
+
+        # Calculate ceiling factor
+        import numpy as np
+        avg_allowed = np.mean(pts_against)
+        p90_allowed = np.percentile(pts_against, 90)
+
+        ceiling_factor = p90_allowed / avg_allowed if avg_allowed > 0 else 1.0
+
+        # Cache result
+        _opponent_defense_variance_cache[cache_key] = ceiling_factor
+
+        return ceiling_factor
+
+    except Exception:
+        # If calculation fails, return neutral factor
+        return 1.0
+
+
 def calculate_smart_ppg_projection(
     season_avg: float,
     recent_avg_5: float | None,
@@ -1014,6 +1080,7 @@ def calculate_smart_ppg_projection(
     opponent_correlation: Optional[pca.OpponentCorrelation] = None,
     pace_split: Optional[dta.DefenseTypePerformance] = None,
     defense_quality_split: Optional[dta.DefenseTypePerformance] = None,
+    opp_team_id: Optional[int] = None,  # NEW: For defense variance ceiling boost
 ) -> tuple[float, float, float, float, dict, str]:
     """
     Calculate smart PPG projection using multi-factor weighted model.
@@ -1272,7 +1339,34 @@ def calculate_smart_ppg_projection(
         ceiling_uncertainty_bonus = 0.30 * uncertainty
 
     ceiling_multiplier = ceiling_base_multiplier + ceiling_uncertainty_bonus
-    ceiling = projection * (1 + ceiling_multiplier)
+
+    # TOURNAMENT ENHANCEMENT: Opponent defense variance boost
+    # Teams with high defensive variance allow explosive scoring games more often
+    # This is critical for tournament strategy - you want matchups that can produce 40-50+ ceilings
+    defense_variance_boost = 0.0
+    if opp_team_id is not None:
+        try:
+            ceiling_factor = get_opponent_defense_ceiling_factor(opp_team_id)
+
+            # Apply boost based on ceiling factor thresholds
+            if ceiling_factor >= 1.15:
+                # Elite ceiling spot (OKC, POR, DAL) - allow 15%+ more in big games
+                defense_variance_boost = 0.10  # +10% ceiling boost
+            elif ceiling_factor >= 1.12:
+                # Good ceiling matchup - allow 12-15% more in big games
+                defense_variance_boost = 0.06  # +6% ceiling boost
+            elif ceiling_factor >= 1.10:
+                # Above average variance - allow 10-12% more in big games
+                defense_variance_boost = 0.03  # +3% ceiling boost
+            # else: tight defense, no boost
+
+        except Exception:
+            # If calculation fails, no boost
+            pass
+
+    # Apply combined multiplier with defense variance boost
+    final_ceiling_multiplier = ceiling_multiplier + defense_variance_boost
+    ceiling = projection * (1 + final_ceiling_multiplier)
 
     # Build breakdown for transparency
     breakdown = {
@@ -2377,6 +2471,7 @@ with games_tab:
                                 opponent_correlation=opponent_correlation_obj,
                                 pace_split=pace_split_obj,
                                 defense_quality_split=defense_quality_split_obj,
+                                opp_team_id=opponent_id,  # NEW: For defense variance ceiling boost
                             )
 
                             # Calculate unified DFS Score
