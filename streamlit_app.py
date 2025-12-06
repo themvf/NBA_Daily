@@ -890,6 +890,8 @@ def _calculate_tournament_dfs_score(
     opp_def_rating: float | None,
     opp_team_id: int | None,
     league_avg_def_rating: float = 112.0,
+    injury_adjusted: bool = False,
+    projection_boost: float = 0.0,
 ) -> tuple[float, str, str]:
     """
     Calculate Tournament DFS Score optimized for winner-take-all contests.
@@ -1022,13 +1024,37 @@ def _calculate_tournament_dfs_score(
             defense_adjustment = -3
             factors.append("elite defense")
 
+    # 6. INJURY BENEFICIARY BONUS (0-12 points)
+    # Players who get boosted usage/minutes due to teammate injuries
+    # This is CRITICAL for tournaments - low ownership + spike potential
+    injury_bonus = 0
+    if injury_adjusted and projection_boost > 0:
+        # Projection boost indicates teammate(s) are OUT
+        # Scale bonus based on size of boost
+        if projection_boost >= 5.0:
+            # Massive boost (5+ PPG) - Star player out
+            injury_bonus = 12
+            factors.append("🔥 STAR OUT (major usage)")
+        elif projection_boost >= 3.0:
+            # Significant boost (3-5 PPG) - Key rotation player out
+            injury_bonus = 8
+            factors.append("key teammate out")
+        elif projection_boost >= 1.5:
+            # Moderate boost (1.5-3 PPG) - Rotation player out
+            injury_bonus = 5
+            factors.append("teammate out")
+
+        # Injury beneficiaries are often LOW OWNED (field can't react)
+        # This is PURE GOLD for tournaments - differentiation + upside
+
     # Calculate final score
     final_score = (
         ceiling_base +
         hot_streak_bonus +
         variance_bonus +
         matchup_bonus +
-        defense_adjustment
+        defense_adjustment +
+        injury_bonus
     )
     final_score = max(0, min(100, final_score))
 
@@ -1070,6 +1096,8 @@ def calculate_daily_pick_score(
     recent_avg_5: float | None = None,
     opp_team_id: int | None = None,
     tournament_mode: bool = False,
+    injury_adjusted: bool = False,
+    projection_boost: float = 0.0,
 ) -> tuple[float, str, str]:
     """
     Calculate unified DFS Score (0-100) combining all analytics.
@@ -1106,6 +1134,8 @@ def calculate_daily_pick_score(
             opp_def_rating=opp_def_rating,
             opp_team_id=opp_team_id,
             league_avg_def_rating=league_avg_def_rating,
+            injury_adjusted=injury_adjusted,
+            projection_boost=projection_boost,
         )
 
     # CASH GAME MODE (default - original logic)
@@ -5112,7 +5142,7 @@ with tournament_tab:
 
     st.divider()
 
-    # Query ceiling candidates (include recent_avg_5 and season_avg_ppg for tournament score)
+    # Query ceiling candidates (include injury data for tournament score bonus)
     query = """
         SELECT
             player_name,
@@ -5127,6 +5157,8 @@ with tournament_tab:
             opponent_def_rating,
             season_avg_ppg,
             recent_avg_5,
+            injury_adjusted,
+            injury_adjustment_amount,
             (proj_ceiling - proj_floor) as upside_range,
             ROUND((proj_ceiling - proj_floor) / projected_ppg, 2) as variance_ratio
         FROM predictions
@@ -5177,6 +5209,10 @@ with tournament_tab:
         # Calculate Tournament DFS Score for each player (different from cash game score)
         def calculate_tournament_score_row(row):
             try:
+                # Handle injury data (may be None/NaN for older predictions)
+                is_injury_adjusted = bool(row.get('injury_adjusted', False))
+                injury_boost = float(row.get('injury_adjustment_amount', 0.0)) if pd.notna(row.get('injury_adjustment_amount')) else 0.0
+
                 score, grade, explanation = calculate_daily_pick_score(
                     player_season_avg=row['season_avg_ppg'],
                     player_projection=row['projected_ppg'],
@@ -5188,6 +5224,9 @@ with tournament_tab:
                     recent_avg_5=row['recent_avg_5'],
                     opp_team_id=int(row['opponent_id']),
                     tournament_mode=True,
+                    # Injury beneficiary bonus
+                    injury_adjusted=is_injury_adjusted,
+                    projection_boost=injury_boost,
                 )
                 return pd.Series({'tourn_score': score, 'tourn_grade': grade})
             except Exception as e:
