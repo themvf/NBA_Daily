@@ -5440,14 +5440,14 @@ with tournament_tab:
                     st.session_state.lineup_b = lineups[1]
                     st.session_state.lineup_c = lineups[2]
                     st.success("✅ Lineups auto-generated! Review and adjust below.")
-                    st.rerun()
+                    # Don't rerun - let Streamlit handle the state update naturally
 
         with button_col2:
             if st.button("🔄 Clear All Lineups", use_container_width=True):
                 st.session_state.lineup_a = ['[Select Player]', '[Select Player]', '[Select Player]']
                 st.session_state.lineup_b = ['[Select Player]', '[Select Player]', '[Select Player]']
                 st.session_state.lineup_c = ['[Select Player]', '[Select Player]', '[Select Player]']
-                st.rerun()
+                # Don't rerun - let Streamlit handle the state update naturally
 
         st.divider()
 
