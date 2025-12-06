@@ -5430,8 +5430,13 @@ with tournament_tab:
 
         # Auto-generate button
         button_col1, button_col2 = st.columns([1, 3])
+
+        # Initialize widget refresh counter if needed
+        if 'lineup_refresh_counter' not in st.session_state:
+            st.session_state.lineup_refresh_counter = 0
+
         with button_col1:
-            if st.button("🤖 Auto-Generate Optimal Lineups", type="primary", use_container_width=True):
+            if st.button("🤖 Auto-Generate Optimal Lineups", type="primary", use_container_width=True, key='auto_gen_btn'):
                 lineups, error = auto_generate_lineups(player_options)
                 if error:
                     st.error(error)
@@ -5439,15 +5444,16 @@ with tournament_tab:
                     st.session_state.lineup_a = lineups[0]
                     st.session_state.lineup_b = lineups[1]
                     st.session_state.lineup_c = lineups[2]
-                    st.success("✅ Lineups auto-generated! Review and adjust below.")
-                    # Don't rerun - let Streamlit handle the state update naturally
+                    st.session_state.lineup_refresh_counter += 1
+                    st.rerun()
 
         with button_col2:
-            if st.button("🔄 Clear All Lineups", use_container_width=True):
+            if st.button("🔄 Clear All Lineups", use_container_width=True, key='clear_btn'):
                 st.session_state.lineup_a = ['[Select Player]', '[Select Player]', '[Select Player]']
                 st.session_state.lineup_b = ['[Select Player]', '[Select Player]', '[Select Player]']
                 st.session_state.lineup_c = ['[Select Player]', '[Select Player]', '[Select Player]']
-                # Don't rerun - let Streamlit handle the state update naturally
+                st.session_state.lineup_refresh_counter += 1
+                st.rerun()
 
         st.divider()
 
