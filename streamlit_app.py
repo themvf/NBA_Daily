@@ -5142,28 +5142,33 @@ if selected_page == "Tournament Strategy":
     st.divider()
 
     # Query ceiling candidates (include injury data for tournament score bonus)
+    # Exclude players marked as injured in injury_list
     query = """
         SELECT
-            player_name,
-            team_name,
-            opponent_name,
-            opponent_id,
-            projected_ppg,
-            proj_ceiling,
-            proj_floor,
-            dfs_score,
-            dfs_grade,
-            opponent_def_rating,
-            season_avg_ppg,
-            recent_avg_5,
-            injury_adjusted,
-            injury_adjustment_amount,
-            (proj_ceiling - proj_floor) as upside_range,
-            ROUND((proj_ceiling - proj_floor) / projected_ppg, 2) as variance_ratio
-        FROM predictions
-        WHERE game_date = ?
-          AND proj_ceiling >= ?
-        ORDER BY proj_ceiling DESC
+            p.player_name,
+            p.team_name,
+            p.opponent_name,
+            p.opponent_id,
+            p.projected_ppg,
+            p.proj_ceiling,
+            p.proj_floor,
+            p.dfs_score,
+            p.dfs_grade,
+            p.opponent_def_rating,
+            p.season_avg_ppg,
+            p.recent_avg_5,
+            p.injury_adjusted,
+            p.injury_adjustment_amount,
+            (p.proj_ceiling - p.proj_floor) as upside_range,
+            ROUND((p.proj_ceiling - p.proj_floor) / p.projected_ppg, 2) as variance_ratio
+        FROM predictions p
+        LEFT JOIN injury_list il ON p.player_name = il.player_name
+            AND p.team_name = il.team_name
+            AND il.status = 'active'
+        WHERE p.game_date = ?
+          AND p.proj_ceiling >= ?
+          AND il.player_name IS NULL  -- Exclude active injuries
+        ORDER BY p.proj_ceiling DESC
     """
 
     try:
