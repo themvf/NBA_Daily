@@ -10,7 +10,7 @@ The **GPP Score** (Guaranteed Prize Pool Score) is a tournament-optimized scorin
 
 ### Total Range: 0-100 points
 
-The GPP Score combines **5 weighted components**:
+The GPP Score combines **6 weighted components**:
 
 ### 1. **Ceiling Base Score (0-50 points)** - 50% weight
 
@@ -99,6 +99,52 @@ Minor bonus/penalty based on opponent's defensive rating vs league average (112.
 | <106 (elite) | -5 |
 
 **Why it matters:** Small tiebreaker for elite vs weak defenses.
+
+---
+
+### 6. **Injury Beneficiary Bonus (0-12 points)** - 12% weight 🔥
+
+**CRITICAL FOR TOURNAMENTS** - Players who get boosted usage/minutes when teammates are injured.
+
+| Projection Boost | Points | Flag |
+|-----------------|--------|------|
+| 5.0+ PPG (star out) | 12 | 🔥 STAR OUT (major usage) |
+| 3.0-4.9 PPG (key player out) | 8 | key teammate out |
+| 1.5-2.9 PPG (rotation out) | 5 | teammate out |
+| <1.5 PPG or no injury | 0 | - |
+
+**Example:**
+- **Austin Reaves** when LeBron & AD are OUT:
+  - Base projection: 18 PPG
+  - Injury boost: +3.5 PPG (teammate analysis shows he averages 21.5 when they sit)
+  - Injury bonus: **+8 points** (key teammate out tier)
+  - Recent L5: 32.4 PPG (hot streak already captures his recent explosions)
+  - **Total GPP Score boost:** 8 points (can jump from "Playable" to "Strong")
+
+**Why this is GOLD for tournaments:**
+
+1. **Low Ownership Edge**: Public can't react to late scratches (6:30 PM injury reports)
+   - Field sets lineups by 6 PM
+   - Late injury announced at 6:35 PM
+   - Only ~5-10% of field can swap in beneficiary
+   - You get 35+ point upside at <10% ownership = PURE GOLD
+
+2. **Proven Usage Spike**: System calculates boost from historical data
+   - Austin Reaves: Averages +15% usage when LeBron out
+   - Not guessing - using actual teammate correlation analytics
+   - injury_impact_analytics module tracks every absence
+
+3. **Differentiation**: Even if hot streak is already captured in L5 avg, the injury bonus explicitly flags this as a tournament priority
+   - Helps you identify the REASON for the hot streak
+   - If it's injury-driven, it's more sustainable (while teammate is out)
+   - Different than a random hot streak that might regress
+
+**How to Use:**
+1. Check "Injury Admin" tab before tournaments (4 PM daily)
+2. Mark late-scratch players as OUT
+3. System auto-boosts teammate projections via `apply_injury_adjustments()`
+4. Tournament tab shows boosted players with injury bonus in GPP Score
+5. Target players with 🔥 STAR OUT flag for maximum edge
 
 ---
 
@@ -286,7 +332,9 @@ Public consensus focuses on projections (28+ PPG). GPP Score highlights contrari
 
 **GPP Score Formula:**
 ```
-GPP Score = Ceiling Base (50%) + Hot Streak (20%) + Defense Variance (15%) + Matchup History (10%) + Defense Quality (5%)
+GPP Score = Ceiling Base (50%) + Hot Streak (20%) + Defense Variance (15%) + Matchup History (10%) + Defense Quality (5%) + Injury Beneficiary (12%)
+
+Note: Total can exceed 100% weighting because injury bonus is situational (only applies when teammate is OUT)
 ```
 
 **Target Lineup:**
