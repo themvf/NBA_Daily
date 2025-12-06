@@ -2282,6 +2282,9 @@ for metric_col, (label, query) in zip(metric_cols, summary_queries.items()):
     except Exception as exc:  # noqa: BLE001 - surface errors to the UI
         metric_col.error(f"{label}: {exc}")
 
+# Sidebar navigation
+st.sidebar.title("📊 Navigation")
+
 tab_titles = [
     "Today's Games",
     "Matchup Spotlight",
@@ -2299,25 +2302,21 @@ tab_titles = [
     "Admin Panel",
     "Tournament Strategy",
 ]
-tabs = st.tabs(tab_titles)
-(
-    games_tab,
-    matchup_spotlight_tab,
-    daily_leaders_tab,
-    injury_impact_tab,
-    standings_tab,
-    three_pt_tab,
-    scoring_tab,
-    defense_3pt_tab,
-    defense_pts_tab,
-    defense_mix_tab,
-    predictions_tab,
-    defense_styles_tab,
-    injury_admin_tab,
-    admin_tab,
-    tournament_tab,
-) = tabs
-defense_style_tab = st.tabs(["Defense Styles"])[0]
+
+# Initialize selected page in session state
+if 'selected_page' not in st.session_state:
+    st.session_state.selected_page = "Tournament Strategy"
+
+# Sidebar selectbox for navigation
+selected_page = st.sidebar.selectbox(
+    "Select View:",
+    tab_titles,
+    index=tab_titles.index(st.session_state.selected_page) if st.session_state.selected_page in tab_titles else 0,
+    key='page_selector'
+)
+
+# Update session state
+st.session_state.selected_page = selected_page
 
 matchup_spotlight_rows: list[Dict[str, Any]] = []
 daily_power_rows_points: list[Dict[str, Any]] = []
@@ -2327,7 +2326,7 @@ player_season_stats_map: Dict[int, Mapping[str, Any]] = {}
 game_totals_by_game: Dict[str, Dict[str, Any]] = {}  # Track team totals by game_id
 
 # Today's games tab --------------------------------------------------------
-with games_tab:
+if selected_page == "Today's Games":
     # Get database connection for logging predictions
     games_conn = get_connection(str(db_path))
     # Ensure predictions table exists
@@ -3157,7 +3156,7 @@ with games_tab:
                 st.caption("S3 backup not configured")
 
 # Matchup spotlight tab ----------------------------------------------------
-with matchup_spotlight_tab:
+if selected_page == "Matchup Spotlight":
     st.subheader("Player Matchup Spotlight")
     if not matchup_spotlight_rows:
         st.info("Run the Today's Games tab to populate matchup insights.")
@@ -3370,7 +3369,7 @@ with matchup_spotlight_tab:
             st.warning(f"Unable to load daily top scorers: {exc}")
 
 # Daily leaders tab --------------------------------------------------------
-with daily_leaders_tab:
+if selected_page == "Daily Leaders":
     st.subheader("Daily Top Scorers (Top 3 per day)")
     if not daily_top_scorers_rows:
         st.info("Run the Today's Games tab to populate the leaders table.")
@@ -3412,7 +3411,7 @@ with daily_leaders_tab:
         st.dataframe(display_df, use_container_width=True, hide_index=True)
 
 # Standings tab -------------------------------------------------------------
-with standings_tab:
+if selected_page == "Standings":
     st.subheader("League Standings")
     seasons = fetch_distinct_values(str(db_path), "standings", "season")
     season = st.selectbox("Season", options=seasons, index=0 if seasons else None)
@@ -3440,7 +3439,7 @@ with standings_tab:
         st.info("Standings data not available in the database.")
 
 # 3PT Leaders tab ----------------------------------------------------------
-with three_pt_tab:
+if selected_page == "3PT Leaders":
     st.subheader("Player 3PT Leaders View")
     row_limit = st.slider("Rows to display", min_value=10, max_value=100, value=25, step=5)
     try:
@@ -3463,7 +3462,7 @@ with three_pt_tab:
         st.warning(f"Three-point leaderboard view not available: {exc}")
 
 # Scoring leaders tab ------------------------------------------------------
-with scoring_tab:
+if selected_page == "Scoring Leaders":
     st.subheader("Player Scoring Leaders View")
     row_limit_pts = st.slider("Rows to display ", min_value=10, max_value=100, value=25, step=5, key="pts_slider")
     try:
@@ -3485,7 +3484,7 @@ with scoring_tab:
         st.warning(f"Scoring leaderboard view not available: {exc}")
 
 # 3PT Defense tab ----------------------------------------------------------
-with defense_3pt_tab:
+if selected_page == "3PT Defense":
     st.subheader("Team 3PT Defense View")
     try:
         defense_query = """
@@ -3504,7 +3503,7 @@ with defense_3pt_tab:
         st.warning(f"3PT defensive view not available: {exc}")
 
 # Points allowed tab -------------------------------------------------------
-with defense_pts_tab:
+if selected_page == "Points Allowed":
     st.subheader("Team Points Allowed View")
     try:
         pts_def_query = """
@@ -3522,7 +3521,7 @@ with defense_pts_tab:
         st.warning(f"Points-allowed view not available: {exc}")
 
 # Defense mix tab ----------------------------------------------------------
-with defense_mix_tab:
+if selected_page == "Defense Mix":
     st.subheader("Team Defense Mix (Points vs 3PM)")
     try:
         mix_query = """
@@ -3568,7 +3567,7 @@ with defense_mix_tab:
         st.warning(f"Defense mix view not available: {exc}")
 
 # Defense styles tab -------------------------------------------------------
-with defense_styles_tab:
+if selected_page == "Defense Styles":
     st.subheader("Team Defense Styles")
     try:
         styles_df = load_team_defense_stats(
@@ -3661,7 +3660,7 @@ with defense_styles_tab:
         st.warning(f"Unable to load defense styles: {exc}")
 
 # Player Impact tab --------------------------------------------------------
-with injury_impact_tab:
+if selected_page == "Player Impact":
     st.subheader("Player Impact Analysis")
     st.markdown(
         "Comprehensive player performance analysis across multiple dimensions: "
@@ -4323,7 +4322,7 @@ with injury_impact_tab:
                 st.code(traceback.format_exc())
 
 # Prediction tab -----------------------------------------------------------
-with predictions_tab:
+if selected_page == "Prediction Log":
     st.subheader("📊 Prediction Accuracy Tracker")
     st.caption("Track projection accuracy vs actual performance to improve the model")
 
@@ -4627,7 +4626,7 @@ with predictions_tab:
                     st.error(f"Error: {e}")
 
 # Injury Admin Tab --------------------------------------------------------
-with injury_admin_tab:
+if selected_page == "Injury Admin":
     st.header("🚑 Injury Administration")
     st.write("Manage injured players and adjust predictions for teammate impacts")
 
@@ -4933,7 +4932,7 @@ with injury_admin_tab:
         st.error(f"Could not load refresh status: {e}")
 
 # Admin Panel tab --------------------------------------------------------
-with admin_tab:
+if selected_page == "Admin Panel":
     st.header("🔧 Admin Panel")
     st.write("One-click data updates and prediction scoring")
 
@@ -5083,7 +5082,7 @@ with admin_tab:
 # ============================================================================
 # TOURNAMENT STRATEGY TAB - PHASE 1: BASIC CEILING ANALYSIS
 # ============================================================================
-with tournament_tab:
+if selected_page == "Tournament Strategy":
     st.header("🏆 Tournament Strategy - Winner-Take-All")
     st.caption("Ceiling-focused player selection for 3-player tournaments vs 2,500 opponents")
 
