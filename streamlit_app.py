@@ -1064,6 +1064,95 @@ def get_opponent_defense_ceiling_factor(opp_team_id: int, season: str = '2024-25
         return 1.0
 
 
+def get_opponent_defense_grade(opp_team_id: int, opp_def_rating: float | None, season: str = '2024-25') -> str:
+    """
+    Generate opponent defense grade for tournament strategy.
+
+    Combines defense quality (def rating) with variance (ceiling factor) to categorize matchups.
+
+    Args:
+        opp_team_id: Opponent team ID
+        opp_def_rating: Opponent's defensive rating (points allowed per 100 possessions)
+        season: NBA season (default: 2024-25)
+
+    Returns:
+        Grade string indicating matchup quality:
+        - "A+ Elite Spot" = Bad defense + high variance (dream matchup)
+        - "A Smash Spot" = Bad defense + good variance
+        - "A- Variance Play" = Good defense but high variance (boom/bust)
+        - "B+ Good Matchup" = Average defense + good variance
+        - "B Solid" = Good matchup overall
+        - "C+ Playable" = Slightly favorable
+        - "C Neutral" = Average matchup
+        - "D Tough" = Good defense, low variance
+        - "F Avoid" = Elite defense, low variance
+    """
+    # Get ceiling factor (variance)
+    ceiling_factor = get_opponent_defense_ceiling_factor(opp_team_id, season)
+
+    # Default league average if no def rating
+    if opp_def_rating is None:
+        opp_def_rating = 112.0
+
+    # Categorize defense quality (lower is better defense)
+    # League average ~112, Elite defense ~105, Poor defense ~118+
+    if opp_def_rating >= 118:
+        def_quality = "bad"  # Poor defense
+    elif opp_def_rating >= 114:
+        def_quality = "below_avg"  # Below average
+    elif opp_def_rating >= 110:
+        def_quality = "avg"  # Average
+    elif opp_def_rating >= 107:
+        def_quality = "good"  # Good defense
+    else:
+        def_quality = "elite"  # Elite defense
+
+    # Categorize variance (ceiling factor)
+    if ceiling_factor >= 1.15:
+        variance = "elite"  # Elite ceiling spot
+    elif ceiling_factor >= 1.12:
+        variance = "good"  # Good variance
+    elif ceiling_factor >= 1.10:
+        variance = "above_avg"  # Above average
+    else:
+        variance = "low"  # Tight/consistent defense
+
+    # Combine into tournament grade
+    grade_matrix = {
+        # Bad defense matchups
+        ("bad", "elite"): "A+ Elite Spot",
+        ("bad", "good"): "A Smash Spot",
+        ("bad", "above_avg"): "A- Great Spot",
+        ("bad", "low"): "B+ Good Matchup",
+
+        # Below average defense
+        ("below_avg", "elite"): "A Elite Variance",
+        ("below_avg", "good"): "A- Smash Spot",
+        ("below_avg", "above_avg"): "B+ Good Matchup",
+        ("below_avg", "low"): "B Solid",
+
+        # Average defense
+        ("avg", "elite"): "A- Variance Play",
+        ("avg", "good"): "B+ Boom/Bust",
+        ("avg", "above_avg"): "B Playable",
+        ("avg", "low"): "C+ Neutral+",
+
+        # Good defense (harder matchup but variance helps)
+        ("good", "elite"): "B Variance Play",
+        ("good", "good"): "B- Boom/Bust",
+        ("good", "above_avg"): "C+ Playable",
+        ("good", "low"): "C Tough",
+
+        # Elite defense (avoid unless high variance)
+        ("elite", "elite"): "B- High Variance",
+        ("elite", "good"): "C Boom/Bust",
+        ("elite", "above_avg"): "C- Risky",
+        ("elite", "low"): "D Avoid",
+    }
+
+    return grade_matrix.get((def_quality, variance), "C Neutral")
+
+
 def calculate_smart_ppg_projection(
     season_avg: float,
     recent_avg_5: float | None,
@@ -4826,6 +4915,7 @@ with tournament_tab:
             player_name,
             team_name,
             opponent_name,
+            opponent_id,
             projected_ppg,
             proj_ceiling,
             proj_floor,
@@ -4867,6 +4957,18 @@ with tournament_tab:
         st.subheader(f"🎯 Ceiling Candidates ({selected_date})")
         st.caption("Players ranked by explosive scoring potential (proj_ceiling)")
 
+        # Calculate Opponent Defense Grade for each player
+        def calculate_opp_def_grade_row(row):
+            try:
+                return get_opponent_defense_grade(
+                    opp_team_id=int(row['opponent_id']),
+                    opp_def_rating=row['opponent_def_rating']
+                )
+            except:
+                return "C Neutral"
+
+        df['opp_def_grade'] = df.apply(calculate_opp_def_grade_row, axis=1)
+
         # Format display dataframe
         display_df = df.copy()
         display_df = display_df.rename(columns={
@@ -4877,6 +4979,7 @@ with tournament_tab:
             'proj_ceiling': 'Ceiling',
             'proj_floor': 'Floor',
             'opponent_def_rating': 'Opp Def',
+            'opp_def_grade': 'Opp Def Grade',
             'dfs_score': 'DFS Score',
             'dfs_grade': 'Grade',
             'upside_range': 'Range',
@@ -4891,20 +4994,47 @@ with tournament_tab:
         display_df['DFS Score'] = display_df['DFS Score'].round(1)
         display_df['Range'] = display_df['Range'].round(1)
 
+        # Select and reorder columns for display
+        display_columns = [
+            'Player', 'Team', 'Opponent', 'Proj PPG', 'Ceiling', 'Floor',
+            'Opp Def Grade', 'Opp Def', 'Range', 'Variance', 'DFS Score', 'Grade'
+        ]
+
         st.dataframe(
-            display_df,
+            display_df[display_columns],
             use_container_width=True,
             hide_index=True,
             height=400
         )
 
-        # Insight box
+        # Insight box with grade legend
         st.info("""
-        **💡 Tournament Strategy Tip:**
-        - **Ceiling > Projection**: Pick players with highest ceiling, not highest projection
+        **💡 Tournament Strategy Guide:**
+
+        **Key Columns:**
+        - **Ceiling**: 90th percentile outcome (explosive game potential)
+        - **Opp Def Grade**: Tournament matchup quality (combines defense quality + variance)
         - **Variance Ratio**: Higher = boom/bust profile (good for tournaments)
-        - **Target**: Combined ceiling of 105+ for your 3-player lineup
+
+        **Opp Def Grade Legend:**
+        - **A+ Elite Spot**: Bad defense + high variance (dream matchup!)
+        - **A Smash Spot**: Bad defense + good variance
+        - **A- Variance Play**: Tight defense but allows big games (boom/bust)
+        - **B+ Good Matchup**: Above average ceiling potential
+        - **B Solid/Playable**: Decent matchup
+        - **C Neutral/Tough**: Average matchup
+        - **D Avoid**: Elite tight defense (low ceiling potential)
+
+        **Target**: Combined ceiling of 105+ for your 3-player lineup
+        **Priority**: Focus on A+/A/A- grades for maximum ceiling differentiation
         """)
+
+        # Add grade distribution summary
+        grade_counts = display_df['Opp Def Grade'].value_counts()
+        if not grade_counts.empty:
+            st.caption("**Opp Def Grade Distribution:**")
+            grade_summary = " | ".join([f"{grade}: {count}" for grade, count in grade_counts.head(5).items()])
+            st.caption(grade_summary)
 
 st.divider()
 st.caption(
