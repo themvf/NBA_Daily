@@ -1849,6 +1849,7 @@ tab_titles = [
     "Defense Styles",
     "Injury Admin",
     "Admin Panel",
+    "Tournament Strategy",
 ]
 tabs = st.tabs(tab_titles)
 (
@@ -1866,6 +1867,7 @@ tabs = st.tabs(tab_titles)
     defense_styles_tab,
     injury_admin_tab,
     admin_tab,
+    tournament_tab,
 ) = tabs
 defense_style_tab = st.tabs(["Defense Styles"])[0]
 
@@ -4628,6 +4630,131 @@ with admin_tab:
                     import traceback
                     with st.expander("🔍 Full Error Traceback", expanded=True):
                         st.code(traceback.format_exc(), language="python")
+
+# ============================================================================
+# TOURNAMENT STRATEGY TAB - PHASE 1: BASIC CEILING ANALYSIS
+# ============================================================================
+with tournament_tab:
+    st.header("🏆 Tournament Strategy - Winner-Take-All")
+    st.caption("Ceiling-focused player selection for 3-player tournaments vs 2,500 opponents")
+
+    # Database connection
+    tourn_conn = get_connection(str(db_path))
+
+    # Date selector
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        cursor = tourn_conn.cursor()
+        cursor.execute("""
+            SELECT DISTINCT game_date
+            FROM predictions
+            ORDER BY game_date DESC
+            LIMIT 30
+        """)
+        available_dates = [row[0] for row in cursor.fetchall()]
+
+        if not available_dates:
+            st.warning("No predictions available. Run 'Today's Games' tab first.")
+            st.stop()
+
+        selected_date = st.selectbox(
+            "Game Date",
+            options=available_dates,
+            index=0,
+            key="tourn_date_select"
+        )
+
+    with col2:
+        min_ceiling = st.slider(
+            "Minimum Ceiling (PPG)",
+            min_value=25,
+            max_value=45,
+            value=35,
+            step=1,
+            help="Filter for explosive scoring potential"
+        )
+
+    st.divider()
+
+    # Query ceiling candidates
+    query = """
+        SELECT
+            player_name,
+            team_name,
+            opponent_name,
+            projected_ppg,
+            proj_ceiling,
+            proj_floor,
+            matchup_rating,
+            dfs_score,
+            dfs_grade,
+            (proj_ceiling - proj_floor) as upside_range,
+            ROUND((proj_ceiling - proj_floor) / projected_ppg, 2) as variance_ratio
+        FROM predictions
+        WHERE game_date = ?
+          AND proj_ceiling >= ?
+        ORDER BY proj_ceiling DESC
+    """
+
+    df = pd.read_sql_query(query, tourn_conn, params=[selected_date, min_ceiling])
+
+    if df.empty:
+        st.info(f"No players with ceiling >= {min_ceiling} PPG found for {selected_date}")
+    else:
+        # Display key metrics
+        metric_cols = st.columns(4)
+        with metric_cols[0]:
+            st.metric("Ceiling Candidates", len(df))
+        with metric_cols[1]:
+            st.metric("Avg Ceiling", f"{df['proj_ceiling'].mean():.1f}")
+        with metric_cols[2]:
+            st.metric("Max Ceiling", f"{df['proj_ceiling'].max():.1f}")
+        with metric_cols[3]:
+            st.metric("Avg Variance", f"{df['variance_ratio'].mean():.2f}")
+
+        st.divider()
+
+        # Display ceiling candidates table
+        st.subheader(f"🎯 Ceiling Candidates ({selected_date})")
+        st.caption("Players ranked by explosive scoring potential (proj_ceiling)")
+
+        # Format display dataframe
+        display_df = df.copy()
+        display_df = display_df.rename(columns={
+            'player_name': 'Player',
+            'team_name': 'Team',
+            'opponent_name': 'Opponent',
+            'projected_ppg': 'Proj PPG',
+            'proj_ceiling': 'Ceiling',
+            'proj_floor': 'Floor',
+            'matchup_rating': 'Matchup',
+            'dfs_score': 'DFS Score',
+            'dfs_grade': 'Grade',
+            'upside_range': 'Range',
+            'variance_ratio': 'Variance'
+        })
+
+        # Round numeric columns
+        display_df['Proj PPG'] = display_df['Proj PPG'].round(1)
+        display_df['Ceiling'] = display_df['Ceiling'].round(1)
+        display_df['Floor'] = display_df['Floor'].round(1)
+        display_df['DFS Score'] = display_df['DFS Score'].round(1)
+        display_df['Range'] = display_df['Range'].round(1)
+
+        st.dataframe(
+            display_df,
+            use_container_width=True,
+            hide_index=True,
+            height=400
+        )
+
+        # Insight box
+        st.info("""
+        **💡 Tournament Strategy Tip:**
+        - **Ceiling > Projection**: Pick players with highest ceiling, not highest projection
+        - **Variance Ratio**: Higher = boom/bust profile (good for tournaments)
+        - **Target**: Combined ceiling of 105+ for your 3-player lineup
+        """)
 
 st.divider()
 st.caption(
