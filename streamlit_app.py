@@ -4680,6 +4680,9 @@ if selected_page == "Injury Admin":
                     except Exception as e:
                         st.sidebar.warning(f"⚠️ S3 backup error: {str(e)}")
 
+                    # Clear cached database connection to force fresh query
+                    st.cache_resource.clear()
+
                     st.rerun()
                 else:
                     st.error("Failed to update injury status")
@@ -4759,6 +4762,9 @@ if selected_page == "Injury Admin":
                                     st.sidebar.warning(f"⚠️ S3 backup failed: {backup_message}")
                         except Exception as e:
                             st.sidebar.warning(f"⚠️ S3 backup error: {str(e)}")
+
+                        # Clear cached database connection to force fresh query
+                        st.cache_resource.clear()
 
                         st.rerun()
                     else:
