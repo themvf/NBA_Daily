@@ -881,6 +881,183 @@ def evaluate_matchup_quality(
     return ("Neutral", "", 0.0)
 
 
+def _calculate_tournament_dfs_score(
+    player_season_avg: float,
+    player_projection: float,
+    proj_ceiling: float,
+    recent_avg_5: float | None,
+    matchup_rating: str,
+    opp_def_rating: float | None,
+    opp_team_id: int | None,
+    league_avg_def_rating: float = 112.0,
+) -> tuple[float, str, str]:
+    """
+    Calculate Tournament DFS Score optimized for winner-take-all contests.
+
+    Tournament strategy emphasizes:
+    1. CEILING (explosive potential) over projection
+    2. Recent hot streaks (momentum = higher boom probability)
+    3. Opponent defense variance (allows big games?)
+    4. Upside/variance (boom/bust is GOOD, not bad)
+
+    Returns higher scores for:
+    - High ceilings (40-50+) even if inconsistent
+    - Players on hot streaks (last 5 > season avg)
+    - Matchups vs high-variance defenses
+    - Boom/bust profiles over consistent mid-range players
+
+    Args:
+        player_season_avg: Season average PPG
+        player_projection: Today's projection
+        proj_ceiling: 90th percentile ceiling
+        recent_avg_5: Last 5 games average (for hot streak detection)
+        matchup_rating: Player-specific matchup quality
+        opp_def_rating: Opponent defensive rating
+        opp_team_id: Opponent team ID (for variance lookup)
+        league_avg_def_rating: League average
+
+    Returns:
+        (score 0-100, grade, explanation)
+    """
+    factors = []
+
+    # 1. CEILING BASE SCORE (0-50 range) - Most important factor
+    # Tournament winners need 40-50+ ceilings, not 28 PPG projections
+    if proj_ceiling >= 50:
+        ceiling_base = 50
+        factors.append("elite 50+ ceiling")
+    elif proj_ceiling >= 45:
+        ceiling_base = 46
+        factors.append("monster 45+ ceiling")
+    elif proj_ceiling >= 40:
+        ceiling_base = 42
+        factors.append("huge 40+ ceiling")
+    elif proj_ceiling >= 35:
+        ceiling_base = 35
+        factors.append("strong 35+ ceiling")
+    elif proj_ceiling >= 30:
+        ceiling_base = 25
+        factors.append("decent 30+ ceiling")
+    else:
+        ceiling_base = max(0, (proj_ceiling - 15) * 1.5)
+        factors.append("limited ceiling")
+
+    # 2. HOT STREAK BONUS (0-20 points) - Recent form heavily weighted
+    # Players on hot streaks are more likely to have explosive games
+    hot_streak_bonus = 0
+    if recent_avg_5 is not None and player_season_avg > 0:
+        hot_streak_ratio = recent_avg_5 / player_season_avg
+
+        if hot_streak_ratio >= 1.25:
+            # On FIRE (25%+ above season avg)
+            hot_streak_bonus = 20
+            factors.append("ON FIRE (L5 +25%)")
+        elif hot_streak_ratio >= 1.15:
+            # Very hot (15-25% above avg)
+            hot_streak_bonus = 15
+            factors.append("very hot L5")
+        elif hot_streak_ratio >= 1.05:
+            # Warm (5-15% above avg)
+            hot_streak_bonus = 10
+            factors.append("trending up")
+        elif hot_streak_ratio <= 0.85:
+            # Cold (15%+ below avg)
+            hot_streak_bonus = -5
+            factors.append("cold streak")
+        elif hot_streak_ratio <= 0.95:
+            # Slightly cool
+            hot_streak_bonus = 0
+            factors.append("slightly cool")
+        else:
+            # Steady
+            hot_streak_bonus = 5
+            factors.append("steady")
+
+    # 3. OPPONENT DEFENSE VARIANCE BONUS (0-15 points)
+    # High-variance defenses allow explosive games
+    variance_bonus = 0
+    if opp_team_id is not None:
+        try:
+            ceiling_factor = get_opponent_defense_ceiling_factor(opp_team_id)
+
+            if ceiling_factor >= 1.15:
+                variance_bonus = 15
+                factors.append("elite variance matchup")
+            elif ceiling_factor >= 1.12:
+                variance_bonus = 10
+                factors.append("good variance matchup")
+            elif ceiling_factor >= 1.10:
+                variance_bonus = 5
+                factors.append("above avg variance")
+            # else: no bonus for tight defenses
+        except:
+            pass
+
+    # 4. MATCHUP HISTORY BONUS (0-10 points)
+    # Less important than cash games but still relevant
+    matchup_adjustments = {
+        "Excellent": 10,
+        "Good": 7,
+        "Neutral": 3,
+        "Difficult": 0,
+        "Avoid": -5,
+    }
+    matchup_bonus = matchup_adjustments.get(matchup_rating, 3)
+
+    if matchup_rating == "Excellent":
+        factors.append("excels vs this team")
+    elif matchup_rating == "Good":
+        factors.append("favorable history")
+
+    # 5. DEFENSE QUALITY ADJUSTMENT (±5 points)
+    # Weaker defense helps ceiling, but variance is more important
+    defense_adjustment = 0
+    if opp_def_rating is not None:
+        if opp_def_rating >= 118:
+            defense_adjustment = 5
+            factors.append("weak defense")
+        elif opp_def_rating >= 114:
+            defense_adjustment = 3
+        elif opp_def_rating <= 106:
+            defense_adjustment = -3
+            factors.append("elite defense")
+
+    # Calculate final score
+    final_score = (
+        ceiling_base +
+        hot_streak_bonus +
+        variance_bonus +
+        matchup_bonus +
+        defense_adjustment
+    )
+    final_score = max(0, min(100, final_score))
+
+    # Build explanation
+    explanation = ", ".join(factors[:4])  # Top 4 factors
+
+    # Grade with tournament-specific thresholds
+    if final_score >= 85:
+        grade = "🔥🔥 GPP Lock"
+        explanation = f"GPP Lock: {explanation}"
+    elif final_score >= 75:
+        grade = "🔥 Core Play"
+        explanation = f"Core play: {explanation}"
+    elif final_score >= 65:
+        grade = "⭐ Strong"
+        explanation = f"Strong: {explanation}"
+    elif final_score >= 55:
+        grade = "✓ Playable"
+        explanation = f"Playable: {explanation}"
+    elif final_score >= 45:
+        grade = "⚠️ Punt/Fade"
+        explanation = f"Punt: {explanation}"
+    else:
+        grade = "❌ Avoid"
+        explanation = f"Avoid: {explanation}"
+
+    return (final_score, grade, explanation)
+
+
 def calculate_daily_pick_score(
     player_season_avg: float,
     player_projection: float,
@@ -888,12 +1065,20 @@ def calculate_daily_pick_score(
     matchup_rating: str,
     opp_def_rating: float | None,
     league_avg_def_rating: float = 112.0,
+    # NEW: Tournament-specific parameters
+    proj_ceiling: float | None = None,
+    recent_avg_5: float | None = None,
+    opp_team_id: int | None = None,
+    tournament_mode: bool = False,
 ) -> tuple[float, str, str]:
     """
     Calculate unified DFS Score (0-100) combining all analytics.
 
     This score answers: "How good is this player as a pick TODAY?"
-    Combines: projection, matchup history, opponent defense, confidence.
+
+    Two modes:
+    - Cash game mode (default): Optimizes for projection accuracy and consistency
+    - Tournament mode: Optimizes for ceiling, recent hot streaks, and opponent variance
 
     Args:
         player_season_avg: Player's season average PPG
@@ -902,10 +1087,28 @@ def calculate_daily_pick_score(
         matchup_rating: Player-specific matchup quality
         opp_def_rating: Opponent's defensive rating
         league_avg_def_rating: League average for comparison
+        proj_ceiling: Player's 90th percentile ceiling (for tournament mode)
+        recent_avg_5: Last 5 games average (for tournament mode hot streak detection)
+        opp_team_id: Opponent team ID (for tournament mode variance bonus)
+        tournament_mode: If True, optimize for ceiling/variance instead of consistency
 
     Returns:
         (score 0-100, grade, explanation)
     """
+    # TOURNAMENT MODE: Completely different scoring logic
+    if tournament_mode and proj_ceiling is not None:
+        return _calculate_tournament_dfs_score(
+            player_season_avg=player_season_avg,
+            player_projection=player_projection,
+            proj_ceiling=proj_ceiling,
+            recent_avg_5=recent_avg_5,
+            matchup_rating=matchup_rating,
+            opp_def_rating=opp_def_rating,
+            opp_team_id=opp_team_id,
+            league_avg_def_rating=league_avg_def_rating,
+        )
+
+    # CASH GAME MODE (default - original logic)
     # 1. Base score from projected points (0-70 range)
     # Scale typical 5-40 PPG range to reasonable scores
     # Formula: (proj - 3) * 1.8 gives 5PPG=3.6, 30PPG=48.6, 40PPG=66.6
@@ -4909,7 +5112,7 @@ with tournament_tab:
 
     st.divider()
 
-    # Query ceiling candidates
+    # Query ceiling candidates (include recent_avg_5 and season_avg_ppg for tournament score)
     query = """
         SELECT
             player_name,
@@ -4922,6 +5125,8 @@ with tournament_tab:
             dfs_score,
             dfs_grade,
             opponent_def_rating,
+            season_avg_ppg,
+            recent_avg_5,
             (proj_ceiling - proj_floor) as upside_range,
             ROUND((proj_ceiling - proj_floor) / projected_ppg, 2) as variance_ratio
         FROM predictions
@@ -4969,6 +5174,30 @@ with tournament_tab:
 
         df['opp_def_grade'] = df.apply(calculate_opp_def_grade_row, axis=1)
 
+        # Calculate Tournament DFS Score for each player (different from cash game score)
+        def calculate_tournament_score_row(row):
+            try:
+                score, grade, explanation = calculate_daily_pick_score(
+                    player_season_avg=row['season_avg_ppg'],
+                    player_projection=row['projected_ppg'],
+                    projection_confidence=0.75,  # Not used in tournament mode
+                    matchup_rating="Neutral",  # Simplified for now
+                    opp_def_rating=row['opponent_def_rating'],
+                    # Tournament-specific parameters
+                    proj_ceiling=row['proj_ceiling'],
+                    recent_avg_5=row['recent_avg_5'],
+                    opp_team_id=int(row['opponent_id']),
+                    tournament_mode=True,
+                )
+                return pd.Series({'tourn_score': score, 'tourn_grade': grade})
+            except Exception as e:
+                return pd.Series({'tourn_score': 50.0, 'tourn_grade': '✓ Playable'})
+
+        df[['tourn_score', 'tourn_grade']] = df.apply(calculate_tournament_score_row, axis=1)
+
+        # Sort by tournament score (not ceiling) for better tournament prioritization
+        df = df.sort_values('tourn_score', ascending=False)
+
         # Format display dataframe
         display_df = df.copy()
         display_df = display_df.rename(columns={
@@ -4980,8 +5209,11 @@ with tournament_tab:
             'proj_floor': 'Floor',
             'opponent_def_rating': 'Opp Def',
             'opp_def_grade': 'Opp Def Grade',
-            'dfs_score': 'DFS Score',
-            'dfs_grade': 'Grade',
+            'tourn_score': 'GPP Score',
+            'tourn_grade': 'GPP Grade',
+            'recent_avg_5': 'L5 Avg',
+            'dfs_score': 'Cash Score',
+            'dfs_grade': 'Cash Grade',
             'upside_range': 'Range',
             'variance_ratio': 'Variance'
         })
@@ -4991,13 +5223,15 @@ with tournament_tab:
         display_df['Ceiling'] = display_df['Ceiling'].round(1)
         display_df['Floor'] = display_df['Floor'].round(1)
         display_df['Opp Def'] = display_df['Opp Def'].round(1)
-        display_df['DFS Score'] = display_df['DFS Score'].round(1)
+        display_df['L5 Avg'] = display_df['L5 Avg'].round(1)
+        display_df['GPP Score'] = display_df['GPP Score'].round(0)
+        display_df['Cash Score'] = display_df['Cash Score'].round(1)
         display_df['Range'] = display_df['Range'].round(1)
 
         # Select and reorder columns for display
         display_columns = [
-            'Player', 'Team', 'Opponent', 'Proj PPG', 'Ceiling', 'Floor',
-            'Opp Def Grade', 'Opp Def', 'Range', 'Variance', 'DFS Score', 'Grade'
+            'Player', 'Team', 'Opponent', 'Ceiling', 'L5 Avg', 'Proj PPG',
+            'GPP Score', 'GPP Grade', 'Opp Def Grade', 'Opp Def', 'Range', 'Variance'
         ]
 
         st.dataframe(
@@ -5007,26 +5241,33 @@ with tournament_tab:
             height=400
         )
 
-        # Insight box with grade legend
+        # Insight box with updated guide
         st.info("""
         **💡 Tournament Strategy Guide:**
 
-        **Key Columns:**
+        **Key Columns (sorted by GPP Score):**
+        - **GPP Score (0-100)**: Tournament-optimized score emphasizing ceiling, hot streaks, and variance
         - **Ceiling**: 90th percentile outcome (explosive game potential)
-        - **Opp Def Grade**: Tournament matchup quality (combines defense quality + variance)
-        - **Variance Ratio**: Higher = boom/bust profile (good for tournaments)
+        - **L5 Avg**: Last 5 games average (hot streak indicator)
+        - **Opp Def Grade**: Matchup quality (defense + variance)
 
-        **Opp Def Grade Legend:**
-        - **A+ Elite Spot**: Bad defense + high variance (dream matchup!)
-        - **A Smash Spot**: Bad defense + good variance
-        - **A- Variance Play**: Tight defense but allows big games (boom/bust)
-        - **B+ Good Matchup**: Above average ceiling potential
-        - **B Solid/Playable**: Decent matchup
-        - **C Neutral/Tough**: Average matchup
-        - **D Avoid**: Elite tight defense (low ceiling potential)
+        **GPP Score Factors:**
+        1. **Ceiling (50%)**: 40-50+ ceilings get elite scores
+        2. **Hot Streak (20%)**: L5 > season avg = bonus (25%+ = huge bonus)
+        3. **Defense Variance (15%)**: High-variance defenses = bonus
+        4. **Matchup History (10%)**: Historical performance vs opponent
+        5. **Defense Quality (5%)**: Weak defenses = small bonus
 
-        **Target**: Combined ceiling of 105+ for your 3-player lineup
-        **Priority**: Focus on A+/A/A- grades for maximum ceiling differentiation
+        **GPP Grade Legend:**
+        - 🔥🔥 **GPP Lock (85+)**: Must-play (high ceiling + hot streak + variance)
+        - 🔥 **Core Play (75-84)**: Build lineups around these players
+        - ⭐ **Strong (65-74)**: Solid tournament picks
+        - ✓ **Playable (55-64)**: Pivot/contrarian options
+        - ⚠️ **Punt/Fade (<55)**: Low ceiling potential
+
+        **Opp Def Grade:** A+/A/A- = elite variance, B = good, C = average, D = avoid
+
+        **Target**: Combined ceiling 105+, at least 2 players with GPP Score 70+
         """)
 
         # Add grade distribution summary
