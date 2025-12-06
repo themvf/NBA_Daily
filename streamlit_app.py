@@ -5432,7 +5432,7 @@ with tournament_tab:
         button_col1, button_col2 = st.columns([1, 3])
         with button_col1:
             if st.button("🤖 Auto-Generate Optimal Lineups", type="primary", use_container_width=True):
-                lineups, error = auto_generate_lineups(display_df)
+                lineups, error = auto_generate_lineups(player_options)
                 if error:
                     st.error(error)
                 else:
