@@ -5197,6 +5197,7 @@ if selected_page == "Tournament Strategy":
         LEFT JOIN injury_list il ON p.player_name = il.player_name
             AND p.team_name = il.team_name
             AND il.status = 'active'
+            AND (il.expected_return_date IS NULL OR il.expected_return_date >= DATE('now'))
         WHERE p.game_date = ?
           AND p.proj_ceiling >= ?
           AND il.player_name IS NULL  -- Exclude active injuries
@@ -5223,6 +5224,7 @@ if selected_page == "Tournament Strategy":
             INNER JOIN injury_list il ON p.player_name = il.player_name
                 AND p.team_name = il.team_name
                 AND il.status = 'active'
+                AND (il.expected_return_date IS NULL OR il.expected_return_date >= DATE('now'))
             WHERE p.game_date = ?
                 AND p.proj_ceiling >= ?
             ORDER BY p.proj_ceiling DESC
