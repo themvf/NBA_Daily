@@ -4529,6 +4529,75 @@ if selected_page == "Prediction Log":
                     df['actual_minutes'] = None
                     df['avg_minutes'] = None
 
+                # Add PPM consistency data
+                ppm_query = """
+                    SELECT
+                        player_name,
+                        AVG(points / CAST(minutes AS REAL)) as avg_ppm,
+                        (SELECT COUNT(*)
+                         FROM player_game_logs
+                         WHERE player_name = pgl.player_name
+                           AND season = '2025-26'
+                           AND CAST(minutes AS REAL) >= 10
+                        ) as games_counted
+                    FROM player_game_logs pgl
+                    WHERE season = '2025-26'
+                      AND CAST(minutes AS REAL) >= 10
+                    GROUP BY player_name
+                """
+                try:
+                    ppm_df = pd.read_sql_query(ppm_query, pred_conn)
+
+                    # Calculate PPM standard deviation for each player
+                    ppm_std_query = """
+                        SELECT
+                            player_name,
+                            points / CAST(minutes AS REAL) as ppm
+                        FROM player_game_logs
+                        WHERE season = '2025-26'
+                          AND CAST(minutes AS REAL) >= 10
+                    """
+                    ppm_raw = pd.read_sql_query(ppm_std_query, pred_conn)
+                    ppm_std_df = ppm_raw.groupby('player_name')['ppm'].std().reset_index()
+                    ppm_std_df.columns = ['player_name', 'std_ppm']
+
+                    # Merge avg and std
+                    ppm_df = ppm_df.merge(ppm_std_df, on='player_name', how='left')
+
+                    # Calculate consistency score
+                    ppm_df['cv_ppm'] = ppm_df['std_ppm'] / ppm_df['avg_ppm']
+                    ppm_df['consistency_score'] = 100 * (1 - ppm_df['cv_ppm'].clip(upper=1.0))
+
+                    # Assign grades
+                    def get_ppm_grade(score):
+                        if pd.isna(score):
+                            return 'N/A'
+                        elif score >= 85:
+                            return 'A+'
+                        elif score >= 75:
+                            return 'A'
+                        elif score >= 65:
+                            return 'B'
+                        elif score >= 55:
+                            return 'C'
+                        else:
+                            return 'D'
+
+                    ppm_df['ppm_grade'] = ppm_df['consistency_score'].apply(get_ppm_grade)
+
+                    # Merge with main df
+                    if not ppm_df.empty:
+                        df = df.merge(ppm_df[['player_name', 'avg_ppm', 'consistency_score', 'ppm_grade']],
+                                     on='player_name', how='left')
+                    else:
+                        df['avg_ppm'] = None
+                        df['consistency_score'] = None
+                        df['ppm_grade'] = 'N/A'
+                except Exception as e:
+                    df['avg_ppm'] = None
+                    df['consistency_score'] = None
+                    df['ppm_grade'] = 'N/A'
+
                 # Add helpful columns
                 df['Status'] = df['actual_ppg'].apply(
                     lambda x: '✅ Complete' if pd.notna(x) else '⏳ Pending'
@@ -4543,13 +4612,13 @@ if selected_page == "Prediction Log":
                 # Format numeric columns
                 display_df = df[['player_name', 'team_name', 'opponent_name', 'Status',
                                  'projected_ppg', 'actual_ppg', 'error', 'abs_error',
-                                 'actual_minutes', 'avg_minutes',
+                                 'actual_minutes', 'avg_minutes', 'avg_ppm', 'consistency_score', 'ppm_grade',
                                  'proj_confidence', 'proj_floor', 'proj_ceiling', 'Accuracy',
                                  'dfs_score', 'dfs_grade', 'analytics_used']].copy()
 
                 display_df.columns = ['Player', 'Team', 'Opponent', 'Status',
                                       'Proj PPG', 'Actual PPG', 'Error', 'Abs Error',
-                                      'Actual Mins', 'Avg Mins',
+                                      'Actual Mins', 'Avg Mins', 'PPM', 'PPM Consistency', 'PPM Grade',
                                       'Confidence', 'Floor', 'Ceiling', 'Accuracy',
                                       'DFS Score', 'Grade', 'Analytics']
 
