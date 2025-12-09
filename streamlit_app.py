@@ -4563,7 +4563,7 @@ if selected_page == "Prediction Log":
                             (SELECT AVG(CAST(minutes AS REAL))
                              FROM player_game_logs
                              WHERE player_name = p.player_name
-                               AND season = '2024-25'
+                               AND season = '2025-26'
                                AND CAST(minutes AS REAL) > 0
                             ) as avg_minutes
                         FROM predictions p
