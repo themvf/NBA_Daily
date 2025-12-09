@@ -4512,7 +4512,7 @@ if selected_page == "Prediction Log":
                            AND CAST(minutes AS REAL) > 0
                         ) as avg_minutes
                     FROM player_game_logs pgl
-                    WHERE game_date = ?
+                    WHERE DATE(game_date) = ?
                 """
                 try:
                     minutes_df = pd.read_sql_query(minutes_query, pred_conn, params=[selected_date])
@@ -4600,7 +4600,7 @@ if selected_page == "Prediction Log":
                         FROM predictions p
                         LEFT JOIN player_game_logs pgl
                             ON p.player_name = pgl.player_name
-                            AND p.game_date = pgl.game_date
+                            AND DATE(pgl.game_date) = p.game_date
                         WHERE p.game_date = ?
                           AND p.actual_ppg IS NOT NULL
                           AND pgl.minutes IS NOT NULL
