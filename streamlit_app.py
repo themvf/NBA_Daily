@@ -4500,6 +4500,35 @@ if selected_page == "Prediction Log":
             df = pt.get_predictions_vs_actuals(pred_conn, selected_date)
 
             if not df.empty:
+                # Add minutes data
+                minutes_query = """
+                    SELECT
+                        player_name,
+                        minutes as actual_minutes,
+                        (SELECT AVG(CAST(minutes AS REAL))
+                         FROM player_game_logs
+                         WHERE player_name = pgl.player_name
+                           AND season = '2025-26'
+                           AND CAST(minutes AS REAL) > 0
+                        ) as avg_minutes
+                    FROM player_game_logs pgl
+                    WHERE game_date = ?
+                """
+                try:
+                    minutes_df = pd.read_sql_query(minutes_query, pred_conn, params=[selected_date])
+                    if not minutes_df.empty:
+                        # Convert to numeric
+                        minutes_df['actual_minutes'] = pd.to_numeric(minutes_df['actual_minutes'], errors='coerce')
+                        minutes_df['avg_minutes'] = pd.to_numeric(minutes_df['avg_minutes'], errors='coerce')
+                        # Merge with main df
+                        df = df.merge(minutes_df, on='player_name', how='left')
+                    else:
+                        df['actual_minutes'] = None
+                        df['avg_minutes'] = None
+                except:
+                    df['actual_minutes'] = None
+                    df['avg_minutes'] = None
+
                 # Add helpful columns
                 df['Status'] = df['actual_ppg'].apply(
                     lambda x: '✅ Complete' if pd.notna(x) else '⏳ Pending'
@@ -4514,11 +4543,13 @@ if selected_page == "Prediction Log":
                 # Format numeric columns
                 display_df = df[['player_name', 'team_name', 'opponent_name', 'Status',
                                  'projected_ppg', 'actual_ppg', 'error', 'abs_error',
+                                 'actual_minutes', 'avg_minutes',
                                  'proj_confidence', 'proj_floor', 'proj_ceiling', 'Accuracy',
                                  'dfs_score', 'dfs_grade', 'analytics_used']].copy()
 
                 display_df.columns = ['Player', 'Team', 'Opponent', 'Status',
                                       'Proj PPG', 'Actual PPG', 'Error', 'Abs Error',
+                                      'Actual Mins', 'Avg Mins',
                                       'Confidence', 'Floor', 'Ceiling', 'Accuracy',
                                       'DFS Score', 'Grade', 'Analytics']
 
