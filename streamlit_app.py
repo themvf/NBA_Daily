@@ -4545,6 +4545,115 @@ if selected_page == "Prediction Log":
                     height=600
                 )
 
+                # Minutes Analysis Section
+                with st.expander("⏱️ Minutes Analysis - Post-Game Insights", expanded=False):
+                    st.markdown("**Analyze prediction misses caused by reduced playing time**")
+
+                    # Query to get actual minutes played vs season average
+                    minutes_query = """
+                        SELECT
+                            p.player_name,
+                            p.team_name,
+                            p.opponent_name,
+                            p.projected_ppg,
+                            p.actual_ppg,
+                            p.error,
+                            p.abs_error,
+                            pgl.minutes as actual_minutes,
+                            (SELECT AVG(CAST(minutes AS REAL))
+                             FROM player_game_logs
+                             WHERE player_name = p.player_name
+                               AND season = '2024-25'
+                               AND CAST(minutes AS REAL) > 0
+                            ) as avg_minutes
+                        FROM predictions p
+                        LEFT JOIN player_game_logs pgl
+                            ON p.player_name = pgl.player_name
+                            AND p.game_date = pgl.game_date
+                        WHERE p.game_date = ?
+                          AND p.actual_ppg IS NOT NULL
+                          AND pgl.minutes IS NOT NULL
+                        ORDER BY p.abs_error DESC
+                    """
+
+                    try:
+                        minutes_df = pd.read_sql_query(minutes_query, pred_conn, params=[selected_date])
+
+                        if not minutes_df.empty:
+                            # Convert minutes to float
+                            minutes_df['actual_minutes'] = minutes_df['actual_minutes'].astype(float)
+                            minutes_df['avg_minutes'] = minutes_df['avg_minutes'].fillna(0).astype(float)
+
+                            # Calculate minutes % of average
+                            minutes_df['min_pct'] = (minutes_df['actual_minutes'] / minutes_df['avg_minutes'] * 100).fillna(0)
+
+                            # Flag reduced minutes (< 70% of average)
+                            minutes_df['reduced_mins'] = minutes_df['min_pct'] < 70
+
+                            # Add analysis column
+                            def minutes_analysis(row):
+                                if row['reduced_mins']:
+                                    return f"⚠️ Low Minutes ({row['min_pct']:.0f}% of avg)"
+                                elif row['min_pct'] > 110:
+                                    return f"✅ High Minutes ({row['min_pct']:.0f}% of avg)"
+                                else:
+                                    return f"Normal ({row['min_pct']:.0f}% of avg)"
+
+                            minutes_df['Minutes Flag'] = minutes_df.apply(minutes_analysis, axis=1)
+
+                            # Display summary metrics
+                            min_cols = st.columns(3)
+                            with min_cols[0]:
+                                reduced_count = minutes_df['reduced_mins'].sum()
+                                st.metric("Players with Reduced Minutes", f"{reduced_count}")
+                            with min_cols[1]:
+                                if reduced_count > 0:
+                                    reduced_avg_error = minutes_df[minutes_df['reduced_mins']]['abs_error'].mean()
+                                    st.metric("Avg Error (Reduced Mins)", f"{reduced_avg_error:.1f} pts")
+                            with min_cols[2]:
+                                normal_mins = minutes_df[~minutes_df['reduced_mins']]
+                                if len(normal_mins) > 0:
+                                    normal_avg_error = normal_mins['abs_error'].mean()
+                                    st.metric("Avg Error (Normal Mins)", f"{normal_avg_error:.1f} pts")
+
+                            st.divider()
+
+                            # Display detailed table
+                            st.markdown("**Players Ordered by Prediction Error:**")
+                            display_mins = minutes_df[['player_name', 'team_name', 'opponent_name',
+                                                       'projected_ppg', 'actual_ppg', 'error', 'abs_error',
+                                                       'actual_minutes', 'avg_minutes', 'min_pct', 'Minutes Flag']].copy()
+
+                            display_mins.columns = ['Player', 'Team', 'Opponent', 'Proj PPG', 'Actual PPG',
+                                                   'Error', 'Abs Error', 'Actual Mins', 'Avg Mins', 'Min %', 'Analysis']
+
+                            # Format columns
+                            display_mins['Proj PPG'] = display_mins['Proj PPG'].round(1)
+                            display_mins['Actual PPG'] = display_mins['Actual PPG'].round(1)
+                            display_mins['Error'] = display_mins['Error'].round(1)
+                            display_mins['Abs Error'] = display_mins['Abs Error'].round(1)
+                            display_mins['Actual Mins'] = display_mins['Actual Mins'].round(1)
+                            display_mins['Avg Mins'] = display_mins['Avg Mins'].round(1)
+                            display_mins['Min %'] = display_mins['Min %'].round(0)
+
+                            st.dataframe(display_mins, use_container_width=True, height=400)
+
+                            # Key insights
+                            st.markdown("**💡 Key Insights:**")
+                            reduced = minutes_df[minutes_df['reduced_mins']]
+                            if len(reduced) > 0:
+                                st.markdown(f"- **{len(reduced)} player(s) played <70% of normal minutes**")
+                                worst_mins = reduced.nlargest(3, 'abs_error')
+                                for _, row in worst_mins.iterrows():
+                                    st.markdown(f"  - **{row['player_name']}**: {row['actual_minutes']:.0f} mins (avg {row['avg_minutes']:.0f}) → {row['abs_error']:.1f} pt error")
+                            else:
+                                st.success("✅ All players played normal minutes - errors not due to playing time")
+                        else:
+                            st.info("No minutes data available for this date yet. Run 'Fetch & Score Latest Games' first.")
+
+                    except Exception as e:
+                        st.error(f"Error loading minutes analysis: {str(e)}")
+
                 # Action buttons
                 col1, col2 = st.columns(2)
 
