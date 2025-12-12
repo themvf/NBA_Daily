@@ -5823,11 +5823,11 @@ if selected_page == "Tournament Strategy":
                     conn=tourn_conn,
                     league_avg_ppm=league_avg_ppm if ppm_loaded else 0.462,
                 )
-                return pd.Series({'tourn_score': score, 'tourn_grade': grade})
+                return pd.Series({'tourn_score': score, 'tourn_grade': grade, 'tourn_explanation': explanation})
             except Exception as e:
-                return pd.Series({'tourn_score': 50.0, 'tourn_grade': '✓ Playable'})
+                return pd.Series({'tourn_score': 50.0, 'tourn_grade': '✓ Playable', 'tourn_explanation': ''})
 
-        df[['tourn_score', 'tourn_grade']] = df.apply(calculate_tournament_score_row, axis=1)
+        df[['tourn_score', 'tourn_grade', 'tourn_explanation']] = df.apply(calculate_tournament_score_row, axis=1)
 
         # Sort by tournament score (not ceiling) for better tournament prioritization
         df = df.sort_values('tourn_score', ascending=False)
@@ -5845,6 +5845,7 @@ if selected_page == "Tournament Strategy":
             'opp_def_grade': 'Opp Def Grade',
             'tourn_score': 'GPP Score',
             'tourn_grade': 'GPP Grade',
+            'tourn_explanation': 'GPP Factors',
             'recent_avg_5': 'L5 Avg',
             'dfs_score': 'Cash Score',
             'dfs_grade': 'Cash Grade',
@@ -5877,7 +5878,7 @@ if selected_page == "Tournament Strategy":
         # Select and reorder columns for display (include PPM if available)
         base_columns = [
             'Player', 'Team', 'Opponent', 'Ceiling', 'L5 Avg', 'Proj PPG',
-            'GPP Score', 'GPP Grade', 'Opp Def Grade'
+            'GPP Score', 'GPP Grade', 'GPP Factors', 'Opp Def Grade'
         ]
 
         # Add PPM columns if they exist
