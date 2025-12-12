@@ -3697,6 +3697,30 @@ if selected_page == "Defense Mix":
                 )
             else:
                 raise
+
+        # Add PPM stats to Defense Mix
+        try:
+            off_ppm_df, def_ppm_df, league_avg_ppm = load_ppm_stats(str(db_path), '2025-26')
+
+            # Merge defensive PPM stats by team_name
+            mix_df = mix_df.merge(
+                def_ppm_df[['team_name', 'avg_def_ppm', 'def_ppm_grade', 'ceiling_factor', 'std_def_ppm']],
+                on='team_name',
+                how='left'
+            )
+
+            # Rename columns for clarity
+            mix_df = mix_df.rename(columns={
+                'avg_def_ppm': 'Def PPM',
+                'def_ppm_grade': 'PPM Grade',
+                'ceiling_factor': 'Ceiling Factor',
+                'std_def_ppm': 'PPM StdDev'
+            })
+
+            st.caption(f"✅ PPM stats loaded (League Avg: {league_avg_ppm:.3f} PPM)")
+        except Exception as ppm_exc:
+            st.caption(f"⚠️ PPM stats unavailable: {ppm_exc}")
+
         render_dataframe(mix_df)
     except Exception as exc:  # noqa: BLE001
         st.warning(f"Defense mix view not available: {exc}")
@@ -5555,6 +5579,27 @@ if selected_page == "Tournament Strategy":
         st.info("The predictions table may be missing required columns. Please regenerate predictions in the 'Today's Games' tab.")
         st.stop()
 
+    # Load PPM stats for enhanced tournament analysis
+    try:
+        off_ppm_df, def_ppm_df, league_avg_ppm = load_ppm_stats(str(db_path), '2025-26')
+        ppm_loaded = True
+
+        # Merge defensive PPM stats by opponent_id
+        df = df.merge(
+            def_ppm_df[['team_id', 'avg_def_ppm', 'def_ppm_grade', 'ceiling_factor', 'std_def_ppm']],
+            left_on='opponent_id',
+            right_on='team_id',
+            how='left'
+        )
+        # Drop redundant team_id column from merge
+        df = df.drop(columns=['team_id'], errors='ignore')
+
+        st.caption(f"✅ PPM stats loaded (League Avg: {league_avg_ppm:.3f} PPM)")
+    except Exception as ppm_exc:
+        st.caption(f"⚠️ PPM stats unavailable: {ppm_exc}")
+        def_ppm_df = None
+        ppm_loaded = False
+
     # Debug: Show injured players being filtered out
     with st.expander("🔍 Debug: Players Filtered by Injury Status", expanded=False):
         debug_query = """
@@ -5633,6 +5678,8 @@ if selected_page == "Tournament Strategy":
                     # Injury beneficiary bonus
                     injury_adjusted=is_injury_adjusted,
                     projection_boost=injury_boost,
+                    # PPM Integration
+                    def_ppm_df=def_ppm_df if ppm_loaded else None,
                 )
                 return pd.Series({'tourn_score': score, 'tourn_grade': grade})
             except Exception as e:
@@ -5660,7 +5707,12 @@ if selected_page == "Tournament Strategy":
             'dfs_score': 'Cash Score',
             'dfs_grade': 'Cash Grade',
             'upside_range': 'Range',
-            'variance_ratio': 'Variance'
+            'variance_ratio': 'Variance',
+            # PPM columns
+            'avg_def_ppm': 'Opp Def PPM',
+            'def_ppm_grade': 'Opp PPM Grade',
+            'ceiling_factor': 'Ceiling Factor',
+            'std_def_ppm': 'PPM StdDev'
         })
 
         # Round numeric columns
@@ -5672,12 +5724,29 @@ if selected_page == "Tournament Strategy":
         display_df['GPP Score'] = display_df['GPP Score'].round(0)
         display_df['Cash Score'] = display_df['Cash Score'].round(1)
         display_df['Range'] = display_df['Range'].round(1)
+        # Round PPM columns (if available)
+        if 'Opp Def PPM' in display_df.columns:
+            display_df['Opp Def PPM'] = display_df['Opp Def PPM'].round(3)
+        if 'Ceiling Factor' in display_df.columns:
+            display_df['Ceiling Factor'] = display_df['Ceiling Factor'].round(3)
+        if 'PPM StdDev' in display_df.columns:
+            display_df['PPM StdDev'] = display_df['PPM StdDev'].round(3)
 
-        # Select and reorder columns for display
-        display_columns = [
+        # Select and reorder columns for display (include PPM if available)
+        base_columns = [
             'Player', 'Team', 'Opponent', 'Ceiling', 'L5 Avg', 'Proj PPG',
-            'GPP Score', 'GPP Grade', 'Opp Def Grade', 'Opp Def', 'Range', 'Variance'
+            'GPP Score', 'GPP Grade', 'Opp Def Grade'
         ]
+
+        # Add PPM columns if they exist
+        ppm_columns = []
+        if 'Opp Def PPM' in display_df.columns:
+            ppm_columns.extend(['Opp Def PPM', 'Opp PPM Grade', 'Ceiling Factor'])
+
+        # Add remaining columns
+        remaining_columns = ['Opp Def', 'Range', 'Variance']
+
+        display_columns = base_columns + ppm_columns + remaining_columns
 
         st.dataframe(
             display_df[display_columns],
