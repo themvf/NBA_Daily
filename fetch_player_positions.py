@@ -151,6 +151,11 @@ def show_position_distribution(conn):
 
 if __name__ == '__main__':
     import sys
+    import io
+
+    # Fix Unicode encoding for Windows console
+    if sys.stdout.encoding != 'utf-8':
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
     print("NBA Player Position Fetcher")
     print("=" * 60)

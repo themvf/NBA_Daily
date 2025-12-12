@@ -30,6 +30,7 @@ import prediction_tracking as pt
 import prediction_refresh as pr
 import s3_storage
 import ppm_stats
+import position_ppm_stats
 
 DEFAULT_DB_PATH = Path(__file__).with_name("nba_stats.db")
 DEFAULT_PREDICTIONS_PATH = Path(__file__).with_name("predictions.csv")
@@ -1499,6 +1500,8 @@ def calculate_smart_ppg_projection(
     def_ppm_df: Optional[pd.DataFrame] = None,  # Defensive PPM dataframe
     league_avg_ppm: float = 0.462,  # League average PPM
     conn: Optional[sqlite3.Connection] = None,  # For player PPM lookup
+    player_position: str = "",  # Player position (Guard/Forward/Center) for position-specific PPM
+    game_date: str = "",  # Game date for season progress calculation
 ) -> tuple[float, float, float, float, dict, str]:
     """
     Calculate smart PPG projection using multi-factor weighted model.
@@ -1593,10 +1596,39 @@ def calculate_smart_ppg_projection(
         analytics_used.append("🛡️")  # Defense split indicator
 
     elif def_ppm_df is not None and opponent_id is not None:
-        # PPM-based defense adjustment (pace-normalized)
+        # ENHANCED: Position-Specific PPM with Bayesian Blending
+        # Uses blended team + position-specific defensive PPM for more accurate matchup analysis
         opp_def_ppm_row = def_ppm_df[def_ppm_df['team_id'] == opponent_id]
         if not opp_def_ppm_row.empty:
-            opp_def_ppm = opp_def_ppm_row['avg_def_ppm'].iloc[0]
+            team_def_ppm = opp_def_ppm_row['avg_def_ppm'].iloc[0]
+
+            # Try to get blended position-specific PPM if player position is known
+            if player_position and player_position in ['Guard', 'Forward', 'Center'] and conn is not None:
+                try:
+                    blended_matchup = position_ppm_stats.get_blended_def_ppm_for_matchup(
+                        conn=conn,
+                        def_team_id=opponent_id,
+                        off_player_position=player_position,
+                        team_overall_def_ppm=team_def_ppm,
+                        season='2025-26',
+                        current_date=game_date if game_date else None
+                    )
+
+                    # Use blended PPM (combines team and position-specific data)
+                    opp_def_ppm = blended_matchup['blended_def_ppm']
+
+                    # Add position exploit indicator if detected
+                    if blended_matchup['exploit_detected']:
+                        if blended_matchup['exploit_severity'] == 'severe':
+                            analytics_used.append("🎯🔥")  # Severe position exploit
+                        else:
+                            analytics_used.append("🎯")  # Moderate position exploit
+                except Exception:
+                    # Fallback to team overall PPM if position-specific fails
+                    opp_def_ppm = team_def_ppm
+            else:
+                # Use team overall PPM if position unknown
+                opp_def_ppm = team_def_ppm
 
             # Calculate PPM boost factor: higher def PPM allowed = easier matchup
             ppm_boost_factor = opp_def_ppm / league_avg_ppm
