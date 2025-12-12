@@ -947,6 +947,10 @@ def _calculate_tournament_dfs_score(
     injury_adjusted: bool = False,
     projection_boost: float = 0.0,
     def_ppm_df: Optional[pd.DataFrame] = None,  # PPM Integration
+    player_position: str = "",  # Position-specific PPM
+    game_date: str = "",  # For season progress calculation
+    conn: Optional[sqlite3.Connection] = None,  # Database connection for position PPM
+    league_avg_ppm: float = 0.462,  # League average PPM
 ) -> tuple[float, str, str]:
     """
     Calculate Tournament DFS Score optimized for winner-take-all contests.
@@ -1032,17 +1036,84 @@ def _calculate_tournament_dfs_score(
 
     # 3. OPPONENT DEFENSE VARIANCE BONUS (0-15 points)
     # High-variance defenses allow explosive games
-    # PPM-based ceiling factor = P90_PPM / Avg_PPM (pace-normalized)
+    # ENHANCED: Position-specific PPM ceiling factor for more accurate targeting
     variance_bonus = 0
+    position_exploit_bonus = 0  # NEW: Component 7 (calculated here for context)
+
     if opp_team_id is not None:
-        # Priority 1: Use PPM ceiling factor (more accurate)
-        if def_ppm_df is not None:
+        # Priority 1: Use position-specific PPM ceiling factor (most accurate)
+        if def_ppm_df is not None and player_position and player_position in ['Guard', 'Forward', 'Center'] and conn is not None:
+            try:
+                # Get team overall PPM for blending
+                opp_def_ppm_row = def_ppm_df[def_ppm_df['team_id'] == opp_team_id]
+                if not opp_def_ppm_row.empty:
+                    team_overall_def_ppm = opp_def_ppm_row['avg_def_ppm'].iloc[0]
+
+                    # Get position-specific blended matchup data
+                    blended_matchup = position_ppm_stats.get_blended_def_ppm_for_matchup(
+                        conn=conn,
+                        def_team_id=opp_team_id,
+                        off_player_position=player_position,
+                        team_overall_def_ppm=team_overall_def_ppm,
+                        season='2025-26',
+                        current_date=game_date if game_date else None
+                    )
+
+                    # Get position-specific data for ceiling factor calculation
+                    position_data = position_ppm_stats.get_position_defensive_ppm(
+                        conn, opp_team_id, player_position, season='2025-26'
+                    )
+
+                    if position_data and position_data['games_count'] >= 5:
+                        # Calculate position-specific ceiling factor
+                        position_ceiling_factor = position_data['p90_ppm'] / position_data['avg_def_ppm_vs_position']
+
+                        # Variance bonus based on position-specific ceiling factor
+                        if position_ceiling_factor >= 1.15:
+                            variance_bonus = 15
+                            factors.append(f"elite {player_position} variance")
+                        elif position_ceiling_factor >= 1.12:
+                            variance_bonus = 10
+                            factors.append(f"high {player_position} variance")
+                        elif position_ceiling_factor >= 1.10:
+                            variance_bonus = 5
+                            factors.append("above avg position variance")
+
+                        # Component 7: Position Exploit Bonus (0-10 points)
+                        # Severe position weaknesses are GPP gold
+                        if blended_matchup['exploit_detected']:
+                            if blended_matchup['exploit_severity'] == 'severe':
+                                position_exploit_bonus = 10
+                                factors.append("🎯🔥 SEVERE position exploit")
+                            elif blended_matchup['exploit_severity'] == 'moderate':
+                                position_exploit_bonus = 7
+                                factors.append("🎯 moderate position exploit")
+                            elif blended_matchup['exploit_severity'] == 'minor':
+                                position_exploit_bonus = 4
+                                factors.append("🎯 minor position exploit")
+                    else:
+                        # Not enough position data, fall back to team ceiling factor
+                        team_ceiling_factor = opp_def_ppm_row['ceiling_factor'].iloc[0]
+                        if team_ceiling_factor >= 1.15:
+                            variance_bonus = 15
+                            factors.append("elite team PPM variance")
+                        elif team_ceiling_factor >= 1.12:
+                            variance_bonus = 10
+                            factors.append("high team PPM variance")
+                        elif team_ceiling_factor >= 1.10:
+                            variance_bonus = 5
+                            factors.append("above avg team variance")
+            except Exception:
+                # Fall through to team-level or old method
+                pass
+
+        # Priority 2: Use team-level PPM ceiling factor
+        if variance_bonus == 0 and def_ppm_df is not None:
             try:
                 opp_def_ppm_row = def_ppm_df[def_ppm_df['team_id'] == opp_team_id]
                 if not opp_def_ppm_row.empty:
                     ppm_ceiling_factor = opp_def_ppm_row['ceiling_factor'].iloc[0]
 
-                    # Same thresholds, but using pace-normalized PPM
                     if ppm_ceiling_factor >= 1.15:
                         variance_bonus = 15
                         factors.append("elite PPM variance")
@@ -1052,26 +1123,13 @@ def _calculate_tournament_dfs_score(
                     elif ppm_ceiling_factor >= 1.10:
                         variance_bonus = 5
                         factors.append("above avg variance")
-                    # else: no bonus for tight defenses
-                else:
-                    # Fallback to old method if team not found in PPM data
-                    ceiling_factor = get_opponent_defense_ceiling_factor(opp_team_id)
-                    if ceiling_factor >= 1.15:
-                        variance_bonus = 15
-                        factors.append("elite variance matchup")
-                    elif ceiling_factor >= 1.12:
-                        variance_bonus = 10
-                        factors.append("good variance matchup")
-                    elif ceiling_factor >= 1.10:
-                        variance_bonus = 5
-                        factors.append("above avg variance")
             except:
                 pass
-        else:
-            # Priority 2: Fallback to old points-per-game ceiling factor
+
+        # Priority 3: Fallback to old points-per-game ceiling factor
+        if variance_bonus == 0:
             try:
                 ceiling_factor = get_opponent_defense_ceiling_factor(opp_team_id)
-
                 if ceiling_factor >= 1.15:
                     variance_bonus = 15
                     factors.append("elite variance matchup")
@@ -1143,9 +1201,10 @@ def _calculate_tournament_dfs_score(
         variance_bonus +
         matchup_bonus +
         defense_adjustment +
-        injury_bonus
+        injury_bonus +
+        position_exploit_bonus  # Component 7: Position Exploit Bonus (0-10 points)
     )
-    final_score = max(0, min(100, final_score))
+    final_score = max(0, min(110, final_score))  # Raised cap to 110 to allow for position exploit bonus
 
     # Build explanation
     explanation = ", ".join(factors[:4])  # Top 4 factors
@@ -1188,6 +1247,10 @@ def calculate_daily_pick_score(
     injury_adjusted: bool = False,
     projection_boost: float = 0.0,
     def_ppm_df: Optional[pd.DataFrame] = None,  # PPM Integration
+    player_position: str = "",  # Position-specific PPM
+    game_date: str = "",  # Season progress calculation
+    conn: Optional[sqlite3.Connection] = None,  # Database connection
+    league_avg_ppm: float = 0.462,  # League average PPM
 ) -> tuple[float, str, str]:
     """
     Calculate unified DFS Score (0-100) combining all analytics.
@@ -1227,6 +1290,10 @@ def calculate_daily_pick_score(
             injury_adjusted=injury_adjusted,
             projection_boost=projection_boost,
             def_ppm_df=def_ppm_df,  # PPM Integration
+            player_position=player_position,  # Position-specific PPM
+            game_date=game_date,  # Season progress
+            conn=conn,  # Database connection
+            league_avg_ppm=league_avg_ppm,  # League average PPM
         )
 
     # CASH GAME MODE (default - original logic)
@@ -5594,6 +5661,7 @@ if selected_page == "Tournament Strategy":
     query = """
         SELECT
             p.player_name,
+            p.player_id,
             p.team_name,
             p.opponent_name,
             p.opponent_id,
@@ -5642,11 +5710,29 @@ if selected_page == "Tournament Strategy":
         # Drop redundant team_id column from merge
         df = df.drop(columns=['team_id'], errors='ignore')
 
+        # Add player positions for position-specific PPM
+        try:
+            position_query = """
+                SELECT player_id, position
+                FROM players
+                WHERE position IS NOT NULL AND position != ''
+            """
+            positions_df = pd.read_sql_query(position_query, tourn_conn)
+            df = df.merge(
+                positions_df,
+                on='player_id',
+                how='left'
+            )
+            df['position'] = df['position'].fillna('')  # Fill missing positions with empty string
+        except Exception as pos_exc:
+            df['position'] = ''  # Add empty position column if lookup fails
+
         st.caption(f"✅ PPM stats loaded (League Avg: {league_avg_ppm:.3f} PPM)")
     except Exception as ppm_exc:
         st.caption(f"⚠️ PPM stats unavailable: {ppm_exc}")
         def_ppm_df = None
         ppm_loaded = False
+        df['position'] = ''  # Add empty position column
 
     # Debug: Show injured players being filtered out
     with st.expander("🔍 Debug: Players Filtered by Injury Status", expanded=False):
@@ -5712,6 +5798,9 @@ if selected_page == "Tournament Strategy":
                 is_injury_adjusted = bool(row.get('injury_adjusted', False))
                 injury_boost = float(row.get('injury_adjustment_amount', 0.0)) if pd.notna(row.get('injury_adjustment_amount')) else 0.0
 
+                # Get player position (from merged position column)
+                player_position = row.get('position', '')
+
                 score, grade, explanation = calculate_daily_pick_score(
                     player_season_avg=row['season_avg_ppg'],
                     player_projection=row['projected_ppg'],
@@ -5728,6 +5817,11 @@ if selected_page == "Tournament Strategy":
                     projection_boost=injury_boost,
                     # PPM Integration
                     def_ppm_df=def_ppm_df if ppm_loaded else None,
+                    # Position-specific PPM
+                    player_position=player_position,
+                    game_date=str(selected_date),
+                    conn=tourn_conn,
+                    league_avg_ppm=league_avg_ppm if ppm_loaded else 0.462,
                 )
                 return pd.Series({'tourn_score': score, 'tourn_grade': grade})
             except Exception as e:
