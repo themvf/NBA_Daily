@@ -29,6 +29,7 @@ import defense_type_analytics as dta
 import prediction_tracking as pt
 import prediction_refresh as pr
 import s3_storage
+import ppm_stats
 
 DEFAULT_DB_PATH = Path(__file__).with_name("nba_stats.db")
 DEFAULT_PREDICTIONS_PATH = Path(__file__).with_name("predictions.csv")
@@ -194,6 +195,22 @@ def get_connection(db_path: str) -> sqlite3.Connection:
 def run_query(db_path: str, query: str, params: Iterable[object] | None = None) -> pd.DataFrame:
     conn = get_connection(db_path)
     return pd.read_sql_query(query, conn, params=params or [])
+
+
+@st.cache_data(ttl=3600)
+def load_ppm_stats(db_path: str, season: str = '2025-26') -> tuple[pd.DataFrame, pd.DataFrame, float]:
+    """Load PPM stats for all teams (offensive and defensive).
+
+    Cached for 1 hour to avoid recalculating for every prediction.
+
+    Returns:
+        tuple: (off_ppm_df, def_ppm_df, league_avg_ppm)
+    """
+    conn = get_connection(db_path)
+    off_ppm_df = ppm_stats.get_team_offensive_ppm_stats(conn, season)
+    def_ppm_df = ppm_stats.get_team_defensive_ppm_stats(conn, season)
+    league_avg_ppm = ppm_stats.get_league_avg_ppm(conn, season)
+    return off_ppm_df, def_ppm_df, league_avg_ppm
 
 
 @st.cache_data(ttl=300)
@@ -928,6 +945,7 @@ def _calculate_tournament_dfs_score(
     league_avg_def_rating: float = 112.0,
     injury_adjusted: bool = False,
     projection_boost: float = 0.0,
+    def_ppm_df: Optional[pd.DataFrame] = None,  # PPM Integration
 ) -> tuple[float, str, str]:
     """
     Calculate Tournament DFS Score optimized for winner-take-all contests.
@@ -1013,23 +1031,57 @@ def _calculate_tournament_dfs_score(
 
     # 3. OPPONENT DEFENSE VARIANCE BONUS (0-15 points)
     # High-variance defenses allow explosive games
+    # PPM-based ceiling factor = P90_PPM / Avg_PPM (pace-normalized)
     variance_bonus = 0
     if opp_team_id is not None:
-        try:
-            ceiling_factor = get_opponent_defense_ceiling_factor(opp_team_id)
+        # Priority 1: Use PPM ceiling factor (more accurate)
+        if def_ppm_df is not None:
+            try:
+                opp_def_ppm_row = def_ppm_df[def_ppm_df['team_id'] == opp_team_id]
+                if not opp_def_ppm_row.empty:
+                    ppm_ceiling_factor = opp_def_ppm_row['ceiling_factor'].iloc[0]
 
-            if ceiling_factor >= 1.15:
-                variance_bonus = 15
-                factors.append("elite variance matchup")
-            elif ceiling_factor >= 1.12:
-                variance_bonus = 10
-                factors.append("good variance matchup")
-            elif ceiling_factor >= 1.10:
-                variance_bonus = 5
-                factors.append("above avg variance")
-            # else: no bonus for tight defenses
-        except:
-            pass
+                    # Same thresholds, but using pace-normalized PPM
+                    if ppm_ceiling_factor >= 1.15:
+                        variance_bonus = 15
+                        factors.append("elite PPM variance")
+                    elif ppm_ceiling_factor >= 1.12:
+                        variance_bonus = 10
+                        factors.append("high PPM variance")
+                    elif ppm_ceiling_factor >= 1.10:
+                        variance_bonus = 5
+                        factors.append("above avg variance")
+                    # else: no bonus for tight defenses
+                else:
+                    # Fallback to old method if team not found in PPM data
+                    ceiling_factor = get_opponent_defense_ceiling_factor(opp_team_id)
+                    if ceiling_factor >= 1.15:
+                        variance_bonus = 15
+                        factors.append("elite variance matchup")
+                    elif ceiling_factor >= 1.12:
+                        variance_bonus = 10
+                        factors.append("good variance matchup")
+                    elif ceiling_factor >= 1.10:
+                        variance_bonus = 5
+                        factors.append("above avg variance")
+            except:
+                pass
+        else:
+            # Priority 2: Fallback to old points-per-game ceiling factor
+            try:
+                ceiling_factor = get_opponent_defense_ceiling_factor(opp_team_id)
+
+                if ceiling_factor >= 1.15:
+                    variance_bonus = 15
+                    factors.append("elite variance matchup")
+                elif ceiling_factor >= 1.12:
+                    variance_bonus = 10
+                    factors.append("good variance matchup")
+                elif ceiling_factor >= 1.10:
+                    variance_bonus = 5
+                    factors.append("above avg variance")
+            except:
+                pass
 
     # 4. MATCHUP HISTORY BONUS (0-10 points)
     # Less important than cash games but still relevant
@@ -1134,6 +1186,7 @@ def calculate_daily_pick_score(
     tournament_mode: bool = False,
     injury_adjusted: bool = False,
     projection_boost: float = 0.0,
+    def_ppm_df: Optional[pd.DataFrame] = None,  # PPM Integration
 ) -> tuple[float, str, str]:
     """
     Calculate unified DFS Score (0-100) combining all analytics.
@@ -1172,6 +1225,7 @@ def calculate_daily_pick_score(
             league_avg_def_rating=league_avg_def_rating,
             injury_adjusted=injury_adjusted,
             projection_boost=projection_boost,
+            def_ppm_df=def_ppm_df,  # PPM Integration
         )
 
     # CASH GAME MODE (default - original logic)
@@ -1439,6 +1493,12 @@ def calculate_smart_ppg_projection(
     pace_split: Optional[dta.DefenseTypePerformance] = None,
     defense_quality_split: Optional[dta.DefenseTypePerformance] = None,
     opp_team_id: Optional[int] = None,  # NEW: For defense variance ceiling boost
+    # PPM Integration Parameters
+    player_name: str = "",  # For PPM consistency lookup
+    opponent_id: Optional[int] = None,  # For PPM defense lookup
+    def_ppm_df: Optional[pd.DataFrame] = None,  # Defensive PPM dataframe
+    league_avg_ppm: float = 0.462,  # League average PPM
+    conn: Optional[sqlite3.Connection] = None,  # For player PPM lookup
 ) -> tuple[float, float, float, float, dict, str]:
     """
     Calculate smart PPG projection using multi-factor weighted model.
@@ -1532,8 +1592,33 @@ def calculate_smart_ppg_projection(
         weights["def_quality"] = 0.15  # Higher weight with real data
         analytics_used.append("🛡️")  # Defense split indicator
 
+    elif def_ppm_df is not None and opponent_id is not None:
+        # PPM-based defense adjustment (pace-normalized)
+        opp_def_ppm_row = def_ppm_df[def_ppm_df['team_id'] == opponent_id]
+        if not opp_def_ppm_row.empty:
+            opp_def_ppm = opp_def_ppm_row['avg_def_ppm'].iloc[0]
+
+            # Calculate PPM boost factor: higher def PPM allowed = easier matchup
+            ppm_boost_factor = opp_def_ppm / league_avg_ppm
+
+            # Cap at ±20% (slightly higher than old ±15% to account for PPM variance)
+            ppm_boost_factor = max(0.80, min(1.20, ppm_boost_factor))
+
+            components["def_ppm_quality"] = season_avg * ppm_boost_factor
+            weights["def_ppm_quality"] = 0.15  # Increase weight from 10% to 15%
+        else:
+            # Fallback to old def_rating if PPM data missing
+            if opp_def_rating is not None:
+                def_adjustment = (league_avg_def_rating - opp_def_rating) / league_avg_def_rating
+                def_adjustment = max(-0.15, min(0.15, def_adjustment))
+                components["def_quality"] = season_avg * (1 + def_adjustment)
+                weights["def_quality"] = 0.10
+            else:
+                components["def_quality"] = season_avg
+                weights["def_quality"] = 0.0
+
     elif opp_def_rating is not None:
-        # Fallback to generic adjustment
+        # Fallback to defensive rating if PPM not available
         def_adjustment = (league_avg_def_rating - opp_def_rating) / league_avg_def_rating
         def_adjustment = max(-0.15, min(0.15, def_adjustment))
         components["def_quality"] = season_avg * (1 + def_adjustment)
@@ -1697,6 +1782,39 @@ def calculate_smart_ppg_projection(
         ceiling_uncertainty_bonus = 0.30 * uncertainty
 
     ceiling_multiplier = ceiling_base_multiplier + ceiling_uncertainty_bonus
+
+    # PPM CONSISTENCY ADJUSTMENT: Adjust floor/ceiling by player PPM consistency
+    # High consistency players = tighter ranges (smaller intervals)
+    # Low consistency players = wider ranges (larger intervals)
+    floor_interval_multiplier = 1.0  # Default: no adjustment
+    ceiling_multiplier_adjustment = 1.0  # Default: no adjustment
+
+    if conn is not None and player_name:
+        try:
+            player_ppm_data = ppm_stats.get_player_ppm_stats(conn, player_name, season='2025-26')
+            if player_ppm_data:
+                consistency_score = player_ppm_data['consistency_score']
+
+                # High consistency = tighter range (A/A+ grade: 75+)
+                # Reduce interval size by 20%, reduce ceiling multiplier by 10%
+                if consistency_score >= 75:
+                    floor_interval_multiplier = 0.80  # Tighter floor (smaller interval)
+                    ceiling_multiplier_adjustment = 0.90  # Lower ceiling multiplier
+                # Low consistency = wider range (D grade: <55)
+                # Increase interval size by 25%, increase ceiling multiplier by 15%
+                elif consistency_score < 55:
+                    floor_interval_multiplier = 1.25  # Wider floor (larger interval)
+                    ceiling_multiplier_adjustment = 1.15  # Higher ceiling multiplier
+                # Average consistency (B/C grade: 55-74) - no adjustment needed
+        except Exception:
+            # If PPM lookup fails, use defaults (no adjustment)
+            pass
+
+    # Apply PPM consistency adjustment to floor (recalculate with adjusted interval)
+    floor = max(0, projection - (floor_interval * floor_interval_multiplier))
+
+    # Apply PPM consistency adjustment to ceiling multiplier
+    ceiling_multiplier = ceiling_multiplier * ceiling_multiplier_adjustment
 
     # TOURNAMENT ENHANCEMENT: Opponent defense variance boost
     # Teams with high defensive variance allow explosive scoring games more often
@@ -2481,6 +2599,16 @@ if selected_page == "Today's Games":
             defense_map: Dict[int, Mapping[str, Any]] = {
                 int(row["team_id"]): row.to_dict() for _, row in defense_stats.iterrows()
             }
+
+            # Load PPM stats for enhanced predictions
+            try:
+                off_ppm_df, def_ppm_df, league_avg_ppm = load_ppm_stats(str(db_path), context_season)
+                ppm_loaded = True
+            except Exception as e:
+                st.warning(f"⚠️ PPM stats not available: {e}")
+                off_ppm_df, def_ppm_df, league_avg_ppm = None, None, 0.462
+                ppm_loaded = False
+
             def_style_map: Dict[int, str] = {
                 int(row["team_id"]): (str(row.get("defense_style") or "Neutral"))
                 for _, row in defense_stats.iterrows()
@@ -2793,6 +2921,12 @@ if selected_page == "Today's Games":
                                 pace_split=pace_split_obj,
                                 defense_quality_split=defense_quality_split_obj,
                                 opp_team_id=opponent_id,  # NEW: For defense variance ceiling boost
+                                # PPM Integration
+                                player_name=player["player_name"],
+                                opponent_id=opponent_id,
+                                def_ppm_df=def_ppm_df if ppm_loaded else None,
+                                league_avg_ppm=league_avg_ppm,
+                                conn=games_conn,
                             )
 
                             # Calculate unified DFS Score
@@ -2802,6 +2936,7 @@ if selected_page == "Today's Games":
                                 projection_confidence=proj_confidence,
                                 matchup_rating=matchup_rating,
                                 opp_def_rating=opp_def_rating,
+                                def_ppm_df=def_ppm_df if ppm_loaded else None,  # PPM Integration
                             )
 
                             # Accumulate game totals for team score projections
