@@ -5838,6 +5838,7 @@ if selected_page == "Tournament Strategy":
             'player_name': 'Player',
             'team_name': 'Team',
             'opponent_name': 'Opponent',
+            'position': 'Pos',
             'projected_ppg': 'Proj PPG',
             'proj_ceiling': 'Ceiling',
             'proj_floor': 'Floor',
@@ -5877,7 +5878,7 @@ if selected_page == "Tournament Strategy":
 
         # Select and reorder columns for display (include PPM if available)
         base_columns = [
-            'Player', 'Team', 'Opponent', 'Ceiling', 'L5 Avg', 'Proj PPG',
+            'Player', 'Pos', 'Team', 'Opponent', 'Ceiling', 'L5 Avg', 'Proj PPG',
             'GPP Score', 'GPP Grade', 'GPP Factors', 'Opp Def Grade'
         ]
 
