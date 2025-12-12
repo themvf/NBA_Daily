@@ -2938,6 +2938,20 @@ if selected_page == "Today's Games":
                             opp_def_rating = safe_float(opponent_stats.get("def_rating")) if opponent_stats else None
                             opp_pace = safe_float(opponent_stats.get("avg_opp_possessions")) if opponent_stats else None
 
+                            # Get player position for position-specific PPM
+                            player_position = ""
+                            try:
+                                cursor = games_conn.cursor()
+                                cursor.execute(
+                                    "SELECT position FROM players WHERE player_id = ?",
+                                    (player.get("player_id"),)
+                                )
+                                position_result = cursor.fetchone()
+                                if position_result and position_result[0]:
+                                    player_position = position_result[0]
+                            except Exception:
+                                pass  # Use empty string if lookup fails
+
                             projection, proj_confidence, proj_floor, proj_ceiling, breakdown, analytics_indicators = calculate_smart_ppg_projection(
                                 season_avg=season_avg_pts,
                                 recent_avg_5=avg_pts_last5,
@@ -2959,6 +2973,8 @@ if selected_page == "Today's Games":
                                 def_ppm_df=def_ppm_df if ppm_loaded else None,
                                 league_avg_ppm=league_avg_ppm,
                                 conn=games_conn,
+                                player_position=player_position,  # NEW: For position-specific PPM
+                                game_date=str(selected_date),  # NEW: For season progress calculation
                             )
 
                             # Calculate unified DFS Score
