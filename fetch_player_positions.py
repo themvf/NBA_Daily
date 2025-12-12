@@ -109,7 +109,7 @@ def fetch_and_update_positions(conn, limit=None, delay=0.6):
                 conn.commit()
 
                 success_count += 1
-                print(f"[{idx+1}/{len(players_df)}] {player_name}: {raw_position} → {normalized_position}")
+                print(f"[{idx+1}/{len(players_df)}] {player_name}: {raw_position} -> {normalized_position}")
             else:
                 print(f"[{idx+1}/{len(players_df)}] {player_name}: No position data found")
                 error_count += 1
@@ -150,6 +150,8 @@ def show_position_distribution(conn):
 
 
 if __name__ == '__main__':
+    import sys
+
     print("NBA Player Position Fetcher")
     print("=" * 60)
 
@@ -158,26 +160,39 @@ if __name__ == '__main__':
     # Show current distribution
     show_position_distribution(conn)
 
-    # Option to run full update or just test with 10 players
-    print("\nOptions:")
-    print("  1. Test mode (fetch 10 players)")
-    print("  2. Full update (all players)")
-    print("  3. Skip update, show current data")
-
-    choice = input("\nEnter choice (1-3): ").strip()
-
-    if choice == '1':
-        print("\n--- TEST MODE: Fetching 10 players ---\n")
-        fetch_and_update_positions(conn, limit=10, delay=0.6)
-    elif choice == '2':
-        confirm = input("\nThis will fetch data for all players. Continue? (yes/no): ").strip().lower()
-        if confirm == 'yes':
+    # Check for command-line argument
+    if len(sys.argv) > 1:
+        mode = sys.argv[1].lower()
+        if mode == 'full':
             print("\n--- FULL UPDATE: Fetching all players ---\n")
             fetch_and_update_positions(conn, limit=None, delay=0.6)
+        elif mode == 'test':
+            print("\n--- TEST MODE: Fetching 10 players ---\n")
+            fetch_and_update_positions(conn, limit=10, delay=0.6)
         else:
-            print("Cancelled.")
+            print(f"Unknown mode: {mode}")
+            print("Usage: python fetch_player_positions.py [test|full]")
     else:
-        print("Skipping update.")
+        # Interactive mode
+        print("\nOptions:")
+        print("  1. Test mode (fetch 10 players)")
+        print("  2. Full update (all players)")
+        print("  3. Skip update, show current data")
+
+        choice = input("\nEnter choice (1-3): ").strip()
+
+        if choice == '1':
+            print("\n--- TEST MODE: Fetching 10 players ---\n")
+            fetch_and_update_positions(conn, limit=10, delay=0.6)
+        elif choice == '2':
+            confirm = input("\nThis will fetch data for all players. Continue? (yes/no): ").strip().lower()
+            if confirm == 'yes':
+                print("\n--- FULL UPDATE: Fetching all players ---\n")
+                fetch_and_update_positions(conn, limit=None, delay=0.6)
+            else:
+                print("Cancelled.")
+        else:
+            print("Skipping update.")
 
     # Show final distribution
     show_position_distribution(conn)
