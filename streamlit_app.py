@@ -6134,6 +6134,29 @@ if selected_page == "Tournament Strategy":
 
         df[['tourn_score', 'tourn_grade', 'tourn_explanation']] = df.apply(calculate_tournament_score_row, axis=1)
 
+        # ADD PROJECTION ANCHOR (15% weight)
+        # Prevents low-projection players from ranking high on ceiling narrative alone
+        # Formula: (Player Proj - Min Proj) / (Max Proj - Min Proj) × 15
+        # This adds "plausibility gravity" - ceiling still dominates, but volume/role matters
+        min_proj = df['projected_ppg'].min()
+        max_proj = df['projected_ppg'].max()
+
+        if max_proj > min_proj:  # Avoid division by zero
+            # Normalize projections to 0-15 scale (15% weight)
+            df['proj_anchor_score'] = ((df['projected_ppg'] - min_proj) / (max_proj - min_proj)) * 15
+
+            # Add projection anchor to tournament score
+            df['tourn_score'] = df['tourn_score'] + df['proj_anchor_score']
+
+            # Update explanation to include projection anchor
+            df['tourn_explanation'] = df.apply(
+                lambda row: f"{row['tourn_explanation']}, proj anchor (+{row['proj_anchor_score']:.0f})"
+                if pd.notna(row['proj_anchor_score']) else row['tourn_explanation'],
+                axis=1
+            )
+        else:
+            df['proj_anchor_score'] = 0  # Fallback if all projections are identical
+
         # Sort by tournament score (not ceiling) for better tournament prioritization
         df = df.sort_values('tourn_score', ascending=False)
 
@@ -6215,11 +6238,11 @@ if selected_page == "Tournament Strategy":
         - **Opp Def Grade**: Matchup quality (defense + variance)
 
         **GPP Score Factors:**
-        1. **Ceiling (50%)**: 40-50+ ceilings get elite scores
+        1. **Ceiling (40%)**: 40-50+ ceilings get elite scores
         2. **Hot Streak (20%)**: L5 > season avg = bonus (25%+ = huge bonus)
-        3. **Defense Variance (15%)**: High-variance defenses = bonus
-        4. **Matchup History (10%)**: Historical performance vs opponent
-        5. **Defense Quality (5%)**: Weak defenses = small bonus
+        3. **Projection Anchor (15%)**: Volume/opportunity requirement (prevents narrative-only rankings)
+        4. **Defense Variance (15%)**: High-variance defenses = bonus
+        5. **Matchup History (10%)**: Historical performance vs opponent
 
         **GPP Grade Legend:**
         - 🔥🔥 **GPP Lock (85+)**: Must-play (high ceiling + hot streak + variance)
