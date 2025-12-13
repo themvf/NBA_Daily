@@ -2166,11 +2166,52 @@ def minutes_str_to_float(value: object) -> float | None:
 
 @st.cache_data(ttl=300)
 def fetch_scoreboard_frames(game_date_str: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    scoreboard = scoreboardv2.ScoreboardV2(game_date=game_date_str, league_id="00")
-    return (
-        scoreboard.game_header.get_data_frame(),
-        scoreboard.line_score.get_data_frame(),
-    )
+    """
+    Fetch scoreboard data from NBA API with extended timeout and retry logic.
+
+    Args:
+        game_date_str: Game date in format 'MM/DD/YYYY'
+
+    Returns:
+        Tuple of (game_header DataFrame, line_score DataFrame)
+
+    Raises:
+        Exception: If all retry attempts fail
+    """
+    import time
+    from requests.exceptions import ReadTimeout, ConnectTimeout
+
+    # Retry configuration
+    max_retries = 3
+    timeout = 60  # Increase from default 30s to 60s
+    retry_delay = 2  # seconds
+
+    for attempt in range(max_retries):
+        try:
+            scoreboard = scoreboardv2.ScoreboardV2(
+                game_date=game_date_str,
+                league_id="00",
+                timeout=timeout
+            )
+            return (
+                scoreboard.game_header.get_data_frame(),
+                scoreboard.line_score.get_data_frame(),
+            )
+        except (ReadTimeout, ConnectTimeout) as e:
+            if attempt < max_retries - 1:
+                # Not the last attempt, retry
+                time.sleep(retry_delay)
+                continue
+            else:
+                # Last attempt failed, re-raise
+                raise Exception(
+                    f"NBA API timeout after {max_retries} attempts. "
+                    f"The stats.nba.com API may be slow or unavailable. "
+                    f"Try again in a few minutes or check https://www.nba.com/stats"
+                ) from e
+        except Exception as e:
+            # Other errors (not timeout), raise immediately
+            raise
 
 
 def build_games_table(
