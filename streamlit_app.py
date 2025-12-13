@@ -6483,6 +6483,9 @@ if selected_page == "Tournament Strategy":
         lineup_b_metrics = calculate_lineup_metrics(lineup_b_players, display_df)
         lineup_c_metrics = calculate_lineup_metrics(lineup_c_players, display_df)
 
+        # Calculate slate average projection for relative projection signal
+        slate_avg_proj = display_df['Proj PPG'].mean() if not display_df.empty else 0
+
         # Display lineup summaries
         summary_cols = st.columns(3)
 
@@ -6493,12 +6496,22 @@ if selected_page == "Tournament Strategy":
                 st.metric("Combined Proj", f"{lineup_a_metrics['total_proj']:.1f} PPG")
                 st.metric("Avg GPP Score", f"{lineup_a_metrics['avg_gpp_score']:.0f}")
 
+                # EDIT #1: Relative Projection Signal
+                if slate_avg_proj > 0:
+                    lineup_a_avg_proj = lineup_a_metrics['total_proj'] / 3
+                    proj_vs_slate = ((lineup_a_avg_proj - slate_avg_proj) / slate_avg_proj) * 100
+                    proj_indicator = "🟢" if proj_vs_slate >= 5 else "🟡" if proj_vs_slate >= -5 else "🔴"
+                    st.caption(f"{proj_indicator} **Proj vs Slate:** {proj_vs_slate:+.1f}%")
+
                 # Check for game stack
                 opponent_counts = {}
                 for opp in lineup_a_metrics['opponents']:
                     opponent_counts[opp] = opponent_counts.get(opp, 0) + 1
                 game_stack = any(count >= 2 for count in opponent_counts.values())
                 st.caption(f"{'✅' if game_stack else '⚠️'} Game Stack: {'YES' if game_stack else 'NO'}")
+
+                # EDIT #2: Win Condition Label
+                st.info("🎯 **Wins if:** Slate plays normal, stars hit ceiling")
             else:
                 st.caption("⚠️ Select 3 different players")
 
@@ -6509,9 +6522,19 @@ if selected_page == "Tournament Strategy":
                 st.metric("Combined Proj", f"{lineup_b_metrics['total_proj']:.1f} PPG")
                 st.metric("Avg GPP Score", f"{lineup_b_metrics['avg_gpp_score']:.0f}")
 
+                # EDIT #1: Relative Projection Signal
+                if slate_avg_proj > 0:
+                    lineup_b_avg_proj = lineup_b_metrics['total_proj'] / 3
+                    proj_vs_slate = ((lineup_b_avg_proj - slate_avg_proj) / slate_avg_proj) * 100
+                    proj_indicator = "🟢" if proj_vs_slate >= 5 else "🟡" if proj_vs_slate >= -5 else "🔴"
+                    st.caption(f"{proj_indicator} **Proj vs Slate:** {proj_vs_slate:+.1f}%")
+
                 # Check for overlap with A
                 overlap_with_a = len(set(lineup_a_players) & set(lineup_b_players)) if lineup_a_metrics else 0
                 st.caption(f"{'✅' if overlap_with_a == 0 else '❌'} Overlap with A: {overlap_with_a} players")
+
+                # EDIT #2: Win Condition Label
+                st.info("🎲 **Wins if:** Chalk fails, leverage hits")
             else:
                 st.caption("⚠️ Select 3 different players")
 
@@ -6522,9 +6545,19 @@ if selected_page == "Tournament Strategy":
                 st.metric("Combined Proj", f"{lineup_c_metrics['total_proj']:.1f} PPG")
                 st.metric("Avg GPP Score", f"{lineup_c_metrics['avg_gpp_score']:.0f}")
 
+                # EDIT #1: Relative Projection Signal
+                if slate_avg_proj > 0:
+                    lineup_c_avg_proj = lineup_c_metrics['total_proj'] / 3
+                    proj_vs_slate = ((lineup_c_avg_proj - slate_avg_proj) / slate_avg_proj) * 100
+                    proj_indicator = "🟢" if proj_vs_slate >= 5 else "🟡" if proj_vs_slate >= -5 else "🔴"
+                    st.caption(f"{proj_indicator} **Proj vs Slate:** {proj_vs_slate:+.1f}%")
+
                 # Check for overlap with A (should be exactly 1)
                 overlap_with_a = len(set(lineup_a_players) & set(lineup_c_players)) if lineup_a_metrics else 0
                 st.caption(f"{'✅' if overlap_with_a == 1 else '⚠️'} Overlap with A: {overlap_with_a} players")
+
+                # EDIT #2: Win Condition Label
+                st.info("⚡ **Wins if:** Game environment spikes, variance plays hit")
             else:
                 st.caption("⚠️ Select 3 different players")
 
@@ -6585,6 +6618,42 @@ if selected_page == "Tournament Strategy":
                 st.warning(f"⚠️ **GOOD PORTFOLIO** - {passed_checks}/6 checks passed. Review warnings above.")
             else:
                 st.error(f"❌ **NEEDS IMPROVEMENT** - Only {passed_checks}/6 checks passed. Adjust lineups.")
+
+            # EDIT #3: Player Exposure Summary
+            st.divider()
+            st.markdown("### 📊 Player Exposure Summary")
+            st.caption("Shows how many lineups each player appears in (out of 3 total)")
+
+            # Calculate exposure counts
+            all_players_list = lineup_a_players + lineup_b_players + lineup_c_players
+            exposure_counts = {}
+            for player in all_players_list:
+                if player:  # Skip None values
+                    exposure_counts[player] = exposure_counts.get(player, 0) + 1
+
+            # Sort by exposure count (descending), then alphabetically
+            sorted_exposure = sorted(exposure_counts.items(), key=lambda x: (-x[1], x[0]))
+
+            # Display in columns
+            if sorted_exposure:
+                exposure_text = []
+                for player, count in sorted_exposure:
+                    percentage = (count / 3) * 100
+                    if count == 3:
+                        emoji = "🔥"  # Full exposure (anchor player)
+                    elif count == 2:
+                        emoji = "⚡"  # High exposure
+                    else:
+                        emoji = "💫"  # Single exposure
+                    exposure_text.append(f"{emoji} **{player}:** {count}/3 ({percentage:.0f}%)")
+
+                # Display in 3 columns for better layout
+                exp_cols = st.columns(3)
+                for idx, text in enumerate(exposure_text):
+                    with exp_cols[idx % 3]:
+                        st.markdown(text)
+            else:
+                st.caption("No players selected yet")
 
 st.divider()
 st.caption(
