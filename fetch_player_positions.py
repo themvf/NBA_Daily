@@ -109,16 +109,25 @@ def fetch_and_update_positions(conn, limit=None, delay=0.6):
                 conn.commit()
 
                 success_count += 1
-                print(f"[{idx+1}/{len(players_df)}] {player_name}: {raw_position} -> {normalized_position}")
+                try:
+                    print(f"[{idx+1}/{len(players_df)}] {player_name}: {raw_position} -> {normalized_position}")
+                except UnicodeEncodeError:
+                    print(f"[{idx+1}/{len(players_df)}] {player_name.encode('ascii', 'replace').decode('ascii')}: {raw_position} -> {normalized_position}")
             else:
-                print(f"[{idx+1}/{len(players_df)}] {player_name}: No position data found")
+                try:
+                    print(f"[{idx+1}/{len(players_df)}] {player_name}: No position data found")
+                except UnicodeEncodeError:
+                    print(f"[{idx+1}/{len(players_df)}] {player_name.encode('ascii', 'replace').decode('ascii')}: No position data found")
                 error_count += 1
 
             # Rate limiting
             time.sleep(delay)
 
         except Exception as e:
-            print(f"[{idx+1}/{len(players_df)}] {player_name}: ERROR - {str(e)}")
+            try:
+                print(f"[{idx+1}/{len(players_df)}] {player_name}: ERROR - {str(e)}")
+            except UnicodeEncodeError:
+                print(f"[{idx+1}/{len(players_df)}] {player_name.encode('ascii', 'replace').decode('ascii')}: ERROR - {str(e)}")
             error_count += 1
             time.sleep(delay * 2)  # Double delay after error
 
