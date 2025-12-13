@@ -5602,28 +5602,104 @@ if selected_page == "Tournament Strategy":
     st.caption("Ceiling-focused player selection for 3-player tournaments vs 2,500 opponents")
 
     # Position & GPP Factors Legend
-    with st.expander("ℹ️ Position Categories & GPP Factors Guide", expanded=False):
-        col1, col2 = st.columns(2)
+    with st.expander("ℹ️ GPP Score Breakdown & Position Guide", expanded=False):
+        st.markdown("### 🎯 How GPP Score is Calculated (Max: 110 points)")
+
+        col1, col2, col3 = st.columns(3)
 
         with col1:
+            st.markdown("**Component 1: Ceiling Base (0-50 pts, 45%)**")
+            st.markdown("""
+            - 50+ PPG ceiling: **50 pts** (elite)
+            - 45-50 ceiling: **46 pts** (monster)
+            - 40-45 ceiling: **42 pts** (huge)
+            - 35-40 ceiling: **35 pts** (strong)
+            - 30-35 ceiling: **25 pts** (decent)
+            - <30 ceiling: *scaled down*
+
+            *Ceiling is the #1 driver - GPP winners need 40-50+ upside*
+            """)
+
+            st.markdown("**Component 2: Hot Streak (-5 to +20 pts, 18%)**")
+            st.markdown("""
+            - L5 +25% above avg: **+20 pts** (ON FIRE)
+            - L5 +15-25%: **+15 pts** (very hot)
+            - L5 +5-15%: **+10 pts** (trending up)
+            - L5 within ±5%: **+5 pts** (steady)
+            - L5 -5 to -15%: **0 pts** (slightly cool)
+            - L5 -15%+: **-5 pts** (cold streak)
+            """)
+
+        with col2:
+            st.markdown("**Component 3: Variance Bonus (0-15 pts, 14%)**")
+            st.markdown("""
+            *Position-specific PPM ceiling factor (P90/Avg):*
+            - 1.15+ ceiling factor: **15 pts** (elite variance)
+            - 1.12-1.15: **10 pts** (high variance)
+            - 1.10-1.12: **5 pts** (above avg)
+            - <1.10: **0 pts**
+
+            *High variance = defense allows occasional blowup games*
+            """)
+
+            st.markdown("**Component 4: Matchup History (0-10 pts, 9%)**")
+            st.markdown("""
+            - Excellent history: **10 pts**
+            - Good history: **7 pts**
+            - Neutral: **3 pts**
+            - Difficult: **0 pts**
+            - Avoid: **-5 pts**
+            """)
+
+            st.markdown("**Component 5: Defense Quality (±5 pts, 5%)**")
+            st.markdown("""
+            - Def Rating 118+: **+5 pts** (weak defense)
+            - Def Rating 114-118: **+3 pts**
+            - Def Rating 106-: **-3 pts** (elite defense)
+            """)
+
+        with col3:
+            st.markdown("**Component 6: Injury Beneficiary (0-12 pts, 11%)**")
+            st.markdown("""
+            - Star teammate out (+5 PPG boost): **12 pts** 🔥
+            - Key player out (+3-5 PPG): **8 pts**
+            - Rotation player out (+1.5-3 PPG): **5 pts**
+
+            *Low ownership + upside spike = GPP gold*
+            """)
+
+            st.markdown("**Component 7: Position Exploit (0-10 pts, 9%)**")
+            st.markdown("""
+            - 🎯🔥 **SEVERE** (15%+ worse): **10 pts**
+            - 🎯 **Moderate** (12-15% worse): **7 pts**
+            - 🎯 **Minor** (8-12% worse): **4 pts**
+
+            *Defense is weak specifically vs this position*
+            """)
+
+        st.divider()
+
+        col_a, col_b = st.columns(2)
+        with col_a:
             st.markdown("**Position Categories:**")
             st.markdown("""
             - **Guard**: Point Guards, Shooting Guards, Guard-Forwards
             - **Forward**: Small Forwards, Power Forwards
             - **Center**: Centers, Forward-Centers
-
-            *Position-specific defensive matchups are used to identify exploitable weaknesses.*
             """)
 
-        with col2:
-            st.markdown("**GPP Factors Indicators:**")
+        with col_b:
+            st.markdown("**Example GPP Score Breakdown:**")
             st.markdown("""
-            - 🎯🔥 **SEVERE position exploit**: Defense allows 15%+ more PPM vs this position (10 bonus points)
-            - 🎯 **Moderate exploit**: 12-15% worse vs position (7 bonus points)
-            - 🎯 **Minor exploit**: 8-12% worse vs position (4 bonus points)
-            - **Elite/high variance**: Defense allows occasional blowup games (high P90/Avg ratio)
-            - **Injury beneficiary**: Teammate out, usage boost expected
-            - **Hot streak**: Positive L5 trend
+            **Zubac @ CLE: 92 points**
+            - Ceiling Base (33 PPG): 35 pts
+            - Hot Streak (+18%): 15 pts
+            - Position Variance (1.16): 15 pts
+            - Matchup History: 7 pts
+            - Defense Quality: 0 pts
+            - Injury Beneficiary: 0 pts
+            - 🎯🔥 SEVERE Center exploit: 10 pts
+            - **Total: 82 pts → ⭐⭐ Elite**
             """)
 
     # Database connection
