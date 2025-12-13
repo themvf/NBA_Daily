@@ -6347,6 +6347,37 @@ if selected_page == "Tournament Strategy":
                     lineup_b.append(row['Display'])
                     used_players_b.add(row['Player'])
 
+            # LINEUP B CEILING CHECK: Ensure combined ceiling ≥ 100
+            # Without ownership data, use ceiling threshold as scenario validator
+            lineup_b_players = [get_player_name(p) for p in lineup_b]
+            lineup_b_ceiling = sum(
+                sorted_players[sorted_players['Player'] == p]['Ceiling'].iloc[0]
+                for p in lineup_b_players if p
+            )
+
+            # If combined ceiling < 100, swap lowest-ceiling player for higher-ceiling volatility
+            if lineup_b_ceiling < 100:
+                # Find the "mid-ceiling drag" player (lowest ceiling in lineup)
+                lineup_b_ceilings = [
+                    (p, sorted_players[sorted_players['Player'] == p]['Ceiling'].iloc[0])
+                    for p in lineup_b_players if p
+                ]
+                lineup_b_ceilings.sort(key=lambda x: x[1])  # Sort by ceiling ascending
+                drag_player = lineup_b_ceilings[0][0]  # Lowest ceiling player
+
+                # Search for high-ceiling replacement
+                # Criteria: Ceiling ≥ 40, not in Lineup A, GPP score reasonable
+                for idx, row in sorted_players.iterrows():
+                    if row['Player'] in used_players_a or row['Player'] in used_players_b:
+                        continue
+                    if row['Ceiling'] >= 40 and row['Ceiling'] > lineup_b_ceilings[0][1] + 5:
+                        # Swap: remove drag player, add high-ceiling player
+                        lineup_b = [p for p in lineup_b if get_player_name(p) != drag_player]
+                        lineup_b.append(row['Display'])
+                        used_players_b.remove(drag_player)
+                        used_players_b.add(row['Player'])
+                        break  # Only swap once
+
             # LINEUP C: Volatility Play
             # Strategy: 1 overlap with A (highest GPP anchor), 2 different from A/B
             lineup_c = []
@@ -6528,6 +6559,11 @@ if selected_page == "Tournament Strategy":
                     proj_vs_slate = ((lineup_b_avg_proj - slate_avg_proj) / slate_avg_proj) * 100
                     proj_indicator = "🟢" if proj_vs_slate >= 5 else "🟡" if proj_vs_slate >= -5 else "🔴"
                     st.caption(f"{proj_indicator} **Proj vs Slate:** {proj_vs_slate:+.1f}%")
+
+                # Lineup B Sanity Checklist (ownership-free ceiling threshold)
+                ceiling_ok = lineup_b_metrics['total_ceiling'] >= 100
+                ceiling_indicator = "✅" if ceiling_ok else "⚠️"
+                st.caption(f"{ceiling_indicator} **Ceiling Threshold:** {lineup_b_metrics['total_ceiling']:.1f} (target: ≥100)")
 
                 # Check for overlap with A
                 overlap_with_a = len(set(lineup_a_players) & set(lineup_b_players)) if lineup_a_metrics else 0
