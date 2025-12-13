@@ -3074,6 +3074,7 @@ if selected_page == "Today's Games":
                                     "Side": team_label,
                                     "Team": team_name,
                                     "Player": player["player_name"],
+                                    "Pos": player_position,  # NEW: Player position (Guard/Forward/Center)
                                     "Matchup": matchup_indicator,  # NEW: Matchup advantage indicator
                                     "Analytics": analytics_indicators,  # NEW: Analytics quality indicators
                                     "DFS Score": f"{daily_pick_score:.1f}",
@@ -3179,6 +3180,7 @@ if selected_page == "Today's Games":
                                     "Side": team_label,
                                     "Team": team_name,
                                     "Player": player["player_name"],
+                                    "Pos": player_position,  # NEW: Player position (Guard/Forward/Center)
                                     "Matchup Ind": matchup_indicator,  # NEW: Matchup indicator
                                     "DFS Score": daily_pick_score,
                                     "Pick Grade": f"{pick_grade}: {pick_explanation}",
@@ -3221,6 +3223,7 @@ if selected_page == "Today's Games":
                                 {
                                     "Matchup": f"{matchup['Away']} at {matchup['Home']}",
                                     "Player": player["player_name"],
+                                    "Pos": player_position,  # NEW: Player position (Guard/Forward/Center)
                                     "Team": team_name,
                                     "Ind": matchup_indicator,  # NEW: Matchup indicator (shorter column name)
                                     "DFS Score": daily_pick_score,
@@ -3243,6 +3246,7 @@ if selected_page == "Today's Games":
                                 {
                                     "Matchup": f"{matchup['Away']} at {matchup['Home']}",
                                     "Player": player["player_name"],
+                                    "Pos": player_position,  # NEW: Player position (Guard/Forward/Center)
                                     "Team": team_name,
                                     "Season Avg 3PM": safe_float(player.get("avg_fg3m")),
                                     "Last5 Avg 3PM": avg_fg3_last5,
