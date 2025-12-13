@@ -6504,9 +6504,15 @@ if selected_page == "Tournament Strategy":
         if 'lineup_d_game' not in st.session_state:
             st.session_state.lineup_d_game = None
 
-        # Display generated lineups
+        # Display generated lineups (3 or 4 columns depending on Lineup D activation)
         if st.session_state.lineup_a and st.session_state.lineup_b and st.session_state.lineup_c:
-            lineup_cols = st.columns(3)
+            # Check if Lineup D is activated
+            has_lineup_d = st.session_state.lineup_d and len(st.session_state.lineup_d) > 0
+
+            if has_lineup_d:
+                lineup_cols = st.columns(4)
+            else:
+                lineup_cols = st.columns(3)
 
             # Lineup A - Balanced Core
             with lineup_cols[0]:
@@ -6528,6 +6534,18 @@ if selected_page == "Tournament Strategy":
                 st.caption("1 overlap with A (anchor), high variance picks")
                 for i, player in enumerate(st.session_state.lineup_c, 1):
                     st.markdown(f"**{i}.** {player}")
+
+            # Lineup D - Game Stack (OPTIONAL - only shows when activated)
+            if has_lineup_d:
+                with lineup_cols[3]:
+                    game_label = ""
+                    if st.session_state.lineup_d_game:
+                        team_a, team_b = st.session_state.lineup_d_game
+                        game_label = f" ({team_a} vs {team_b})"
+                    st.markdown(f"### 🔥 Lineup D: Game Stack{game_label}")
+                    st.caption("High-total game outlier, correlation bet")
+                    for i, player in enumerate(st.session_state.lineup_d, 1):
+                        st.markdown(f"**{i}.** {player}")
         else:
             st.info("👆 Click **Auto-Generate Optimal Lineups** to build your tournament portfolio")
 
