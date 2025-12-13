@@ -6404,7 +6404,60 @@ if selected_page == "Tournament Strategy":
                         lineup_c.append(player_display)
                         used_players_c.add(player_name)
 
-            return (lineup_a, lineup_b, lineup_c), None
+            # LINEUP D (OPTIONAL): Game Stack / Correlation Bet
+            # Only activate when there's a clear high-total game outlier
+            lineup_d = []
+            lineup_d_game = None
+
+            # Step 1: Group players by game and calculate projected game totals
+            game_totals = {}
+            for idx, row in sorted_players.iterrows():
+                # Create game identifier (team_a vs team_b, sorted alphabetically)
+                teams = tuple(sorted([row['Team'], row['Opponent']]))
+                if teams not in game_totals:
+                    game_totals[teams] = {
+                        'projected_total': 0,
+                        'ceiling_total': 0,
+                        'players': []
+                    }
+                game_totals[teams]['projected_total'] += row['Proj PPG']
+                game_totals[teams]['ceiling_total'] += row['Ceiling']
+                game_totals[teams]['players'].append(row)
+
+            # Step 2: Find if there's a clear high-total outlier
+            if len(game_totals) >= 2:  # Need at least 2 games to compare
+                # Calculate median projected total
+                all_totals = [g['projected_total'] for g in game_totals.values()]
+                median_total = sorted(all_totals)[len(all_totals) // 2]
+
+                # Find highest-total game
+                highest_game = max(game_totals.items(), key=lambda x: x[1]['projected_total'])
+                highest_total = highest_game[1]['projected_total']
+
+                # Check if it's a clear outlier (15%+ above median)
+                if highest_total >= median_total * 1.15:
+                    # This is a qualifying high-total game
+                    lineup_d_game = highest_game[0]  # (Team_A, Team_B)
+                    game_players = highest_game[1]['players']
+
+                    # Sort game players by ceiling (descending)
+                    game_players_sorted = sorted(game_players, key=lambda x: x['Ceiling'], reverse=True)
+
+                    # Build Lineup D with 2-3 top players from this game
+                    for player_row in game_players_sorted[:3]:
+                        if len(lineup_d) < 3:
+                            lineup_d.append(player_row['Display'])
+
+                    # Validate ceiling threshold (must be 110+)
+                    lineup_d_ceiling = sum(
+                        p['Ceiling'] for p in game_players_sorted[:len(lineup_d)]
+                    )
+                    if lineup_d_ceiling < 110:
+                        # Doesn't meet ceiling threshold, clear lineup
+                        lineup_d = []
+                        lineup_d_game = None
+
+            return (lineup_a, lineup_b, lineup_c, lineup_d, lineup_d_game), None
 
         # Auto-generate button
         button_col1, button_col2 = st.columns([1, 3])
@@ -6422,6 +6475,8 @@ if selected_page == "Tournament Strategy":
                     st.session_state.lineup_a = lineups[0]
                     st.session_state.lineup_b = lineups[1]
                     st.session_state.lineup_c = lineups[2]
+                    st.session_state.lineup_d = lineups[3]  # Optional game stack
+                    st.session_state.lineup_d_game = lineups[4]  # Game matchup info
                     st.session_state.lineup_refresh_counter += 1
                     st.rerun()
 
@@ -6430,6 +6485,8 @@ if selected_page == "Tournament Strategy":
                 st.session_state.lineup_a = []
                 st.session_state.lineup_b = []
                 st.session_state.lineup_c = []
+                st.session_state.lineup_d = []
+                st.session_state.lineup_d_game = None
                 st.session_state.lineup_refresh_counter += 1
                 st.rerun()
 
@@ -6442,6 +6499,10 @@ if selected_page == "Tournament Strategy":
             st.session_state.lineup_b = []
         if 'lineup_c' not in st.session_state:
             st.session_state.lineup_c = []
+        if 'lineup_d' not in st.session_state:
+            st.session_state.lineup_d = []
+        if 'lineup_d_game' not in st.session_state:
+            st.session_state.lineup_d_game = None
 
         # Display generated lineups
         if st.session_state.lineup_a and st.session_state.lineup_b and st.session_state.lineup_c:
