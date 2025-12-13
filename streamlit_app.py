@@ -5608,6 +5608,15 @@ if selected_page == "Admin Panel":
         admin_conn = get_connection(str(db_path))
         cursor = admin_conn.cursor()
 
+        # MIGRATION: Add position column if it doesn't exist
+        cursor.execute("PRAGMA table_info(players)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if 'position' not in columns:
+            st.info("🔧 Adding position column to players table...")
+            cursor.execute("ALTER TABLE players ADD COLUMN position TEXT")
+            admin_conn.commit()
+            st.success("✅ Position column added successfully!")
+
         # Check current position data status
         cursor.execute('SELECT COUNT(*) FROM players')
         total_players = cursor.fetchone()[0]
