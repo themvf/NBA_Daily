@@ -6408,6 +6408,7 @@ if selected_page == "Tournament Strategy":
             # Only activate when there's a clear high-total game outlier
             lineup_d = []
             lineup_d_game = None
+            lineup_d_debug_info = {}  # Store diagnostic info for debug display
 
             # Step 1: Group players by game and calculate projected game totals
             game_totals = {}
@@ -6434,6 +6435,23 @@ if selected_page == "Tournament Strategy":
                 highest_game = max(game_totals.items(), key=lambda x: x[1]['projected_total'])
                 highest_total = highest_game[1]['projected_total']
 
+                # Calculate threshold percentage
+                threshold_pct = ((highest_total / median_total) - 1) * 100 if median_total > 0 else 0
+
+                # Store debug info
+                lineup_d_debug_info = {
+                    'game_totals': {f"{t[0]} vs {t[1]}": round(g['projected_total'], 1)
+                                   for t, g in sorted(game_totals.items(),
+                                                      key=lambda x: x[1]['projected_total'],
+                                                      reverse=True)},
+                    'median_total': round(median_total, 1),
+                    'highest_total': round(highest_total, 1),
+                    'highest_game': f"{highest_game[0][0]} vs {highest_game[0][1]}",
+                    'threshold_pct': round(threshold_pct, 1),
+                    'required_pct': 15.0,
+                    'passed_threshold': threshold_pct >= 15.0
+                }
+
                 # Check if it's a clear outlier (15%+ above median)
                 if highest_total >= median_total * 1.15:
                     # This is a qualifying high-total game
@@ -6452,12 +6470,15 @@ if selected_page == "Tournament Strategy":
                     lineup_d_ceiling = sum(
                         p['Ceiling'] for p in game_players_sorted[:len(lineup_d)]
                     )
+                    lineup_d_debug_info['combined_ceiling'] = round(lineup_d_ceiling, 1)
+                    lineup_d_debug_info['ceiling_threshold_met'] = lineup_d_ceiling >= 110
+
                     if lineup_d_ceiling < 110:
                         # Doesn't meet ceiling threshold, clear lineup
                         lineup_d = []
                         lineup_d_game = None
 
-            return (lineup_a, lineup_b, lineup_c, lineup_d, lineup_d_game), None
+            return (lineup_a, lineup_b, lineup_c, lineup_d, lineup_d_game, lineup_d_debug_info), None
 
         # Auto-generate button
         button_col1, button_col2 = st.columns([1, 3])
@@ -6477,6 +6498,7 @@ if selected_page == "Tournament Strategy":
                     st.session_state.lineup_c = lineups[2]
                     st.session_state.lineup_d = lineups[3]  # Optional game stack
                     st.session_state.lineup_d_game = lineups[4]  # Game matchup info
+                    st.session_state.lineup_d_debug_info = lineups[5]  # Debug info
                     st.session_state.lineup_refresh_counter += 1
                     st.rerun()
 
@@ -6487,6 +6509,7 @@ if selected_page == "Tournament Strategy":
                 st.session_state.lineup_c = []
                 st.session_state.lineup_d = []
                 st.session_state.lineup_d_game = None
+                st.session_state.lineup_d_debug_info = {}
                 st.session_state.lineup_refresh_counter += 1
                 st.rerun()
 
@@ -6503,6 +6526,8 @@ if selected_page == "Tournament Strategy":
             st.session_state.lineup_d = []
         if 'lineup_d_game' not in st.session_state:
             st.session_state.lineup_d_game = None
+        if 'lineup_d_debug_info' not in st.session_state:
+            st.session_state.lineup_d_debug_info = {}
 
         # Display generated lineups (3 or 4 columns depending on Lineup D activation)
         if st.session_state.lineup_a and st.session_state.lineup_b and st.session_state.lineup_c:
@@ -6557,10 +6582,42 @@ if selected_page == "Tournament Strategy":
             st.write(f"- lineup_d_game: {st.session_state.lineup_d_game}")
             st.write(f"- lineup_d content: {st.session_state.lineup_d}")
 
+            # Show detailed game total analysis
+            if st.session_state.lineup_d_debug_info:
+                st.divider()
+                st.write("**Game Total Analysis:**")
+                debug_info = st.session_state.lineup_d_debug_info
+
+                # Show all game totals (sorted highest to lowest)
+                if 'game_totals' in debug_info:
+                    st.write("Game Totals (Projected PPG):")
+                    for game, total in debug_info['game_totals'].items():
+                        st.write(f"  • {game}: **{total}** PPG")
+
+                st.write(f"- Median Total: **{debug_info.get('median_total', 'N/A')}** PPG")
+                st.write(f"- Highest Total: **{debug_info.get('highest_total', 'N/A')}** PPG ({debug_info.get('highest_game', 'N/A')})")
+                st.write(f"- Threshold: **{debug_info.get('threshold_pct', 0)}%** above median (need **{debug_info.get('required_pct', 15)}%**)")
+
+                if debug_info.get('passed_threshold'):
+                    st.success(f"✅ Passed threshold! ({debug_info.get('threshold_pct', 0)}% ≥ 15%)")
+                    if 'combined_ceiling' in debug_info:
+                        ceiling_met = debug_info.get('ceiling_threshold_met', False)
+                        ceiling_val = debug_info.get('combined_ceiling', 0)
+                        if ceiling_met:
+                            st.success(f"✅ Ceiling threshold met! ({ceiling_val} ≥ 110 PPG)")
+                        else:
+                            st.error(f"❌ Ceiling threshold NOT met ({ceiling_val} < 110 PPG)")
+                else:
+                    st.warning(f"❌ Did NOT pass threshold ({debug_info.get('threshold_pct', 0)}% < 15%)")
+                    gap = 15.0 - debug_info.get('threshold_pct', 0)
+                    st.caption(f"Need {gap:.1f}% more separation for Lineup D to activate")
+
             if st.session_state.lineup_d and len(st.session_state.lineup_d) > 0:
-                st.success("✅ Lineup D is ACTIVE (should be showing)")
+                st.divider()
+                st.success("✅ Lineup D is ACTIVE (should be showing in 4th column)")
             else:
-                st.warning("❌ Lineup D is INACTIVE")
+                st.divider()
+                st.warning("❌ Lineup D is INACTIVE (showing 3 columns only)")
                 st.caption("Reasons Lineup D might not activate:")
                 st.caption("• No game has 15%+ higher total than median")
                 st.caption("• Combined ceiling of top 3 players < 110 PPG")
