@@ -5601,6 +5601,31 @@ if selected_page == "Tournament Strategy":
     st.header("🏆 Tournament Strategy - Winner-Take-All")
     st.caption("Ceiling-focused player selection for 3-player tournaments vs 2,500 opponents")
 
+    # Position & GPP Factors Legend
+    with st.expander("ℹ️ Position Categories & GPP Factors Guide", expanded=False):
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.markdown("**Position Categories:**")
+            st.markdown("""
+            - **Guard**: Point Guards, Shooting Guards, Guard-Forwards
+            - **Forward**: Small Forwards, Power Forwards
+            - **Center**: Centers, Forward-Centers
+
+            *Position-specific defensive matchups are used to identify exploitable weaknesses.*
+            """)
+
+        with col2:
+            st.markdown("**GPP Factors Indicators:**")
+            st.markdown("""
+            - 🎯🔥 **SEVERE position exploit**: Defense allows 15%+ more PPM vs this position (10 bonus points)
+            - 🎯 **Moderate exploit**: 12-15% worse vs position (7 bonus points)
+            - 🎯 **Minor exploit**: 8-12% worse vs position (4 bonus points)
+            - **Elite/high variance**: Defense allows occasional blowup games (high P90/Avg ratio)
+            - **Injury beneficiary**: Teammate out, usage boost expected
+            - **Hot streak**: Positive L5 trend
+            """)
+
     # Database connection
     tourn_conn = get_connection(str(db_path))
 
