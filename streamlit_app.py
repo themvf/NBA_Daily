@@ -5598,6 +5598,156 @@ if selected_page == "Admin Panel":
                     with st.expander("🔍 Full Error Traceback", expanded=True):
                         st.code(traceback.format_exc(), language="python")
 
+    st.divider()
+
+    # Position Data Management Section
+    st.subheader("🏀 Player Position Data")
+    st.write("Populate Guard/Forward/Center positions from NBA API for position-specific PPM analysis")
+
+    try:
+        admin_conn = get_connection(str(db_path))
+        cursor = admin_conn.cursor()
+
+        # Check current position data status
+        cursor.execute('SELECT COUNT(*) FROM players')
+        total_players = cursor.fetchone()[0]
+
+        cursor.execute('SELECT COUNT(*) FROM players WHERE position IS NOT NULL AND position != ""')
+        players_with_positions = cursor.fetchone()[0]
+
+        # Get position distribution
+        cursor.execute('''
+            SELECT position, COUNT(*) as count
+            FROM players
+            WHERE position IS NOT NULL AND position != ""
+            GROUP BY position
+            ORDER BY count DESC
+        ''')
+        position_dist = cursor.fetchall()
+
+        col3, col4 = st.columns(2)
+
+        with col3:
+            st.metric("Total Players", total_players)
+            st.metric("Players with Position Data", f"{players_with_positions}/{total_players}")
+
+            if position_dist:
+                st.write("**Current Distribution:**")
+                for pos, count in position_dist:
+                    st.write(f"- {pos}: {count}")
+            else:
+                st.warning("⚠️ No position data populated yet")
+
+        with col4:
+            st.write("**Populate Position Data:**")
+            st.write("This will:")
+            st.write("- Fetch positions from NBA API for all players")
+            st.write("- Normalize to Guard/Forward/Center")
+            st.write("- Enable position-specific PPM analysis")
+            st.write("- Take ~5-10 minutes for ~600 players")
+
+            if st.button("🎯 Populate Player Positions", type="secondary", use_container_width=True):
+                import time
+                from nba_api.stats.endpoints import commonplayerinfo
+                import pandas as pd
+
+                def normalize_position(position: str) -> str:
+                    """Normalize NBA API positions to Guard/Forward/Center."""
+                    if not position:
+                        return ""
+                    pos_lower = position.lower()
+                    if 'guard' in pos_lower:
+                        return "Guard"
+                    if 'center' in pos_lower:
+                        return "Center"
+                    if 'forward' in pos_lower:
+                        return "Forward"
+                    return ""
+
+                with st.spinner("Fetching position data from NBA API..."):
+                    try:
+                        # Get all unique players from player_game_logs who don't have positions
+                        query = """
+                            SELECT DISTINCT pgl.player_id, pgl.player_name
+                            FROM player_game_logs pgl
+                            LEFT JOIN players p ON pgl.player_id = p.player_id
+                            WHERE p.position IS NULL OR p.position = ''
+                            ORDER BY pgl.player_name
+                        """
+                        players_df = pd.read_sql_query(query, admin_conn)
+
+                        if players_df.empty:
+                            st.success("✅ All players already have position data!")
+                        else:
+                            progress_text = st.empty()
+                            progress_bar = st.progress(0)
+                            success_count = 0
+                            error_count = 0
+                            total = len(players_df)
+
+                            progress_text.text(f"Processing {total} players...")
+
+                            for idx, row in players_df.iterrows():
+                                player_id = row['player_id']
+                                player_name = row['player_name']
+
+                                try:
+                                    # Fetch player info from NBA API
+                                    player_info = commonplayerinfo.CommonPlayerInfo(
+                                        player_id=player_id,
+                                        timeout=30
+                                    )
+
+                                    df = player_info.get_data_frames()[0]
+
+                                    if not df.empty and 'POSITION' in df.columns:
+                                        raw_position = df['POSITION'].iloc[0]
+                                        normalized_position = normalize_position(raw_position)
+
+                                        if normalized_position:
+                                            # Update database
+                                            cursor.execute(
+                                                "UPDATE players SET position = ? WHERE player_id = ?",
+                                                (normalized_position, player_id)
+                                            )
+                                            admin_conn.commit()
+                                            success_count += 1
+
+                                    # Rate limiting
+                                    time.sleep(0.6)
+
+                                    # Update progress
+                                    progress = (idx + 1) / total
+                                    progress_bar.progress(progress)
+                                    progress_text.text(f"Processing {idx + 1}/{total}: {player_name} ({success_count} successful)")
+
+                                except Exception as e:
+                                    error_count += 1
+                                    time.sleep(1.2)  # Double delay after error
+
+                            progress_bar.empty()
+                            progress_text.empty()
+
+                            # Show summary
+                            st.success(f"✅ Position data population complete!")
+                            st.info(f"📊 Successfully updated: **{success_count}** players")
+                            if error_count > 0:
+                                st.warning(f"⚠️ Errors: {error_count} players")
+
+                            # Auto-refresh to show updated stats
+                            st.info("🔄 Refreshing in 2 seconds to show updated distribution...")
+                            time.sleep(2)
+                            st.rerun()
+
+                    except Exception as e:
+                        st.error(f"❌ Position population failed: {str(e)}")
+                        import traceback
+                        with st.expander("🔍 Error Details", expanded=True):
+                            st.code(traceback.format_exc(), language="python")
+
+    except Exception as e:
+        st.error(f"Error checking position data: {e}")
+
 # ============================================================================
 # TOURNAMENT STRATEGY TAB - PHASE 1: BASIC CEILING ANALYSIS
 # ============================================================================
