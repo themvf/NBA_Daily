@@ -6549,6 +6549,23 @@ if selected_page == "Tournament Strategy":
         else:
             st.info("👆 Click **Auto-Generate Optimal Lineups** to build your tournament portfolio")
 
+        # Debug: Show Lineup D detection status
+        with st.expander("🔍 Debug: Lineup D Status", expanded=False):
+            st.write("**Session State Values:**")
+            st.write(f"- lineup_d exists: {bool(st.session_state.lineup_d)}")
+            st.write(f"- lineup_d length: {len(st.session_state.lineup_d) if st.session_state.lineup_d else 0}")
+            st.write(f"- lineup_d_game: {st.session_state.lineup_d_game}")
+            st.write(f"- lineup_d content: {st.session_state.lineup_d}")
+
+            if st.session_state.lineup_d and len(st.session_state.lineup_d) > 0:
+                st.success("✅ Lineup D is ACTIVE (should be showing)")
+            else:
+                st.warning("❌ Lineup D is INACTIVE")
+                st.caption("Reasons Lineup D might not activate:")
+                st.caption("• No game has 15%+ higher total than median")
+                st.caption("• Combined ceiling of top 3 players < 110 PPG")
+                st.caption("• Fewer than 2 games on slate")
+
         st.divider()
 
         # ========== LINEUP VALIDATION & METRICS ==========
