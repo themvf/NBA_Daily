@@ -6,8 +6,8 @@ Migrates injury_list table to support multi-status tracking with automated updat
 
 Changes:
 1. Adds new columns: injury_type, source, confidence, last_fetched_at
-2. Updates UNIQUE constraint: (player_id, status) → (player_id)
-3. Migrates existing data: 'active' → 'out'
+2. Updates UNIQUE constraint: (player_id, status) -> (player_id)
+3. Migrates existing data: 'active' -> 'out'
 4. Creates new tables: player_aliases, injury_fetch_errors, injury_fetch_lock, injury_history
 5. Adds indexes for performance
 
@@ -63,15 +63,15 @@ def backup_injury_list(conn: sqlite3.Connection) -> bool:
         backup_count = cursor.fetchone()[0]
 
         if original_count != backup_count:
-            print(f"⚠️  Warning: Backup count mismatch ({backup_count} vs {original_count})")
+            print(f"[WARNING] Backup count mismatch ({backup_count} vs {original_count})")
             return False
 
-        print(f"✅ Backed up {backup_count} records to injury_list_backup")
+        print(f"[OK] Backed up {backup_count} records to injury_list_backup")
         conn.commit()
         return True
 
     except Exception as e:
-        print(f"❌ Backup failed: {e}")
+        print(f"[ERROR] Backup failed: {e}")
         conn.rollback()
         return False
 
@@ -141,7 +141,7 @@ def add_new_columns(conn: sqlite3.Connection) -> bool:
     try:
         cursor = conn.cursor()
 
-        print("\n📝 Adding new columns to injury_list...")
+        print("\n[INFO] Adding new columns to injury_list...")
 
         # Check which columns are missing
         cursor.execute("PRAGMA table_info(injury_list)")
@@ -149,32 +149,32 @@ def add_new_columns(conn: sqlite3.Connection) -> bool:
 
         if 'injury_type' not in existing_columns:
             cursor.execute("ALTER TABLE injury_list ADD COLUMN injury_type TEXT")
-            print("  ✅ Added injury_type column")
+            print("  [OK] Added injury_type column")
 
         if 'source' not in existing_columns:
             cursor.execute("ALTER TABLE injury_list ADD COLUMN source TEXT DEFAULT 'manual'")
-            print("  ✅ Added source column")
+            print("  [OK] Added source column")
 
         if 'confidence' not in existing_columns:
             cursor.execute("ALTER TABLE injury_list ADD COLUMN confidence REAL DEFAULT 1.0")
-            print("  ✅ Added confidence column")
+            print("  [OK] Added confidence column")
 
         if 'last_fetched_at' not in existing_columns:
             cursor.execute("ALTER TABLE injury_list ADD COLUMN last_fetched_at TEXT")
-            print("  ✅ Added last_fetched_at column")
+            print("  [OK] Added last_fetched_at column")
 
         conn.commit()
         return True
 
     except Exception as e:
-        print(f"  ❌ Failed to add columns: {e}")
+        print(f"  [ERROR] Failed to add columns: {e}")
         conn.rollback()
         return False
 
 
 def migrate_status_values(conn: sqlite3.Connection) -> bool:
     """
-    Migrate existing status values: 'active' → 'out', keep 'returned'.
+    Migrate existing status values: 'active' -> 'out', keep 'returned'.
 
     Args:
         conn: Database connection
@@ -185,7 +185,7 @@ def migrate_status_values(conn: sqlite3.Connection) -> bool:
     try:
         cursor = conn.cursor()
 
-        print("\n📝 Migrating status values...")
+        print("\n[INFO] Migrating status values...")
 
         # Count records to migrate
         cursor.execute("SELECT COUNT(*) FROM injury_list WHERE status = 'active'")
@@ -197,15 +197,15 @@ def migrate_status_values(conn: sqlite3.Connection) -> bool:
                 SET status = 'out'
                 WHERE status = 'active'
             """)
-            print(f"  ✅ Migrated {active_count} 'active' → 'out'")
+            print(f"  [OK] Migrated {active_count} 'active' -> 'out'")
         else:
-            print("  ℹ️  No 'active' records to migrate")
+            print("  [INFO]  No 'active' records to migrate")
 
         conn.commit()
         return True
 
     except Exception as e:
-        print(f"  ❌ Failed to migrate status values: {e}")
+        print(f"  [ERROR] Failed to migrate status values: {e}")
         conn.rollback()
         return False
 
@@ -223,7 +223,7 @@ def create_player_aliases_table(conn: sqlite3.Connection) -> bool:
     try:
         cursor = conn.cursor()
 
-        print("\n📝 Creating player_aliases table...")
+        print("\n[INFO] Creating player_aliases table...")
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS player_aliases (
@@ -243,12 +243,12 @@ def create_player_aliases_table(conn: sqlite3.Connection) -> bool:
             ON player_aliases(alias_name)
         """)
 
-        print("  ✅ Created player_aliases table")
+        print("  [OK] Created player_aliases table")
         conn.commit()
         return True
 
     except Exception as e:
-        print(f"  ❌ Failed to create player_aliases table: {e}")
+        print(f"  [ERROR] Failed to create player_aliases table: {e}")
         conn.rollback()
         return False
 
@@ -266,7 +266,7 @@ def create_injury_fetch_errors_table(conn: sqlite3.Connection) -> bool:
     try:
         cursor = conn.cursor()
 
-        print("\n📝 Creating injury_fetch_errors table...")
+        print("\n[INFO] Creating injury_fetch_errors table...")
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS injury_fetch_errors (
@@ -278,12 +278,12 @@ def create_injury_fetch_errors_table(conn: sqlite3.Connection) -> bool:
             )
         """)
 
-        print("  ✅ Created injury_fetch_errors table")
+        print("  [OK] Created injury_fetch_errors table")
         conn.commit()
         return True
 
     except Exception as e:
-        print(f"  ❌ Failed to create injury_fetch_errors table: {e}")
+        print(f"  [ERROR] Failed to create injury_fetch_errors table: {e}")
         conn.rollback()
         return False
 
@@ -301,7 +301,7 @@ def create_injury_fetch_lock_table(conn: sqlite3.Connection) -> bool:
     try:
         cursor = conn.cursor()
 
-        print("\n📝 Creating injury_fetch_lock table...")
+        print("\n[INFO] Creating injury_fetch_lock table...")
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS injury_fetch_lock (
@@ -318,12 +318,12 @@ def create_injury_fetch_lock_table(conn: sqlite3.Connection) -> bool:
             VALUES (1, 0)
         """)
 
-        print("  ✅ Created injury_fetch_lock table")
+        print("  [OK] Created injury_fetch_lock table")
         conn.commit()
         return True
 
     except Exception as e:
-        print(f"  ❌ Failed to create injury_fetch_lock table: {e}")
+        print(f"  [ERROR] Failed to create injury_fetch_lock table: {e}")
         conn.rollback()
         return False
 
@@ -341,7 +341,7 @@ def create_injury_history_table(conn: sqlite3.Connection) -> bool:
     try:
         cursor = conn.cursor()
 
-        print("\n📝 Creating injury_history table (optional)...")
+        print("\n[INFO] Creating injury_history table (optional)...")
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS injury_history (
@@ -363,12 +363,12 @@ def create_injury_history_table(conn: sqlite3.Connection) -> bool:
             ON injury_history(player_id, snapshot_date)
         """)
 
-        print("  ✅ Created injury_history table")
+        print("  [OK] Created injury_history table")
         conn.commit()
         return True
 
     except Exception as e:
-        print(f"  ❌ Failed to create injury_history table: {e}")
+        print(f"  [ERROR] Failed to create injury_history table: {e}")
         conn.rollback()
         return False
 
@@ -386,7 +386,7 @@ def create_indexes(conn: sqlite3.Connection) -> bool:
     try:
         cursor = conn.cursor()
 
-        print("\n📝 Creating indexes...")
+        print("\n[INFO] Creating indexes...")
 
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_injury_list_player_id
@@ -403,12 +403,12 @@ def create_indexes(conn: sqlite3.Connection) -> bool:
             ON injury_list(source)
         """)
 
-        print("  ✅ Created indexes")
+        print("  [OK] Created indexes")
         conn.commit()
         return True
 
     except Exception as e:
-        print(f"  ❌ Failed to create indexes: {e}")
+        print(f"  [ERROR] Failed to create indexes: {e}")
         conn.rollback()
         return False
 
@@ -426,7 +426,7 @@ def verify_migration(conn: sqlite3.Connection) -> bool:
     try:
         cursor = conn.cursor()
 
-        print("\n🔍 Verifying migration...")
+        print("\n[VERIFY] Verifying migration...")
 
         # Check columns
         cursor.execute("PRAGMA table_info(injury_list)")
@@ -436,10 +436,10 @@ def verify_migration(conn: sqlite3.Connection) -> bool:
         missing_columns = required_columns - columns
 
         if missing_columns:
-            print(f"  ❌ Missing columns: {missing_columns}")
+            print(f"  [ERROR] Missing columns: {missing_columns}")
             return False
 
-        print(f"  ✅ All required columns present")
+        print(f"  [OK] All required columns present")
 
         # Check tables
         cursor.execute("""
@@ -454,29 +454,29 @@ def verify_migration(conn: sqlite3.Connection) -> bool:
         missing_tables = required_tables - tables
 
         if missing_tables:
-            print(f"  ❌ Missing tables: {missing_tables}")
+            print(f"  [ERROR] Missing tables: {missing_tables}")
             return False
 
-        print(f"  ✅ All required tables present")
+        print(f"  [OK] All required tables present")
 
         # Check data integrity
         cursor.execute("SELECT COUNT(*) FROM injury_list WHERE status = 'active'")
         active_count = cursor.fetchone()[0]
 
         if active_count > 0:
-            print(f"  ⚠️  Warning: {active_count} records still have status='active'")
+            print(f"  [WARNING]  Warning: {active_count} records still have status='active'")
         else:
-            print(f"  ✅ No 'active' status records (migration complete)")
+            print(f"  [OK] No 'active' status records (migration complete)")
 
         # Check backup
         cursor.execute("SELECT COUNT(*) FROM injury_list_backup")
         backup_count = cursor.fetchone()[0]
-        print(f"  ✅ Backup contains {backup_count} records")
+        print(f"  [OK] Backup contains {backup_count} records")
 
         return True
 
     except Exception as e:
-        print(f"  ❌ Verification failed: {e}")
+        print(f"  [ERROR] Verification failed: {e}")
         return False
 
 
@@ -500,12 +500,12 @@ def run_migration(db_path: str, dry_run: bool = False) -> bool:
     print("="*70)
 
     if dry_run:
-        print("\n⚠️  DRY RUN MODE - No changes will be made")
+        print("\n[WARNING]  DRY RUN MODE - No changes will be made")
         print("\nWould perform:")
         print("  1. Check if migration needed")
         print("  2. Backup injury_list table")
         print("  3. Add new columns (injury_type, source, confidence, last_fetched_at)")
-        print("  4. Migrate status values ('active' → 'out')")
+        print("  4. Migrate status values ('active' -> 'out')")
         print("  5. Create player_aliases table")
         print("  6. Create injury_fetch_errors table")
         print("  7. Create injury_fetch_lock table")
@@ -523,54 +523,54 @@ def run_migration(db_path: str, dry_run: bool = False) -> bool:
         needs_migration, reason = check_if_migration_needed(conn)
 
         if not needs_migration:
-            print(f"\n✅ {reason}")
+            print(f"\n[OK] {reason}")
             print("No migration needed!")
             return True
 
-        print(f"\n📋 Migration needed: {reason}")
+        print(f"\n[INFO] Migration needed: {reason}")
 
         # Backup
         if not backup_injury_list(conn):
-            print("\n❌ Backup failed - aborting migration")
+            print("\n[ERROR] Backup failed - aborting migration")
             return False
 
         # Add columns
         if not add_new_columns(conn):
-            print("\n❌ Failed to add columns - aborting migration")
+            print("\n[ERROR] Failed to add columns - aborting migration")
             return False
 
         # Migrate status values
         if not migrate_status_values(conn):
-            print("\n❌ Failed to migrate status values - aborting migration")
+            print("\n[ERROR] Failed to migrate status values - aborting migration")
             return False
 
         # Create new tables
         if not create_player_aliases_table(conn):
-            print("\n❌ Failed to create player_aliases table - aborting migration")
+            print("\n[ERROR] Failed to create player_aliases table - aborting migration")
             return False
 
         if not create_injury_fetch_errors_table(conn):
-            print("\n❌ Failed to create injury_fetch_errors table - aborting migration")
+            print("\n[ERROR] Failed to create injury_fetch_errors table - aborting migration")
             return False
 
         if not create_injury_fetch_lock_table(conn):
-            print("\n❌ Failed to create injury_fetch_lock table - aborting migration")
+            print("\n[ERROR] Failed to create injury_fetch_lock table - aborting migration")
             return False
 
         if not create_injury_history_table(conn):
-            print("\n⚠️  Warning: Failed to create injury_history table (optional)")
+            print("\n[WARNING]  Warning: Failed to create injury_history table (optional)")
 
         # Create indexes
         if not create_indexes(conn):
-            print("\n⚠️  Warning: Failed to create some indexes")
+            print("\n[WARNING]  Warning: Failed to create some indexes")
 
         # Verify
         if not verify_migration(conn):
-            print("\n❌ Verification failed - migration may be incomplete")
+            print("\n[ERROR] Verification failed - migration may be incomplete")
             return False
 
         print("\n" + "="*70)
-        print("✅ MIGRATION COMPLETED SUCCESSFULLY!")
+        print("[OK] MIGRATION COMPLETED SUCCESSFULLY!")
         print("="*70)
         print("\nRollback instructions (if needed):")
         print("  DROP TABLE injury_list;")
@@ -581,7 +581,7 @@ def run_migration(db_path: str, dry_run: bool = False) -> bool:
         return True
 
     except Exception as e:
-        print(f"\n❌ Migration failed: {e}")
+        print(f"\n[ERROR] Migration failed: {e}")
         return False
 
 
@@ -610,7 +610,7 @@ def main():
 
     # Confirmation prompt
     if not args.dry_run and not args.force:
-        print("\n⚠️  WARNING: This will modify your database schema!")
+        print("\n[WARNING]  WARNING: This will modify your database schema!")
         print(f"Database: {args.db}")
         response = input("\nProceed with migration? (yes/no): ")
         if response.lower() != 'yes':
