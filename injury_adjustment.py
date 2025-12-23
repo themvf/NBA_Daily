@@ -55,17 +55,25 @@ def apply_injury_adjustments(
     game_date: str,
     conn: sqlite3.Connection,
     min_historical_games: int = 3,
-    max_adjustment_pct: float = 0.25
+    max_adjustment_pct: float = 0.25,
+    status_aware: bool = True
 ) -> Tuple[int, int, List[AdjustmentRecord]]:
     """
-    Adjust teammate predictions based on injured players.
+    Adjust teammate predictions based on injured players with status-aware scaling.
+
+    When status_aware=True, adjustments are scaled based on injury status:
+    - OUT (0.0 play prob): 100% adjustment (player excluded from predictions)
+    - DOUBTFUL (0.25 play prob): 100% adjustment (player excluded)
+    - QUESTIONABLE (0.5 play prob): 50% adjustment (player included but risky)
+    - PROBABLE (0.8 play prob): 20% adjustment (player included, minimal boost)
 
     Args:
-        injured_player_ids: List of player IDs who are OUT
+        injured_player_ids: List of player IDs who are injured
         game_date: Game date in YYYY-MM-DD format
         conn: Database connection
         min_historical_games: Minimum absences required for reliable data
         max_adjustment_pct: Maximum % increase allowed (0.25 = 25%)
+        status_aware: If True, scale adjustments based on injury status play probability
 
     Returns:
         Tuple of (adjusted_count, skipped_count, adjustment_records)
@@ -95,6 +103,31 @@ def apply_injury_adjustments(
     teammate_adjustments = {}  # {teammate_id: total_ppg_boost}
     teammate_historical_games = {}  # {teammate_id: max_games_apart}
     injured_player_names = {}  # {player_id: player_name}
+    injury_status_multipliers = {}  # {player_id: adjustment_multiplier}
+
+    # Fetch injury statuses if status_aware mode is enabled
+    if status_aware:
+        try:
+            import injury_config as config
+            # Get statuses for all injured players
+            placeholders = ','.join('?' * len(injured_player_ids))
+            cursor.execute(f"""
+                SELECT player_id, status, confidence
+                FROM injury_list
+                WHERE player_id IN ({placeholders})
+            """, injured_player_ids)
+
+            for row in cursor.fetchall():
+                player_id, status, confidence = row
+                multiplier = config.get_adjustment_multiplier(status)
+                injury_status_multipliers[player_id] = multiplier
+        except Exception as e:
+            print(f"Warning: Could not load injury statuses, using full adjustments: {e}")
+            # Fallback: treat all as full adjustment (1.0)
+            injury_status_multipliers = {pid: 1.0 for pid in injured_player_ids}
+    else:
+        # Status-aware disabled: treat all as full adjustment
+        injury_status_multipliers = {pid: 1.0 for pid in injured_player_ids}
 
     for injured_id in injured_player_ids:
         # Get injured player's name
@@ -113,6 +146,9 @@ def apply_injury_adjustments(
             )
 
             # Accumulate adjustments for teammates who benefited
+            # Scale by injury status multiplier (1.0 for OUT, 0.5 for QUESTIONABLE, etc.)
+            status_multiplier = injury_status_multipliers.get(injured_id, 1.0)
+
             for impact in impacts:
                 if impact.pts_delta > 0 and impact.games_apart >= min_historical_games:
                     teammate_id = impact.teammate_id
@@ -121,7 +157,9 @@ def apply_injury_adjustments(
                         teammate_adjustments[teammate_id] = 0.0
                         teammate_historical_games[teammate_id] = 0
 
-                    teammate_adjustments[teammate_id] += impact.pts_delta
+                    # Scale adjustment by injury status
+                    scaled_delta = impact.pts_delta * status_multiplier
+                    teammate_adjustments[teammate_id] += scaled_delta
                     teammate_historical_games[teammate_id] = max(
                         teammate_historical_games[teammate_id],
                         impact.games_apart
@@ -482,36 +520,69 @@ def add_to_injury_list(
     player_id: int,
     player_name: str,
     team_name: str,
+    status: str = 'out',
+    injury_type: Optional[str] = None,
     expected_return_date: Optional[str] = None,
-    notes: Optional[str] = None
+    notes: Optional[str] = None,
+    source: str = 'manual'
 ) -> int:
     """
-    Add a player to the injury list.
+    Add a player to the injury list with proper UPSERT.
+
+    Uses ON CONFLICT DO UPDATE to preserve existing fields like created_at
+    when updating an existing injury record.
 
     Args:
         conn: Database connection
         player_id: Player ID
         player_name: Player full name
         team_name: Team name
+        status: Injury status ('out', 'doubtful', 'questionable', 'probable', 'day-to-day')
+        injury_type: Description of injury (e.g., 'Ankle Sprain', 'Rest')
         expected_return_date: Expected return date (YYYY-MM-DD) or None for indefinite
         notes: Optional notes about the injury
+        source: Data source ('manual' or 'automated')
 
     Returns:
-        injury_id of the created record
+        injury_id of the created/updated record
     """
     cursor = conn.cursor()
     today = date.today().strftime('%Y-%m-%d')
 
-    # Insert or replace (handles re-adding previously returned players)
-    cursor.execute("""
-        INSERT OR REPLACE INTO injury_list (
-            player_id, player_name, team_name, injury_date,
-            expected_return_date, status, notes
-        ) VALUES (?, ?, ?, ?, ?, 'active', ?)
-    """, (player_id, player_name, team_name, today, expected_return_date, notes))
+    # First, check if player already has an injury record
+    cursor.execute("SELECT injury_id FROM injury_list WHERE player_id = ?", (player_id,))
+    existing = cursor.fetchone()
 
-    conn.commit()
-    return cursor.lastrowid
+    if existing:
+        # Update existing record
+        cursor.execute("""
+            UPDATE injury_list
+            SET player_name = ?,
+                team_name = ?,
+                status = ?,
+                injury_type = ?,
+                expected_return_date = ?,
+                notes = COALESCE(?, notes),
+                source = ?,
+                confidence = 1.0,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE player_id = ?
+        """, (player_name, team_name, status, injury_type, expected_return_date,
+              notes, source, player_id))
+        conn.commit()
+        return existing[0]
+    else:
+        # Insert new record
+        cursor.execute("""
+            INSERT INTO injury_list (
+                player_id, player_name, team_name, injury_date,
+                expected_return_date, status, injury_type, notes,
+                source, confidence, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1.0, CURRENT_TIMESTAMP)
+        """, (player_id, player_name, team_name, today, expected_return_date,
+              status, injury_type, notes, source))
+        conn.commit()
+        return cursor.lastrowid
 
 
 def remove_from_injury_list(
@@ -520,6 +591,9 @@ def remove_from_injury_list(
 ) -> bool:
     """
     Mark a player as returned (status = 'returned').
+
+    Updates any non-returned injury status to 'returned', indicating the player
+    is no longer injured and available to play.
 
     Args:
         conn: Database connection
@@ -534,7 +608,7 @@ def remove_from_injury_list(
         UPDATE injury_list
         SET status = 'returned',
             updated_at = CURRENT_TIMESTAMP
-        WHERE player_id = ? AND status = 'active'
+        WHERE player_id = ? AND status != 'returned'
     """, (player_id,))
 
     conn.commit()
@@ -543,26 +617,52 @@ def remove_from_injury_list(
 
 def get_active_injuries(
     conn: sqlite3.Connection,
-    check_return_dates: bool = True
+    check_return_dates: bool = True,
+    status_filter: Optional[List[str]] = None
 ) -> List[Dict]:
     """
-    Get all currently injured players (status = 'active').
+    Get currently injured players filtered by status.
+
+    By default, returns players whose injury status indicates they should be
+    excluded from predictions (play_probability < PREDICTION_EXCLUSION_THRESHOLD).
 
     Args:
         conn: Database connection
         check_return_dates: If True, filter out players past their return date
+        status_filter: List of statuses to include. If None, uses default filter
+                      based on PREDICTION_EXCLUSION_THRESHOLD from injury_config.
+                      Default filters: ['out', 'doubtful'] (play_prob < 0.3)
 
     Returns:
-        List of injury records as dictionaries
+        List of injury records as dictionaries with fields:
+        - injury_id, player_id, player_name, team_name
+        - injury_date, expected_return_date, status
+        - injury_type, source, confidence, notes
     """
-    query = """
+    # Default filter: statuses where play probability < 0.3 (out, doubtful)
+    if status_filter is None:
+        try:
+            import injury_config as config
+            # Filter statuses below exclusion threshold
+            status_filter = [
+                status for status, prob in config.STATUS_PLAY_PROBABILITY.items()
+                if prob < config.PREDICTION_EXCLUSION_THRESHOLD
+            ]
+        except ImportError:
+            # Fallback if config not available
+            status_filter = ['out', 'doubtful']
+
+    # Build query with status filter
+    placeholders = ','.join('?' * len(status_filter))
+    query = f"""
         SELECT injury_id, player_id, player_name, team_name,
-               injury_date, expected_return_date, status, notes
+               injury_date, expected_return_date, status,
+               injury_type, source, confidence, notes
         FROM injury_list
-        WHERE status = 'active'
+        WHERE status IN ({placeholders})
     """
 
-    df = pd.read_sql_query(query, conn)
+    df = pd.read_sql_query(query, conn, params=status_filter)
 
     if df.empty:
         return []
@@ -598,7 +698,7 @@ def update_injury_return_date(
         UPDATE injury_list
         SET expected_return_date = ?,
             updated_at = CURRENT_TIMESTAMP
-        WHERE player_id = ? AND status = 'active'
+        WHERE player_id = ? AND status != 'returned'
     """, (new_return_date, player_id))
 
     conn.commit()
