@@ -155,9 +155,9 @@ API_RETRY_BASE_DELAY: int = 2
 # ==============================================================================
 # STATUS MAPPINGS
 # ==============================================================================
-# Maps nbainjuries API status values to our internal schema
-# nbainjuries may return slightly different status strings than our schema
-NBAINJURIES_STATUS_MAP: Dict[str, str] = {
+# Maps balldontlie.io API status values to our internal schema
+# API may return slightly different status strings than our schema
+BALLDONTLIE_STATUS_MAP: Dict[str, str] = {
     'Out': 'out',
     'Doubtful': 'doubtful',
     'Questionable': 'questionable',
