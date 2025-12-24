@@ -5410,35 +5410,35 @@ if selected_page == "Injury Admin":
     st.subheader("📡 Auto-Fetch Current Injury Reports")
     st.caption("Fetch latest injury data from balldontlie.io API and sync to database")
 
-    # Admin: Lock management (in expander to avoid clutter)
-    with st.expander("🔧 Advanced: Lock Management", expanded=False):
-        col_lock1, col_lock2 = st.columns(2)
+    # Lock Status Display (always visible for transparency)
+    col_status, col_clear = st.columns([2, 1])
 
-        with col_lock1:
-            if st.button("🔓 Clear Fetch Lock", help="Clears cooldown to allow immediate fetch"):
-                try:
-                    cursor = injury_conn.cursor()
-                    cursor.execute("UPDATE injury_fetch_lock SET locked = 0, locked_at = NULL, locked_by = NULL WHERE lock_id = 1")
-                    injury_conn.commit()
-                    st.success("✅ Lock cleared! You can now fetch immediately.")
-                    st.cache_resource.clear()
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"❌ Failed to clear lock: {e}")
+    with col_status:
+        try:
+            cursor = injury_conn.cursor()
+            cursor.execute("SELECT locked, locked_at, locked_by FROM injury_fetch_lock WHERE lock_id = 1")
+            result = cursor.fetchone()
+            if result:
+                locked_emoji = "🔒" if result[0] else "🔓"
+                status_text = "Locked" if result[0] else "Unlocked"
+                last_fetch = result[1] if result[1] else "Never"
+                st.info(f"{locked_emoji} **Status:** {status_text} | **Last Fetch:** {last_fetch}")
+            else:
+                st.warning("⚠️ Lock table exists but no lock record found")
+        except Exception as e:
+            st.warning(f"⚠️ Lock table not found (old schema) - Fetch will create it")
 
-        with col_lock2:
-            # Show current lock status
+    with col_clear:
+        if st.button("🔓 Clear Lock", help="Clears cooldown to allow immediate fetch", use_container_width=True):
             try:
                 cursor = injury_conn.cursor()
-                cursor.execute("SELECT locked, locked_at, locked_by FROM injury_fetch_lock WHERE lock_id = 1")
-                result = cursor.fetchone()
-                if result:
-                    locked_emoji = "🔒" if result[0] else "🔓"
-                    st.caption(f"**Lock Status:**")
-                    st.caption(f"{locked_emoji} {'Locked' if result[0] else 'Unlocked'}")
-                    st.caption(f"Last: {result[1] or 'Never'}")
-            except:
-                st.caption("⚠️ Lock table not found")
+                cursor.execute("UPDATE injury_fetch_lock SET locked = 0, locked_at = NULL, locked_by = NULL WHERE lock_id = 1")
+                injury_conn.commit()
+                st.success("✅ Cleared!")
+                st.cache_resource.clear()
+                st.rerun()
+            except Exception as e:
+                st.error(f"❌ Error: {e}")
 
     if st.button("🔄 Fetch Now", type="primary", use_container_width=True, key="manual_fetch_btn"):
         with st.spinner("Fetching injury reports from API..."):
