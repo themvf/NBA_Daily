@@ -652,6 +652,10 @@ def get_active_injuries(
             # Fallback if config not available
             status_filter = ['out', 'doubtful']
 
+    # Handle empty status filter - return empty list immediately
+    if not status_filter:
+        return []
+
     # Build query with status filter
     placeholders = ','.join('?' * len(status_filter))
     query = f"""
@@ -662,7 +666,7 @@ def get_active_injuries(
         WHERE status IN ({placeholders})
     """
 
-    df = pd.read_sql_query(query, conn, params=status_filter)
+    df = pd.read_sql_query(query, conn, params=tuple(status_filter))
 
     if df.empty:
         return []
