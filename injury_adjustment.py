@@ -486,9 +486,10 @@ def get_adjusted_predictions_summary(
 # ============================================================================
 
 def create_injury_list_table(conn: sqlite3.Connection) -> None:
-    """Create the injury_list table if it doesn't exist."""
+    """Create the injury_list table if it doesn't exist, and add new columns if missing."""
     cursor = conn.cursor()
 
+    # Create table with full schema (for new installations)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS injury_list (
             injury_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -498,6 +499,10 @@ def create_injury_list_table(conn: sqlite3.Connection) -> None:
             injury_date TEXT NOT NULL,
             expected_return_date TEXT,
             status TEXT NOT NULL DEFAULT 'active',
+            injury_type TEXT,
+            source TEXT DEFAULT 'manual',
+            confidence REAL DEFAULT 1.0,
+            last_fetched_at TEXT,
             notes TEXT,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -506,10 +511,47 @@ def create_injury_list_table(conn: sqlite3.Connection) -> None:
         )
     """)
 
+    # For existing tables, try to add new columns if they don't exist
+    new_columns = [
+        ("injury_type", "TEXT"),
+        ("source", "TEXT DEFAULT 'manual'"),
+        ("confidence", "REAL DEFAULT 1.0"),
+        ("last_fetched_at", "TEXT")
+    ]
+
+    for col_name, col_def in new_columns:
+        try:
+            cursor.execute(f"ALTER TABLE injury_list ADD COLUMN {col_name} {col_def}")
+        except sqlite3.OperationalError:
+            # Column already exists, skip
+            pass
+
     # Create index for quick lookups
     cursor.execute("""
         CREATE INDEX IF NOT EXISTS idx_injury_list_status
         ON injury_list(status)
+    """)
+
+    conn.commit()
+
+
+def create_injury_fetch_lock_table(conn: sqlite3.Connection) -> None:
+    """Create the injury_fetch_lock table if it doesn't exist."""
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS injury_fetch_lock (
+            lock_id INTEGER PRIMARY KEY CHECK (lock_id = 1),
+            locked INTEGER DEFAULT 0,
+            locked_at TEXT,
+            locked_by TEXT
+        )
+    """)
+
+    # Insert initial lock record
+    cursor.execute("""
+        INSERT OR IGNORE INTO injury_fetch_lock (lock_id, locked)
+        VALUES (1, 0)
     """)
 
     conn.commit()

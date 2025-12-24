@@ -5178,6 +5178,9 @@ if selected_page == "Injury Admin":
     # Ensure injury_list table exists
     ia.create_injury_list_table(injury_conn)
 
+    # Ensure injury_fetch_lock table exists (for auto-fetch cooldown)
+    ia.create_injury_fetch_lock_table(injury_conn)
+
     st.divider()
 
     # Two-column layout
@@ -5410,31 +5413,17 @@ if selected_page == "Injury Admin":
     st.subheader("📡 Auto-Fetch Current Injury Reports")
     st.caption("Fetch latest injury data from balldontlie.io API and sync to database")
 
-    # DEBUG: This should ALWAYS show
-    st.write("🔍 DEBUG: Code execution reached this point")
-
-    # Try to detect lock status
-    lock_status = "unknown"
-    lock_error = None
+    # Display lock status
     try:
         cursor = injury_conn.cursor()
-        st.write("🔍 DEBUG: Database cursor created")
         cursor.execute("SELECT locked, locked_at, locked_by FROM injury_fetch_lock WHERE lock_id = 1")
-        st.write("🔍 DEBUG: Query executed")
         result = cursor.fetchone()
         if result:
             lock_status = "locked" if result[0] else "unlocked"
             st.info(f"🔒 Lock Status: {lock_status.upper()} | Last: {result[1] or 'Never'}")
-        else:
-            st.warning("⚠️ Lock table exists but empty")
-    except Exception as e:
-        lock_error = str(e)
-        st.warning(f"⚠️ Lock table not found: {lock_error}")
-
-    st.write(f"🔍 DEBUG: lock_status={lock_status}, error={lock_error}")
-
-    # Fetch button (no conditional, always show)
-    st.write("🔍 DEBUG: About to render Fetch Now button")
+    except Exception:
+        # Lock table will be created on first run
+        pass
 
     if st.button("🔄 Fetch Now", type="primary", use_container_width=True, key="manual_fetch_btn"):
         with st.spinner("Fetching injury reports from API..."):
@@ -5475,6 +5464,17 @@ if selected_page == "Injury Admin":
             except Exception as e:
                 st.error(f"❌ Auto-fetch failed: {e}")
                 st.caption("You can still add injuries manually using the form above.")
+
+    # Clear lock button (for stuck locks)
+    if st.button("🔓 Clear Fetch Lock", help="Clear the fetch cooldown if stuck", key="clear_lock_btn"):
+        try:
+            cursor = injury_conn.cursor()
+            cursor.execute("UPDATE injury_fetch_lock SET locked = 0, locked_at = NULL WHERE lock_id = 1")
+            injury_conn.commit()
+            st.success("✅ Fetch lock cleared!")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Error clearing lock: {e}")
 
     st.divider()
 
