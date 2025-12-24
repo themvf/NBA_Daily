@@ -2793,6 +2793,21 @@ if selected_page == "Today's Games":
                     "composite_score" if "composite_score" in leaders_df.columns else "weighted_score"
                 )
 
+                # AUTO-FETCH INJURIES: Refresh injury data before generating predictions
+                try:
+                    import fetch_injury_data
+                    updated, new, skipped, errors = fetch_injury_data.fetch_current_injuries(games_conn)
+
+                    if updated > 0 or new > 0:
+                        st.info(f"📡 Injury data auto-updated: {updated} updated, {new} new, {skipped} skipped")
+
+                    if errors:
+                        with st.expander("⚠️ Injury Fetch Warnings", expanded=False):
+                            for error in errors:
+                                st.warning(error)
+                except Exception as e:
+                    st.warning(f"⚠️ Could not auto-fetch injuries: {e}")
+
                 # Get list of injured player IDs for today to exclude from predictions
                 active_injuries = ia.get_active_injuries(games_conn, check_return_dates=True)
                 injured_player_ids = {inj['player_id'] for inj in active_injuries}
@@ -5983,13 +5998,12 @@ if selected_page == "Tournament Strategy":
             (p.proj_ceiling - p.proj_floor) as upside_range,
             ROUND((p.proj_ceiling - p.proj_floor) / p.projected_ppg, 2) as variance_ratio
         FROM predictions p
-        LEFT JOIN injury_list il ON p.player_name = il.player_name
-            AND p.team_name = il.team_name
-            AND il.status = 'active'
+        LEFT JOIN injury_list il ON p.player_id = il.player_id
+            AND il.status IN ('out', 'doubtful')
             AND (il.expected_return_date IS NULL OR il.expected_return_date >= DATE('now'))
         WHERE p.game_date = ?
           AND p.proj_ceiling >= ?
-          AND il.player_name IS NULL  -- Exclude active injuries
+          AND il.player_id IS NULL  -- Exclude injured players (OUT/DOUBTFUL)
         ORDER BY p.proj_ceiling DESC
     """
 
@@ -6047,11 +6061,12 @@ if selected_page == "Tournament Strategy":
                 p.team_name,
                 p.proj_ceiling,
                 il.status as injury_status,
-                il.injury_date
+                il.injury_type,
+                il.injury_date,
+                il.source
             FROM predictions p
-            INNER JOIN injury_list il ON p.player_name = il.player_name
-                AND p.team_name = il.team_name
-                AND il.status = 'active'
+            INNER JOIN injury_list il ON p.player_id = il.player_id
+                AND il.status IN ('out', 'doubtful')
                 AND (il.expected_return_date IS NULL OR il.expected_return_date >= DATE('now'))
             WHERE p.game_date = ?
                 AND p.proj_ceiling >= ?

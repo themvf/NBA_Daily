@@ -122,6 +122,32 @@ def main():
         print(f"\nFound {pred_count} predictions for {yesterday}")
         print(f"Currently scored: {scored_count}/{pred_count}")
 
+    # Step 0.5: Auto-fetch current injury data
+    print(f"\n{'='*70}")
+    print("STEP 0.5: Auto-Fetching Current Injury Reports")
+    print(f"{'='*70}")
+
+    try:
+        import fetch_injury_data
+        conn = sqlite3.connect('nba_stats.db')
+        updated, new, skipped, errors = fetch_injury_data.fetch_current_injuries(conn)
+        conn.close()
+
+        print(f"\n✅ Injury data updated:")
+        print(f"   - Updated: {updated}")
+        print(f"   - New: {new}")
+        print(f"   - Skipped: {skipped}")
+
+        if errors:
+            print(f"\n⚠️ Warnings during fetch:")
+            for error in errors[:5]:  # Show first 5 errors
+                print(f"   - {error}")
+            if len(errors) > 5:
+                print(f"   ... and {len(errors) - 5} more")
+    except Exception as e:
+        print(f"\n⚠️ Could not auto-fetch injuries: {e}")
+        print("Continuing with manual injury data...")
+
     # Step 1: Fetch latest game data
     step1_success = run_command(
         'python nba_to_sqlite.py --season "2025-26" --season-type "Regular Season" --no-include-rosters',
