@@ -5186,14 +5186,72 @@ if selected_page == "Injury Admin":
     with col1:
         st.subheader("📋 Active Injury List")
 
-        # Display current injury list
-        injury_list = ia.get_active_injuries(injury_conn, check_return_dates=True)
+        # Status filter
+        status_filter_options = st.multiselect(
+            "Filter by status",
+            options=['out', 'doubtful', 'questionable', 'probable', 'day-to-day', 'returned'],
+            default=['out', 'doubtful', 'questionable'],
+            key="injury_status_filter"
+        )
+
+        source_filter = st.selectbox(
+            "Filter by source",
+            options=['all', 'manual', 'automated'],
+            key="injury_source_filter"
+        )
+
+        # Display current injury list with filters
+        if status_filter_options:
+            injury_list = ia.get_active_injuries(
+                injury_conn,
+                check_return_dates=True,
+                status_filter=status_filter_options
+            )
+        else:
+            injury_list = []
+
+        # Apply source filter
+        if source_filter != 'all' and injury_list:
+            injury_list = [inj for inj in injury_list if inj.get('source') == source_filter]
 
         if injury_list:
+            # Helper function for status emoji
+            def get_status_emoji(status):
+                emoji_map = {
+                    'out': '🔴',
+                    'doubtful': '🟠',
+                    'questionable': '🟡',
+                    'probable': '🟢',
+                    'day-to-day': '🔵',
+                    'returned': '✅'
+                }
+                return emoji_map.get(status, '⚪')
+
             # Convert to DataFrame for display
             injury_df = pd.DataFrame(injury_list)
-            display_df = injury_df[['player_name', 'team_name', 'injury_date', 'expected_return_date', 'notes']]
-            display_df.columns = ['Player', 'Team', 'Injury Date', 'Expected Return', 'Notes']
+
+            # Format status with emoji
+            injury_df['status_display'] = injury_df['status'].apply(
+                lambda s: f"{get_status_emoji(s)} {s.upper()}"
+            )
+
+            # Select and rename columns
+            display_df = injury_df[[
+                'player_name', 'team_name', 'status_display',
+                'injury_type', 'injury_date', 'expected_return_date',
+                'source', 'confidence', 'notes'
+            ]]
+            display_df.columns = [
+                'Player', 'Team', 'Status', 'Injury Type',
+                'Injury Date', 'Expected Return',
+                'Source', 'Conf', 'Notes'
+            ]
+
+            # Format confidence as percentage
+            display_df['Conf'] = display_df['Conf'].apply(lambda x: f"{x*100:.0f}%" if pd.notna(x) else "N/A")
+            display_df['Injury Type'] = display_df['Injury Type'].fillna('N/A')
+            display_df['Notes'] = display_df['Notes'].fillna('')
+
             st.dataframe(display_df, use_container_width=True)
 
             # Mark as Returned functionality
@@ -5267,6 +5325,31 @@ if selected_page == "Injury Admin":
                     key="add_injured_player_selector"
                 )
 
+                # Helper function for status display
+                def format_status_option(status):
+                    emoji_map = {
+                        'out': '🔴',
+                        'doubtful': '🟠',
+                        'questionable': '🟡',
+                        'probable': '🟢',
+                        'day-to-day': '🔵'
+                    }
+                    return f"{emoji_map.get(status, '⚪')} {status.upper()}"
+
+                injury_status = st.selectbox(
+                    "Injury Status",
+                    options=['out', 'doubtful', 'questionable', 'probable', 'day-to-day'],
+                    format_func=format_status_option,
+                    index=0,  # Default to 'out'
+                    key="injury_status_selector"
+                )
+
+                injury_type_input = st.text_input(
+                    "Injury Type",
+                    placeholder="e.g., Ankle Sprain, Rest, Illness, Back Soreness",
+                    key="injury_type_input"
+                )
+
                 return_date = st.date_input(
                     "Expected return date (optional)",
                     value=None,
@@ -5274,8 +5357,8 @@ if selected_page == "Injury Admin":
                 )
 
                 notes = st.text_area(
-                    "Notes (e.g., injury type, severity)",
-                    placeholder="Sprained ankle, day-to-day",
+                    "Additional Notes",
+                    placeholder="Optional: Additional details about the injury",
                     key="injury_notes_input"
                 )
 
@@ -5287,8 +5370,11 @@ if selected_page == "Injury Admin":
                         player_id=player_id,
                         player_name=player_name,
                         team_name=team_name,
+                        status=injury_status,
+                        injury_type=injury_type_input if injury_type_input else None,
                         expected_return_date=str(return_date) if return_date else None,
-                        notes=notes if notes else None
+                        notes=notes if notes else None,
+                        source='manual'
                     )
 
                     if injury_id:
@@ -5317,6 +5403,52 @@ if selected_page == "Injury Admin":
 
         except Exception as e:
             st.error(f"Error loading players: {e}")
+
+    st.divider()
+
+    # Auto-Fetch Section
+    st.subheader("📡 Auto-Fetch Current Injury Reports")
+    st.caption("Fetch latest injury data from balldontlie.io API and sync to database")
+
+    if st.button("🔄 Fetch Now", type="primary", use_container_width=True, key="manual_fetch_btn"):
+        with st.spinner("Fetching injury reports from API..."):
+            try:
+                import fetch_injury_data
+                updated, new, skipped, errors = fetch_injury_data.fetch_current_injuries(injury_conn)
+
+                # Show results
+                col_a, col_b, col_c = st.columns(3)
+                col_a.metric("Updated", updated, delta=None)
+                col_b.metric("New", new, delta=None)
+                col_c.metric("Skipped", skipped, delta=None)
+
+                if updated > 0 or new > 0:
+                    st.success(f"✅ Injury data refreshed! {updated} updated, {new} new injuries added.")
+
+                    # Backup to S3 after successful fetch
+                    try:
+                        storage = s3_storage.S3PredictionStorage()
+                        if storage.is_connected():
+                            backup_success, backup_message = storage.upload_database(db_path)
+                            if backup_success:
+                                st.sidebar.info("☁️ Database backed up to S3")
+                    except:
+                        pass  # Silent fail for S3 backup
+
+                    # Clear cache and refresh
+                    st.cache_resource.clear()
+                    st.rerun()
+                else:
+                    st.info("ℹ️ No updates needed. All injury data is current.")
+
+                if errors:
+                    with st.expander(f"⚠️ {len(errors)} Warnings", expanded=False):
+                        for error in errors:
+                            st.warning(error)
+
+            except Exception as e:
+                st.error(f"❌ Auto-fetch failed: {e}")
+                st.caption("You can still add injuries manually using the form above.")
 
     st.divider()
 
