@@ -5410,32 +5410,31 @@ if selected_page == "Injury Admin":
     st.subheader("📡 Auto-Fetch Current Injury Reports")
     st.caption("Fetch latest injury data from balldontlie.io API and sync to database")
 
-    # Lock Status Display (simplified - no columns to avoid rendering issues)
+    # DEBUG: This should ALWAYS show
+    st.write("🔍 DEBUG: Code execution reached this point")
+
+    # Try to detect lock status
+    lock_status = "unknown"
+    lock_error = None
     try:
         cursor = injury_conn.cursor()
+        st.write("🔍 DEBUG: Database cursor created")
         cursor.execute("SELECT locked, locked_at, locked_by FROM injury_fetch_lock WHERE lock_id = 1")
+        st.write("🔍 DEBUG: Query executed")
         result = cursor.fetchone()
         if result:
-            locked_emoji = "🔒" if result[0] else "🔓"
-            status_text = "Locked" if result[0] else "Unlocked"
-            last_fetch = result[1] if result[1] else "Never"
-            st.info(f"{locked_emoji} **Status:** {status_text} | **Last Fetch:** {last_fetch}")
+            lock_status = "locked" if result[0] else "unlocked"
+            st.info(f"🔒 Lock Status: {lock_status.upper()} | Last: {result[1] or 'Never'}")
         else:
-            st.warning("⚠️ Lock table exists but no lock record found")
+            st.warning("⚠️ Lock table exists but empty")
     except Exception as e:
-        st.warning(f"⚠️ Lock table not found (old schema) - Fetch will create it")
+        lock_error = str(e)
+        st.warning(f"⚠️ Lock table not found: {lock_error}")
 
-    # Clear lock button
-    if st.button("🔓 Clear Lock", help="Clears cooldown to allow immediate fetch"):
-        try:
-            cursor = injury_conn.cursor()
-            cursor.execute("UPDATE injury_fetch_lock SET locked = 0, locked_at = NULL, locked_by = NULL WHERE lock_id = 1")
-            injury_conn.commit()
-            st.success("✅ Lock cleared! You can now fetch immediately.")
-            st.cache_resource.clear()
-            st.rerun()
-        except Exception as e:
-            st.error(f"❌ Failed to clear lock: {e}")
+    st.write(f"🔍 DEBUG: lock_status={lock_status}, error={lock_error}")
+
+    # Fetch button (no conditional, always show)
+    st.write("🔍 DEBUG: About to render Fetch Now button")
 
     if st.button("🔄 Fetch Now", type="primary", use_container_width=True, key="manual_fetch_btn"):
         with st.spinner("Fetching injury reports from API..."):
