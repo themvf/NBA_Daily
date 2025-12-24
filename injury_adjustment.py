@@ -557,6 +557,31 @@ def create_injury_fetch_lock_table(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def create_player_aliases_table(conn: sqlite3.Connection) -> None:
+    """Create the player_aliases table if it doesn't exist."""
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS player_aliases (
+            alias_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alias_name TEXT NOT NULL,
+            player_id INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            confidence REAL NOT NULL DEFAULT 1.0,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(alias_name, source)
+        )
+    """)
+
+    # Create index for fast lookups
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_player_aliases_name
+        ON player_aliases(alias_name)
+    """)
+
+    conn.commit()
+
+
 def add_to_injury_list(
     conn: sqlite3.Connection,
     player_id: int,

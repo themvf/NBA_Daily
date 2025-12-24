@@ -5181,6 +5181,9 @@ if selected_page == "Injury Admin":
     # Ensure injury_fetch_lock table exists (for auto-fetch cooldown)
     ia.create_injury_fetch_lock_table(injury_conn)
 
+    # Ensure player_aliases table exists (for name matching)
+    ia.create_player_aliases_table(injury_conn)
+
     st.divider()
 
     # Two-column layout
