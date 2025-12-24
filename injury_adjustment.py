@@ -658,15 +658,33 @@ def get_active_injuries(
 
     # Build query with status filter
     placeholders = ','.join('?' * len(status_filter))
-    query = f"""
-        SELECT injury_id, player_id, player_name, team_name,
-               injury_date, expected_return_date, status,
-               injury_type, source, confidence, notes
-        FROM injury_list
-        WHERE status IN ({placeholders})
-    """
 
-    df = pd.read_sql_query(query, conn, params=tuple(status_filter))
+    # Try new schema first (with injury_type, source, confidence)
+    try:
+        query = f"""
+            SELECT injury_id, player_id, player_name, team_name,
+                   injury_date, expected_return_date, status,
+                   injury_type, source, confidence, notes
+            FROM injury_list
+            WHERE status IN ({placeholders})
+        """
+        df = pd.read_sql_query(query, conn, params=tuple(status_filter))
+    except Exception:
+        # Fallback to old schema (without new columns and only 'active' status)
+        query = """
+            SELECT injury_id, player_id, player_name, team_name,
+                   injury_date, expected_return_date, status, notes
+            FROM injury_list
+            WHERE status = 'active'
+        """
+        df = pd.read_sql_query(query, conn)
+
+        # Add missing columns with default values for backward compatibility
+        df['injury_type'] = None
+        df['source'] = 'manual'
+        df['confidence'] = 1.0
+        # Map old 'active' status to new 'out' status for consistency
+        df['status'] = df['status'].replace('active', 'out')
 
     if df.empty:
         return []
