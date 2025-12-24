@@ -349,36 +349,67 @@ def upsert_injury(
     cursor = conn.cursor()
 
     try:
+        # Check if player already has an injury record
         cursor.execute("""
-            INSERT INTO injury_list (
-                player_id, player_name, team_name, status, injury_type,
-                source, confidence, last_fetched_at, injury_date,
-                expected_return_date, notes, updated_at
+            SELECT injury_id, source, updated_at
+            FROM injury_list
+            WHERE player_id = ?
+        """, (player_id,))
+        existing = cursor.fetchone()
+
+        if existing:
+            injury_id, existing_source, updated_at = existing
+
+            # Check manual override rule
+            cursor.execute("""
+                SELECT datetime(?, '-24 hours') < datetime(?)
+            """, (updated_at, updated_at))
+            is_recent_manual = (
+                existing_source == 'manual' and
+                cursor.fetchone()[0] == 1
             )
-            VALUES (?, ?, ?, ?, ?, 'automated', ?, CURRENT_TIMESTAMP, DATE('now'), ?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(player_id) DO UPDATE SET
-                status = CASE
-                    -- Manual override rule: If manual entry within last 24 hours, don't overwrite
-                    WHEN injury_list.source = 'manual'
-                         AND injury_list.updated_at > datetime('now', '-24 hours')
-                    THEN injury_list.status
-                    ELSE excluded.status
-                END,
-                injury_type = excluded.injury_type,
-                team_name = excluded.team_name,
-                confidence = excluded.confidence,
-                last_fetched_at = excluded.last_fetched_at,
-                expected_return_date = COALESCE(excluded.expected_return_date, injury_list.expected_return_date),
-                notes = COALESCE(excluded.notes, injury_list.notes),
-                source = CASE
-                    WHEN injury_list.source = 'manual'
-                         AND injury_list.updated_at > datetime('now', '-24 hours')
-                    THEN 'manual'  -- Preserve manual source
-                    ELSE 'automated'
-                END,
-                updated_at = CURRENT_TIMESTAMP
-                -- Preserved: injury_date, created_at
-        """, (player_id, player_name, team_name, status, injury_type, confidence, return_date, description))
+
+            if is_recent_manual:
+                # Manual override active - don't update status, just refresh metadata
+                cursor.execute("""
+                    UPDATE injury_list
+                    SET team_name = ?,
+                        injury_type = ?,
+                        confidence = ?,
+                        last_fetched_at = CURRENT_TIMESTAMP,
+                        expected_return_date = COALESCE(?, expected_return_date),
+                        notes = COALESCE(?, notes),
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE player_id = ?
+                """, (team_name, injury_type, confidence, return_date, description, player_id))
+            else:
+                # Normal update - automated source can update everything
+                cursor.execute("""
+                    UPDATE injury_list
+                    SET player_name = ?,
+                        team_name = ?,
+                        status = ?,
+                        injury_type = ?,
+                        confidence = ?,
+                        last_fetched_at = CURRENT_TIMESTAMP,
+                        expected_return_date = COALESCE(?, expected_return_date),
+                        notes = COALESCE(?, notes),
+                        source = 'automated',
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE player_id = ?
+                """, (player_name, team_name, status, injury_type, confidence,
+                      return_date, description, player_id))
+        else:
+            # Insert new record
+            cursor.execute("""
+                INSERT INTO injury_list (
+                    player_id, player_name, team_name, status, injury_type,
+                    source, confidence, last_fetched_at, injury_date,
+                    expected_return_date, notes, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, 'automated', ?, CURRENT_TIMESTAMP, DATE('now'), ?, ?, CURRENT_TIMESTAMP)
+            """, (player_id, player_name, team_name, status, injury_type,
+                  confidence, return_date, description))
 
         conn.commit()
         return True
