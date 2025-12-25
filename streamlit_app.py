@@ -1747,6 +1747,8 @@ def calculate_smart_ppg_projection(
     # Track which analytics were used
     analytics_indicators = "".join(analytics_used) if analytics_used else "📊"
 
+    # Add momentum indicator if breakout detected (will be appended after momentum check)
+
     # Normalize weights to sum to 1.0
     total_weight = sum(weights.values())
     if total_weight > 0:
@@ -1758,6 +1760,41 @@ def calculate_smart_ppg_projection(
         for k in components
         if components[k] is not None and weights[k] > 0
     )
+
+    # MOMENTUM MODIFIER: Catch breakout performances (Murray 52, Pritchard 42, Vassell 35)
+    # Only triggers when ALL conditions are met (conservative guardrail)
+    momentum_bonus = 0.0
+    momentum_applied = False
+    if recent_avg_3 is not None and season_avg > 0 and season_avg_minutes is not None:
+        # Condition 1: Recent surge (last 3 games ≥ +15% vs season)
+        recent_surge = (recent_avg_3 - season_avg) / season_avg
+
+        # Condition 2: Minutes stable or rising (≥90% of season avg)
+        minutes_stable = (avg_minutes_last5 is not None and
+                         avg_minutes_last5 >= season_avg_minutes * 0.90)
+
+        # Condition 3: Usage stable (within ±2% if available)
+        usage_stable = True  # Default to True if no usage data
+        if avg_usg_last5 is not None and usage_pct is not None and usage_pct > 0:
+            usage_change = abs(avg_usg_last5 - usage_pct) / usage_pct
+            usage_stable = usage_change <= 0.02
+
+        # Apply bonus if all conditions met
+        if recent_surge >= 0.15 and minutes_stable and usage_stable:
+            # Scale bonus: +15% surge → 5% bonus, +30% surge → 10% bonus, +50% surge → 12% bonus
+            # Hard capped at 12%
+            if recent_surge >= 0.50:
+                momentum_bonus = 0.12
+            elif recent_surge >= 0.30:
+                momentum_bonus = 0.10
+            elif recent_surge >= 0.20:
+                momentum_bonus = 0.07
+            else:
+                momentum_bonus = 0.05
+
+            projection = projection * (1 + momentum_bonus)
+            momentum_applied = True
+            analytics_indicators += "🔥"  # Momentum boost indicator
 
     # FIX 2: Add regression to mean for high scorers (22+ PPG)
     # High scorers are over-projected by ~3.5 PPG on average
@@ -1947,12 +1984,70 @@ def calculate_smart_ppg_projection(
     final_ceiling_multiplier = ceiling_multiplier + defense_variance_boost
     ceiling = projection * (1 + final_ceiling_multiplier)
 
+    # CEILING CONFIDENCE SCORE (DFS Overlay - doesn't touch mean projection)
+    # Ranks ceiling quality for tournament play (0-100 scale)
+    ceiling_confidence = 50.0  # Base neutral score
+
+    # Factor 1: Pace environment (+/- 15 points)
+    if opp_pace is not None and league_avg_pace > 0:
+        pace_factor = ((opp_pace - league_avg_pace) / league_avg_pace) * 100
+        ceiling_confidence += min(15, max(-15, pace_factor))
+
+    # Factor 2: Correlation strength (+/- 20 points)
+    if opponent_correlation is not None and opponent_correlation.games_vs_opponent >= 2:
+        # Strong positive matchup = high ceiling confidence
+        if opponent_correlation.matchup_score >= 60:
+            ceiling_confidence += 20
+        elif opponent_correlation.matchup_score >= 55:
+            ceiling_confidence += 12
+        elif opponent_correlation.matchup_score <= 40:
+            ceiling_confidence -= 20
+        elif opponent_correlation.matchup_score <= 45:
+            ceiling_confidence -= 12
+
+    # Factor 3: Opponent ceiling allowance (+/- 10 points)
+    if opp_team_id is not None:
+        try:
+            ceiling_factor = get_opponent_defense_ceiling_factor(opp_team_id)
+            if ceiling_factor >= 1.15:
+                ceiling_confidence += 10  # Elite ceiling spot
+            elif ceiling_factor >= 1.12:
+                ceiling_confidence += 6
+            elif ceiling_factor >= 1.10:
+                ceiling_confidence += 3
+            elif ceiling_factor <= 0.90:
+                ceiling_confidence -= 10  # Ceiling suppressor
+        except Exception:
+            pass
+
+    # Factor 4: Recent efficiency spike (+/- 10 points)
+    if recent_avg_3 is not None and season_avg > 0:
+        efficiency_trend = (recent_avg_3 - season_avg) / season_avg
+        if efficiency_trend >= 0.20:
+            ceiling_confidence += 10  # Hot streak
+        elif efficiency_trend >= 0.10:
+            ceiling_confidence += 5
+        elif efficiency_trend <= -0.20:
+            ceiling_confidence -= 10  # Cold streak
+
+    # Factor 5: Player tier adjustment (+/- 5 points)
+    # High-usage stars have more reliable ceilings
+    if season_avg >= 25:
+        ceiling_confidence += 5
+    elif season_avg <= 10:
+        ceiling_confidence -= 5  # Boom-bust risk
+
+    # Clamp to 0-100 scale
+    ceiling_confidence = max(0, min(100, ceiling_confidence))
+
     # Build breakdown for transparency
     breakdown = {
         "projection": projection,
         "confidence": confidence_score,
         "floor": floor,
         "ceiling": ceiling,
+        "ceiling_confidence": ceiling_confidence,  # NEW: DFS overlay score
+        "momentum_bonus": momentum_bonus if momentum_applied else 0.0,  # Track momentum
         "components": {
             k: {"value": components[k], "weight": weights[k] * 100}
             for k in components
