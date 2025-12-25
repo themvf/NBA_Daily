@@ -5328,6 +5328,209 @@ if selected_page == "Prediction Log":
                 except Exception as e:
                     st.error(f"Error: {e}")
 
+        # Enhanced Metrics Section
+        st.divider()
+
+        with st.expander("📊 Enhanced Evaluation Metrics", expanded=False):
+            st.markdown("**Deep-dive prediction quality analysis beyond simple MAE**")
+
+            # Date range selector for enhanced metrics
+            metric_date_option = st.radio(
+                "Analysis Period",
+                options=["Single Date", "Last 7 Days", "Last 30 Days", "Season to Date"],
+                horizontal=True,
+                key="enhanced_metrics_period"
+            )
+
+            try:
+                import prediction_evaluation_metrics as pem
+                from datetime import datetime, timedelta
+
+                # Calculate date range based on selection
+                if metric_date_option == "Single Date":
+                    metrics = pem.calculate_enhanced_metrics(
+                        pred_conn,
+                        game_date=selected_date,
+                        min_actual_ppg=1.0  # Filter DNPs
+                    )
+                    analysis_label = selected_date
+                elif metric_date_option == "Last 7 Days":
+                    end_date = datetime.strptime(selected_date, '%Y-%m-%d')
+                    start_date = end_date - timedelta(days=7)
+                    metrics = pem.calculate_enhanced_metrics(
+                        pred_conn,
+                        start_date=start_date.strftime('%Y-%m-%d'),
+                        end_date=selected_date,
+                        min_actual_ppg=1.0
+                    )
+                    analysis_label = f"Last 7 Days (through {selected_date})"
+                elif metric_date_option == "Last 30 Days":
+                    end_date = datetime.strptime(selected_date, '%Y-%m-%d')
+                    start_date = end_date - timedelta(days=30)
+                    metrics = pem.calculate_enhanced_metrics(
+                        pred_conn,
+                        start_date=start_date.strftime('%Y-%m-%d'),
+                        end_date=selected_date,
+                        min_actual_ppg=1.0
+                    )
+                    analysis_label = f"Last 30 Days (through {selected_date})"
+                else:  # Season to Date
+                    metrics = pem.calculate_enhanced_metrics(
+                        pred_conn,
+                        start_date='2025-10-01',
+                        end_date=selected_date,
+                        min_actual_ppg=1.0
+                    )
+                    analysis_label = f"Season to Date (through {selected_date})"
+
+                if 'error' in metrics:
+                    st.warning(metrics['error'])
+                elif metrics['total_predictions'] == 0:
+                    st.info("No predictions found for selected period")
+                else:
+                    st.markdown(f"### Analysis: {analysis_label}")
+                    st.caption(f"Total Predictions: {metrics['total_predictions']} (filtered DNPs)")
+
+                    # Core metrics
+                    st.markdown("#### 📈 Core Accuracy Metrics")
+                    core_cols = st.columns(4)
+                    core_cols[0].metric("MAE", f"{metrics['mae']:.2f} PPG")
+                    core_cols[1].metric("RMSE", f"{metrics['rmse']:.2f} PPG")
+                    core_cols[2].metric("Bias", f"{metrics['bias']:+.2f} PPG",
+                                       help="Positive = over-projecting, Negative = under-projecting")
+                    core_cols[3].metric("Median Error", f"{metrics['median_error']:+.2f} PPG")
+
+                    st.divider()
+
+                    # Hit rates
+                    st.markdown("#### 🎯 Hit Rates")
+                    hit_cols = st.columns(5)
+                    hit_cols[0].metric("Within ±5 PPG", f"{metrics['hit_rate_within_5']:.1f}%")
+                    hit_cols[1].metric("Within ±10 PPG", f"{metrics['hit_rate_within_10']:.1f}%")
+                    hit_cols[2].metric("Floor-Ceiling Hit", f"{metrics['floor_ceiling_hit_rate']:.1f}%",
+                                      help="% of actuals within projected range")
+                    hit_cols[3].metric("Above Floor", f"{metrics['floor_coverage']:.1f}%")
+                    hit_cols[4].metric("Below Ceiling", f"{metrics['ceiling_coverage']:.1f}%")
+
+                    st.divider()
+
+                    # Rank-ordering quality
+                    st.markdown("#### 🏆 Rank-Ordering Quality")
+                    st.caption("How well do we order players relative to each other? (Critical for DFS)")
+
+                    rank_cols = st.columns(3)
+                    rank_cols[0].metric(
+                        "Spearman Correlation",
+                        f"{metrics['spearman_correlation']:.3f}",
+                        help="Perfect rank-ordering = 1.0, Random = 0.0"
+                    )
+                    rank_cols[1].metric(
+                        "Pearson Correlation",
+                        f"{metrics['pearson_correlation']:.3f}",
+                        help="Linear correlation between projected and actual"
+                    )
+
+                    # Interpretation
+                    if metrics['spearman_correlation'] >= 0.75:
+                        rank_quality = "🟢 Excellent - Strong rank-ordering"
+                    elif metrics['spearman_correlation'] >= 0.65:
+                        rank_quality = "🟡 Good - Reliable rank-ordering"
+                    elif metrics['spearman_correlation'] >= 0.50:
+                        rank_quality = "🟠 Fair - Some rank-ordering skill"
+                    else:
+                        rank_quality = "🔴 Poor - Weak rank-ordering"
+
+                    rank_cols[2].info(rank_quality)
+
+                    st.divider()
+
+                    # Outlier analysis
+                    st.markdown("#### 🔥 Outlier Analysis")
+                    outlier_cols = st.columns(3)
+
+                    if metrics['top_10_pct_miss_rate']:
+                        outlier_cols[0].metric(
+                            "Top 10% Worst Misses",
+                            f"{metrics['top_10_pct_miss_rate']:.2f} PPG MAE",
+                            help="Average error for worst 10% of predictions"
+                        )
+                        outlier_cols[1].metric(
+                            "Top 10% Max Miss",
+                            f"{metrics['top_10_pct_max_miss']:.2f} PPG",
+                            help="Single worst prediction error"
+                        )
+
+                    if metrics['bottom_10_pct_mae']:
+                        outlier_cols[2].metric(
+                            "Bottom 10% Best",
+                            f"{metrics['bottom_10_pct_mae']:.2f} PPG MAE",
+                            help="Average error for best 10% of predictions"
+                        )
+
+                    st.divider()
+
+                    # Over/under balance
+                    st.markdown("#### ⚖️ Over/Under Balance")
+                    balance_cols = st.columns(4)
+                    balance_cols[0].metric("Over-Projections", metrics['over_projections'])
+                    balance_cols[1].metric("Under-Projections", metrics['under_projections'])
+                    balance_cols[2].metric("Over %", f"{metrics['over_pct']:.1f}%")
+                    balance_cols[3].metric("Under %", f"{metrics['under_pct']:.1f}%")
+
+                    # Balance interpretation
+                    balance_diff = abs(metrics['over_pct'] - 50.0)
+                    if balance_diff <= 5:
+                        st.success("✅ Well-balanced projection bias")
+                    elif balance_diff <= 10:
+                        st.info("ℹ️ Slight projection bias")
+                    else:
+                        if metrics['over_pct'] > 50:
+                            st.warning(f"⚠️ Tendency to over-project ({metrics['over_pct']:.1f}%)")
+                        else:
+                            st.warning(f"⚠️ Tendency to under-project ({metrics['under_pct']:.1f}%)")
+
+                    st.divider()
+
+                    # Metrics by player tier
+                    st.markdown("#### 📊 Performance by Player Tier")
+
+                    if metric_date_option == "Single Date":
+                        tier_start = selected_date
+                        tier_end = selected_date
+                    elif metric_date_option == "Last 7 Days":
+                        tier_end = selected_date
+                        tier_start = (datetime.strptime(selected_date, '%Y-%m-%d') - timedelta(days=7)).strftime('%Y-%m-%d')
+                    elif metric_date_option == "Last 30 Days":
+                        tier_end = selected_date
+                        tier_start = (datetime.strptime(selected_date, '%Y-%m-%d') - timedelta(days=30)).strftime('%Y-%m-%d')
+                    else:
+                        tier_start = '2025-10-01'
+                        tier_end = selected_date
+
+                    tier_metrics = pem.get_metrics_by_player_tier(
+                        pred_conn,
+                        start_date=tier_start,
+                        end_date=tier_end
+                    )
+
+                    if not tier_metrics.empty:
+                        st.dataframe(
+                            tier_metrics,
+                            use_container_width=True,
+                            hide_index=True
+                        )
+
+                        # Key insights
+                        st.caption("**Key Insights:**")
+                        st.caption("- MAE = Mean Absolute Error (lower is better)")
+                        st.caption("- Floor_Ceiling_Rate = % of predictions within projected range")
+                        st.caption("- Compare tiers to identify if model performs differently for stars vs role players")
+
+            except Exception as e:
+                st.error(f"Error calculating enhanced metrics: {e}")
+                import traceback
+                st.code(traceback.format_exc())
+
 # Ceiling Analytics Tab ---------------------------------------------------
 if selected_page == "Ceiling Analytics":
     st.header("🎯 Opponent Ceiling Analytics")
