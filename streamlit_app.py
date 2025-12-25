@@ -146,6 +146,7 @@ tab_titles = [
     "Defense Mix",
     "Prediction Log",
     "Defense Styles",
+    "Ceiling Analytics",
     "Injury Admin",
     "Admin Panel",
     "Tournament Strategy",
@@ -2005,18 +2006,46 @@ def calculate_smart_ppg_projection(
         elif opponent_correlation.matchup_score <= 45:
             ceiling_confidence -= 12
 
-    # Factor 3: Opponent ceiling allowance (+/- 10 points)
+    # Factor 3: Opponent ceiling allowance (+/- 15 points)
+    # ENHANCED: Use detailed ceiling analytics (35+/40+/45+ game rates)
     if opp_team_id is not None:
         try:
-            ceiling_factor = get_opponent_defense_ceiling_factor(opp_team_id)
-            if ceiling_factor >= 1.15:
-                ceiling_confidence += 10  # Elite ceiling spot
-            elif ceiling_factor >= 1.12:
-                ceiling_confidence += 6
-            elif ceiling_factor >= 1.10:
-                ceiling_confidence += 3
-            elif ceiling_factor <= 0.90:
-                ceiling_confidence -= 10  # Ceiling suppressor
+            import opponent_ceiling_analytics as oca
+            ceiling_profile = oca.get_team_ceiling_profile(
+                conn,
+                opp_team_id,
+                season='2025-26',
+                min_games=5
+            )
+
+            if ceiling_profile:
+                volatility = ceiling_profile['ceiling_volatility']
+                # Elite ceiling spots (70+): +15 pts
+                # High ceiling (55-70): +10 pts
+                # Average (40-55): 0 pts
+                # Low ceiling (25-40): -8 pts
+                # Suppressors (<25): -15 pts
+                if volatility >= 70:
+                    ceiling_confidence += 15
+                elif volatility >= 55:
+                    ceiling_confidence += 10
+                elif volatility >= 40:
+                    pass  # Neutral
+                elif volatility >= 25:
+                    ceiling_confidence -= 8
+                else:
+                    ceiling_confidence -= 15
+            else:
+                # Fallback to old method if no ceiling profile data
+                ceiling_factor = get_opponent_defense_ceiling_factor(opp_team_id)
+                if ceiling_factor >= 1.15:
+                    ceiling_confidence += 10
+                elif ceiling_factor >= 1.12:
+                    ceiling_confidence += 6
+                elif ceiling_factor >= 1.10:
+                    ceiling_confidence += 3
+                elif ceiling_factor <= 0.90:
+                    ceiling_confidence -= 10
         except Exception:
             pass
 
@@ -5298,6 +5327,139 @@ if selected_page == "Prediction Log":
                             st.write("---")
                 except Exception as e:
                     st.error(f"Error: {e}")
+
+# Ceiling Analytics Tab ---------------------------------------------------
+if selected_page == "Ceiling Analytics":
+    st.header("🎯 Opponent Ceiling Analytics")
+    st.write("Which teams allow explosive scoring performances? Track ceiling volatility for DFS tournament strategy.")
+
+    ceiling_conn = get_connection(str(db_path))
+
+    # Season selector
+    ceiling_season = st.selectbox(
+        "Select season",
+        options=['2025-26', '2024-25', '2023-24'],
+        index=0,
+        key="ceiling_season"
+    )
+
+    try:
+        import opponent_ceiling_analytics as oca
+
+        st.divider()
+
+        # Get rankings
+        with st.spinner("Calculating ceiling analytics..."):
+            rankings = oca.get_all_teams_ceiling_rankings(
+                ceiling_conn,
+                season=ceiling_season,
+                min_games=5
+            )
+
+        if not rankings.empty:
+            # Summary stats
+            col1, col2, col3, col4 = st.columns(4)
+
+            elite_count = len(rankings[rankings['ceiling_volatility'] >= 70])
+            high_count = len(rankings[rankings['ceiling_volatility'] >= 55])
+            suppressor_count = len(rankings[rankings['ceiling_volatility'] < 25])
+            avg_volatility = rankings['ceiling_volatility'].mean()
+
+            col1.metric("Elite Ceiling Spots", elite_count, help="Volatility ≥ 70")
+            col2.metric("High Ceiling Spots", high_count, help="Volatility ≥ 55")
+            col3.metric("Ceiling Suppressors", suppressor_count, help="Volatility < 25")
+            col4.metric("Avg Volatility", f"{avg_volatility:.1f}")
+
+            st.divider()
+
+            # Top ceiling spots
+            st.subheader("🔥 Top 10 Ceiling Spots (Best for DFS Tournaments)")
+            st.caption("These teams allow the most 35+, 40+, and 45+ point performances")
+
+            top10 = rankings.head(10).copy()
+            top10['ceiling_volatility'] = top10['ceiling_volatility'].apply(lambda x: f"{x:.1f}")
+            top10['pct_35plus'] = top10['pct_35plus'].apply(lambda x: f"{x:.1f}%")
+            top10['pct_40plus'] = top10['pct_40plus'].apply(lambda x: f"{x:.1f}%")
+            top10['pct_45plus'] = top10['pct_45plus'].apply(lambda x: f"{x:.1f}%")
+
+            st.dataframe(
+                top10[['rank', 'team_name', 'ceiling_volatility', 'tier',
+                       'pct_35plus', 'pct_40plus', 'pct_45plus', 'total_games']],
+                use_container_width=True,
+                hide_index=True
+            )
+
+            st.divider()
+
+            # Bottom ceiling spots
+            st.subheader("🛡️ Bottom 10 Ceiling Suppressors (Avoid for Tournaments)")
+            st.caption("These teams rarely allow explosive scoring performances")
+
+            bottom10 = rankings.tail(10).copy()
+            bottom10['ceiling_volatility'] = bottom10['ceiling_volatility'].apply(lambda x: f"{x:.1f}")
+            bottom10['pct_35plus'] = bottom10['pct_35plus'].apply(lambda x: f"{x:.1f}%")
+            bottom10['pct_40plus'] = bottom10['pct_40plus'].apply(lambda x: f"{x:.1f}%")
+            bottom10['pct_45plus'] = bottom10['pct_45plus'].apply(lambda x: f"{x:.1f}%")
+
+            st.dataframe(
+                bottom10[['rank', 'team_name', 'ceiling_volatility', 'tier',
+                         'pct_35plus', 'pct_40plus', 'pct_45plus', 'total_games']],
+                use_container_width=True,
+                hide_index=True
+            )
+
+            st.divider()
+
+            # Full rankings
+            with st.expander("📊 View Full Rankings", expanded=False):
+                full_rankings = rankings.copy()
+                full_rankings['ceiling_volatility'] = full_rankings['ceiling_volatility'].apply(lambda x: f"{x:.1f}")
+                full_rankings['pct_35plus'] = full_rankings['pct_35plus'].apply(lambda x: f"{x:.1f}%")
+                full_rankings['pct_40plus'] = full_rankings['pct_40plus'].apply(lambda x: f"{x:.1f}%")
+                full_rankings['pct_45plus'] = full_rankings['pct_45plus'].apply(lambda x: f"{x:.1f}%")
+                full_rankings['avg_allowed'] = full_rankings['avg_allowed'].apply(lambda x: f"{x:.1f}")
+
+                st.dataframe(
+                    full_rankings,
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+            # Explanation
+            with st.expander("ℹ️ How Ceiling Volatility Works"):
+                st.markdown("""
+**Ceiling Volatility Score (0-100):**
+
+Measures how often a team allows high-scoring individual performances. This is different
+from raw defensive rating - some teams suppress averages but allow spikes (volatile),
+while others are consistently tight (suppressor).
+
+**Scoring Breakdown:**
+- **35+ point games:** Base weight (30%)
+- **40+ point games:** 2x weight (60%) - these are DFS tournament targets
+- **45+ point games:** 3x weight (90%) - nuclear outcomes
+- **Variance:** Contributes 0-20 points based on scoring distribution
+
+**Tiers:**
+- **Elite Ceiling Spot (70+):** Frequently allows explosive games - target for tournaments
+- **High Ceiling Spot (55-70):** Above average ceiling potential
+- **Average Ceiling (40-55):** Moderate ceiling potential
+- **Low Ceiling Spot (25-40):** Below average ceiling potential
+- **Ceiling Suppressor (<25):** Rarely allows big games - avoid for tournaments
+
+**DFS Strategy:**
+- Tournament play: Target players vs Elite/High Ceiling Spots
+- Cash games: Avoid extreme ceiling spots (higher variance)
+- This score is already integrated into your ceiling confidence predictions!
+                """)
+
+        else:
+            st.warning(f"No data available for {ceiling_season} season yet. Data requires at least 5 games per team.")
+
+    except Exception as e:
+        st.error(f"Error loading ceiling analytics: {e}")
+        import traceback
+        st.code(traceback.format_exc())
 
 # Injury Admin Tab --------------------------------------------------------
 if selected_page == "Injury Admin":
