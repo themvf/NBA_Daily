@@ -2696,6 +2696,38 @@ if selected_page == "Today's Games":
     # Collect predictions for CSV export
     predictions_for_export = []
 
+    # DNP WARNING SYSTEM: Alert if OUT players have predictions
+    try:
+        import injury_adjustment as ia
+        today_str = default_game_date().strftime('%Y-%m-%d')
+
+        # Check for OUT players with predictions
+        out_players_query = """
+            SELECT COUNT(*) as count
+            FROM predictions p
+            INNER JOIN injury_list i ON p.player_id = i.player_id
+            WHERE p.game_date = ?
+              AND i.status IN ('out', 'doubtful')
+        """
+        cursor = games_conn.cursor()
+        cursor.execute(out_players_query, (today_str,))
+        out_count = cursor.fetchone()[0]
+
+        if out_count > 0:
+            st.warning(f"""
+⚠️ **{out_count} OUT/DOUBTFUL player(s) have predictions for today!**
+
+These predictions should be removed to avoid DNP errors.
+
+👉 Go to **Injury Admin** tab → Click **"Refresh Predictions"** to:
+- Delete OUT player predictions
+- Redistribute expected points to healthy teammates
+- Update your projections with latest injury news
+            """, icon="⚠️")
+    except Exception:
+        # Silently fail if injury check fails
+        pass
+
     st.subheader("Today's Games (Scoreboard)")
     selected_date = st.date_input(
         "Game date",
