@@ -511,7 +511,12 @@ def create_injury_list_table(conn: sqlite3.Connection) -> None:
         )
     """)
 
-    # For existing tables, try to add new columns if they don't exist
+    # For existing tables, check if columns exist before adding
+    # Get current column names
+    cursor.execute("PRAGMA table_info(injury_list)")
+    existing_columns = {row[1] for row in cursor.fetchall()}
+
+    # Columns we want to ensure exist
     new_columns = [
         ("injury_type", "TEXT"),
         ("source", "TEXT DEFAULT 'manual'"),
@@ -520,11 +525,12 @@ def create_injury_list_table(conn: sqlite3.Connection) -> None:
     ]
 
     for col_name, col_def in new_columns:
-        try:
-            cursor.execute(f"ALTER TABLE injury_list ADD COLUMN {col_name} {col_def}")
-        except sqlite3.OperationalError:
-            # Column already exists, skip
-            pass
+        if col_name not in existing_columns:
+            try:
+                cursor.execute(f"ALTER TABLE injury_list ADD COLUMN {col_name} {col_def}")
+            except sqlite3.OperationalError:
+                # Column already exists (race condition), skip
+                pass
 
     # Create index for quick lookups
     cursor.execute("""
