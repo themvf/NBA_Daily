@@ -1843,9 +1843,11 @@ def calculate_smart_ppg_projection(
     uncertainty = 1.0 - confidence_score  # High confidence → low uncertainty (0.05 to 0.95)
 
     # FLOOR: Conservative estimate (bad game scenario)
-    # Base floor: 9% below projection (inherent game variance)
+    # Base floor: 14% below projection (inherent game variance + off-night risk)
     # Uncertainty adjustment: scale between 80% and 120% of base
-    floor_base_interval = season_avg * 0.09
+    # UPDATED: Widened from 9% to 14% based on actual prediction log analysis
+    # showing only 13% hit rate with narrower ranges
+    floor_base_interval = season_avg * 0.14
     floor_uncertainty_factor = 0.8 + (0.4 * uncertainty)
     floor_interval = floor_base_interval * floor_uncertainty_factor
     floor = max(0, projection - floor_interval)
@@ -1863,22 +1865,24 @@ def calculate_smart_ppg_projection(
     # - Top 10% of games for bench players (<15 PPG): +80-120% above average
     #
     # Formula: Base ceiling multiplier adjusted by player tier and uncertainty
+    # UPDATED: Increased multipliers by 15-20% based on prediction log analysis
+    # showing under-projection of breakout performances (only 13% hit rate)
     if season_avg >= 25:
-        # Star players: 60-80% upside (e.g., 28 PPG → 44-50 ceiling)
-        ceiling_base_multiplier = 0.60
-        ceiling_uncertainty_bonus = 0.20 * uncertainty  # More uncertainty = higher ceiling
-    elif season_avg >= 20:
-        # High-volume scorers: 55-75% upside (e.g., 22 PPG → 34-38 ceiling)
-        ceiling_base_multiplier = 0.55
-        ceiling_uncertainty_bonus = 0.20 * uncertainty
-    elif season_avg >= 15:
-        # Mid-tier players: 50-70% upside (e.g., 17 PPG → 25-29 ceiling)
-        ceiling_base_multiplier = 0.50
-        ceiling_uncertainty_bonus = 0.20 * uncertainty
-    else:
-        # Role/bench players: 70-100% upside (e.g., 10 PPG → 17-20 ceiling)
+        # Star players: 70-95% upside (e.g., 28 PPG → 48-55 ceiling)
         ceiling_base_multiplier = 0.70
-        ceiling_uncertainty_bonus = 0.30 * uncertainty
+        ceiling_uncertainty_bonus = 0.25 * uncertainty  # More uncertainty = higher ceiling
+    elif season_avg >= 20:
+        # High-volume scorers: 65-90% upside (e.g., 22 PPG → 36-42 ceiling)
+        ceiling_base_multiplier = 0.65
+        ceiling_uncertainty_bonus = 0.25 * uncertainty
+    elif season_avg >= 15:
+        # Mid-tier players: 60-85% upside (e.g., 17 PPG → 27-31 ceiling)
+        ceiling_base_multiplier = 0.60
+        ceiling_uncertainty_bonus = 0.25 * uncertainty
+    else:
+        # Role/bench players: 85-120% upside (e.g., 10 PPG → 18-22 ceiling)
+        ceiling_base_multiplier = 0.85
+        ceiling_uncertainty_bonus = 0.35 * uncertainty
 
     ceiling_multiplier = ceiling_base_multiplier + ceiling_uncertainty_bonus
 
