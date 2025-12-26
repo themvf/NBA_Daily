@@ -174,44 +174,73 @@ def get_api_key(conn: sqlite3.Connection) -> Optional[str]:
 
 def fetch_injuries_from_api(api_key: str) -> List[Dict]:
     """
-    Fetch injury data from balldontlie.io API with retry logic.
+    Fetch injury data from balldontlie.io API with pagination support.
 
     Args:
         api_key: balldontlie.io API key
 
     Returns:
-        List of injury records from API
+        List of injury records from API (all pages combined)
 
     Raises:
         Exception: If API call fails after retries
     """
     headers = {"Authorization": api_key}
+    all_injuries = []
+    cursor = None
+    page = 1
+    max_pages = 10  # Safety limit to prevent infinite loops
 
-    for attempt in range(config.API_RETRY_COUNT):
-        try:
-            response = requests.get(
-                f"{BASE_URL}/player_injuries",
-                headers=headers,
-                timeout=30
-            )
-            response.raise_for_status()
+    while page <= max_pages:
+        for attempt in range(config.API_RETRY_COUNT):
+            try:
+                # Build URL with pagination
+                params = {"per_page": 100}  # Use max page size for efficiency
+                if cursor:
+                    params["cursor"] = cursor
 
-            data = response.json()
-            injuries = data.get('data', [])
+                response = requests.get(
+                    f"{BASE_URL}/player_injuries",
+                    headers=headers,
+                    params=params,
+                    timeout=30
+                )
+                response.raise_for_status()
 
-            print(f"Fetched {len(injuries)} injuries from balldontlie.io")
-            return injuries
+                data = response.json()
+                injuries = data.get('data', [])
+                all_injuries.extend(injuries)
 
-        except requests.exceptions.RequestException as e:
-            if attempt < config.API_RETRY_COUNT - 1:
-                # Exponential backoff
-                delay = config.API_RETRY_BASE_DELAY * (2 ** attempt)
-                print(f"API call failed (attempt {attempt + 1}/{config.API_RETRY_COUNT}), "
-                      f"retrying in {delay}s: {e}")
-                time.sleep(delay)
-            else:
-                # Final attempt failed
-                raise Exception(f"API call failed after {config.API_RETRY_COUNT} attempts: {e}")
+                print(f"Fetched page {page}: {len(injuries)} injuries")
+
+                # Check for next page
+                meta = data.get('meta', {})
+                next_cursor = meta.get('next_cursor')
+
+                if not next_cursor or len(injuries) == 0:
+                    # No more pages
+                    print(f"Total injuries fetched: {len(all_injuries)} (across {page} pages)")
+                    return all_injuries
+
+                # Move to next page
+                cursor = next_cursor
+                page += 1
+                break  # Break retry loop on success
+
+            except requests.exceptions.RequestException as e:
+                if attempt < config.API_RETRY_COUNT - 1:
+                    # Exponential backoff
+                    delay = config.API_RETRY_BASE_DELAY * (2 ** attempt)
+                    print(f"API call failed (page {page}, attempt {attempt + 1}/{config.API_RETRY_COUNT}), "
+                          f"retrying in {delay}s: {e}")
+                    time.sleep(delay)
+                else:
+                    # Final attempt failed
+                    raise Exception(f"API call failed after {config.API_RETRY_COUNT} attempts: {e}")
+
+    # Reached max pages
+    print(f"Warning: Reached max page limit ({max_pages}). Total fetched: {len(all_injuries)}")
+    return all_injuries
 
 
 def map_player_name_to_id(
