@@ -3682,83 +3682,6 @@ These predictions should be removed to avoid DNP errors.
             else:
                 st.caption("S3 backup not configured")
 
-    # Populate Daily Leaders data (runs every time "Today's Games" tab is visited)
-    top_scorers_query = """
-        WITH ranked AS (
-            SELECT
-                player_id,
-                player_name,
-                team_name,
-                game_date,
-                matchup,
-                points,
-                minutes,
-                ROW_NUMBER() OVER (
-                    PARTITION BY game_date
-                    ORDER BY points DESC
-                ) AS rn
-            FROM player_game_logs
-            WHERE season = ?
-              AND season_type = ?
-              AND points IS NOT NULL
-        )
-        SELECT
-            r.game_date,
-            r.player_id,
-            r.player_name,
-            r.team_name,
-            r.matchup,
-            r.points,
-            r.minutes,
-            pst.usg_pct
-        FROM ranked AS r
-        LEFT JOIN player_season_totals AS pst
-          ON pst.player_id = r.player_id
-         AND pst.season = ?
-         AND pst.season_type = ?
-        WHERE r.rn <= ?
-        ORDER BY r.game_date DESC, r.points DESC
-    """
-    try:
-        top_df = run_query(
-            str(db_path),
-            top_scorers_query,
-            params=(
-                context_season,
-                context_season_type,
-                context_season,
-                context_season_type,
-                DAILY_LEADERS_MAX,
-            ),
-        )
-        daily_top_scorers_rows.clear()
-        for _, row in top_df.iterrows():
-            game_date = pd.to_datetime(row["game_date"]).date()
-            home_team, away_team = derive_home_away(row["team_name"], row["matchup"])
-            minutes_float = minutes_str_to_float(row["minutes"])
-            usage_pct = safe_float(row["usg_pct"])
-            player_id = safe_int(row.get("player_id"))
-            season_stats = player_season_stats_map.get(player_id) if player_id is not None else {}
-            season_avg_pts = safe_float((season_stats or {}).get("avg_points"))
-            season_median_pts = safe_float((season_stats or {}).get("median_points"))
-            daily_top_scorers_rows.append(
-                {
-                    "Date": game_date.isoformat(),
-                    "Player": row["player_name"],
-                    "Home Team": home_team,
-                    "Away Team": away_team,
-                    "Total Points": row["points"],
-                    "Minutes": minutes_float,
-                    "Usage %": (usage_pct * 100.0) if usage_pct is not None else None,
-                    "Season Avg Pts": season_avg_pts,
-                    "Season Median Pts": season_median_pts,
-                }
-            )
-    except Exception as exc:
-        st.error(f"❌ **Failed to load daily top scorers:** {exc}")
-        import traceback
-        st.code(traceback.format_exc(), language="python")
-
 # Matchup spotlight tab ----------------------------------------------------
 if selected_page == "Matchup Spotlight":
     st.subheader("Player Matchup Spotlight")
@@ -3901,59 +3824,142 @@ if selected_page == "Matchup Spotlight":
 # Daily leaders tab --------------------------------------------------------
 if selected_page == "Daily Leaders":
     st.subheader("Daily Top Scorers (Top 3 per day)")
-    if not daily_top_scorers_rows:
-        st.warning("""
-        ⚠️ **No daily leaders data available**
 
-        **To populate this page:**
-        1. Go to the **"Today's Games"** tab
-        2. Scroll to the bottom of the page
-        3. Look for any error messages (red boxes) about "daily top scorers"
-        4. The data should load automatically when you visit Today's Games
-
-        **If you see an error**, it might be:
-        - Database connection issue
-        - Missing `player_game_logs` or `player_season_totals` tables
-        - Season/season_type mismatch
-
-        Check the error details in Today's Games tab for more info.
-        """)
-    else:
-        leaders_df = pd.DataFrame(daily_top_scorers_rows)
-        leaders_df["Date"] = pd.to_datetime(leaders_df["Date"])
-        available_dates = sorted(leaders_df["Date"].dt.date.unique(), reverse=True)
-        selected_date = st.selectbox(
-            "Select date",
-            options=available_dates,
+    # Season filter
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        leaders_season = st.text_input(
+            "Season",
+            value=DEFAULT_SEASON,
+            key="leaders_season_input",
+        ).strip() or DEFAULT_SEASON
+    with col2:
+        leaders_season_type = st.selectbox(
+            "Season type",
+            options=[DEFAULT_SEASON_TYPE, "Playoffs", "Pre Season"],
             index=0,
+            key="leaders_season_type_input",
         )
-        max_players = st.slider(
-            "Players shown per day",
-            min_value=1,
-            max_value=DAILY_LEADERS_MAX,
-            value=5,
-            step=1,
+
+    # Load data directly from database
+    top_scorers_query = """
+        WITH ranked AS (
+            SELECT
+                player_id,
+                player_name,
+                team_name,
+                game_date,
+                matchup,
+                points,
+                minutes,
+                ROW_NUMBER() OVER (
+                    PARTITION BY game_date
+                    ORDER BY points DESC
+                ) AS rn
+            FROM player_game_logs
+            WHERE season = ?
+              AND season_type = ?
+              AND points IS NOT NULL
         )
-        filtered_df = leaders_df[leaders_df["Date"].dt.date == selected_date].copy()
-        filtered_df = filtered_df.sort_values("Total Points", ascending=False).head(max_players)
-        filtered_df["Minutes"] = filtered_df["Minutes"].map(lambda v: format_number(v, 1))
-        filtered_df["Usage %"] = filtered_df["Usage %"].map(lambda v: format_number(v, 1))
-        filtered_df["Season Avg Pts"] = filtered_df["Season Avg Pts"].map(lambda v: format_number(v, 1))
-        filtered_df["Season Median Pts"] = filtered_df["Season Median Pts"].map(lambda v: format_number(v, 1))
-        display_df = filtered_df[
-            [
-                "Date",
-                "Player",
-                "Home Team",
-                "Away Team",
-                "Total Points",
-                "Minutes",
-                "Usage %",
-                "Season Avg Pts",
-                "Season Median Pts",
-            ]
-        ].reset_index(drop=True)
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
+        SELECT
+            r.game_date,
+            r.player_id,
+            r.player_name,
+            r.team_name,
+            r.matchup,
+            r.points,
+            r.minutes,
+            pst.usg_pct
+        FROM ranked AS r
+        LEFT JOIN player_season_totals AS pst
+          ON pst.player_id = r.player_id
+         AND pst.season = ?
+         AND pst.season_type = ?
+        WHERE r.rn <= ?
+        ORDER BY r.game_date DESC, r.points DESC
+    """
+
+    try:
+        top_df = run_query(
+            str(db_path),
+            top_scorers_query,
+            params=(
+                leaders_season,
+                leaders_season_type,
+                leaders_season,
+                leaders_season_type,
+                DAILY_LEADERS_MAX,
+            ),
+        )
+
+        if top_df.empty:
+            st.warning(f"""
+            ⚠️ **No data found for {leaders_season} {leaders_season_type}**
+
+            This could mean:
+            - No games have been played yet for this season
+            - The database needs to be updated
+            - The season name is incorrect
+
+            Try changing the season filter above or updating your database.
+            """)
+        else:
+            # Build leaders list
+            leaders_rows = []
+            for _, row in top_df.iterrows():
+                game_date = pd.to_datetime(row["game_date"]).date()
+                home_team, away_team = derive_home_away(row["team_name"], row["matchup"])
+                minutes_float = minutes_str_to_float(row["minutes"])
+                usage_pct = safe_float(row["usg_pct"])
+                leaders_rows.append({
+                    "Date": game_date.isoformat(),
+                    "Player": row["player_name"],
+                    "Home Team": home_team,
+                    "Away Team": away_team,
+                    "Total Points": row["points"],
+                    "Minutes": minutes_float,
+                    "Usage %": (usage_pct * 100.0) if usage_pct is not None else None,
+                })
+
+            leaders_df = pd.DataFrame(leaders_rows)
+            leaders_df["Date"] = pd.to_datetime(leaders_df["Date"])
+            available_dates = sorted(leaders_df["Date"].dt.date.unique(), reverse=True)
+
+            selected_date = st.selectbox(
+                "Select date",
+                options=available_dates,
+                index=0,
+            )
+            max_players = st.slider(
+                "Players shown per day",
+                min_value=1,
+                max_value=DAILY_LEADERS_MAX,
+                value=5,
+                step=1,
+            )
+
+            filtered_df = leaders_df[leaders_df["Date"].dt.date == selected_date].copy()
+            filtered_df = filtered_df.sort_values("Total Points", ascending=False).head(max_players)
+            filtered_df["Minutes"] = filtered_df["Minutes"].map(lambda v: format_number(v, 1))
+            filtered_df["Usage %"] = filtered_df["Usage %"].map(lambda v: format_number(v, 1) if v is not None else "N/A")
+
+            display_df = filtered_df[
+                [
+                    "Date",
+                    "Player",
+                    "Home Team",
+                    "Away Team",
+                    "Total Points",
+                    "Minutes",
+                    "Usage %",
+                ]
+            ].reset_index(drop=True)
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+    except Exception as exc:
+        st.error(f"❌ **Failed to load daily leaders:** {exc}")
+        import traceback
+        st.code(traceback.format_exc(), language="python")
 
 # Standings tab -------------------------------------------------------------
 if selected_page == "Standings":
