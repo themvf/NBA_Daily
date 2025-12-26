@@ -199,23 +199,33 @@ def calculate_opponent_injury_impact(
         if not importance:
             continue
 
-        # Check if this injury affects our player
+        # FILTER 1: Only significant players (20+ MPG, key rotation)
+        # Importance threshold: 0.45 = ~20 MPG, 12 PPG, 18% usage
+        if importance['importance_score'] < 0.45:
+            continue  # Skip bench players
+
+        # FILTER 2: Direct positional matchup ONLY
+        # Only count injuries that directly affect our player's matchup
         is_defensive_matchup = False
         if player_position and injury['position']:
             matchup_positions = DEFENSIVE_MATCHUPS.get(player_position, [])
             is_defensive_matchup = injury['position'] in matchup_positions
 
+        # Skip if NOT a direct matchup
+        if not is_defensive_matchup:
+            continue
+
         # Calculate impact based on:
         # 1. Player importance (0-1)
         # 2. Position defensive importance (0-1)
-        # 3. Defensive matchup bonus (1.5x if direct matchup)
+        # 3. Direct matchup multiplier (1.5x)
 
         position_factor = POSITION_DEFENSIVE_IMPORTANCE.get(
             injury['position'],
             0.5
         )
 
-        matchup_multiplier = 1.5 if is_defensive_matchup else 1.0
+        matchup_multiplier = 1.5  # Always 1.5x since we filtered for direct matchups only
 
         # Status factor (OUT = 1.0, DOUBTFUL = 0.5)
         status_factor = 1.0 if injury['status'] == 'out' else 0.5
@@ -230,22 +240,24 @@ def calculate_opponent_injury_impact(
 
         total_impact += impact
 
-        if impact >= 0.15:  # Significant impact threshold
-            significant_injuries.append({
-                'player_name': injury['player_name'],
-                'position': injury['position'],
-                'status': injury['status'],
-                'importance': importance['importance_score'],
-                'impact': round(impact, 3),
-                'is_direct_matchup': is_defensive_matchup
-            })
+        # Track for display (all direct matchup injuries are significant)
+        significant_injuries.append({
+            'player_name': injury['player_name'],
+            'position': injury['position'],
+            'status': injury['status'],
+            'importance': importance['importance_score'],
+            'impact': round(impact, 3),
+            'is_direct_matchup': is_defensive_matchup
+        })
 
     # Convert impact to boost percentages
     # Scale: 0.0-0.3 impact → 0-15% ceiling boost, 0-8% projection boost
     ceiling_boost = min(0.15, total_impact * 0.50)  # Max 15% ceiling boost
     projection_boost = min(0.08, total_impact * 0.27)  # Max 8% projection boost
 
-    has_significant = len(significant_injuries) > 0 or total_impact >= 0.20
+    # Only flag as significant if we have direct matchup injuries
+    # (not just any random opponent injury)
+    has_significant = len(significant_injuries) > 0
 
     return {
         'has_significant_injuries': has_significant,
@@ -254,7 +266,7 @@ def calculate_opponent_injury_impact(
         'total_impact_score': round(total_impact, 3),
         'injuries': significant_injuries,
         'all_injuries': injuries,
-        'reason': f"{len(injuries)} opponent injuries, {len(significant_injuries)} significant"
+        'reason': f"{len(injuries)} opponent injuries, {len(significant_injuries)} direct matchups"
     }
 
 
