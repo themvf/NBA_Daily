@@ -5783,11 +5783,19 @@ if selected_page == "Injury Admin":
             key="injury_source_filter"
         )
 
+        # Option to disable return date filtering
+        check_dates = st.checkbox(
+            "Hide players past expected return date",
+            value=True,
+            key="check_return_dates",
+            help="Uncheck to show ALL injuries regardless of return date (useful if dates need updating)"
+        )
+
         # Display current injury list with filters
         if status_filter_options:
             injury_list = ia.get_active_injuries(
                 injury_conn,
-                check_return_dates=True,
+                check_return_dates=check_dates,
                 status_filter=status_filter_options
             )
         else:
