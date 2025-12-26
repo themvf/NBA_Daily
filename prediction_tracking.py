@@ -63,6 +63,13 @@ class Prediction:
     abs_error: Optional[float] = None  # |actual - projected|
     hit_floor_ceiling: Optional[bool] = None  # Was actual within range?
 
+    # Opponent injury impact (filled in during prediction)
+    opponent_injury_detected: bool = False  # Was opponent injury boost applied?
+    opponent_injury_boost_projection: float = 0.0  # Projection boost % (e.g., 0.05 = +5%)
+    opponent_injury_boost_ceiling: float = 0.0  # Ceiling boost % (e.g., 0.12 = +12%)
+    opponent_injured_player_ids: Optional[str] = None  # Comma-separated IDs
+    opponent_injury_impact_score: float = 0.0  # Total impact score (0-2.0+)
+
     created_at: Optional[str] = None  # Timestamp when logged
 
 
@@ -138,7 +145,7 @@ def create_predictions_table(conn: sqlite3.Connection) -> None:
             abs_error REAL,
             hit_floor_ceiling BOOLEAN,
 
-            -- Injury adjustment tracking
+            -- Injury adjustment tracking (OUR team's injuries)
             injury_adjusted BOOLEAN DEFAULT 0,
             injury_adjustment_amount REAL DEFAULT 0.0,
             injured_player_ids TEXT DEFAULT NULL,
@@ -146,6 +153,13 @@ def create_predictions_table(conn: sqlite3.Connection) -> None:
             original_proj_floor REAL DEFAULT NULL,
             original_proj_ceiling REAL DEFAULT NULL,
             original_proj_confidence REAL DEFAULT NULL,
+
+            -- Opponent injury impact tracking (OPPONENT team's injuries)
+            opponent_injury_detected BOOLEAN DEFAULT 0,
+            opponent_injury_boost_projection REAL DEFAULT 0.0,
+            opponent_injury_boost_ceiling REAL DEFAULT 0.0,
+            opponent_injured_player_ids TEXT DEFAULT NULL,
+            opponent_injury_impact_score REAL DEFAULT 0.0,
 
             -- Refresh audit trail
             last_refreshed_at TEXT DEFAULT NULL,
@@ -230,6 +244,32 @@ def upgrade_predictions_table_for_refresh(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def upgrade_predictions_table_for_opponent_injury(conn: sqlite3.Connection) -> None:
+    """Add opponent injury impact fields to existing predictions table if they don't exist."""
+    cursor = conn.cursor()
+
+    # Check which columns already exist
+    cursor.execute("PRAGMA table_info(predictions)")
+    existing_columns = {row[1] for row in cursor.fetchall()}
+
+    # Define new columns to add
+    new_columns = {
+        'opponent_injury_detected': 'BOOLEAN DEFAULT 0',
+        'opponent_injury_boost_projection': 'REAL DEFAULT 0.0',
+        'opponent_injury_boost_ceiling': 'REAL DEFAULT 0.0',
+        'opponent_injured_player_ids': 'TEXT DEFAULT NULL',
+        'opponent_injury_impact_score': 'REAL DEFAULT 0.0',
+    }
+
+    # Add missing columns
+    for col_name, col_type in new_columns.items():
+        if col_name not in existing_columns:
+            cursor.execute(f"ALTER TABLE predictions ADD COLUMN {col_name} {col_type}")
+            print(f"Added opponent injury column: {col_name}")
+
+    conn.commit()
+
+
 def get_predictions_for_date(
     conn: sqlite3.Connection,
     game_date: str
@@ -279,8 +319,11 @@ def log_prediction(conn: sqlite3.Connection, pred: Prediction) -> int:
             vs_opponent_avg, vs_opponent_games,
             analytics_used, opponent_def_rating, opponent_pace,
             dfs_score, dfs_grade,
+            opponent_injury_detected, opponent_injury_boost_projection,
+            opponent_injury_boost_ceiling, opponent_injured_player_ids,
+            opponent_injury_impact_score,
             created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
     """, (
         pred.prediction_date, pred.game_date, pred.player_id, pred.player_name,
         pred.team_id, pred.team_name, pred.opponent_id, pred.opponent_name,
@@ -288,7 +331,10 @@ def log_prediction(conn: sqlite3.Connection, pred: Prediction) -> int:
         pred.season_avg_ppg, pred.recent_avg_3, pred.recent_avg_5,
         pred.vs_opponent_avg, pred.vs_opponent_games,
         pred.analytics_used, pred.opponent_def_rating, pred.opponent_pace,
-        pred.dfs_score, pred.dfs_grade
+        pred.dfs_score, pred.dfs_grade,
+        pred.opponent_injury_detected, pred.opponent_injury_boost_projection,
+        pred.opponent_injury_boost_ceiling, pred.opponent_injured_player_ids,
+        pred.opponent_injury_impact_score
     ))
 
     conn.commit()

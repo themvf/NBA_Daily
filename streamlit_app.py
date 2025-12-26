@@ -2124,6 +2124,9 @@ def calculate_smart_ppg_projection(
         "ceiling": ceiling,
         "ceiling_confidence": ceiling_confidence,  # NEW: DFS overlay score
         "momentum_bonus": momentum_bonus if momentum_applied else 0.0,  # Track momentum
+        "opponent_injury_detected": opponent_injury_detected,  # Track opponent injuries
+        "opponent_injury_boost_projection": opponent_injury_boost,  # Projection boost %
+        "opponent_injury_boost_ceiling": opponent_injury_ceiling_boost,  # Ceiling boost %
         "components": {
             k: {"value": components[k], "weight": weights[k] * 100}
             for k in components
@@ -2731,6 +2734,7 @@ try:
     pt.create_predictions_table(games_conn)
     pt.upgrade_predictions_table_for_injuries(games_conn)
     pt.upgrade_predictions_table_for_refresh(games_conn)
+    pt.upgrade_predictions_table_for_opponent_injury(games_conn)  # NEW: Opponent injury impact tracking
 
 except Exception as init_exc:
     st.warning(f"Could not initialize injury tracking tables: {init_exc}")
@@ -3403,7 +3407,13 @@ These predictions should be removed to avoid DNP errors.
                                     opponent_def_rating=opp_def_rating,
                                     opponent_pace=opp_pace,
                                     dfs_score=daily_pick_score,
-                                    dfs_grade=pick_grade
+                                    dfs_grade=pick_grade,
+                                    # Opponent injury impact tracking
+                                    opponent_injury_detected=breakdown.get("opponent_injury_detected", False),
+                                    opponent_injury_boost_projection=breakdown.get("opponent_injury_boost_projection", 0.0),
+                                    opponent_injury_boost_ceiling=breakdown.get("opponent_injury_boost_ceiling", 0.0),
+                                    opponent_injured_player_ids=None,  # Will be populated when we store injury details
+                                    opponent_injury_impact_score=0.0  # Will be calculated from injury impact data
                                 )
 
                                 # Add to export list
