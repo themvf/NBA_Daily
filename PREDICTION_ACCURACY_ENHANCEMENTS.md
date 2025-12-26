@@ -1,7 +1,7 @@
 # NBA Daily - Prediction Accuracy Enhancements
 
-**Version:** 2.0
-**Date:** December 24, 2025
+**Version:** 2.1
+**Date:** December 26, 2025
 **Status:** Production Ready
 
 ## Executive Summary
@@ -15,10 +15,10 @@ Based on comprehensive analysis of **852 predictions** (November 26 - December 6
 - ❌ No rank-ordering quality metrics (critical for DFS)
 
 ### Solutions Deployed
-- ✅ **6 major enhancements** across Tier 1 & Tier 2
-- ✅ **3 new Python modules** (ceiling analytics, evaluation metrics, auto-fetch)
+- ✅ **7 major enhancements** across Tier 1 & Tier 2
+- ✅ **4 new Python modules** (ceiling analytics, evaluation metrics, injury impact, auto-fetch)
 - ✅ **5 new UI features** (momentum indicators, ceiling scores, DNP warnings, analytics tabs)
-- ✅ **~1,050 lines** of production code
+- ✅ **~1,400 lines** of production code
 
 ### Expected Impact
 - Floor-ceiling hit rate: **13% → 60%+**
@@ -38,6 +38,7 @@ Based on comprehensive analysis of **852 predictions** (November 26 - December 6
 2. [Tier 2 Improvements (Advanced Analytics)](#tier-2-improvements)
    - [Opponent Ceiling Analytics](#5-opponent-ceiling-analytics)
    - [Enhanced Evaluation Metrics](#6-enhanced-evaluation-metrics)
+   - [Opponent Injury Impact](#7-opponent-injury-impact)
 3. [Technical Implementation](#technical-implementation)
 4. [Usage Guide](#usage-guide)
 5. [Testing & Validation](#testing--validation)
@@ -333,15 +334,98 @@ Identifies if model performs differently for each tier.
 
 ---
 
+### 7. Opponent Injury Impact
+
+**Problem:** Missing explanation for extreme outliers (e.g., Jokić 56 points vs 24.9 projection)
+
+**Solution:** Track opponent team injuries that create easier defensive matchups
+
+**New Module:** `opponent_injury_impact.py`
+
+**Key Concept:** When opponent's primary defender or rim protector is OUT, our offensive players face easier matchups → increase ceiling & projection
+
+**Matchup Logic:**
+```python
+DEFENSIVE_MATCHUPS = {
+    'C': ['C'],          # Centers guard centers
+    'PF': ['PF', 'C'],   # Power forwards guard PF/C
+    'SF': ['SF', 'PF'],  # Small forwards guard SF/PF
+    'SG': ['SG', 'SF'],  # Shooting guards guard SG/SF
+    'PG': ['PG', 'SG'],  # Point guards guard PG/SG
+}
+```
+
+**Impact Calculation:**
+```python
+# For each opponent injury, calculate impact:
+impact = (
+    player_importance_score (0-1) *    # Minutes, PPG, usage
+    position_defensive_importance *    # C=1.0, PF=0.8, etc.
+    matchup_multiplier (1.5x direct) * # 1.5x if direct matchup
+    status_factor                      # OUT=1.0, DOUBTFUL=0.5
+)
+
+# Convert total impact to boost percentages:
+ceiling_boost = min(0.15, total_impact * 0.50)      # Max 15%
+projection_boost = min(0.08, total_impact * 0.27)   # Max 8%
+```
+
+**Position Defensive Importance:**
+- **Centers (1.0):** Rim protectors have highest defensive impact
+- **Power Forwards (0.8):** Secondary rim protection
+- **Shooting Guards (0.7):** Perimeter defense
+- **Small Forwards (0.6):** Perimeter defense
+- **Point Guards (0.6):** Perimeter defense
+
+**Example Scenarios:**
+1. **Jokić vs MIN (Christmas Day)**
+   - If Gobert OUT → Direct matchup (C guards C)
+   - Gobert importance: ~0.75 (30+ MPG, elite defender)
+   - Impact: 0.75 × 1.0 × 1.5 × 1.0 = **1.125**
+   - Ceiling boost: +15% (capped), Projection boost: +8%
+   - 24.9 proj → 26.9 proj, 42 ceiling → 48 ceiling
+
+2. **Perimeter Player vs Team with OUT Rim Protector**
+   - Guard vs Team missing their Center
+   - NOT direct matchup → No 1.5x multiplier
+   - Impact: 0.65 × 1.0 × 1.0 × 1.0 = **0.65**
+   - Ceiling boost: +7.5%, Projection boost: +4%
+
+**Visual Indicator:**
+- 🚑 emoji added to analytics indicators when opponent injuries detected
+- Appears alongside 🔥 (momentum), ⚡ (pace), etc.
+
+**Integration with Ceiling Confidence:**
+```python
+# Factor 6: Opponent injury impact (+/- 12 points)
+if opponent_injury_ceiling_boost >= 0.10:  # 10%+ boost
+    ceiling_confidence += 12  # Major defensive gap
+elif opponent_injury_ceiling_boost >= 0.06:  # 6-10% boost
+    ceiling_confidence += 8
+elif opponent_injury_ceiling_boost >= 0.03:  # 3-6% boost
+    ceiling_confidence += 4
+```
+
+**Commit:** `[pending]`
+
+**Expected Impact:**
+- Better capture of extreme outliers (Jokić 56, etc.)
+- Identify "smash spots" where key defenders are OUT
+- Improved ceiling confidence for tournament DFS
+- More accurate projections in lopsided matchups
+
+---
+
 ## Technical Implementation
 
 ### Files Modified
 
 | File | Lines Changed | Purpose |
 |------|--------------|---------|
-| `streamlit_app.py` | +450 lines | UI integration, momentum, ceiling confidence, DNP warnings |
+| `streamlit_app.py` | +490 lines | UI integration, momentum, ceiling confidence, DNP warnings, injury impact |
 | `opponent_ceiling_analytics.py` | +220 lines | NEW - Ceiling volatility tracking |
 | `prediction_evaluation_metrics.py` | +413 lines | NEW - Advanced evaluation metrics |
+| `opponent_injury_impact.py` | +345 lines | NEW - Opponent injury matchup impact |
 
 ### Key Functions Added
 
@@ -401,6 +485,49 @@ df['tier'] = pd.cut(actual_ppg, bins=[0,10,15,20,25,100])
 tier_metrics = df.groupby('tier').agg(['mean', 'std', 'count'])
 ```
 
+#### Opponent Injury Impact (opponent_injury_impact.py:159-258)
+```python
+# Get opponent injuries
+injuries = get_opponent_injuries(conn, opponent_team_id, game_date)
+
+# Calculate impact for each injury
+for injury in injuries:
+    importance = get_player_importance(conn, injury['player_id'])
+
+    # Check defensive matchup
+    is_direct_matchup = injury['position'] in DEFENSIVE_MATCHUPS[player_position]
+
+    # Calculate combined impact
+    impact = (
+        importance['importance_score'] *
+        POSITION_DEFENSIVE_IMPORTANCE[injury['position']] *
+        (1.5 if is_direct_matchup else 1.0) *
+        (1.0 if injury['status'] == 'out' else 0.5)
+    )
+    total_impact += impact
+
+# Convert to boost percentages
+ceiling_boost = min(0.15, total_impact * 0.50)
+projection_boost = min(0.08, total_impact * 0.27)
+```
+
+#### Opponent Injury Integration (streamlit_app.py:1800-1834)
+```python
+# Check opponent injuries
+injury_impact = oii.calculate_opponent_injury_impact(
+    conn,
+    player_position=player_position,
+    opponent_team_id=opp_team_id,
+    game_date=game_date
+)
+
+if injury_impact['has_significant_injuries']:
+    # Apply boosts
+    projection *= (1 + injury_impact['projection_boost_pct'])
+    ceiling_multiplier += injury_impact['ceiling_boost_pct']
+    analytics_indicators += "🚑"
+```
+
 ### Database Schema (No Changes)
 All enhancements work with **existing schema** - backward compatible!
 
@@ -430,7 +557,13 @@ scipy  # For Spearman correlation calculation
    - These players have sustainable scoring surges
    - Consider for tournament lineups
 
-4. **Review Ceiling Confidence**
+4. **Identify Opponent Injury Advantage**
+   - Look for **🚑** emoji in Analytics column
+   - Opponent's key defender is OUT → easier matchup
+   - Prime "smash spot" candidates for DFS
+   - Review injury details in Injury Admin tab
+
+5. **Review Ceiling Confidence**
    - Check Ceiling Confidence score (0-100)
    - Target 70+ for tournament plays
    - Use 40- for cash games only

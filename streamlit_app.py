@@ -1797,6 +1797,42 @@ def calculate_smart_ppg_projection(
             momentum_applied = True
             analytics_indicators += "🔥"  # Momentum boost indicator
 
+    # OPPONENT INJURY IMPACT: Easier matchups when opponent's defenders are OUT
+    # When opponent's primary defender or rim protector is absent, our player faces
+    # easier matchup → increase ceiling & projection
+    opponent_injury_boost = 0.0
+    opponent_injury_ceiling_boost = 0.0
+    opponent_injury_detected = False
+
+    if opp_team_id is not None and conn is not None and game_date:
+        try:
+            import opponent_injury_impact as oii
+
+            injury_impact = oii.calculate_opponent_injury_impact(
+                conn,
+                player_position=player_position if player_position else None,
+                opponent_team_id=opp_team_id,
+                game_date=game_date,
+                season='2025-26'
+            )
+
+            if injury_impact['has_significant_injuries']:
+                # Apply boosts from opponent injuries
+                opponent_injury_boost = injury_impact['projection_boost_pct']
+                opponent_injury_ceiling_boost = injury_impact['ceiling_boost_pct']
+                opponent_injury_detected = True
+
+                # Apply projection boost
+                if opponent_injury_boost > 0:
+                    projection = projection * (1 + opponent_injury_boost)
+
+                # Add injury indicator
+                analytics_indicators += "🚑"  # Opponent injury boost indicator
+
+        except Exception:
+            # If opponent injury calculation fails, continue without boost
+            pass
+
     # FIX 2: Add regression to mean for high scorers (22+ PPG)
     # High scorers are over-projected by ~3.5 PPG on average
     if projection >= 22.0:
@@ -1981,8 +2017,8 @@ def calculate_smart_ppg_projection(
             # If calculation fails, no boost
             pass
 
-    # Apply combined multiplier with defense variance boost
-    final_ceiling_multiplier = ceiling_multiplier + defense_variance_boost
+    # Apply combined multiplier with defense variance boost + opponent injury boost
+    final_ceiling_multiplier = ceiling_multiplier + defense_variance_boost + opponent_injury_ceiling_boost
     ceiling = projection * (1 + final_ceiling_multiplier)
 
     # CEILING CONFIDENCE SCORE (DFS Overlay - doesn't touch mean projection)
@@ -2065,6 +2101,17 @@ def calculate_smart_ppg_projection(
         ceiling_confidence += 5
     elif season_avg <= 10:
         ceiling_confidence -= 5  # Boom-bust risk
+
+    # Factor 6: Opponent injury impact (+/- 12 points)
+    # Significant opponent injuries = easier defensive matchup = higher ceiling potential
+    if opponent_injury_detected and opponent_injury_ceiling_boost > 0:
+        # Scale based on magnitude of boost
+        if opponent_injury_ceiling_boost >= 0.10:  # 10%+ ceiling boost
+            ceiling_confidence += 12  # Major defensive gap
+        elif opponent_injury_ceiling_boost >= 0.06:  # 6-10% boost
+            ceiling_confidence += 8
+        elif opponent_injury_ceiling_boost >= 0.03:  # 3-6% boost
+            ceiling_confidence += 4
 
     # Clamp to 0-100 scale
     ceiling_confidence = max(0, min(100, ceiling_confidence))
