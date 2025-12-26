@@ -3893,13 +3893,30 @@ if selected_page == "Matchup Spotlight":
                     }
                 )
         except Exception as exc:
-            st.warning(f"Unable to load daily top scorers: {exc}")
+            st.error(f"❌ **Failed to load daily top scorers:** {exc}")
+            import traceback
+            st.code(traceback.format_exc(), language="python")
 
 # Daily leaders tab --------------------------------------------------------
 if selected_page == "Daily Leaders":
     st.subheader("Daily Top Scorers (Top 3 per day)")
     if not daily_top_scorers_rows:
-        st.info("Run the Today's Games tab to populate the leaders table.")
+        st.warning("""
+        ⚠️ **No daily leaders data available**
+
+        **To populate this page:**
+        1. Go to the **"Today's Games"** tab
+        2. Scroll to the bottom of the page
+        3. Look for any error messages (red boxes) about "daily top scorers"
+        4. The data should load automatically when you visit Today's Games
+
+        **If you see an error**, it might be:
+        - Database connection issue
+        - Missing `player_game_logs` or `player_season_totals` tables
+        - Season/season_type mismatch
+
+        Check the error details in Today's Games tab for more info.
+        """)
     else:
         leaders_df = pd.DataFrame(daily_top_scorers_rows)
         leaders_df["Date"] = pd.to_datetime(leaders_df["Date"])
