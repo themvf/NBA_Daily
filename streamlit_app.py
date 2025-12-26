@@ -3682,7 +3682,7 @@ These predictions should be removed to avoid DNP errors.
             else:
                 st.caption("S3 backup not configured")
 
-    # Populate Daily Leaders data (used by Daily Leaders tab)
+    # Populate Daily Leaders data (runs every time "Today's Games" tab is visited)
     top_scorers_query = """
         WITH ranked AS (
             SELECT
