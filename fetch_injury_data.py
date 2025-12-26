@@ -360,10 +360,10 @@ def upsert_injury(
         if existing:
             injury_id, existing_source, updated_at = existing
 
-            # Check manual override rule
+            # Check manual override rule (manual entries protected for 24 hours)
             cursor.execute("""
-                SELECT datetime(?, '-24 hours') < datetime(?)
-            """, (updated_at, updated_at))
+                SELECT datetime('now') < datetime(?, '+24 hours')
+            """, (updated_at,))
             is_recent_manual = (
                 existing_source == 'manual' and
                 cursor.fetchone()[0] == 1
