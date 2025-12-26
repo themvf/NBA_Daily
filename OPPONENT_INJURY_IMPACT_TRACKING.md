@@ -1,8 +1,8 @@
 # Opponent Injury Impact Tracking
 
-**Version:** 1.0
+**Version:** 1.1
 **Date:** December 26, 2025
-**Status:** Production Ready
+**Status:** Production Ready (Filters Added)
 
 ## Overview
 
@@ -15,6 +15,19 @@ When an opponent's primary defender or rim protector is OUT/DOUBTFUL, our offens
 ### Visual Indicator
 
 Players benefiting from opponent injuries display the **🚑 emoji** in the Analytics column.
+
+### Expected Frequency
+
+The 🚑 indicator is **intentionally rare** (5-10% of predictions):
+- **Only star players** (20+ MPG, key rotation)
+- **Only direct matchups** (C vs C, PG vs PG/SG, etc.)
+- **Only OUT/DOUBTFUL** status
+
+**If you see 🚑 on 100% of players:** The filters are not working - check for bugs.
+
+**If you see 🚑 on 0% of players:** Either no opponent injuries today, or all injuries are bench players/wrong positions.
+
+**Ideal:** 5-10% of predictions show 🚑 (1-3 players per full slate).
 
 ---
 
@@ -55,6 +68,18 @@ importance_score = (
 )
 ```
 
+**FILTER 1 - Star Players Only:**
+
+Only count significant players (minimum importance: **0.45**):
+- ~20+ MPG, 12+ PPG, 18%+ usage
+- Key rotation players and stars
+- **Skips:** Bench players, deep rotation, low-impact injuries
+
+```python
+if importance_score < 0.45:
+    continue  # Skip this injury
+```
+
 ### Step 3: Determine Defensive Matchup
 
 Check if the injured player directly guards our player's position:
@@ -69,13 +94,30 @@ DEFENSIVE_MATCHUPS = {
 }
 ```
 
+**FILTER 2 - Direct Matchup ONLY:**
+
+Only count injuries that **directly affect** our player's matchup:
+- PG benefits from opponent PG/SG injuries (NOT from opponent C injuries)
+- C benefits from opponent C injuries (NOT from opponent PG injuries)
+- **Skips:** Non-matchup injuries (no indirect impact)
+
+```python
+matchup_positions = DEFENSIVE_MATCHUPS.get(player_position, [])
+is_direct_matchup = injury['position'] in matchup_positions
+
+if not is_direct_matchup:
+    continue  # Skip this injury
+```
+
 ### Step 4: Calculate Impact
+
+Only processes injuries that passed BOTH filters (star players + direct matchups):
 
 ```python
 impact = (
-    importance_score *                           # 0-1
+    importance_score *                           # 0-1 (≥0.45 due to Filter 1)
     POSITION_DEFENSIVE_IMPORTANCE[position] *    # C=1.0, PF=0.8, SG=0.7, SF/PG=0.6
-    matchup_multiplier *                         # 1.5x if direct matchup, 1.0x otherwise
+    matchup_multiplier *                         # Always 1.5x (direct matchups only due to Filter 2)
     status_factor                                # OUT=1.0, DOUBTFUL=0.5
 )
 ```
@@ -529,6 +571,23 @@ projection_boost = min(0.08, 0.704 * 0.27) = 0.05  # 5%
 
 ## Changelog
 
+### v1.1 - December 26, 2025 (Filter Fix)
+
+**Fixed:**
+- **CRITICAL BUG:** Every player was showing 🚑 emoji (too broad)
+- Added Filter 1: Only star players (importance ≥ 0.45, ~20+ MPG)
+- Added Filter 2: Direct positional matchup ONLY (no indirect impacts)
+- Changed matchup_multiplier from conditional to always 1.5x (since we filter)
+- Updated has_significant logic to require len(significant_injuries) > 0
+
+**Impact:**
+- 🚑 frequency: 100% → 5-10% of predictions (expected)
+- Only triggers for meaningful matchup advantages
+- Cleaner signal for DFS "smash spots"
+
+**Commit:**
+- `0bcf846` - Fix opponent injury impact to only trigger for direct matchups with stars
+
 ### v1.0 - December 26, 2025 (Initial Release)
 
 **Added:**
@@ -542,6 +601,7 @@ projection_boost = min(0.08, 0.704 * 0.27) = 0.05  # 5%
 **Commits:**
 - `694793d` - Add opponent injury impact analysis to predictions
 - `282f128` - Add opponent injury impact tracking to predictions database
+- `8ee2ba4` - Add comprehensive documentation (OPPONENT_INJURY_IMPACT_TRACKING.md)
 
 ---
 
