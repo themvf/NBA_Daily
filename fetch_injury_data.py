@@ -12,16 +12,63 @@ Usage:
 
 import sqlite3
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from typing import Dict, List, Optional, Tuple
 from rapidfuzz import fuzz
 import time
+import re
 
 # Import configuration
 import injury_config as config
 
 # Constants
 BASE_URL = "https://api.balldontlie.io/v1"
+
+
+def normalize_return_date(api_date_str: Optional[str]) -> Optional[str]:
+    """
+    Convert API return date format (e.g., "Dec 31", "Jan 4") to ISO format (YYYY-MM-DD).
+
+    Args:
+        api_date_str: Date string from API (e.g., "Dec 31")
+
+    Returns:
+        ISO format date string (e.g., "2025-12-31") or None if invalid
+
+    Logic:
+        - Parse the month/day from API format
+        - Assume current year first
+        - If parsed date is in the past, assume next year
+    """
+    if not api_date_str:
+        return None
+
+    try:
+        # Parse "Dec 31" or "Jan 4" format
+        # API format: "{MonthAbbrev} {Day}"
+        parsed = datetime.strptime(api_date_str, "%b %d")
+
+        # Get current year and today's date
+        current_year = date.today().year
+        today = date.today()
+
+        # Try with current year
+        return_date = date(current_year, parsed.month, parsed.day)
+
+        # If date is in the past, use next year
+        if return_date < today:
+            return_date = date(current_year + 1, parsed.month, parsed.day)
+
+        return return_date.strftime("%Y-%m-%d")
+
+    except (ValueError, AttributeError) as e:
+        # If parsing fails, return original string (might already be ISO format)
+        # Check if it looks like ISO format (YYYY-MM-DD)
+        if api_date_str and re.match(r'^\d{4}-\d{2}-\d{2}$', api_date_str):
+            return api_date_str
+        # Otherwise invalid
+        print(f"Warning: Could not parse return date '{api_date_str}': {e}")
+        return None
 
 
 def acquire_fetch_lock(conn: sqlite3.Connection, lock_by: str = "fetch_injury_data") -> bool:
@@ -536,6 +583,8 @@ def fetch_current_injuries(conn: sqlite3.Connection) -> Tuple[int, int, int, Lis
 
             # Get injury details
             return_date_str = injury_record.get('return_date')
+            # Normalize return date from API format ("Dec 31") to ISO format ("2025-12-31")
+            return_date_str = normalize_return_date(return_date_str)
             description = injury_record.get('description', '')
 
             # Extract injury type from description (first sentence)
