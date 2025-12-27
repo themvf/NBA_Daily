@@ -28,6 +28,7 @@ import player_correlation_analytics as pca
 import defense_type_analytics as dta
 import prediction_tracking as pt
 import prediction_refresh as pr
+import prediction_generator as pg
 import s3_storage
 import ppm_stats
 import position_ppm_stats
@@ -178,6 +179,42 @@ with st.sidebar:
         st.warning(s3_sync_message)
     st.divider()
 
+    # PREDICTION GENERATION - Quick Action Button
+    st.markdown("### 🎯 Quick Actions")
+    st.markdown("#### Generate Predictions")
+
+    # Date picker for predictions
+    pred_date = st.date_input(
+        "Date:",
+        value=default_game_date(),
+        key="quick_gen_date",
+        label_visibility="collapsed"
+    )
+
+    # Check if predictions already exist for this date
+    try:
+        conn = get_connection(str(db_path))
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT COUNT(*) FROM predictions WHERE game_date = ?",
+            (str(pred_date),)
+        )
+        existing_count = cursor.fetchone()[0]
+        conn.close()
+
+        if existing_count > 0:
+            st.caption(f"✓ {existing_count} predictions exist")
+    except Exception:
+        existing_count = 0
+
+    # Button label changes based on whether predictions exist
+    gen_button_label = "🔄 Regenerate" if existing_count > 0 else "🎯 Generate Predictions"
+
+    if st.button(gen_button_label, type="primary", use_container_width=True, key="sidebar_gen_predictions"):
+        generate_predictions_ui(pred_date, db_path, builder_config)
+
+    st.divider()
+
 
 @st.cache_resource
 def get_connection(db_path: str) -> sqlite3.Connection:
@@ -245,6 +282,102 @@ def normalize_weight_map(weight_map: Dict[str, float]) -> Dict[str, float]:
         uniform = 1.0 / len(sanitized)
         return {k: uniform for k in sanitized}
     return {k: value / total for k, value in sanitized.items()}
+
+
+def generate_predictions_ui(pred_date: date, db_path: Path, builder_config: Dict):
+    """Handle prediction generation with progress UI in sidebar."""
+    progress_bar = st.sidebar.progress(0)
+    status_text = st.sidebar.empty()
+
+    def update_progress(current: int, total: int, message: str):
+        progress = current / total if total > 0 else 0
+        progress_bar.progress(progress)
+        status_text.text(f"{message} ({current}/{total})")
+
+    try:
+        result = pg.generate_predictions_for_date(
+            game_date=pred_date,
+            db_path=db_path,
+            season=builder_config["season"],
+            season_type=DEFAULT_SEASON_TYPE,
+            progress_callback=update_progress
+        )
+
+        # Clear progress indicators
+        progress_bar.empty()
+        status_text.empty()
+
+        # Show results
+        if result['predictions_logged'] > 0:
+            st.sidebar.success(
+                f"✅ Generated {result['predictions_logged']} predictions\n\n"
+                f"Avg confidence: {result['summary']['avg_confidence']:.0%}\n\n"
+                f"Avg DFS score: {result['summary']['avg_dfs_score']:.1f}"
+            )
+
+            # Trigger S3 backup if configured
+            try:
+                storage = s3_storage.S3PredictionStorage()
+                if storage.is_connected():
+                    backup_success, backup_message = storage.upload_database(db_path)
+                    if backup_success:
+                        st.sidebar.info("☁️ Backed up to S3")
+            except Exception:
+                pass  # Silent fail for S3
+
+        if result['predictions_failed'] > 0:
+            st.sidebar.warning(f"⚠️ {result['predictions_failed']} predictions failed")
+
+        if result['errors']:
+            with st.sidebar.expander("❌ View Errors", expanded=False):
+                for error in result['errors'][:5]:  # Show first 5
+                    st.error(error)
+
+    except Exception as e:
+        progress_bar.empty()
+        status_text.empty()
+        st.sidebar.error(f"❌ Generation failed: {str(e)}")
+
+
+def load_predictions_for_date(conn: sqlite3.Connection, game_date: str) -> pd.DataFrame:
+    """Load all predictions for a specific date from database."""
+    query = """
+        SELECT
+            player_name, team_name, opponent_name,
+            projected_ppg, proj_confidence, proj_floor, proj_ceiling,
+            season_avg_ppg, recent_avg_5, recent_avg_3,
+            dfs_score, dfs_grade, analytics_used,
+            opponent_def_rating, vs_opponent_avg, vs_opponent_games,
+            prediction_date, player_id, team_id, opponent_id
+        FROM predictions
+        WHERE game_date = ?
+        ORDER BY dfs_score DESC
+    """
+    return pd.read_sql_query(query, conn, params=[game_date])
+
+
+def display_team_predictions(team_preds: pd.DataFrame):
+    """Display predictions for one team in a formatted table."""
+    if team_preds.empty:
+        st.caption("No predictions available")
+        return
+
+    # Format for display
+    display_df = team_preds[[
+        'player_name', 'projected_ppg', 'proj_confidence',
+        'proj_floor', 'proj_ceiling', 'dfs_score', 'dfs_grade'
+    ]].copy()
+
+    display_df.columns = ['Player', 'Proj PPG', 'Confidence', 'Floor', 'Ceiling', 'DFS Score', 'Grade']
+
+    # Format numeric columns
+    display_df['Proj PPG'] = display_df['Proj PPG'].map(lambda x: f"{x:.1f}")
+    display_df['Confidence'] = display_df['Confidence'].map(lambda x: f"{x:.0%}")
+    display_df['Floor'] = display_df['Floor'].map(lambda x: f"{x:.1f}")
+    display_df['Ceiling'] = display_df['Ceiling'].map(lambda x: f"{x:.1f}")
+    display_df['DFS Score'] = display_df['DFS Score'].map(lambda x: f"{x:.1f}")
+
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
 
 
 @st.cache_data(ttl=600)
@@ -2764,22 +2897,24 @@ game_totals_by_game: Dict[str, Dict[str, Any]] = {}  # Track team totals by game
 
 # Today's games tab --------------------------------------------------------
 if selected_page == "Today's Games":
-    # Get database connection for logging predictions
+    st.subheader("Today's Games - Predictions View")
+
+    # Get database connection
     games_conn = get_connection(str(db_path))
     # Ensure predictions table exists
     pt.create_predictions_table(games_conn)
 
-    # Track prediction logging for debugging
-    predictions_logged = 0
-    predictions_failed = 0
-
-    # Collect predictions for CSV export
-    predictions_for_export = []
+    # Date selector
+    selected_date = st.date_input(
+        "Game date",
+        value=default_game_date(),
+        key="todays_games_date",
+    )
 
     # DNP WARNING SYSTEM: Alert if OUT players have predictions
     try:
         import injury_adjustment as ia
-        today_str = default_game_date().strftime('%Y-%m-%d')
+        selected_date_str = selected_date.strftime('%Y-%m-%d')
 
         # Check for OUT players with predictions
         out_players_query = """
@@ -2790,12 +2925,12 @@ if selected_page == "Today's Games":
               AND i.status IN ('out', 'doubtful')
         """
         cursor = games_conn.cursor()
-        cursor.execute(out_players_query, (today_str,))
+        cursor.execute(out_players_query, (selected_date_str,))
         out_count = cursor.fetchone()[0]
 
         if out_count > 0:
             st.warning(f"""
-⚠️ **{out_count} OUT/DOUBTFUL player(s) have predictions for today!**
+⚠️ **{out_count} OUT/DOUBTFUL player(s) have predictions for {selected_date}!**
 
 These predictions should be removed to avoid DNP errors.
 
@@ -2808,871 +2943,113 @@ These predictions should be removed to avoid DNP errors.
         # Silently fail if injury check fails
         pass
 
-    st.subheader("Today's Games (Scoreboard)")
-    selected_date = st.date_input(
-        "Game date",
-        value=default_game_date(),
-        key="scoreboard_date",
-    )
-    context_season = st.text_input(
-        "Standings season for context",
-        value=builder_config["season"],
-        key="scoreboard_context_season",
-    ).strip() or builder_config["season"]
-    context_season_type = st.selectbox(
-        "Season type for context",
-        options=[DEFAULT_SEASON_TYPE, "Playoffs", "Pre Season"],
-        index=0,
-        key="scoreboard_context_season_type",
-    )
-    with st.expander("Matchup leader settings", expanded=False):
-        min_games_input = st.number_input(
-            "Minimum games played",
-            min_value=1,
-            max_value=82,
-            value=DEFAULT_MIN_GAMES,
-            step=1,
-            key="leader_min_games",
+    # Load predictions from database
+    predictions_df = load_predictions_for_date(games_conn, str(selected_date))
+
+    if predictions_df.empty:
+        st.info(
+            f"📊 No predictions found for {selected_date}.\n\n"
+            f"Use the **Generate Predictions** button in the sidebar to create predictions for this date."
         )
-        weight_cols_top = st.columns(3)
-        weight_cols_bottom = st.columns(4)
-        weight_inputs = {
-            "avg": weight_cols_top[0].number_input(
-                "Weight: Avg PPG",
-                min_value=0.0,
-                max_value=5.0,
-                value=DEFAULT_WEIGHTS["avg"],
-                step=0.1,
-                key="weight_avg_ppg",
-            ),
-            "median": weight_cols_top[1].number_input(
-                "Weight: Median PPG",
-                min_value=0.0,
-                max_value=5.0,
-                value=DEFAULT_WEIGHTS["median"],
-                step=0.1,
-                key="weight_median_ppg",
-            ),
-            "max": weight_cols_top[2].number_input(
-                "Weight: Max PPG",
-                min_value=0.0,
-                max_value=5.0,
-                value=DEFAULT_WEIGHTS["max"],
-                step=0.1,
-                key="weight_max_ppg",
-            ),
-            "last3": weight_cols_bottom[0].number_input(
-                "Weight: Last 3 Avg Pts",
-                min_value=0.0,
-                max_value=5.0,
-                value=DEFAULT_WEIGHTS["last3"],
-                step=0.1,
-                key="weight_last3_pts",
-            ),
-            "last5": weight_cols_bottom[1].number_input(
-                "Weight: Last 5 Avg Pts",
-                min_value=0.0,
-                max_value=5.0,
-                value=DEFAULT_WEIGHTS["last5"],
-                step=0.1,
-                key="weight_last5_pts",
-            ),
-            "minutes5": weight_cols_bottom[2].number_input(
-                "Weight: Last 5 Avg Minutes",
-                min_value=0.0,
-                max_value=5.0,
-                value=DEFAULT_WEIGHTS["minutes5"],
-                step=0.1,
-                key="weight_last5_minutes",
-            ),
-            "usage5": weight_cols_bottom[3].number_input(
-                "Weight: Last 5 Usage %",
-                min_value=0.0,
-                max_value=5.0,
-                value=DEFAULT_WEIGHTS["usage5"],
-                step=0.1,
-                key="weight_last5_usage",
-            ),
-        }
-        normalized_weights = normalize_weight_map(weight_inputs)
-        weights_display = ", ".join(
-            [
-                f"Avg: {normalized_weights.get('avg', 0.0):.2f}",
-                f"Median: {normalized_weights.get('median', 0.0):.2f}",
-                f"Max: {normalized_weights.get('max', 0.0):.2f}",
-                f"Last3: {normalized_weights.get('last3', 0.0):.2f}",
-                f"Last5: {normalized_weights.get('last5', 0.0):.2f}",
-                f"Min(L5): {normalized_weights.get('minutes5', 0.0):.2f}",
-                f"Usage(L5): {normalized_weights.get('usage5', 0.0):.2f}",
-            ]
-        )
-        st.caption(f"Normalized weights -> {weights_display}")
-    try:
-        matchup_spotlight_rows.clear()
-        daily_power_rows_points.clear()
-        daily_power_rows_3pm.clear()
-        games_df, scoring_map = build_games_table(
-            str(db_path),
-            selected_date,
-            context_season,
-            context_season_type,
-        )
-        if games_df.empty:
-            st.info("No NBA games scheduled for this date per the official scoreboard.")
-        else:
-            display_df = games_df.drop(columns=MATCHUP_INTERNAL_COLUMNS, errors="ignore")
-            render_dataframe(display_df)
-            st.caption(
-                "Data source: nba_api ScoreboardV2 + standings context from the local SQLite database."
-            )
-            base_stats = aggregate_player_scoring(
-                str(db_path),
-                context_season,
-                context_season_type,
-            )
-            leaders_df = prepare_weighted_scores(
-                base_stats,
-                int(min_games_input),
-                normalized_weights,
-            )
-            player_season_stats_map.clear()
-            for _, row in leaders_df.iterrows():
-                player_id = safe_int(row.get("player_id"))
-                if player_id is None:
-                    continue
-                player_season_stats_map[player_id] = row.to_dict()
-            defense_stats = load_team_defense_stats(
-                str(db_path),
-                context_season,
-                context_season_type,
-                rolling_window=None,
-            )
-            defense_map: Dict[int, Mapping[str, Any]] = {
-                int(row["team_id"]): row.to_dict() for _, row in defense_stats.iterrows()
-            }
 
-            # Load PPM stats for enhanced predictions
-            try:
-                off_ppm_df, def_ppm_df, league_avg_ppm = load_ppm_stats(str(db_path), context_season)
-                ppm_loaded = True
-            except Exception as e:
-                st.warning(f"⚠️ PPM stats not available: {e}")
-                off_ppm_df, def_ppm_df, league_avg_ppm = None, None, 0.462
-                ppm_loaded = False
-
-            def_style_map: Dict[int, str] = {
-                int(row["team_id"]): (str(row.get("defense_style") or "Neutral"))
-                for _, row in defense_stats.iterrows()
-            }
-            player_style_splits = build_player_style_splits(
+        # Show games schedule without predictions
+        try:
+            games_df, _ = build_games_table(
                 str(db_path),
-                context_season,
-                context_season_type,
-                def_style_map,
+                selected_date,
+                builder_config["season"],
+                DEFAULT_SEASON_TYPE,
             )
-            player_vs_team_history = build_player_vs_team_history(
-                str(db_path),
-                context_season,
-                context_season_type,
-            )
-            def_score_series = defense_stats["def_composite_score"].dropna() if not defense_stats.empty else pd.Series(dtype=float)
-            if not def_score_series.empty:
-                low_thresh = def_score_series.quantile(0.33)
-                mid_thresh = def_score_series.quantile(0.66)
-            else:
-                low_thresh = mid_thresh = None
-
-            def classify_difficulty(score: float | None) -> str:
-                if score is None or pd.isna(score):
-                    return "Unknown"
-                if low_thresh is None or mid_thresh is None:
-                    return "Neutral"
-                if score <= low_thresh:
-                    return "Hard"
-                if score <= mid_thresh:
-                    return "Neutral"
-                return "Favorable"
-
-            st.subheader("Top scorers per matchup")
-            if leaders_df.empty:
-                st.info(
-                    "No qualifying player scoring data yet for the selected season/type. "
-                    "Rebuild the database or adjust the minimum games threshold."
+            if not games_df.empty:
+                st.markdown("### Games Schedule")
+                display_df = games_df.drop(columns=MATCHUP_INTERNAL_COLUMNS, errors="ignore")
+                render_dataframe(display_df)
+                st.caption(
+                    "Data source: nba_api ScoreboardV2 + standings context from the local SQLite database."
                 )
             else:
-                score_column = (
-                    "composite_score" if "composite_score" in leaders_df.columns else "weighted_score"
-                )
+                st.info("No NBA games scheduled for this date per the official scoreboard.")
+        except Exception as e:
+            st.error(f"Could not load games schedule: {e}")
 
-                # AUTO-FETCH INJURIES: Refresh injury data before generating predictions
-                try:
-                    import fetch_injury_data
-                    updated, new, skipped, removed, errors = fetch_injury_data.fetch_current_injuries(games_conn)
+    else:
+        # Display predictions grouped by game
+        st.success(f"✅ Loaded {len(predictions_df)} predictions for {selected_date}")
 
-                    if updated > 0 or new > 0 or removed > 0:
-                        parts = []
-                        if updated > 0:
-                            parts.append(f"{updated} updated")
-                        if new > 0:
-                            parts.append(f"{new} new")
-                        if removed > 0:
-                            parts.append(f"{removed} returned")
-                        if skipped > 0:
-                            parts.append(f"{skipped} skipped")
-                        st.info(f"📡 Injury data auto-updated: {', '.join(parts)}")
-
-                    if errors:
-                        with st.expander("⚠️ Injury Fetch Warnings", expanded=False):
-                            for error in errors:
-                                st.warning(error)
-                except Exception as e:
-                    st.warning(f"⚠️ Could not auto-fetch injuries: {e}")
-
-                # Get list of injured player IDs for today to exclude from predictions
-                active_injuries = ia.get_active_injuries(games_conn, check_return_dates=True)
-                injured_player_ids = {inj['player_id'] for inj in active_injuries}
-
-                for _, matchup in games_df.iterrows():
-                    away_id = matchup.get("away_team_id")
-                    home_id = matchup.get("home_team_id")
-                    game_id_val = matchup.get("game_id")
-                    if pd.isna(away_id) or pd.isna(home_id):
-                        continue
-                    away_id = int(away_id)
-                    home_id = int(home_id)
-
-                    # Initialize game totals tracking for this game
-                    if game_id_val not in game_totals_by_game:
-                        game_totals_by_game[game_id_val] = {
-                            "game_id": game_id_val,
-                            "away_team": matchup["Away"],
-                            "home_team": matchup["Home"],
-                            "away_id": away_id,
-                            "home_id": home_id,
-                            "away_projected_total": 0.0,
-                            "home_projected_total": 0.0,
-                            "away_player_count": 0,
-                            "home_player_count": 0,
-                            "away_top_5_total": 0.0,
-                            "home_top_5_total": 0.0,
-                        }
-
-                    matchup_rows: list[Dict[str, Any]] = []
-                    for team_label, team_id, team_name in [
-                        ("Away", away_id, matchup["Away"]),
-                        ("Home", home_id, matchup["Home"]),
-                    ]:
-                        team_leaders = leaders_df[leaders_df["team_id"] == team_id].nlargest(
-                            TOP_LEADERS_COUNT, score_column
-                        )
-
-                        # Filter out injured players from predictions
-                        if injured_player_ids:
-                            team_leaders = team_leaders[~team_leaders['player_id'].isin(injured_player_ids)]
-
-                        if team_leaders.empty:
-                            continue
-                        opponent_id = home_id if team_label == "Away" else away_id
-                        opponent_name = matchup["Home"] if team_label == "Away" else matchup["Away"]
-                        opponent_stats = (
-                            defense_map.get(int(opponent_id))
-                            if opponent_id is not None
-                            else None
-                        )
-                        opp_avg_allowed = safe_float(opponent_stats.get("avg_allowed_pts")) if opponent_stats else None
-                        opp_recent_allowed = safe_float(
-                            opponent_stats.get("avg_allowed_pts_last5")
-                        ) if opponent_stats else None
-                        team_stats = scoring_map.get(team_id)
-                        team_avg_pts = safe_float(team_stats.get("avg_pts")) if team_stats else None
-                        opp_composite = safe_float(
-                            opponent_stats.get("def_composite_score")
-                        ) if opponent_stats else None
-                        opp_style = (
-                            def_style_map.get(int(opponent_id), "Neutral")
-                            if opponent_id is not None
-                            else "Neutral"
-                        )
-                        opp_difficulty = classify_difficulty(opp_composite)
-                        for _, player in team_leaders.iterrows():
-                            avg_pts_last5 = safe_float(player.get("avg_pts_last5")) or safe_float(
-                                player.get("avg_points")
-                            )
-                            avg_pts_last3 = safe_float(player.get("avg_pts_last3")) or avg_pts_last5
-                            avg_fg3_last3 = safe_float(player.get("avg_fg3m_last3"))
-                            avg_fg3_last5 = safe_float(player.get("avg_fg3m_last5"))
-                            avg_minutes_last5 = safe_float(player.get("avg_minutes_last5"))
-                            avg_usg_last5 = safe_float(player.get("avg_usg_last5"))
-                            composite_score = safe_float(player.get(score_column)) or 0.0
-                            season_avg_pts = safe_float(player.get("avg_points")) or 0.0
-                            season_avg_minutes = safe_float(player.get("avg_minutes"))
-                            usage_pct = (
-                                avg_usg_last5
-                                if avg_usg_last5 is not None
-                                else safe_float(player.get("usg_pct"))
-                            )
-                            usage_pct_display = (
-                                usage_pct * 100.0 if usage_pct is not None and usage_pct <= 1.0 else usage_pct
-                            )
-                            defense_factor = (
-                                opp_recent_allowed
-                                if opp_recent_allowed is not None
-                                else opp_composite
-                                if opp_composite is not None
-                                else opp_avg_allowed
-                                if opp_avg_allowed is not None
-                                else 0.0
-                            )
-                            if team_avg_pts and team_avg_pts > 0 and defense_factor is not None:
-                                opportunity_index = defense_factor * (season_avg_pts / team_avg_pts)
-                            else:
-                                opportunity_index = defense_factor
-                            matchup_score = (
-                                season_avg_pts * 0.4
-                                + (avg_pts_last5 or season_avg_pts) * 0.3
-                                + composite_score * 10.0 * 0.2
-                                + defense_factor * 0.1
-                            )
-                            pts_delta = (
-                                (avg_pts_last5 - season_avg_pts)
-                                if avg_pts_last5 is not None and season_avg_pts is not None
-                                else None
-                            )
-                            min_delta = (
-                                (avg_minutes_last5 - season_avg_minutes)
-                                if avg_minutes_last5 is not None and season_avg_minutes is not None
-                                else None
-                            )
-                            usage_delta = (
-                                (avg_usg_last5 - usage_pct)
-                                if avg_usg_last5 is not None and usage_pct is not None
-                                else None
-                            )
-                            # Get player history vs this opponent
-                            player_id_val = safe_int(player.get("player_id"))
-                            vs_opp_history = None
-                            avg_vs_opp = None
-                            games_vs_opp = 0
-                            std_vs_opp = None
-
-                            if player_id_val is not None and opponent_id is not None:
-                                vs_opp_history = player_vs_team_history.get(player_id_val, {}).get(int(opponent_id))
-                                if vs_opp_history:
-                                    avg_vs_opp = vs_opp_history["avg_pts"]
-                                    games_vs_opp = vs_opp_history["games"]
-                                    std_vs_opp = vs_opp_history["std_pts"]
-
-                            # Get player history vs this defense style
-                            avg_vs_style = None
-                            games_vs_style = 0
-                            if player_id_val is not None:
-                                style_data = player_style_splits.get(player_id_val, {})
-                                avg_vs_style = style_data.get(opp_style)
-                                # Estimate games from all teams with this style
-                                if avg_vs_style is not None:
-                                    games_vs_style = 5  # Conservative estimate
-
-                            # Evaluate matchup quality
-                            matchup_rating, matchup_warning, matchup_confidence = evaluate_matchup_quality(
-                                season_avg_pts,
-                                avg_vs_opp,
-                                avg_vs_style,
-                                games_vs_opp,
-                                games_vs_style,
-                                std_vs_opp,
-                            )
-
-                            # Get opponent correlation/matchup advantage indicator
-                            # NEW: Also store the correlation object for enhanced projection
-                            matchup_indicator = ""
-                            matchup_advantage_text = ""
-                            opponent_correlation_obj = None
-                            if player_id_val is not None:
-                                try:
-                                    # Calculate opponent correlations for this player
-                                    opponent_corrs = pca.calculate_opponent_correlations(
-                                        sqlite3.connect(str(db_path)),
-                                        player_id_val,
-                                        context_season,
-                                        context_season_type,
-                                        min_games_vs=1
-                                    )
-
-                                    # Find this specific opponent in the correlations
-                                    if opponent_corrs and opponent_id is not None:
-                                        for opp_corr in opponent_corrs:
-                                            if opp_corr.opponent_team_id == int(opponent_id):
-                                                # Found the matchup!
-                                                opponent_correlation_obj = opp_corr  # Store for projection
-                                                score = opp_corr.matchup_score
-                                                delta = opp_corr.pts_delta
-
-                                                if score >= 60:
-                                                    matchup_indicator = "✅✅"  # Excellent matchup
-                                                    matchup_advantage_text = f"Elite matchup ({delta:+.1f} PPG)"
-                                                elif score >= 55:
-                                                    matchup_indicator = "✅"  # Good matchup
-                                                    matchup_advantage_text = f"Favorable ({delta:+.1f} PPG)"
-                                                elif score <= 40:
-                                                    matchup_indicator = "❌❌"  # Very poor matchup
-                                                    matchup_advantage_text = f"Struggles ({delta:+.1f} PPG)"
-                                                elif score <= 45:
-                                                    matchup_indicator = "❌"  # Poor matchup
-                                                    matchup_advantage_text = f"Tough ({delta:+.1f} PPG)"
-                                                else:
-                                                    matchup_indicator = "➖"  # Neutral
-                                                    matchup_advantage_text = f"Neutral ({delta:+.1f} PPG)"
-                                                break
-                                except Exception:
-                                    # Silently fail - don't break the display if correlation calc fails
-                                    pass
-
-                            # NEW: Calculate pace and defense quality splits for enhanced projection
-                            pace_split_obj = None
-                            defense_quality_split_obj = None
-                            if player_id_val is not None and opponent_id is not None:
-                                try:
-                                    conn_for_splits = sqlite3.connect(str(db_path))
-
-                                    # Get all defense type splits for this player
-                                    defense_splits = dta.calculate_defense_type_splits(
-                                        conn_for_splits,
-                                        player_id_val,
-                                        context_season,
-                                        context_season_type,
-                                        min_games=2
-                                    )
-
-                                    # Also need to categorize the opponent team to know which split to use
-                                    team_categories = dta.categorize_teams_by_defense(
-                                        conn_for_splits,
-                                        context_season,
-                                        context_season_type
-                                    )
-
-                                    if int(opponent_id) in team_categories:
-                                        opp_pace_cat = team_categories[int(opponent_id)]['pace_category']
-                                        opp_def_cat = team_categories[int(opponent_id)]['defense_category']
-
-                                        # Find matching splits
-                                        for split in defense_splits:
-                                            if split.defense_type == f"{opp_pace_cat} Pace":
-                                                pace_split_obj = split
-                                            elif split.defense_type == f"{opp_def_cat} Defense":
-                                                defense_quality_split_obj = split
-
-                                    conn_for_splits.close()
-                                except Exception:
-                                    # Silently fail - don't break the display
-                                    pass
-
-                            # Display string for vs opponent
-                            if avg_vs_opp is not None and games_vs_opp >= 2:
-                                vs_opp_display = f"{avg_vs_opp:.1f} ({games_vs_opp}G)"
-                            else:
-                                vs_opp_display = "N/A"
-
-                            # Display string for vs style
-                            avg_vs_style_display = (
-                                format_number(avg_vs_style, 1) if avg_vs_style is not None else "N/A"
-                            )
-
-                            # Calculate smart PPG projection with enhanced analytics
-                            opp_def_rating = safe_float(opponent_stats.get("def_rating")) if opponent_stats else None
-                            opp_pace = safe_float(opponent_stats.get("avg_opp_possessions")) if opponent_stats else None
-
-                            # Get player position for position-specific PPM
-                            player_position = ""
-                            try:
-                                cursor = games_conn.cursor()
-                                cursor.execute(
-                                    "SELECT position FROM players WHERE player_id = ?",
-                                    (player.get("player_id"),)
-                                )
-                                position_result = cursor.fetchone()
-                                if position_result and position_result[0]:
-                                    player_position = position_result[0]
-                            except Exception:
-                                pass  # Use empty string if lookup fails
-
-                            projection, proj_confidence, proj_floor, proj_ceiling, breakdown, analytics_indicators = calculate_smart_ppg_projection(
-                                season_avg=season_avg_pts,
-                                recent_avg_5=avg_pts_last5,
-                                recent_avg_3=avg_pts_last3,
-                                vs_opp_team_avg=avg_vs_opp,
-                                vs_opp_team_games=games_vs_opp,
-                                vs_defense_style_avg=avg_vs_style,
-                                vs_defense_style_games=games_vs_style,
-                                opp_def_rating=opp_def_rating,
-                                opp_pace=opp_pace,
-                                # NEW: Enhanced analytics parameters
-                                opponent_correlation=opponent_correlation_obj,
-                                pace_split=pace_split_obj,
-                                defense_quality_split=defense_quality_split_obj,
-                                opp_team_id=opponent_id,  # NEW: For defense variance ceiling boost
-                                # PPM Integration
-                                player_name=player["player_name"],
-                                opponent_id=opponent_id,
-                                def_ppm_df=def_ppm_df if ppm_loaded else None,
-                                league_avg_ppm=league_avg_ppm,
-                                conn=games_conn,
-                                player_position=player_position,  # NEW: For position-specific PPM
-                                game_date=str(selected_date),  # NEW: For season progress calculation
-                            )
-
-                            # Calculate unified DFS Score
-                            daily_pick_score, pick_grade, pick_explanation = calculate_daily_pick_score(
-                                player_season_avg=season_avg_pts,
-                                player_projection=projection,
-                                projection_confidence=proj_confidence,
-                                matchup_rating=matchup_rating,
-                                opp_def_rating=opp_def_rating,
-                                def_ppm_df=def_ppm_df if ppm_loaded else None,  # PPM Integration
-                            )
-
-                            # Accumulate game totals for team score projections
-                            if game_id_val in game_totals_by_game:
-                                if team_label == "Away":
-                                    game_totals_by_game[game_id_val]["away_projected_total"] += projection
-                                    game_totals_by_game[game_id_val]["away_player_count"] += 1
-                                    # Track top 5 separately
-                                    if game_totals_by_game[game_id_val]["away_player_count"] <= 5:
-                                        game_totals_by_game[game_id_val]["away_top_5_total"] += projection
-                                else:  # Home
-                                    game_totals_by_game[game_id_val]["home_projected_total"] += projection
-                                    game_totals_by_game[game_id_val]["home_player_count"] += 1
-                                    # Track top 5 separately
-                                    if game_totals_by_game[game_id_val]["home_player_count"] <= 5:
-                                        game_totals_by_game[game_id_val]["home_top_5_total"] += projection
-
-                            matchup_rows.append(
-                                {
-                                    "Side": team_label,
-                                    "Team": team_name,
-                                    "Player": player["player_name"],
-                                    "Pos": player_position,  # NEW: Player position (Guard/Forward/Center)
-                                    "Matchup": matchup_indicator,  # NEW: Matchup advantage indicator
-                                    "Analytics": analytics_indicators,  # NEW: Analytics quality indicators
-                                    "DFS Score": f"{daily_pick_score:.1f}",
-                                    "Grade": f"{pick_grade}\n{pick_explanation}",
-                                    "Games": int(player["games_played"]),
-                                    "Projected PPG": f"{projection:.1f}",
-                                    "Proj Conf": f"{proj_confidence:.0%}",
-                                    "Avg PPG": f"{player['avg_points']:.1f}",
-                                    "Median PPG": f"{player['median_points']:.1f}",
-                                    "Max PPG": f"{player['max_points']:.1f}",
-                                    "Proj Range": f"{proj_floor:.1f}-{proj_ceiling:.1f}",
-                                    "Avg 3PM": f"{player['avg_fg3m']:.1f}",
-                                    "Median 3PM": f"{player['median_fg3m']:.1f}",
-                                    "Last3 Avg Pts": format_number(player.get("avg_pts_last3"), 1),
-                                    "Last3 Avg 3PM": format_number(player.get("avg_fg3m_last3"), 1),
-                                    "Last5 Avg Pts": format_number(player.get("avg_pts_last5"), 1),
-                                    "Last5 Avg 3PM": format_number(player.get("avg_fg3m_last5"), 1),
-                                    "Last5 Avg Minutes": format_number(avg_minutes_last5, 1),
-                                    "Last5 Usage %": format_number(usage_pct_display, 1),
-                                    "Usage %": format_number(usage_pct_display, 1),
-                                    "Composite Score": format_number(composite_score, 2),
-                                    "Comp Z Avg": format_number(player.get("z_avg"), 2),
-                                    "Comp Z Last3": format_number(player.get("z_last3"), 2),
-                                    "Comp Z Last5": format_number(player.get("z_last5"), 2),
-                                    "Comp Z Min5": format_number(player.get("z_minutes5"), 2),
-                                    "Comp Z Usg5": format_number(player.get("z_usage5"), 2),
-                                    "Last5 vs Season Pts": format_number(pts_delta, 1),
-                                    "Last5 vs Season Min": format_number(min_delta, 1),
-                                    "Last5 vs Season Usage": format_number(usage_delta, 1),
-                                    "Opp Defense Style": opp_style,
-                                    "Opp Difficulty": opp_difficulty,
-                                    "Vs This Team": vs_opp_display,
-                                    "Vs This Style": avg_vs_style_display,
-                                    "Matchup Rating": matchup_rating,
-                                    "Matchup Adv": matchup_advantage_text,  # NEW: Detailed matchup text
-                                    "Warning": matchup_warning,
-                                    "Confidence": f"{matchup_confidence:.0%}" if matchup_confidence > 0 else "Low",
-                                }
-                            )
-
-                            # NEW: Log prediction for tracking
-                            try:
-                                prediction = pt.Prediction(
-                                    prediction_id=None,
-                                    prediction_date=str(date.today()),
-                                    game_date=str(selected_date),
-                                    player_id=player_id_val,
-                                    player_name=player["player_name"],
-                                    team_id=team_id,
-                                    team_name=team_name,
-                                    opponent_id=opponent_id if opponent_id else 0,
-                                    opponent_name=opponent_name,
-                                    projected_ppg=projection,
-                                    proj_confidence=proj_confidence,
-                                    proj_floor=proj_floor,
-                                    proj_ceiling=proj_ceiling,
-                                    season_avg_ppg=season_avg_pts,
-                                    recent_avg_3=avg_pts_last3,
-                                    recent_avg_5=avg_pts_last5,
-                                    vs_opponent_avg=avg_vs_opp,
-                                    vs_opponent_games=games_vs_opp,
-                                    analytics_used=analytics_indicators,
-                                    opponent_def_rating=opp_def_rating,
-                                    opponent_pace=opp_pace,
-                                    dfs_score=daily_pick_score,
-                                    dfs_grade=pick_grade,
-                                    # Opponent injury impact tracking
-                                    opponent_injury_detected=breakdown.get("opponent_injury_detected", False),
-                                    opponent_injury_boost_projection=breakdown.get("opponent_injury_boost_projection", 0.0),
-                                    opponent_injury_boost_ceiling=breakdown.get("opponent_injury_boost_ceiling", 0.0),
-                                    opponent_injured_player_ids=None,  # Will be populated when we store injury details
-                                    opponent_injury_impact_score=0.0  # Will be calculated from injury impact data
-                                )
-
-                                # Add to export list
-                                predictions_for_export.append({
-                                    'game_date': str(selected_date),
-                                    'player_name': player["player_name"],
-                                    'team_name': team_name,
-                                    'opponent_name': opponent_name,
-                                    'projected_ppg': projection,
-                                    'proj_confidence': proj_confidence,
-                                    'proj_floor': proj_floor,
-                                    'proj_ceiling': proj_ceiling,
-                                    'season_avg_ppg': season_avg_pts,
-                                    'recent_avg_3': avg_pts_last3,
-                                    'recent_avg_5': avg_pts_last5,
-                                    'vs_opponent_avg': avg_vs_opp,
-                                    'vs_opponent_games': games_vs_opp,
-                                    'analytics_used': analytics_indicators,
-                                    'opponent_def_rating': opp_def_rating,
-                                    'opponent_pace': opp_pace,
-                                    'dfs_score': daily_pick_score,
-                                    'dfs_grade': pick_grade
-                                })
-
-                                # Try to log to database (optional, won't break if it fails)
-                                pt.log_prediction(games_conn, prediction)
-                                predictions_logged += 1
-                            except Exception as e:
-                                # Show error in sidebar to help debug without breaking main display
-                                predictions_failed += 1
-                                if predictions_failed <= 3:  # Only show first 3 errors to avoid spam
-                                    st.sidebar.warning(f"⚠️ Prediction logging error: {str(e)[:100]}")
-
-                            matchup_spotlight_rows.append(
-                                {
-                                    "Matchup": f"{matchup['Away']} at {matchup['Home']}",
-                                    "Side": team_label,
-                                    "Team": team_name,
-                                    "Player": player["player_name"],
-                                    "Pos": player_position,  # NEW: Player position (Guard/Forward/Center)
-                                    "Matchup Ind": matchup_indicator,  # NEW: Matchup indicator
-                                    "DFS Score": daily_pick_score,
-                                    "Pick Grade": f"{pick_grade}: {pick_explanation}",
-                                    "Season Avg PPG": season_avg_pts,
-                                    "Projected PPG": projection,
-                                    "Proj Floor": proj_floor,
-                                    "Proj Ceiling": proj_ceiling,
-                                    "Proj Confidence": proj_confidence,
-                                    "Last5 Avg PPG": avg_pts_last5,
-                                    "Last3 Avg PPG": avg_pts_last3,
-                                    "Last5 Avg 3PM": avg_fg3_last5,
-                                    "Last3 Avg 3PM": avg_fg3_last3,
-                                    "Opponent": opponent_name,
-                                    "Opp Avg Allowed PPG": opp_avg_allowed,
-                                    "Opp Last5 Avg Allowed": opp_recent_allowed,
-                                    "Opp Def Composite": opp_composite,
-                                    "Opp Defense Style": opp_style,
-                                    "Last5 Avg Minutes": avg_minutes_last5,
-                                    "Last5 Usage %": usage_pct_display,
-                                    "Usage %": usage_pct_display,
-                                    "Composite Score": composite_score,
-                                    "Comp Z Avg": player.get("z_avg"),
-                                    "Comp Z Last3": player.get("z_last3"),
-                                    "Comp Z Last5": player.get("z_last5"),
-                                    "Comp Z Min5": player.get("z_minutes5"),
-                                    "Comp Z Usg5": player.get("z_usage5"),
-                                    "Last5 vs Season Pts": pts_delta,
-                                    "Last5 vs Season Min": min_delta,
-                                    "Last5 vs Season Usage": usage_delta,
-                                    "Opp Difficulty": opp_difficulty,
-                                    "Vs This Team": vs_opp_display,
-                                    "Vs This Style": avg_vs_style_display,
-                                    "Matchup Rating": matchup_rating,
-                                    "Matchup Adv": matchup_advantage_text,  # NEW: Matchup advantage text
-                                    "Warning": matchup_warning,
-                                    "Matchup Score": matchup_score,
-                                }
-                            )
-                            daily_power_rows_points.append(
-                                {
-                                    "Matchup": f"{matchup['Away']} at {matchup['Home']}",
-                                    "Player": player["player_name"],
-                                    "Pos": player_position,  # NEW: Player position (Guard/Forward/Center)
-                                    "Team": team_name,
-                                    "Ind": matchup_indicator,  # NEW: Matchup indicator (shorter column name)
-                                    "DFS Score": daily_pick_score,
-                                    "Grade": f"{pick_grade}: {pick_explanation}",
-                                    "Projected PPG": projection,
-                                    "Season Avg PPG": season_avg_pts,
-                                    "Proj Conf": f"{proj_confidence:.0%}",
-                                    "Last5 Avg PPG": avg_pts_last5,
-                                    "Opp Avg Allowed PPG": opp_avg_allowed,
-                                    "Opp Last5 Avg Allowed": opp_recent_allowed,
-                                    "Opp Def Composite": opp_composite,
-                                    "Opportunity Index": opportunity_index,
-                                    "Usage %": usage_pct_display,
-                                    "Opp Defense Style": opp_style,
-                                    "Opp Difficulty": opp_difficulty,
-                                    "Matchup Score": matchup_score,
-                                }
-                            )
-                            daily_power_rows_3pm.append(
-                                {
-                                    "Matchup": f"{matchup['Away']} at {matchup['Home']}",
-                                    "Player": player["player_name"],
-                                    "Pos": player_position,  # NEW: Player position (Guard/Forward/Center)
-                                    "Team": team_name,
-                                    "Season Avg 3PM": safe_float(player.get("avg_fg3m")),
-                                    "Last5 Avg 3PM": avg_fg3_last5,
-                                    "Opp Avg Allowed PPG": opp_avg_allowed,
-                                    "Opp Last5 Avg Allowed": opp_recent_allowed,
-                                    "Opp Def Composite": opp_composite,
-                                    "Opportunity Index": opportunity_index,
-                                    "Usage %": usage_pct_display,
-                                    "Opp Defense Style": opp_style,
-                                    "Opp Difficulty": opp_difficulty,
-                                    "Matchup Score": (
-                                        (avg_fg3_last5 or safe_float(player.get("avg_fg3m")) or 0.0) * 0.6
-                                        + (avg_fg3_last3 or safe_float(player.get("avg_fg3m")) or 0.0) * 0.3
-                                        + (opp_recent_allowed or opp_avg_allowed or 0.0) * 0.1
-                                    ),
-                                }
-                            )
-                    st.markdown(f"**{matchup['Away']} at {matchup['Home']}**")
-                    if matchup_rows:
-                        matchup_df = pd.DataFrame(matchup_rows)
-
-                        # Apply styling based on matchup rating
-                        def style_matchup_rating(val):
-                            if val == "Excellent":
-                                return "background-color: #d4edda; color: #155724"  # Green
-                            elif val == "Good":
-                                return "background-color: #d1ecf1; color: #0c5460"  # Blue
-                            elif val == "Difficult":
-                                return "background-color: #fff3cd; color: #856404"  # Yellow
-                            elif val == "Avoid":
-                                return "background-color: #f8d7da; color: #721c24"  # Red
-                            return ""
-
-                        def style_warning(val):
-                            if val and isinstance(val, str) and len(val) > 0:
-                                return "background-color: #fff3cd; font-weight: bold"
-                            return ""
-
-                        def style_projection_confidence(val):
-                            """Style projection confidence - green for high, yellow for medium, gray for low"""
-                            if not val or val == "N/A":
-                                return ""
-                            try:
-                                # Remove % sign and convert to float
-                                conf_str = val.replace("%", "").strip()
-                                conf_val = float(conf_str) / 100.0
-                                if conf_val >= 0.75:
-                                    return "background-color: #d4edda; color: #155724; font-weight: bold"  # High confidence - Green
-                                elif conf_val >= 0.50:
-                                    return "background-color: #fff3cd; color: #856404"  # Medium confidence - Yellow
-                                else:
-                                    return "background-color: #e2e3e5; color: #383d41"  # Low confidence - Gray
-                            except (ValueError, AttributeError):
-                                return ""
-
-                        styled_df = matchup_df.style.applymap(
-                            style_matchup_rating, subset=["Matchup Rating"]
-                        ).applymap(
-                            style_warning, subset=["Warning"]
-                        ).applymap(
-                            style_projection_confidence, subset=["Proj Conf"]
-                        )
-
-                        st.dataframe(styled_df, use_container_width=True)
-
-                        # Show warnings prominently
-                        warnings = matchup_df[matchup_df["Warning"].notna() & (matchup_df["Warning"] != "")]
-                        if not warnings.empty:
-                            with st.expander("⚠️ Matchup Warnings", expanded=True):
-                                for _, row in warnings.iterrows():
-                                    if row["Matchup Rating"] == "Avoid":
-                                        st.error(f"**{row['Player']} ({row['Team']})**: {row['Warning']}")
-                                    elif row["Matchup Rating"] == "Difficult":
-                                        st.warning(f"**{row['Player']} ({row['Team']})**: {row['Warning']}")
-                                    elif row["Matchup Rating"] == "Excellent":
-                                        st.success(f"**{row['Player']} ({row['Team']})**: {row['Warning']}")
-                    else:
-                        st.caption("No qualified players for this matchup yet.")
-    except Exception as exc:  # noqa: BLE001
-        st.error(f"Unable to load today's games: {exc}")
-
-    # Show prediction logging status
-    if predictions_logged > 0 or predictions_failed > 0:
-        st.sidebar.success(f"✅ Logged {predictions_logged} predictions")
-        if predictions_failed > 0:
-            st.sidebar.error(f"❌ Failed to log {predictions_failed} predictions")
-
-        # Auto-apply injury adjustments if there are active injuries
-        if predictions_logged > 0 and injured_player_ids:
-            try:
-                adjusted, skipped, records = ia.apply_injury_adjustments(
-                    list(injured_player_ids),
-                    str(selected_date),
-                    games_conn,
-                    min_historical_games=3
-                )
-                if adjusted > 0:
-                    st.sidebar.info(f"🚑 Auto-adjusted {adjusted} predictions for {len(injured_player_ids)} injuries")
-                    if skipped > 0:
-                        st.sidebar.caption(f"({skipped} skipped - insufficient data)")
-            except Exception as e:
-                st.sidebar.warning(f"⚠️ Injury adjustment failed: {e}")
-
-        # Auto-backup to S3 after logging predictions
-        if predictions_logged > 0:
-            storage = s3_storage.S3PredictionStorage()
-            if storage.is_connected():
-                success, message = storage.upload_database(db_path)
-                if success:
-                    st.sidebar.info(f"☁️ {message}")
-                else:
-                    st.sidebar.warning(f"⚠️ S3 backup failed: {message}")
-
-    # CSV Export Button
-    if predictions_for_export:
-        st.divider()
-        st.subheader("📥 Export Today's Predictions")
-
-        # Convert to DataFrame
-        export_df = pd.DataFrame(predictions_for_export)
-
-        # Sort by DFS score descending
-        export_df = export_df.sort_values('dfs_score', ascending=False).reset_index(drop=True)
-
-        # Show summary
-        st.caption(f"Total predictions: {len(export_df)} | Top DFS Score: {export_df['dfs_score'].max():.1f} | Date: {export_df['game_date'].iloc[0]}")
-
-        # Convert to CSV
-        csv = export_df.to_csv(index=False)
-
-        # Download button
-        col1, col2 = st.columns([2, 1])
-
-        with col1:
-            st.download_button(
-                label="📥 Download Predictions CSV",
-                data=csv,
-                file_name=f"nba_predictions_{export_df['game_date'].iloc[0]}.csv",
-                mime="text/csv",
-                help="Download all predictions from this page as CSV"
-            )
+        # Action buttons row
+        col1, col2, col3 = st.columns([2, 1, 1])
 
         with col2:
-            # Manual S3 backup button
+            if st.button("🔄 Regenerate All", help="Regenerate all predictions for this date", use_container_width=True):
+                generate_predictions_ui(selected_date, db_path, builder_config)
+                st.rerun()
+
+        with col3:
+            # CSV export
+            if not predictions_df.empty:
+                export_df = predictions_df.copy()
+                csv = export_df.to_csv(index=False)
+                st.download_button(
+                    label="📥 CSV",
+                    data=csv,
+                    file_name=f"nba_predictions_{selected_date}.csv",
+                    mime="text/csv",
+                    help="Download predictions as CSV",
+                    use_container_width=True
+                )
+
+        # Group predictions by game (matchup)
+        # Create game key: "Away @ Home"
+        predictions_df['game_key'] = predictions_df['opponent_name'] + ' @ ' + predictions_df['team_name']
+
+        # Get unique games
+        games = predictions_df['game_key'].unique()
+
+        st.markdown("### Game-by-Game Predictions")
+        st.caption(f"Showing {len(games)} game(s) with predictions")
+
+        for game_key in games:
+            game_preds = predictions_df[predictions_df['game_key'] == game_key]
+
+            # Parse away/home teams
+            if ' @ ' in game_key:
+                away_team, home_team = game_key.split(' @ ')
+            else:
+                continue
+
+            st.markdown(f"#### {away_team} at {home_team}")
+
+            # Split into away and home columns
+            col_away, col_home = st.columns(2)
+
+            with col_away:
+                st.markdown(f"**{away_team}** (Away)")
+                # Get away team predictions (where team_name != home_team or opponent_name == home_team)
+                # Actually, in the predictions table, team_name is the team the player is ON
+                # opponent_name is who they're playing against
+                # So if opponent_name == home_team, then this player is on the away team
+                away_preds = game_preds[game_preds['opponent_name'] == home_team]
+                if not away_preds.empty:
+                    display_team_predictions(away_preds)
+                else:
+                    st.caption("No predictions for this team")
+
+            with col_home:
+                st.markdown(f"**{home_team}** (Home)")
+                # If opponent_name == away_team, then this player is on the home team
+                home_preds = game_preds[game_preds['opponent_name'] == away_team]
+                if not home_preds.empty:
+                    display_team_predictions(home_preds)
+                else:
+                    st.caption("No predictions for this team")
+
+            st.markdown("---")
+
+        # S3 backup option at bottom
+        st.markdown("### Cloud Backup")
+        col_backup1, col_backup2 = st.columns(2)
+
+        with col_backup1:
             storage = s3_storage.S3PredictionStorage()
             if storage.is_connected():
                 if st.button("☁️ Backup to S3", help="Manually backup database to S3"):
@@ -3700,7 +3077,7 @@ if selected_page == "Matchup Spotlight":
         # Get selected date
         spotlight_date = st.date_input(
             "Select Date",
-            value=selected_date,
+            value=default_game_date(),
             key="spotlight_date_input"
         )
         spotlight_date_str = spotlight_date.strftime('%Y-%m-%d')
