@@ -5997,6 +5997,53 @@ if selected_page == "Injury Admin":
 
     st.divider()
 
+    # DIAGNOSTIC: Search for specific player
+    with st.expander("🔍 Debug: Search Specific Player", expanded=False):
+        st.caption("Search for a player by name to see their exact database record (ignores all filters)")
+        search_name = st.text_input("Player name", placeholder="e.g., Giannis", key="debug_search_player")
+
+        if search_name and len(search_name) >= 3:
+            try:
+                cursor = injury_conn.cursor()
+                cursor.execute("""
+                    SELECT player_id, player_name, team_name, status,
+                           injury_type, expected_return_date, source,
+                           confidence, injury_date, updated_at
+                    FROM injury_list
+                    WHERE player_name LIKE ?
+                """, (f'%{search_name}%',))
+
+                results = cursor.fetchall()
+                if results:
+                    st.success(f"Found {len(results)} record(s):")
+                    for row in results:
+                        st.write("---")
+                        st.write(f"**Player:** {row[1]}")
+                        st.write(f"**Team:** {row[2]}")
+                        st.write(f"**Status:** `{row[3]}` ← Check if this matches your status filter!")
+                        st.write(f"**Injury Type:** {row[4] or 'N/A'}")
+                        st.write(f"**Expected Return:** `{row[5]}` ← Check format!")
+                        st.write(f"**Source:** {row[6]}")
+                        st.write(f"**Confidence:** {row[7]}")
+                        st.write(f"**Injury Date:** {row[8]}")
+                        st.write(f"**Updated:** {row[9]}")
+
+                        # Check why it might be filtered
+                        today = date.today().strftime('%Y-%m-%d')
+                        if row[5]:  # has return date
+                            if row[5] < today:
+                                st.error(f"⚠️ FILTERED OUT: Return date ({row[5]}) < today ({today})")
+                            else:
+                                st.info(f"✓ Return date ({row[5]}) >= today ({today})")
+                else:
+                    st.warning(f"No records found for '{search_name}'")
+            except Exception as e:
+                st.error(f"Error: {e}")
+                import traceback
+                st.code(traceback.format_exc())
+
+    st.divider()
+
     # Auto-Fetch Section
     st.subheader("📡 Auto-Fetch Current Injury Reports")
     st.caption("Fetch latest injury data from balldontlie.io API and sync to database")
