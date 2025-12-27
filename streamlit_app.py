@@ -3007,10 +3007,19 @@ These predictions should be removed to avoid DNP errors.
                 # AUTO-FETCH INJURIES: Refresh injury data before generating predictions
                 try:
                     import fetch_injury_data
-                    updated, new, skipped, errors = fetch_injury_data.fetch_current_injuries(games_conn)
+                    updated, new, skipped, removed, errors = fetch_injury_data.fetch_current_injuries(games_conn)
 
-                    if updated > 0 or new > 0:
-                        st.info(f"📡 Injury data auto-updated: {updated} updated, {new} new, {skipped} skipped")
+                    if updated > 0 or new > 0 or removed > 0:
+                        parts = []
+                        if updated > 0:
+                            parts.append(f"{updated} updated")
+                        if new > 0:
+                            parts.append(f"{new} new")
+                        if removed > 0:
+                            parts.append(f"{removed} returned")
+                        if skipped > 0:
+                            parts.append(f"{skipped} skipped")
+                        st.info(f"📡 Injury data auto-updated: {', '.join(parts)}")
 
                     if errors:
                         with st.expander("⚠️ Injury Fetch Warnings", expanded=False):
@@ -6064,16 +6073,24 @@ if selected_page == "Injury Admin":
         with st.spinner("Fetching injury reports from API..."):
             try:
                 import fetch_injury_data
-                updated, new, skipped, errors = fetch_injury_data.fetch_current_injuries(injury_conn)
+                updated, new, skipped, removed, errors = fetch_injury_data.fetch_current_injuries(injury_conn)
 
                 # Show results
-                col_a, col_b, col_c = st.columns(3)
+                col_a, col_b, col_c, col_d = st.columns(4)
                 col_a.metric("Updated", updated, delta=None)
                 col_b.metric("New", new, delta=None)
-                col_c.metric("Skipped", skipped, delta=None)
+                col_c.metric("Returned", removed, delta=None, delta_color="normal")
+                col_d.metric("Skipped", skipped, delta=None)
 
-                if updated > 0 or new > 0:
-                    st.success(f"✅ Injury data refreshed! {updated} updated, {new} new injuries added.")
+                if updated > 0 or new > 0 or removed > 0:
+                    parts = []
+                    if updated > 0:
+                        parts.append(f"{updated} updated")
+                    if new > 0:
+                        parts.append(f"{new} new")
+                    if removed > 0:
+                        parts.append(f"{removed} returned")
+                    st.success(f"✅ Injury data refreshed! {', '.join(parts)}")
 
                     # Backup to S3 after successful fetch
                     try:

@@ -521,7 +521,7 @@ def log_fetch_error(
         print(f"Error logging fetch error: {e}")
 
 
-def fetch_current_injuries(conn: sqlite3.Connection) -> Tuple[int, int, int, List[str]]:
+def fetch_current_injuries(conn: sqlite3.Connection) -> Tuple[int, int, int, int, List[str]]:
     """
     Main entry point: Fetch injury data from balldontlie.io and sync to database.
 
@@ -529,6 +529,7 @@ def fetch_current_injuries(conn: sqlite3.Connection) -> Tuple[int, int, int, Lis
     - Atomic fetch lock (prevents concurrent fetches)
     - 3-tier name matching (alias → exact → fuzzy)
     - Proper UPSERT with manual override protection
+    - Automatic removal of stale injury records (players who returned)
     - Error logging to database
     - Cooldown enforcement
 
@@ -536,37 +537,42 @@ def fetch_current_injuries(conn: sqlite3.Connection) -> Tuple[int, int, int, Lis
         conn: Database connection
 
     Returns:
-        Tuple of (updated_count, new_count, skipped_count, error_messages)
+        Tuple of (updated_count, new_count, skipped_count, removed_count, error_messages)
         - updated_count: Number of existing injuries updated
         - new_count: Number of new injuries added
         - skipped_count: Number of players that couldn't be matched
+        - removed_count: Number of stale injuries removed (players returned)
         - error_messages: List of error message strings
     """
     # Check if automation is enabled
     if not config.INJURY_AUTOMATION_ENABLED:
-        return (0, 0, 0, ["Injury automation is disabled in config"])
+        return (0, 0, 0, 0, ["Injury automation is disabled in config"])
 
     # Try to acquire lock
     if not acquire_fetch_lock(conn):
-        return (0, 0, 0, [f"Fetch skipped: cooldown active or another fetch in progress"])
+        return (0, 0, 0, 0, [f"Fetch skipped: cooldown active or another fetch in progress"])
 
     error_messages = []
     updated_count = 0
     new_count = 0
     skipped_count = 0
+    removed_count = 0
+    fetched_player_ids = set()  # Track player_ids from current API fetch
 
     try:
         # Get API key
         api_key = get_api_key(conn)
         if not api_key:
             error_messages.append("No API key found. Check Streamlit secrets or environment.")
-            return (0, 0, 0, error_messages)
+            return (0, 0, 0, 0, error_messages)
 
         # Fetch injuries from API
         injuries = fetch_injuries_from_api(api_key)
 
         if not injuries:
-            return (0, 0, 0, ["No injuries returned from API (may be normal if no active injuries)"])
+            # Even with no injuries, we should clean up stale records
+            # (all automated entries should be removed if API returns empty list)
+            pass  # Continue to cleanup logic
 
         # Process each injury
         for injury_record in injuries:
@@ -618,6 +624,9 @@ def fetch_current_injuries(conn: sqlite3.Connection) -> Tuple[int, int, int, Lis
             )
 
             if success:
+                # Track this player_id as current in API
+                fetched_player_ids.add(player_id)
+
                 if is_update:
                     updated_count += 1
                 else:
@@ -625,11 +634,42 @@ def fetch_current_injuries(conn: sqlite3.Connection) -> Tuple[int, int, int, Lis
             else:
                 error_messages.append(f"Failed to upsert injury for {full_name}")
 
-        return (updated_count, new_count, skipped_count, error_messages)
+        # ====================================================================
+        # CLEANUP: Remove stale automated injury records
+        # ====================================================================
+        # Any automated injury not in the current API fetch has been resolved
+        # (player returned from injury). Remove these stale records.
+        #
+        # We preserve manual entries (user may want to track historical data).
+        # ====================================================================
+        cursor = conn.cursor()
+
+        if fetched_player_ids:
+            # Build NOT IN clause for player_ids we just fetched
+            placeholders = ','.join('?' * len(fetched_player_ids))
+            cursor.execute(f"""
+                DELETE FROM injury_list
+                WHERE source = 'automated'
+                  AND player_id NOT IN ({placeholders})
+            """, list(fetched_player_ids))
+        else:
+            # No injuries from API - remove ALL automated entries
+            cursor.execute("""
+                DELETE FROM injury_list
+                WHERE source = 'automated'
+            """)
+
+        removed_count = cursor.rowcount
+        conn.commit()
+
+        if removed_count > 0:
+            print(f"Removed {removed_count} stale injury record(s) (players returned from injury)")
+
+        return (updated_count, new_count, skipped_count, removed_count, error_messages)
 
     except Exception as e:
         error_messages.append(f"Fatal error during fetch: {e}")
-        return (0, 0, 0, error_messages)
+        return (0, 0, 0, 0, error_messages)
 
     finally:
         # Always release lock
