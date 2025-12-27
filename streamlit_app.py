@@ -3694,9 +3694,105 @@ These predictions should be removed to avoid DNP errors.
 # Matchup spotlight tab ----------------------------------------------------
 if selected_page == "Matchup Spotlight":
     st.subheader("Player Matchup Spotlight")
-    if not matchup_spotlight_rows:
-        st.info("Run the Today's Games tab to populate matchup insights.")
-    else:
+
+    # Load predictions directly from database (self-contained)
+    try:
+        # Get selected date
+        spotlight_date = st.date_input(
+            "Select Date",
+            value=selected_date,
+            key="spotlight_date_input"
+        )
+        spotlight_date_str = spotlight_date.strftime('%Y-%m-%d')
+
+        # Query predictions for this date
+        spotlight_query = """
+            SELECT
+                player_name,
+                team_name,
+                opponent_name,
+                projected_ppg,
+                proj_floor,
+                proj_ceiling,
+                proj_confidence,
+                season_avg_ppg,
+                recent_avg_5 as last5_avg_ppg,
+                recent_avg_3 as last3_avg_ppg,
+                vs_opponent_avg,
+                vs_opponent_games,
+                dfs_score,
+                dfs_grade,
+                opponent_def_rating,
+                opponent_pace,
+                game_date
+            FROM predictions
+            WHERE game_date = ?
+            ORDER BY dfs_score DESC
+        """
+
+        spotlight_conn = get_connection(str(db_path))
+        spotlight_df_raw = run_query(str(db_path), spotlight_query, params=(spotlight_date_str,))
+
+        if spotlight_df_raw.empty:
+            st.info(f"📊 No predictions found for {spotlight_date_str}. Go to Today's Games tab and generate predictions first.")
+        else:
+            # Rebuild matchup_spotlight_rows from database
+            matchup_spotlight_rows = []
+            for _, row in spotlight_df_raw.iterrows():
+                matchup_spotlight_rows.append({
+                    "Matchup": f"{row['opponent_name']} at {row['team_name']}",  # Simplified
+                    "Player": row['player_name'],
+                    "Team": row['team_name'],
+                    "Opponent": row['opponent_name'],
+                    "DFS Score": row['dfs_score'],
+                    "Pick Grade": row['dfs_grade'],
+                    "Season Avg PPG": row['season_avg_ppg'],
+                    "Projected PPG": row['projected_ppg'],
+                    "Proj Floor": row['proj_floor'],
+                    "Proj Ceiling": row['proj_ceiling'],
+                    "Proj Confidence": row['proj_confidence'],
+                    "Last5 Avg PPG": row['last5_avg_ppg'],
+                    "Last3 Avg PPG": row['last3_avg_ppg'],
+                    "Vs This Team": f"{row['vs_opponent_avg']:.1f} ({row['vs_opponent_games']}g)" if row['vs_opponent_avg'] else "N/A",
+                    "Opp Def Rating": row['opponent_def_rating'],
+                    "Matchup Score": row['dfs_score'],  # Use DFS score as matchup score
+                    "Composite Score": row['dfs_score'],  # Use DFS score as composite
+                })
+
+            # Calculate game totals from predictions
+            game_totals_by_game = {}
+            for _, row in spotlight_df_raw.iterrows():
+                matchup_key = f"{row['opponent_name']} @ {row['team_name']}"
+
+                if matchup_key not in game_totals_by_game:
+                    game_totals_by_game[matchup_key] = {
+                        'away_team': row['opponent_name'] if '@' in matchup_key else row['team_name'],
+                        'home_team': row['team_name'] if '@' in matchup_key else row['opponent_name'],
+                        'away_projected_total': 0.0,
+                        'home_projected_total': 0.0,
+                        'away_top_5_total': 0.0,
+                        'home_top_5_total': 0.0,
+                        'away_count': 0,
+                        'home_count': 0,
+                    }
+
+                # Aggregate by team
+                if row['team_name'] == game_totals_by_game[matchup_key]['home_team']:
+                    game_totals_by_game[matchup_key]['home_projected_total'] += row['projected_ppg'] or 0
+                    game_totals_by_game[matchup_key]['home_count'] += 1
+                else:
+                    game_totals_by_game[matchup_key]['away_projected_total'] += row['projected_ppg'] or 0
+                    game_totals_by_game[matchup_key]['away_count'] += 1
+
+            # Now continue with existing display logic
+    except Exception as exc:
+        st.error(f"❌ **Failed to load matchup spotlight:** {exc}")
+        import traceback
+        st.code(traceback.format_exc())
+        matchup_spotlight_rows = []
+        game_totals_by_game = {}
+
+    if matchup_spotlight_rows:
         # NEW: Game Totals Summary Section
         if game_totals_by_game:
             st.markdown("### 🏀 Projected Game Totals")
@@ -3747,9 +3843,10 @@ if selected_page == "Matchup Spotlight":
             "Sort by",
             options=[
                 "Matchup Score",
+                "DFS Score",
+                "Projected PPG",
                 "Season Avg PPG",
                 "Last5 Avg PPG",
-                "Opp Avg Allowed PPG",
                 "Composite Score",
             ],
             index=0,
@@ -3778,6 +3875,23 @@ if selected_page == "Matchup Spotlight":
         st.dataframe(display_df, use_container_width=True)
         st.subheader("Daily Power Rankings")
         col_points, col_3pm = st.columns(2)
+
+        # Build daily power rankings from predictions
+        daily_power_rows_points = []
+        for _, row in spotlight_df_raw.iterrows():
+            daily_power_rows_points.append({
+                "Matchup": f"{row['opponent_name']} @ {row['team_name']}",
+                "Player": row['player_name'],
+                "DFS Score": row['dfs_score'],
+                "Projected PPG": row['projected_ppg'],
+                "Opp Avg Allowed PPG": 0,  # Not available
+                "Opp Last5 Avg Allowed": 0,  # Not available
+                "Opportunity Index": row['dfs_score'] / 10,  # Approximate
+                "Opp Def Composite": row['opponent_def_rating'],
+                "Usage %": 0,  # Not available
+                "Proj Conf": f"{row['proj_confidence']:.0%}" if row['proj_confidence'] else "N/A",
+            })
+
         if daily_power_rows_points:
             points_df = pd.DataFrame(daily_power_rows_points)
             points_top = points_df.sort_values("DFS Score", ascending=False).head(10)
@@ -3813,6 +3927,10 @@ if selected_page == "Matchup Spotlight":
             col_points.dataframe(styled_points, use_container_width=True)
         else:
             col_points.info("No scoring data yet. Refresh Today's Games.")
+
+        # 3PM rankings not available from predictions table
+        daily_power_rows_3pm = []
+
         if daily_power_rows_3pm:
             threes_df = pd.DataFrame(daily_power_rows_3pm)
             threes_top = threes_df.sort_values("Matchup Score", ascending=False).head(10)
@@ -3828,7 +3946,7 @@ if selected_page == "Matchup Spotlight":
             col_3pm.markdown("**Top 10 Players by Matchup Score (3PM)**")
             col_3pm.dataframe(threes_top, use_container_width=True)
         else:
-            col_3pm.info("No three-point data yet. Refresh Today's Games.")
+            col_3pm.info("💡 3PM rankings available in Today's Games tab during prediction generation.")
 
 # Daily leaders tab --------------------------------------------------------
 if selected_page == "Daily Leaders":
