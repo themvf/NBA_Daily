@@ -6100,6 +6100,59 @@ if selected_page == "Injury Admin":
                 st.error(f"❌ Auto-fetch failed: {e}")
                 st.caption("You can still add injuries manually using the form above.")
 
+    # Clear duplicate records button
+    if st.button("🧹 Clean Up Duplicate Records", help="Remove old duplicate injury statuses for same player", key="cleanup_dupes_btn"):
+        try:
+            cursor = injury_conn.cursor()
+
+            # Find duplicates
+            cursor.execute("""
+                SELECT player_id, player_name, COUNT(*) as cnt
+                FROM injury_list
+                GROUP BY player_id
+                HAVING COUNT(*) > 1
+            """)
+            duplicates = cursor.fetchall()
+
+            if not duplicates:
+                st.info("✓ No duplicate records found. Database is clean!")
+            else:
+                deleted_total = 0
+                for player_id, player_name, count in duplicates:
+                    # Keep most recent, delete older ones
+                    cursor.execute("""
+                        SELECT injury_id
+                        FROM injury_list
+                        WHERE player_id = ?
+                        ORDER BY updated_at DESC
+                    """, (player_id,))
+
+                    all_ids = [row[0] for row in cursor.fetchall()]
+                    keep_id = all_ids[0]
+                    delete_ids = all_ids[1:]
+
+                    if delete_ids:
+                        placeholders = ','.join('?' * len(delete_ids))
+                        cursor.execute(f"DELETE FROM injury_list WHERE injury_id IN ({placeholders})", delete_ids)
+                        deleted_total += cursor.rowcount
+
+                injury_conn.commit()
+                st.success(f"✅ Cleaned up {len(duplicates)} players with duplicate records ({deleted_total} old records deleted)")
+
+                # Backup to S3
+                try:
+                    storage = s3_storage.S3PredictionStorage()
+                    if storage.is_connected():
+                        storage.upload_database(db_path)
+                        st.sidebar.info("☁️ Database backed up to S3")
+                except:
+                    pass
+
+                st.rerun()
+
+        except Exception as e:
+            st.error(f"Error cleaning duplicates: {e}")
+
     # Clear lock button (for stuck locks)
     if st.button("🔓 Clear Fetch Lock", help="Clear the fetch cooldown if stuck", key="clear_lock_btn"):
         try:
