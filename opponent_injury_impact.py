@@ -29,11 +29,15 @@ from datetime import datetime
 
 # Position matchup matrix - who guards who
 DEFENSIVE_MATCHUPS = {
-    'C': ['C'],  # Centers guard centers
-    'PF': ['PF', 'C'],  # Power forwards guard PF/C
-    'SF': ['SF', 'PF'],  # Small forwards guard SF/PF
-    'SG': ['SG', 'SF'],  # Shooting guards guard SG/SF
-    'PG': ['PG', 'SG'],  # Point guards guard PG/SG
+    'C': ['C', 'Center'],  # Centers guard centers
+    'PF': ['PF', 'C', 'Forward', 'Center'],  # Power forwards guard PF/C
+    'SF': ['SF', 'PF', 'Forward'],  # Small forwards guard SF/PF
+    'SG': ['SG', 'SF', 'Guard', 'Forward'],  # Shooting guards guard SG/SF/Guards
+    'PG': ['PG', 'SG', 'Guard'],  # Point guards guard PG/SG/Guards
+    # Also support broad position inputs
+    'Guard': ['Guard', 'PG', 'SG'],
+    'Forward': ['Forward', 'SF', 'PF'],
+    'Center': ['Center', 'C'],
 }
 
 # Position importance for defensive impact
@@ -43,6 +47,10 @@ POSITION_DEFENSIVE_IMPORTANCE = {
     'SF': 0.6,  # Perimeter defense
     'SG': 0.7,  # Perimeter defense
     'PG': 0.6,  # Perimeter defense
+    # Broad positions (average of specific positions)
+    'Center': 1.0,  # Same as C
+    'Forward': 0.7,  # Average of SF(0.6) and PF(0.8)
+    'Guard': 0.65,  # Average of PG(0.6) and SG(0.7)
 }
 
 
