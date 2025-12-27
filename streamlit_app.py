@@ -186,7 +186,7 @@ with st.sidebar:
     # Date picker for predictions
     pred_date = st.date_input(
         "Date:",
-        value=default_game_date(),
+        value=datetime.now(EASTERN_TZ).date(),
         key="quick_gen_date",
         label_visibility="collapsed"
     )
