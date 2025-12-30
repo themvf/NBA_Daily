@@ -253,27 +253,7 @@ tab_titles = [
 if 'selected_page' not in st.session_state:
     st.session_state.selected_page = "Tournament Strategy"
 
-# Sidebar selectbox for navigation
-selected_page = st.sidebar.selectbox(
-    "Select View:",
-    tab_titles,
-    index=tab_titles.index(st.session_state.selected_page) if st.session_state.selected_page in tab_titles else 0,
-    key='page_selector'
-)
-
-# Update session state
-st.session_state.selected_page = selected_page
-
-# Show S3 sync status in sidebar
-with st.sidebar:
-    st.markdown("### ☁️ Cloud Backup Status")
-    if "S3 not configured" in s3_sync_message:
-        st.info("💻 Running in local mode")
-    elif s3_sync_status:
-        st.success(s3_sync_message)
-    else:
-        st.warning(s3_sync_message)
-    st.divider()
+# Note: All sidebar content consolidated in single block below (after db_path initialization)
 
 
 
@@ -2677,6 +2657,25 @@ if "auto_build_attempted" not in st.session_state:
 db_path = Path(st.session_state["db_path_input"]).expanduser()
 
 with st.sidebar:
+    # Navigation
+    selected_page = st.selectbox(
+        "Select View:",
+        tab_titles,
+        index=tab_titles.index(st.session_state.selected_page) if st.session_state.selected_page in tab_titles else 0,
+        key='page_selector'
+    )
+    st.session_state.selected_page = selected_page
+
+    # S3 Cloud Backup Status
+    st.markdown("### ☁️ Cloud Backup Status")
+    if "S3 not configured" in s3_sync_message:
+        st.info("💻 Running in local mode")
+    elif s3_sync_status:
+        st.success(s3_sync_message)
+    else:
+        st.warning(s3_sync_message)
+    st.divider()
+
     st.header("Data Inputs")
 
     st.text_input(
