@@ -275,41 +275,6 @@ with st.sidebar:
         st.warning(s3_sync_message)
     st.divider()
 
-    # PREDICTION GENERATION - Quick Action Button
-    st.markdown("### 🎯 Quick Actions")
-    st.markdown("#### Generate Predictions")
-
-    # Date picker for predictions
-    pred_date = st.date_input(
-        "Date:",
-        value=datetime.now(EASTERN_TZ).date(),
-        key="quick_gen_date",
-        label_visibility="collapsed"
-    )
-
-    # Check if predictions already exist for this date
-    try:
-        conn = get_connection(str(db_path))
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT COUNT(*) FROM predictions WHERE game_date = ?",
-            (str(pred_date),)
-        )
-        existing_count = cursor.fetchone()[0]
-        conn.close()
-
-        if existing_count > 0:
-            st.caption(f"✓ {existing_count} predictions exist")
-    except Exception:
-        existing_count = 0
-
-    # Button label changes based on whether predictions exist
-    gen_button_label = "🔄 Regenerate" if existing_count > 0 else "🎯 Generate Predictions"
-
-    if st.button(gen_button_label, type="primary", use_container_width=True, key="sidebar_gen_predictions"):
-        generate_predictions_ui(pred_date, db_path, builder_config)
-
-    st.divider()
 
 
 @st.cache_resource
@@ -2708,6 +2673,9 @@ if "predictions_path_input" not in st.session_state:
 if "auto_build_attempted" not in st.session_state:
     st.session_state["auto_build_attempted"] = False
 
+# Initialize db_path early so it's available throughout the app
+db_path = Path(st.session_state["db_path_input"]).expanduser()
+
 with st.sidebar:
     st.header("Data Inputs")
 
@@ -2842,20 +2810,56 @@ with st.sidebar:
             st.session_state["auto_build_attempted"] = True
             rebuild_database(builder_config, "Manual rebuild requested")
 
-db_path = Path(st.session_state["db_path_input"]).expanduser()
-if not db_path.exists():
-    if not st.session_state["auto_build_attempted"]:
-        st.session_state["auto_build_attempted"] = True
-        st.info("No local database found. Building from the NBA API now...")
-        build_ok = rebuild_database(builder_config, "Automatic rebuild")
-        if not build_ok:
+    # Auto-build database if it doesn't exist
+    if not db_path.exists():
+        if not st.session_state["auto_build_attempted"]:
+            st.session_state["auto_build_attempted"] = True
+            st.info("No local database found. Building from the NBA API now...")
+            build_ok = rebuild_database(builder_config, "Automatic rebuild")
+            if not build_ok:
+                st.stop()
+            db_path = Path(st.session_state["db_path_input"]).expanduser()
+        else:
+            st.error(
+                f"SQLite database not found at `{db_path}` even after rebuild attempts."
+            )
             st.stop()
-        db_path = Path(st.session_state["db_path_input"]).expanduser()
-    else:
-        st.error(
-            f"SQLite database not found at `{db_path}` even after rebuild attempts."
+
+    # PREDICTION GENERATION - Quick Action Button
+    st.markdown("### 🎯 Quick Actions")
+    st.markdown("#### Generate Predictions")
+
+    # Date picker for predictions
+    pred_date = st.date_input(
+        "Date:",
+        value=datetime.now(EASTERN_TZ).date(),
+        key="quick_gen_date",
+        label_visibility="collapsed"
+    )
+
+    # Check if predictions already exist for this date
+    try:
+        conn = get_connection(str(db_path))
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT COUNT(*) FROM predictions WHERE game_date = ?",
+            (str(pred_date),)
         )
-        st.stop()
+        existing_count = cursor.fetchone()[0]
+        conn.close()
+
+        if existing_count > 0:
+            st.caption(f"✓ {existing_count} predictions exist")
+    except Exception:
+        existing_count = 0
+
+    # Button label changes based on whether predictions exist
+    gen_button_label = "🔄 Regenerate" if existing_count > 0 else "🎯 Generate Predictions"
+
+    if st.button(gen_button_label, type="primary", use_container_width=True, key="sidebar_gen_predictions"):
+        generate_predictions_ui(pred_date, db_path, builder_config)
+
+    st.divider()
 
 # Initialize injury tracking tables -----------------------------------------
 # Ensure injury_list and predictions tables exist with proper schema
