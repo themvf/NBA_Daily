@@ -2661,7 +2661,8 @@ with st.sidebar:
     selected_page = st.selectbox(
         "Select View:",
         tab_titles,
-        index=tab_titles.index(st.session_state.selected_page) if st.session_state.selected_page in tab_titles else 0
+        index=tab_titles.index(st.session_state.selected_page) if st.session_state.selected_page in tab_titles else 0,
+        key='sidebar_page_nav'
     )
     st.session_state.selected_page = selected_page
 
@@ -4434,7 +4435,8 @@ if selected_page == "Prediction Log":
                 selected_date = st.selectbox(
                     "Game Date",
                     options=available_dates,
-                    index=0
+                    index=0,
+                    key='pred_log_date_select'
                 )
             else:
                 st.info("No predictions logged yet. They will appear after viewing Daily Games.")
