@@ -2656,16 +2656,16 @@ if "auto_build_attempted" not in st.session_state:
 # Initialize db_path early so it's available throughout the app
 db_path = Path(st.session_state["db_path_input"]).expanduser()
 
-with st.sidebar:
-    # Navigation
-    selected_page = st.selectbox(
-        "📊 Navigation",
-        tab_titles,
-        index=tab_titles.index(st.session_state.selected_page) if st.session_state.selected_page in tab_titles else 0,
-        key='main_nav_selector_v2'
-    )
-    st.session_state.selected_page = selected_page
+# Navigation - MUST be outside sidebar block to avoid double-execution when generate_predictions_ui() runs
+selected_page = st.sidebar.selectbox(
+    "📊 Navigation",
+    tab_titles,
+    index=tab_titles.index(st.session_state.selected_page) if st.session_state.selected_page in tab_titles else 0,
+    key='main_nav_selector_v3'
+)
+st.session_state.selected_page = selected_page
 
+with st.sidebar:
     # S3 Cloud Backup Status
     st.markdown("### ☁️ Cloud Backup Status")
     if "S3 not configured" in s3_sync_message:
