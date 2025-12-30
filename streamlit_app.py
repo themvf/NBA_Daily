@@ -73,6 +73,102 @@ def _resolve_eastern_zone() -> timezone:
 
 EASTERN_TZ = _resolve_eastern_zone()
 
+def generate_predictions_ui(pred_date: date, db_path: Path, builder_config: Dict):
+    """Handle prediction generation with progress UI in sidebar."""
+    progress_bar = st.sidebar.progress(0)
+    status_text = st.sidebar.empty()
+
+    def update_progress(current: int, total: int, message: str):
+        progress = current / total if total > 0 else 0
+        progress_bar.progress(progress)
+        status_text.text(f"{message} ({current}/{total})")
+
+    try:
+        result = pg.generate_predictions_for_date(
+            game_date=pred_date,
+            db_path=db_path,
+            season=builder_config["season"],
+            season_type=DEFAULT_SEASON_TYPE,
+            progress_callback=update_progress
+        )
+
+        # Clear progress indicators
+        progress_bar.empty()
+        status_text.empty()
+
+        # Show results
+        if result['predictions_logged'] > 0:
+            st.sidebar.success(
+                f"✅ Generated {result['predictions_logged']} predictions\n\n"
+                f"Avg confidence: {result['summary']['avg_confidence']:.0%}\n\n"
+                f"Avg DFS score: {result['summary']['avg_dfs_score']:.1f}"
+            )
+
+            # Trigger S3 backup if configured
+            try:
+                storage = s3_storage.S3PredictionStorage()
+                if storage.is_connected():
+                    backup_success, backup_message = storage.upload_database(db_path)
+                    if backup_success:
+                        st.sidebar.info("☁️ Backed up to S3")
+            except Exception:
+                pass  # Silent fail for S3
+
+        if result['predictions_failed'] > 0:
+            st.sidebar.warning(f"⚠️ {result['predictions_failed']} predictions failed")
+
+        if result['errors']:
+            with st.sidebar.expander("❌ View Errors", expanded=False):
+                for error in result['errors'][:5]:  # Show first 5
+                    st.error(error)
+
+    except Exception as e:
+        progress_bar.empty()
+        status_text.empty()
+        st.sidebar.error(f"❌ Generation failed: {str(e)}")
+
+
+def load_predictions_for_date(conn: sqlite3.Connection, game_date: str) -> pd.DataFrame:
+    """Load all predictions for a specific date from database."""
+    query = """
+        SELECT
+            player_name, team_name, opponent_name,
+            projected_ppg, proj_confidence, proj_floor, proj_ceiling,
+            season_avg_ppg, recent_avg_5, recent_avg_3,
+            dfs_score, dfs_grade, analytics_used,
+            opponent_def_rating, vs_opponent_avg, vs_opponent_games,
+            prediction_date, player_id, team_id, opponent_id
+        FROM predictions
+        WHERE game_date = ?
+        ORDER BY dfs_score DESC
+    """
+    return pd.read_sql_query(query, conn, params=[game_date])
+
+
+def display_team_predictions(team_preds: pd.DataFrame):
+    """Display predictions for one team in a formatted table."""
+    if team_preds.empty:
+        st.caption("No predictions available")
+        return
+
+    # Format for display
+    display_df = team_preds[[
+        'player_name', 'projected_ppg', 'proj_confidence',
+        'proj_floor', 'proj_ceiling', 'dfs_score', 'dfs_grade'
+    ]].copy()
+
+    display_df.columns = ['Player', 'Proj PPG', 'Confidence', 'Floor', 'Ceiling', 'DFS Score', 'Grade']
+
+    # Format numeric columns
+    display_df['Proj PPG'] = display_df['Proj PPG'].map(lambda x: f"{x:.1f}")
+    display_df['Confidence'] = display_df['Confidence'].map(lambda x: f"{x:.0%}")
+    display_df['Floor'] = display_df['Floor'].map(lambda x: f"{x:.1f}")
+    display_df['Ceiling'] = display_df['Ceiling'].map(lambda x: f"{x:.1f}")
+    display_df['DFS Score'] = display_df['DFS Score'].map(lambda x: f"{x:.1f}")
+
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+
 st.set_page_config(page_title="NBA Daily Insights", layout="wide", initial_sidebar_state="expanded")
 st.title("NBA Daily Insights")
 st.caption(
@@ -284,100 +380,6 @@ def normalize_weight_map(weight_map: Dict[str, float]) -> Dict[str, float]:
     return {k: value / total for k, value in sanitized.items()}
 
 
-def generate_predictions_ui(pred_date: date, db_path: Path, builder_config: Dict):
-    """Handle prediction generation with progress UI in sidebar."""
-    progress_bar = st.sidebar.progress(0)
-    status_text = st.sidebar.empty()
-
-    def update_progress(current: int, total: int, message: str):
-        progress = current / total if total > 0 else 0
-        progress_bar.progress(progress)
-        status_text.text(f"{message} ({current}/{total})")
-
-    try:
-        result = pg.generate_predictions_for_date(
-            game_date=pred_date,
-            db_path=db_path,
-            season=builder_config["season"],
-            season_type=DEFAULT_SEASON_TYPE,
-            progress_callback=update_progress
-        )
-
-        # Clear progress indicators
-        progress_bar.empty()
-        status_text.empty()
-
-        # Show results
-        if result['predictions_logged'] > 0:
-            st.sidebar.success(
-                f"✅ Generated {result['predictions_logged']} predictions\n\n"
-                f"Avg confidence: {result['summary']['avg_confidence']:.0%}\n\n"
-                f"Avg DFS score: {result['summary']['avg_dfs_score']:.1f}"
-            )
-
-            # Trigger S3 backup if configured
-            try:
-                storage = s3_storage.S3PredictionStorage()
-                if storage.is_connected():
-                    backup_success, backup_message = storage.upload_database(db_path)
-                    if backup_success:
-                        st.sidebar.info("☁️ Backed up to S3")
-            except Exception:
-                pass  # Silent fail for S3
-
-        if result['predictions_failed'] > 0:
-            st.sidebar.warning(f"⚠️ {result['predictions_failed']} predictions failed")
-
-        if result['errors']:
-            with st.sidebar.expander("❌ View Errors", expanded=False):
-                for error in result['errors'][:5]:  # Show first 5
-                    st.error(error)
-
-    except Exception as e:
-        progress_bar.empty()
-        status_text.empty()
-        st.sidebar.error(f"❌ Generation failed: {str(e)}")
-
-
-def load_predictions_for_date(conn: sqlite3.Connection, game_date: str) -> pd.DataFrame:
-    """Load all predictions for a specific date from database."""
-    query = """
-        SELECT
-            player_name, team_name, opponent_name,
-            projected_ppg, proj_confidence, proj_floor, proj_ceiling,
-            season_avg_ppg, recent_avg_5, recent_avg_3,
-            dfs_score, dfs_grade, analytics_used,
-            opponent_def_rating, vs_opponent_avg, vs_opponent_games,
-            prediction_date, player_id, team_id, opponent_id
-        FROM predictions
-        WHERE game_date = ?
-        ORDER BY dfs_score DESC
-    """
-    return pd.read_sql_query(query, conn, params=[game_date])
-
-
-def display_team_predictions(team_preds: pd.DataFrame):
-    """Display predictions for one team in a formatted table."""
-    if team_preds.empty:
-        st.caption("No predictions available")
-        return
-
-    # Format for display
-    display_df = team_preds[[
-        'player_name', 'projected_ppg', 'proj_confidence',
-        'proj_floor', 'proj_ceiling', 'dfs_score', 'dfs_grade'
-    ]].copy()
-
-    display_df.columns = ['Player', 'Proj PPG', 'Confidence', 'Floor', 'Ceiling', 'DFS Score', 'Grade']
-
-    # Format numeric columns
-    display_df['Proj PPG'] = display_df['Proj PPG'].map(lambda x: f"{x:.1f}")
-    display_df['Confidence'] = display_df['Confidence'].map(lambda x: f"{x:.0%}")
-    display_df['Floor'] = display_df['Floor'].map(lambda x: f"{x:.1f}")
-    display_df['Ceiling'] = display_df['Ceiling'].map(lambda x: f"{x:.1f}")
-    display_df['DFS Score'] = display_df['DFS Score'].map(lambda x: f"{x:.1f}")
-
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
 
 
 @st.cache_data(ttl=600)
