@@ -2659,10 +2659,10 @@ db_path = Path(st.session_state["db_path_input"]).expanduser()
 with st.sidebar:
     # Navigation
     selected_page = st.selectbox(
-        "Select View:",
+        "📊 Navigation",
         tab_titles,
         index=tab_titles.index(st.session_state.selected_page) if st.session_state.selected_page in tab_titles else 0,
-        key='sidebar_page_nav'
+        key='main_nav_selector_v2'
     )
     st.session_state.selected_page = selected_page
 
