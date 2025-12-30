@@ -2846,7 +2846,7 @@ with st.sidebar:
             (str(pred_date),)
         )
         existing_count = cursor.fetchone()[0]
-        conn.close()
+        # Don't close cached connection - it's shared across the app
 
         if existing_count > 0:
             st.caption(f"✓ {existing_count} predictions exist")
