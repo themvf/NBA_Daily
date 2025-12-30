@@ -2657,13 +2657,17 @@ if "auto_build_attempted" not in st.session_state:
 db_path = Path(st.session_state["db_path_input"]).expanduser()
 
 # Navigation - MUST be outside sidebar block to avoid double-execution when generate_predictions_ui() runs
+# Using session state to track selection, no explicit key needed (Streamlit auto-generates stable key)
+if 'nav_selection' not in st.session_state:
+    st.session_state.nav_selection = st.session_state.selected_page
+
 selected_page = st.sidebar.selectbox(
     "📊 Navigation",
     tab_titles,
-    index=tab_titles.index(st.session_state.selected_page) if st.session_state.selected_page in tab_titles else 0,
-    key='main_nav_selector_v3'
+    index=tab_titles.index(st.session_state.nav_selection) if st.session_state.nav_selection in tab_titles else 0
 )
 st.session_state.selected_page = selected_page
+st.session_state.nav_selection = selected_page
 
 with st.sidebar:
     # S3 Cloud Backup Status
