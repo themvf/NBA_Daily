@@ -2661,8 +2661,7 @@ with st.sidebar:
     selected_page = st.selectbox(
         "Select View:",
         tab_titles,
-        index=tab_titles.index(st.session_state.selected_page) if st.session_state.selected_page in tab_titles else 0,
-        key='page_selector'
+        index=tab_titles.index(st.session_state.selected_page) if st.session_state.selected_page in tab_titles else 0
     )
     st.session_state.selected_page = selected_page
 
