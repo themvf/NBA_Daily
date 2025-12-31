@@ -253,6 +253,16 @@ tab_titles = [
 if 'selected_page' not in st.session_state:
     st.session_state.selected_page = "Tournament Strategy"
 
+# PROBE: Detect circular import
+import sys
+import traceback
+st.write(f"🔍 __name__ = {__name__}")
+st.write(f"🔍 Import stack depth: {len([f for f in traceback.extract_stack() if 'import' in f.line.lower()])}")
+
+# Show who imported us
+with st.expander("🔍 Import Stack Trace"):
+    st.code('\n'.join([f"{f.filename}:{f.lineno} in {f.name}" for f in traceback.extract_stack()]))
+
 # Note: All sidebar content consolidated in single block below (after db_path initialization)
 
 
