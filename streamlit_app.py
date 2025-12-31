@@ -2657,6 +2657,13 @@ if "auto_build_attempted" not in st.session_state:
 db_path = Path(st.session_state["db_path_input"]).expanduser()
 
 with st.sidebar:
+    # PROBE: Count how many times this executes
+    if 'nav_render_count' not in st.session_state:
+        st.session_state.nav_render_count = 0
+    st.session_state.nav_render_count += 1
+
+    st.write(f"🔍 DEBUG: Nav render #{st.session_state.nav_render_count}")
+
     # Navigation FIRST - before any dynamic content
     if 'nav_selection' not in st.session_state:
         st.session_state.nav_selection = st.session_state.selected_page
