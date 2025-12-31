@@ -2656,13 +2656,18 @@ if "auto_build_attempted" not in st.session_state:
 # Initialize db_path early so it's available throughout the app
 db_path = Path(st.session_state["db_path_input"]).expanduser()
 
-with st.sidebar:
-    # PROBE: Count how many times this executes
-    if 'nav_render_count' not in st.session_state:
-        st.session_state.nav_render_count = 0
-    st.session_state.nav_render_count += 1
+# PROBE: Module-level list (appends track execution count per render)
+_sidebar_executions = []
 
-    st.write(f"🔍 DEBUG: Nav render #{st.session_state.nav_render_count}")
+with st.sidebar:
+    # PROBE: Track execution
+    _sidebar_executions.append(1)
+    exec_count = len(_sidebar_executions)
+
+    st.write(f"🔍 DEBUG: Sidebar executed {exec_count} time(s) in THIS render")
+
+    if exec_count > 1:
+        st.error(f"⚠️ BUG FOUND: Sidebar executing {exec_count} times!")
 
     # Navigation FIRST - before any dynamic content
     if 'nav_selection' not in st.session_state:
