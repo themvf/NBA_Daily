@@ -60,14 +60,15 @@ def generate_predictions_for_date(
         ValueError: If no games found for date
         sqlite3.Error: If database connection fails
     """
-    # Import streamlit_app functions - use sys.modules to avoid re-executing if already imported
-    # This prevents circular import from re-running streamlit_app.py module-level code
+    # Import streamlit_app functions - use sys.modules to avoid re-executing module
+    # CRITICAL: Streamlit runs app as __main__, NOT as streamlit_app module
+    # So we must check for __main__ to get the already-running module
     import sys
-    if 'streamlit_app' in sys.modules:
-        # Already imported - reuse existing module (avoid re-execution)
-        st_app = sys.modules['streamlit_app']
+    if '__main__' in sys.modules:
+        # App is running - reuse the main module (avoid re-execution)
+        st_app = sys.modules['__main__']
     else:
-        # First import
+        # Fallback for standalone testing
         import streamlit_app as st_app
 
     # Initialize result tracking
@@ -195,7 +196,7 @@ def _load_data_dependencies(
             - classify_difficulty: Function to classify opponent difficulty
             - low_thresh, mid_thresh: Difficulty thresholds
     """
-    from ppm_stats import load_ppm_stats
+    # load_ppm_stats is in streamlit_app, accessed via st_app
 
     # Get database connection
     games_conn = sqlite3.connect(db_path)
@@ -211,13 +212,12 @@ def _load_data_dependencies(
         season_type
     )
 
-    # Load player leaders
+    # Load player leaders - first aggregate, then apply weights
+    base_stats = st_app.aggregate_player_scoring(db_path, season, season_type)
     leaders_df = st_app.prepare_weighted_scores(
-        db_path,
-        season,
-        season_type,
-        min_games=st_app.DEFAULT_MIN_GAMES,
-        weights=st_app.DEFAULT_WEIGHTS
+        base_stats,
+        st_app.DEFAULT_MIN_GAMES,
+        st_app.DEFAULT_WEIGHTS
     )
 
     # Determine score column
@@ -240,7 +240,7 @@ def _load_data_dependencies(
 
     # Load PPM stats
     try:
-        off_ppm_df, def_ppm_df, league_avg_ppm = load_ppm_stats(db_path, season)
+        off_ppm_df, def_ppm_df, league_avg_ppm = st_app.load_ppm_stats(db_path, season)
         ppm_loaded = True
     except Exception:
         off_ppm_df, def_ppm_df, league_avg_ppm = None, None, 0.462
