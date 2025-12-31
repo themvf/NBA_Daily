@@ -253,16 +253,6 @@ tab_titles = [
 if 'selected_page' not in st.session_state:
     st.session_state.selected_page = "Tournament Strategy"
 
-# PROBE: Detect circular import
-import sys
-import traceback
-st.write(f"🔍 __name__ = {__name__}")
-st.write(f"🔍 Import stack depth: {len([f for f in traceback.extract_stack() if 'import' in f.line.lower()])}")
-
-# Show who imported us
-with st.expander("🔍 Import Stack Trace"):
-    st.code('\n'.join([f"{f.filename}:{f.lineno} in {f.name}" for f in traceback.extract_stack()]))
-
 # Note: All sidebar content consolidated in single block below (after db_path initialization)
 
 
@@ -2666,19 +2656,7 @@ if "auto_build_attempted" not in st.session_state:
 # Initialize db_path early so it's available throughout the app
 db_path = Path(st.session_state["db_path_input"]).expanduser()
 
-# PROBE: Module-level list (appends track execution count per render)
-_sidebar_executions = []
-
 with st.sidebar:
-    # PROBE: Track execution
-    _sidebar_executions.append(1)
-    exec_count = len(_sidebar_executions)
-
-    st.write(f"🔍 DEBUG: Sidebar executed {exec_count} time(s) in THIS render")
-
-    if exec_count > 1:
-        st.error(f"⚠️ BUG FOUND: Sidebar executing {exec_count} times!")
-
     # Navigation FIRST - before any dynamic content
     if 'nav_selection' not in st.session_state:
         st.session_state.nav_selection = st.session_state.selected_page

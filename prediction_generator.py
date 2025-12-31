@@ -60,9 +60,15 @@ def generate_predictions_for_date(
         ValueError: If no games found for date
         sqlite3.Error: If database connection fails
     """
-    # Import streamlit_app functions dynamically to avoid circular dependencies
-    # These imports are inside the function to allow streamlit_app to import this module
-    import streamlit_app as st_app
+    # Import streamlit_app functions - use sys.modules to avoid re-executing if already imported
+    # This prevents circular import from re-running streamlit_app.py module-level code
+    import sys
+    if 'streamlit_app' in sys.modules:
+        # Already imported - reuse existing module (avoid re-execution)
+        st_app = sys.modules['streamlit_app']
+    else:
+        # First import
+        import streamlit_app as st_app
 
     # Initialize result tracking
     result = {
