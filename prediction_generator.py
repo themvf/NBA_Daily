@@ -61,14 +61,22 @@ def generate_predictions_for_date(
         sqlite3.Error: If database connection fails
     """
     # Import streamlit_app functions - use sys.modules to avoid re-executing module
-    # CRITICAL: Streamlit runs app as __main__, NOT as streamlit_app module
-    # So we must check for __main__ to get the already-running module
+    # When Streamlit runs, the app is loaded as __main__, not streamlit_app
+    # We need to check if __main__ actually IS streamlit_app before using it
     import sys
-    if '__main__' in sys.modules:
-        # App is running - reuse the main module (avoid re-execution)
-        st_app = sys.modules['__main__']
+
+    # Strategy: Check if __main__ has a key function from streamlit_app
+    # If yes, use __main__ (we're running inside the Streamlit app)
+    # If no, import streamlit_app directly (we're running standalone)
+    main_mod = sys.modules.get('__main__')
+    if main_mod is not None and hasattr(main_mod, 'build_games_table'):
+        # Running inside Streamlit - __main__ IS streamlit_app
+        st_app = main_mod
+    elif 'streamlit_app' in sys.modules:
+        # streamlit_app was already imported, reuse it
+        st_app = sys.modules['streamlit_app']
     else:
-        # Fallback for standalone testing
+        # Fresh import for standalone testing
         import streamlit_app as st_app
 
     # Initialize result tracking
@@ -475,6 +483,12 @@ def _generate_prediction_for_player(
     avg_pts_last3 = st_app.safe_float(player.get("avg_pts_last3")) or avg_pts_last5
     season_avg_pts = st_app.safe_float(player.get("avg_points")) or 0.0
 
+    # Extract minutes and usage stats for momentum calculation
+    season_avg_minutes = st_app.safe_float(player.get("avg_minutes"))
+    avg_minutes_last5 = st_app.safe_float(player.get("avg_minutes_last5"))
+    avg_usg_last5 = st_app.safe_float(player.get("avg_usg_last5"))
+    usage_pct = st_app.safe_float(player.get("usg_pct"))
+
     # Get player history vs opponent
     vs_opp_history = None
     avg_vs_opp = None
@@ -598,6 +612,11 @@ def _generate_prediction_for_player(
         conn=data['games_conn'],
         player_position=player_position,
         game_date=str(game_date),
+        # Momentum calculation parameters
+        season_avg_minutes=season_avg_minutes,
+        avg_minutes_last5=avg_minutes_last5,
+        avg_usg_last5=avg_usg_last5,
+        usage_pct=usage_pct,
     )
 
     # Calculate DFS score

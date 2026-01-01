@@ -1650,6 +1650,11 @@ def calculate_smart_ppg_projection(
     conn: Optional[sqlite3.Connection] = None,  # For player PPM lookup
     player_position: str = "",  # Player position (Guard/Forward/Center) for position-specific PPM
     game_date: str = "",  # Game date for season progress calculation
+    # Momentum calculation parameters (optional)
+    season_avg_minutes: Optional[float] = None,  # Season average minutes
+    avg_minutes_last5: Optional[float] = None,  # Last 5 games average minutes
+    avg_usg_last5: Optional[float] = None,  # Last 5 games average usage
+    usage_pct: Optional[float] = None,  # Season usage percentage
 ) -> tuple[float, float, float, float, dict, str]:
     """
     Calculate smart PPG projection using multi-factor weighted model.
