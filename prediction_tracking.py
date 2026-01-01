@@ -296,6 +296,194 @@ def upgrade_predictions_table_for_fanduel(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def upgrade_predictions_table_for_fanduel_comparison(conn: sqlite3.Connection) -> None:
+    """Add FanDuel comparison tracking columns to predictions table."""
+    cursor = conn.cursor()
+
+    # Check which columns already exist
+    cursor.execute("PRAGMA table_info(predictions)")
+    existing_columns = {row[1] for row in cursor.fetchall()}
+
+    # Define new comparison columns
+    new_columns = {
+        # Over/Under tracking
+        'our_ou_call': 'TEXT DEFAULT NULL',           # 'over' or 'under'
+        'actual_ou_result': 'TEXT DEFAULT NULL',      # 'over' or 'under'
+        'ou_call_correct': 'INTEGER DEFAULT NULL',    # 1 if correct, 0 if not
+        # Who was closer
+        'fanduel_error': 'REAL DEFAULT NULL',         # |actual - fanduel_ou|
+        'we_were_closer': 'INTEGER DEFAULT NULL',     # 1 if we were closer
+        'closer_margin': 'REAL DEFAULT NULL',         # How much closer (positive = us)
+    }
+
+    # Add missing columns
+    for col_name, col_type in new_columns.items():
+        if col_name not in existing_columns:
+            cursor.execute(f"ALTER TABLE predictions ADD COLUMN {col_name} {col_type}")
+            print(f"Added FanDuel comparison column: {col_name}")
+
+    conn.commit()
+
+
+def calculate_fanduel_comparison_metrics(conn: sqlite3.Connection, game_date: Optional[str] = None) -> int:
+    """
+    Calculate FanDuel comparison metrics for predictions with actuals.
+
+    Calculates:
+    - our_ou_call: Did we project over or under FanDuel's line?
+    - actual_ou_result: Did the actual score go over or under?
+    - ou_call_correct: Did our call match reality?
+    - fanduel_error: How far off was FanDuel?
+    - we_were_closer: Did we beat FanDuel's prediction?
+    - closer_margin: By how much?
+
+    Args:
+        conn: Database connection
+        game_date: Optional specific date (YYYY-MM-DD). If None, processes all.
+
+    Returns:
+        Number of predictions updated
+    """
+    cursor = conn.cursor()
+
+    # Build query for predictions with both actuals and FanDuel lines
+    where_clause = """
+        WHERE actual_ppg IS NOT NULL
+        AND fanduel_ou IS NOT NULL
+        AND (ou_call_correct IS NULL OR fanduel_error IS NULL)
+    """
+    if game_date:
+        where_clause += f" AND game_date = '{game_date}'"
+
+    # Get predictions that need calculation
+    cursor.execute(f"""
+        SELECT prediction_id, projected_ppg, fanduel_ou, actual_ppg
+        FROM predictions
+        {where_clause}
+    """)
+
+    rows = cursor.fetchall()
+    updated_count = 0
+
+    for prediction_id, projected_ppg, fanduel_ou, actual_ppg in rows:
+        # Calculate our O/U call (what we implied vs FanDuel line)
+        our_ou_call = 'over' if projected_ppg > fanduel_ou else 'under'
+
+        # Calculate actual result vs FanDuel line
+        actual_ou_result = 'over' if actual_ppg > fanduel_ou else 'under'
+
+        # Did our call match reality?
+        ou_call_correct = 1 if our_ou_call == actual_ou_result else 0
+
+        # Calculate errors
+        our_error = abs(actual_ppg - projected_ppg)
+        fanduel_error = abs(actual_ppg - fanduel_ou)
+
+        # Who was closer?
+        we_were_closer = 1 if our_error < fanduel_error else 0
+        closer_margin = fanduel_error - our_error  # Positive = we were closer
+
+        # Update the prediction
+        cursor.execute("""
+            UPDATE predictions
+            SET our_ou_call = ?,
+                actual_ou_result = ?,
+                ou_call_correct = ?,
+                fanduel_error = ?,
+                we_were_closer = ?,
+                closer_margin = ?
+            WHERE prediction_id = ?
+        """, (our_ou_call, actual_ou_result, ou_call_correct,
+              fanduel_error, we_were_closer, closer_margin, prediction_id))
+
+        updated_count += 1
+
+    conn.commit()
+    return updated_count
+
+
+def get_fanduel_comparison_summary(conn: sqlite3.Connection,
+                                    start_date: Optional[str] = None,
+                                    end_date: Optional[str] = None) -> Dict:
+    """
+    Get summary statistics for Model vs FanDuel comparison.
+
+    Returns:
+        Dict with keys: total_compared, ou_accuracy_pct, we_closer_pct,
+                       our_avg_error, fd_avg_error, by_player stats
+    """
+    cursor = conn.cursor()
+
+    where_clauses = ["ou_call_correct IS NOT NULL"]
+    if start_date:
+        where_clauses.append(f"game_date >= '{start_date}'")
+    if end_date:
+        where_clauses.append(f"game_date <= '{end_date}'")
+
+    where_sql = " AND ".join(where_clauses)
+
+    # Overall stats
+    cursor.execute(f"""
+        SELECT
+            COUNT(*) as total,
+            SUM(ou_call_correct) as correct_calls,
+            SUM(we_were_closer) as times_closer,
+            AVG(abs_error) as our_avg_error,
+            AVG(fanduel_error) as fd_avg_error
+        FROM predictions
+        WHERE {where_sql}
+    """)
+
+    row = cursor.fetchone()
+    total = row[0] or 0
+
+    if total == 0:
+        return {
+            'total_compared': 0,
+            'ou_accuracy_pct': 0,
+            'we_closer_pct': 0,
+            'our_avg_error': 0,
+            'fd_avg_error': 0,
+            'by_player': []
+        }
+
+    # Per-player breakdown (min 3 games)
+    cursor.execute(f"""
+        SELECT
+            player_name,
+            COUNT(*) as games,
+            SUM(ou_call_correct) as correct,
+            SUM(we_were_closer) as closer,
+            AVG(abs_error) as our_mae,
+            AVG(fanduel_error) as fd_mae
+        FROM predictions
+        WHERE {where_sql}
+        GROUP BY player_id, player_name
+        HAVING COUNT(*) >= 3
+        ORDER BY SUM(we_were_closer) * 1.0 / COUNT(*) DESC
+    """)
+
+    by_player = []
+    for player_row in cursor.fetchall():
+        by_player.append({
+            'player_name': player_row[0],
+            'games': player_row[1],
+            'ou_correct': player_row[2],
+            'times_closer': player_row[3],
+            'our_mae': player_row[4],
+            'fd_mae': player_row[5],
+        })
+
+    return {
+        'total_compared': total,
+        'ou_accuracy_pct': (row[1] / total * 100) if total > 0 else 0,
+        'we_closer_pct': (row[2] / total * 100) if total > 0 else 0,
+        'our_avg_error': row[3] or 0,
+        'fd_avg_error': row[4] or 0,
+        'by_player': by_player
+    }
+
+
 def get_predictions_for_date(
     conn: sqlite3.Connection,
     game_date: str

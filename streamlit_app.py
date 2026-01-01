@@ -248,6 +248,7 @@ tab_titles = [
     "Admin Panel",
     "Tournament Strategy",
     "FanDuel Compare",
+    "Model vs FanDuel",
 ]
 
 # Initialize selected page in session state
@@ -7405,6 +7406,184 @@ if selected_page == "FanDuel Compare":
                     mime="text/csv",
                     use_container_width=True
                 )
+
+# Model vs FanDuel tab --------------------------------------------------------
+if selected_page == "Model vs FanDuel":
+    st.title("Model vs FanDuel Analytics")
+    st.caption("Compare your projection accuracy against FanDuel's lines after games complete")
+
+    # Get database connection
+    games_conn = get_connection(str(db_path))
+
+    # Ensure schema is up to date
+    pt.upgrade_predictions_table_for_fanduel_comparison(games_conn)
+
+    # Date range selector
+    col1, col2, col3 = st.columns([2, 2, 2])
+
+    with col1:
+        # Default to last 30 days
+        default_start = datetime.now().date() - timedelta(days=30)
+        start_date = st.date_input("Start Date", value=default_start, key="mvf_start")
+
+    with col2:
+        end_date = st.date_input("End Date", value=datetime.now().date(), key="mvf_end")
+
+    with col3:
+        if st.button("🔄 Recalculate Metrics", type="primary"):
+            with st.spinner("Calculating comparison metrics..."):
+                updated = pt.calculate_fanduel_comparison_metrics(games_conn)
+                if updated > 0:
+                    st.success(f"Updated {updated} predictions with comparison metrics")
+                    st.rerun()
+                else:
+                    st.info("No new predictions to calculate (all up to date)")
+
+    st.divider()
+
+    # Get summary stats
+    summary = pt.get_fanduel_comparison_summary(
+        games_conn,
+        start_date=str(start_date),
+        end_date=str(end_date)
+    )
+
+    if summary['total_compared'] == 0:
+        st.info(
+            "No comparison data available yet. This requires:\n"
+            "1. Predictions with FanDuel lines (use FanDuel Compare tab)\n"
+            "2. Actual results after games complete\n"
+            "3. Click 'Recalculate Metrics' to compute comparisons"
+        )
+    else:
+        # Summary metrics row
+        col1, col2, col3, col4 = st.columns(4)
+
+        with col1:
+            ou_acc = summary['ou_accuracy_pct']
+            st.metric(
+                "Our O/U Accuracy",
+                f"{ou_acc:.1f}%",
+                delta=f"{ou_acc - 50:.1f}% vs coin flip" if ou_acc != 50 else None,
+                delta_color="normal" if ou_acc >= 50 else "inverse"
+            )
+
+        with col2:
+            closer_pct = summary['we_closer_pct']
+            st.metric(
+                "We Were Closer",
+                f"{closer_pct:.1f}%",
+                delta=f"{closer_pct - 50:.1f}% vs FanDuel" if closer_pct != 50 else None,
+                delta_color="normal" if closer_pct >= 50 else "inverse"
+            )
+
+        with col3:
+            st.metric(
+                "Our Avg Error",
+                f"{summary['our_avg_error']:.1f} PPG"
+            )
+
+        with col4:
+            st.metric(
+                "FanDuel Avg Error",
+                f"{summary['fd_avg_error']:.1f} PPG"
+            )
+
+        st.divider()
+
+        # Detailed comparison table
+        st.subheader("Detailed Comparisons")
+
+        # Query for detailed data
+        query = f"""
+            SELECT
+                game_date,
+                player_name,
+                team_name,
+                projected_ppg,
+                fanduel_ou,
+                actual_ppg,
+                our_ou_call,
+                actual_ou_result,
+                ou_call_correct,
+                abs_error as our_error,
+                fanduel_error,
+                we_were_closer,
+                closer_margin
+            FROM predictions
+            WHERE ou_call_correct IS NOT NULL
+            AND game_date >= '{start_date}'
+            AND game_date <= '{end_date}'
+            ORDER BY game_date DESC, player_name
+        """
+
+        detail_df = pd.read_sql_query(query, games_conn)
+
+        if not detail_df.empty:
+            # Format for display
+            display_df = detail_df.copy()
+            display_df['Date'] = display_df['game_date']
+            display_df['Player'] = display_df['player_name']
+            display_df['Team'] = display_df['team_name']
+            display_df['Our Proj'] = display_df['projected_ppg'].apply(lambda x: f"{x:.1f}")
+            display_df['FD Line'] = display_df['fanduel_ou'].apply(lambda x: f"{x:.1f}")
+            display_df['Actual'] = display_df['actual_ppg'].apply(lambda x: f"{x:.1f}")
+            display_df['Our Call'] = display_df['our_ou_call'].str.upper()
+            display_df['Result'] = display_df['actual_ou_result'].str.upper()
+            display_df['Correct?'] = display_df['ou_call_correct'].apply(lambda x: "✅" if x == 1 else "❌")
+            display_df['Our Error'] = display_df['our_error'].apply(lambda x: f"{x:.1f}")
+            display_df['FD Error'] = display_df['fanduel_error'].apply(lambda x: f"{x:.1f}")
+            display_df['Winner'] = display_df['we_were_closer'].apply(lambda x: "🏆 Us" if x == 1 else "FanDuel")
+
+            # Select display columns
+            table_df = display_df[[
+                'Date', 'Player', 'Team', 'Our Proj', 'FD Line', 'Actual',
+                'Our Call', 'Result', 'Correct?', 'Our Error', 'FD Error', 'Winner'
+            ]]
+
+            st.dataframe(table_df, use_container_width=True, hide_index=True, height=500)
+
+            # Export button
+            csv = detail_df.to_csv(index=False)
+            st.download_button(
+                label="📥 Export Comparison Data",
+                data=csv,
+                file_name=f"model_vs_fanduel_{start_date}_to_{end_date}.csv",
+                mime="text/csv"
+            )
+
+        st.divider()
+
+        # Player insights section
+        st.subheader("Player Insights")
+
+        if summary['by_player']:
+            # Best edge (where we beat FanDuel most)
+            best_players = [p for p in summary['by_player'] if p['times_closer'] / p['games'] >= 0.6]
+            worst_players = [p for p in summary['by_player'] if p['times_closer'] / p['games'] <= 0.4]
+
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.markdown("**🎯 Our Best Edge** (beat FD 60%+ of time)")
+                if best_players:
+                    for p in best_players[:5]:
+                        pct = p['times_closer'] / p['games'] * 100
+                        st.markdown(f"- **{p['player_name']}**: {pct:.0f}% closer ({p['times_closer']}/{p['games']} games)")
+                else:
+                    st.caption("No players with 60%+ edge yet")
+
+            with col2:
+                st.markdown("**⚠️ FanDuel's Edge** (FD beat us 60%+ of time)")
+                if worst_players:
+                    for p in worst_players[:5]:
+                        pct = (1 - p['times_closer'] / p['games']) * 100
+                        st.markdown(f"- **{p['player_name']}**: FD {pct:.0f}% closer ({p['games'] - p['times_closer']}/{p['games']} games)")
+                else:
+                    st.caption("No players where FD has 60%+ edge")
+        else:
+            st.info("Need at least 3 games per player to show insights")
+
 
 st.divider()
 st.caption(
