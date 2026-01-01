@@ -162,6 +162,31 @@ def generate_predictions_for_date(
             result['summary']['avg_confidence'] = confidence_sum / player_count
             result['summary']['avg_dfs_score'] = dfs_score_sum / player_count
 
+        # Step 4: Fetch FanDuel odds (optional, fails gracefully)
+        if progress_callback:
+            progress_callback(total_games, total_games, "Fetching FanDuel lines...")
+
+        try:
+            import odds_api
+            odds_api.create_odds_tables(data['games_conn'])
+
+            should_fetch, reason = odds_api.should_fetch_odds(data['games_conn'], game_date)
+            if should_fetch:
+                odds_result = odds_api.fetch_fanduel_lines_for_date(data['games_conn'], game_date)
+                result['summary']['fanduel_lines_matched'] = odds_result.get('players_matched', 0)
+                result['summary']['fanduel_api_requests'] = odds_result.get('api_requests_used', 0)
+                if odds_result.get('error'):
+                    result['errors'].append(f"FanDuel fetch: {odds_result['error']}")
+            else:
+                result['summary']['fanduel_lines_matched'] = 0
+                result['summary']['fanduel_skip_reason'] = reason
+        except ImportError:
+            # odds_api module not available - skip silently
+            pass
+        except Exception as e:
+            # Log but don't fail predictions for odds errors
+            result['errors'].append(f"FanDuel fetch warning: {str(e)[:50]}")
+
         return result
 
     except Exception as e:

@@ -270,6 +270,32 @@ def upgrade_predictions_table_for_opponent_injury(conn: sqlite3.Connection) -> N
     conn.commit()
 
 
+def upgrade_predictions_table_for_fanduel(conn: sqlite3.Connection) -> None:
+    """Add FanDuel odds fields to existing predictions table if they don't exist."""
+    cursor = conn.cursor()
+
+    # Check which columns already exist
+    cursor.execute("PRAGMA table_info(predictions)")
+    existing_columns = {row[1] for row in cursor.fetchall()}
+
+    # Define new columns to add
+    new_columns = {
+        'fanduel_ou': 'REAL DEFAULT NULL',
+        'fanduel_over_odds': 'INTEGER DEFAULT NULL',
+        'fanduel_under_odds': 'INTEGER DEFAULT NULL',
+        'fanduel_fetched_at': 'TEXT DEFAULT NULL',
+        'odds_event_id': 'TEXT DEFAULT NULL',
+    }
+
+    # Add missing columns
+    for col_name, col_type in new_columns.items():
+        if col_name not in existing_columns:
+            cursor.execute(f"ALTER TABLE predictions ADD COLUMN {col_name} {col_type}")
+            print(f"Added FanDuel column: {col_name}")
+
+    conn.commit()
+
+
 def get_predictions_for_date(
     conn: sqlite3.Connection,
     game_date: str

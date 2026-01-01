@@ -247,6 +247,7 @@ tab_titles = [
     "Injury Admin",
     "Admin Panel",
     "Tournament Strategy",
+    "FanDuel Compare",
 ]
 
 # Initialize selected page in session state
@@ -7237,6 +7238,173 @@ if selected_page == "Tournament Strategy":
                         st.markdown(text)
             else:
                 st.caption("No players selected yet")
+
+# FanDuel Compare tab --------------------------------------------------------
+if selected_page == "FanDuel Compare":
+    st.header("📊 FanDuel O/U Comparison")
+    st.caption("Compare our projections against FanDuel player points over/under lines")
+
+    # Import odds_api module
+    try:
+        import odds_api
+        odds_available = True
+    except ImportError:
+        odds_available = False
+        st.error("odds_api module not found. Please ensure odds_api.py is in the project directory.")
+
+    if odds_available:
+        # Date selector
+        col_date, col_toggle = st.columns([2, 1])
+
+        with col_date:
+            compare_date = st.date_input(
+                "Game Date",
+                value=date.today(),
+                key="fanduel_compare_date"
+            )
+
+        with col_toggle:
+            show_all_players = st.toggle(
+                "Show all players",
+                value=False,
+                help="Show all predicted players, including those without FanDuel lines"
+            )
+
+        # Check for API key configuration
+        api_key = odds_api.get_api_key()
+
+        if not api_key:
+            st.warning(
+                "**API key not configured.** Add `[theoddsapi]` section to `.streamlit/secrets.toml`:\n\n"
+                "```toml\n[theoddsapi]\nAPI_KEY = \"your-api-key-here\"\n```"
+            )
+
+        # Load comparison data
+        games_conn = get_connection(str(db_path))
+
+        # Ensure schema is up to date
+        odds_api.create_odds_tables(games_conn)
+        pt.upgrade_predictions_table_for_fanduel(games_conn)
+
+        # Load predictions with FanDuel data
+        query = """
+            SELECT
+                player_name,
+                team_name,
+                opponent_name,
+                projected_ppg,
+                proj_floor,
+                proj_ceiling,
+                proj_confidence,
+                fanduel_ou,
+                fanduel_over_odds,
+                fanduel_under_odds,
+                fanduel_fetched_at,
+                dfs_score,
+                dfs_grade
+            FROM predictions
+            WHERE game_date = ?
+            ORDER BY dfs_score DESC
+        """
+        comparison_df = pd.read_sql_query(query, games_conn, params=[str(compare_date)])
+
+        if comparison_df.empty:
+            st.info(f"No predictions found for {compare_date}. Generate predictions first using the sidebar button.")
+        else:
+            # Count players with FanDuel lines
+            with_lines = comparison_df['fanduel_ou'].notna().sum()
+            total_players = len(comparison_df)
+
+            # Metrics row
+            col1, col2, col3, col4 = st.columns(4)
+
+            with col1:
+                st.metric("Total Predictions", total_players)
+
+            with col2:
+                st.metric("With FanDuel Lines", with_lines)
+
+            with col3:
+                if with_lines > 0:
+                    lines_df = comparison_df[comparison_df['fanduel_ou'].notna()].copy()
+                    lines_df['diff'] = lines_df['projected_ppg'] - lines_df['fanduel_ou']
+                    avg_diff = lines_df['diff'].mean()
+                    st.metric("Avg Difference", f"{avg_diff:+.1f}")
+                else:
+                    st.metric("Avg Difference", "N/A")
+
+            with col4:
+                # API usage
+                monthly_usage = odds_api.get_monthly_api_usage(games_conn)
+                st.metric("API Usage", f"{monthly_usage}/500")
+
+            st.divider()
+
+            # Manual fetch button
+            if api_key:
+                should_fetch, reason = odds_api.should_fetch_odds(games_conn, compare_date)
+
+                if should_fetch:
+                    if st.button("🔄 Fetch FanDuel Lines", type="primary"):
+                        with st.spinner("Fetching from The Odds API..."):
+                            result = odds_api.fetch_fanduel_lines_for_date(games_conn, compare_date)
+
+                            if result['success']:
+                                st.success(f"Fetched lines for {result['players_matched']} players using {result['api_requests_used']} API requests")
+                                st.rerun()
+                            else:
+                                st.error(f"Fetch failed: {result.get('error', 'Unknown error')}")
+                else:
+                    st.caption(f"ℹ️ {reason}")
+
+            # Filter based on toggle
+            if not show_all_players:
+                display_df = comparison_df[comparison_df['fanduel_ou'].notna()].copy()
+            else:
+                display_df = comparison_df.copy()
+
+            if display_df.empty:
+                st.info("No FanDuel lines found for this date. Click 'Fetch FanDuel Lines' to get latest odds.")
+            else:
+                # Calculate difference columns
+                display_df['Diff'] = display_df['projected_ppg'] - display_df['fanduel_ou']
+                display_df['Diff %'] = (display_df['Diff'] / display_df['fanduel_ou'] * 100).round(1)
+
+                # Prepare display table
+                table_df = display_df[[
+                    'player_name', 'team_name', 'projected_ppg', 'fanduel_ou', 'Diff', 'Diff %'
+                ]].copy()
+
+                table_df.columns = ['Player', 'Team', 'Our Projection', 'FanDuel O/U', 'Difference', '% Diff']
+
+                # Format numeric columns
+                table_df['Our Projection'] = table_df['Our Projection'].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "N/A")
+                table_df['FanDuel O/U'] = table_df['FanDuel O/U'].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "N/A")
+                table_df['Difference'] = table_df['Difference'].apply(lambda x: f"{x:+.1f}" if pd.notna(x) else "N/A")
+                table_df['% Diff'] = table_df['% Diff'].apply(lambda x: f"{x:+.1f}%" if pd.notna(x) else "N/A")
+
+                st.dataframe(
+                    table_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    height=600
+                )
+
+                # Legend
+                st.caption(
+                    "**Reading the table:** Positive difference means our projection is HIGHER than FanDuel's O/U line "
+                    "(potential **over** opportunity). Negative means our projection is LOWER (potential **under**)."
+                )
+
+                # Export button
+                csv = display_df.to_csv(index=False)
+                st.download_button(
+                    label="📥 Export to CSV",
+                    data=csv,
+                    file_name=f"fanduel_comparison_{compare_date}.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
 
 st.divider()
 st.caption(
