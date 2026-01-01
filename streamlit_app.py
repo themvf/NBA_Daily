@@ -3015,8 +3015,14 @@ These predictions should be removed to avoid DNP errors.
                 )
 
         # Group predictions by game (matchup)
-        # Create game key: "Away @ Home"
-        predictions_df['game_key'] = predictions_df['opponent_name'] + ' @ ' + predictions_df['team_name']
+        # Create a CANONICAL game key by sorting team names alphabetically
+        # This ensures both teams' predictions end up in the same game group
+        # e.g., "Dallas Mavericks vs Philadelphia 76ers" (always alphabetical order)
+        def make_canonical_game_key(row):
+            teams = sorted([row['team_name'], row['opponent_name']])
+            return f"{teams[0]} vs {teams[1]}"
+
+        predictions_df['game_key'] = predictions_df.apply(make_canonical_game_key, axis=1)
 
         # Get unique games
         games = predictions_df['game_key'].unique()
@@ -3027,35 +3033,33 @@ These predictions should be removed to avoid DNP errors.
         for game_key in games:
             game_preds = predictions_df[predictions_df['game_key'] == game_key]
 
-            # Parse away/home teams
-            if ' @ ' in game_key:
-                away_team, home_team = game_key.split(' @ ')
+            # Parse teams from canonical key (alphabetical order)
+            if ' vs ' in game_key:
+                team_a, team_b = game_key.split(' vs ')
             else:
                 continue
 
-            st.markdown(f"#### {away_team} at {home_team}")
+            # Display as "Team A vs Team B" (alphabetical, not home/away since we don't track that)
+            st.markdown(f"#### {team_a} vs {team_b}")
 
-            # Split into away and home columns
-            col_away, col_home = st.columns(2)
+            # Split into two columns
+            col_a, col_b = st.columns(2)
 
-            with col_away:
-                st.markdown(f"**{away_team}** (Away)")
-                # Get away team predictions (where team_name != home_team or opponent_name == home_team)
-                # Actually, in the predictions table, team_name is the team the player is ON
-                # opponent_name is who they're playing against
-                # So if opponent_name == home_team, then this player is on the away team
-                away_preds = game_preds[game_preds['opponent_name'] == home_team]
-                if not away_preds.empty:
-                    display_team_predictions(away_preds)
+            with col_a:
+                st.markdown(f"**{team_a}**")
+                # Get predictions for team_a (where team_name == team_a)
+                team_a_preds = game_preds[game_preds['team_name'] == team_a]
+                if not team_a_preds.empty:
+                    display_team_predictions(team_a_preds)
                 else:
                     st.caption("No predictions for this team")
 
-            with col_home:
-                st.markdown(f"**{home_team}** (Home)")
-                # If opponent_name == away_team, then this player is on the home team
-                home_preds = game_preds[game_preds['opponent_name'] == away_team]
-                if not home_preds.empty:
-                    display_team_predictions(home_preds)
+            with col_b:
+                st.markdown(f"**{team_b}**")
+                # Get predictions for team_b (where team_name == team_b)
+                team_b_preds = game_preds[game_preds['team_name'] == team_b]
+                if not team_b_preds.empty:
+                    display_team_predictions(team_b_preds)
                 else:
                     st.caption("No predictions for this team")
 
