@@ -14,6 +14,7 @@ import sqlite3
 import requests
 from datetime import datetime, date, timedelta
 from typing import Dict, List, Optional, Tuple, Any
+from zoneinfo import ZoneInfo
 from rapidfuzz import fuzz
 import time
 import os
@@ -473,12 +474,24 @@ def fetch_fanduel_lines_for_date(
         events, req_count = get_nba_events(api_key)
         total_requests += req_count
 
-        # Filter to events on the target date
+        # Filter to events on the target date (convert UTC to Eastern time)
         game_date_str = game_date.strftime("%Y-%m-%d")
-        todays_events = [
-            e for e in events
-            if e.get("commence_time", "").startswith(game_date_str)
-        ]
+        eastern = ZoneInfo("America/New_York")
+
+        todays_events = []
+        for e in events:
+            commence_str = e.get("commence_time", "")
+            if commence_str:
+                try:
+                    # Parse UTC timestamp: "2026-01-01T23:00:00Z"
+                    utc_dt = datetime.fromisoformat(commence_str.replace("Z", "+00:00"))
+                    # Convert to Eastern time
+                    eastern_dt = utc_dt.astimezone(eastern)
+                    # Compare date in Eastern timezone
+                    if eastern_dt.strftime("%Y-%m-%d") == game_date_str:
+                        todays_events.append(e)
+                except ValueError:
+                    continue
 
         result["events_fetched"] = len(todays_events)
 
