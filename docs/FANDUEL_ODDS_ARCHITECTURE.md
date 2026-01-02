@@ -44,7 +44,16 @@ API_KEY = "your-api-key-here"
 │                       │ odds_fetch_  │           │                 │
 │                       │ log table    │           │                 │
 │                       └──────────────┘           │                 │
-│                                                  │                 │
+│                              │                                      │
+│                              ▼                                      │
+│                       ┌──────────────┐     ┌──────────────┐        │
+│                       │  AWS S3      │◀───▶│ s3_storage.py│        │
+│                       │  Bucket      │     │              │        │
+│                       └──────────────┘     └──────────────┘        │
+│                              │                                      │
+│                              ├── predictions/nba_stats.db (full DB) │
+│                              └── odds/fanduel_lines_YYYY-MM-DD.csv  │
+│                                                                      │
 │  ┌──────────────┐                               │                 │
 │  │  NBA API     │────▶ actual_ppg ─────────────▶│                 │
 │  │  (actuals)   │                               │                 │
@@ -81,6 +90,8 @@ API_KEY = "your-api-key-here"
 | `fetch_fanduel_lines_for_date()` | Main entry point - fetches all lines for a date |
 | `should_fetch_odds()` | Check if we should fetch (budget, already fetched) |
 | `get_monthly_api_usage()` | Track API budget usage |
+| `archive_fanduel_lines_to_s3()` | Export lines to CSV and upload to S3 |
+| `auto_backup_to_s3()` | Trigger full database backup to S3 |
 
 ### Player Name Matching
 
@@ -168,6 +179,55 @@ CREATE TABLE odds_player_aliases (
 
 ---
 
+## S3 Cloud Storage
+
+**Purpose:** Prevent data loss when Streamlit Cloud reboots (ephemeral storage)
+
+### Auto-Backup Strategy
+
+When FanDuel lines are successfully fetched, two backups occur automatically:
+
+1. **Full Database Backup** - `nba_stats.db` uploaded to S3
+2. **Daily CSV Snapshot** - `odds/fanduel_lines_YYYY-MM-DD.csv` created
+
+### S3 Bucket Structure
+
+```
+s3://nba-daily-predictions/
+├── predictions/
+│   └── nba_stats.db              # Full database (auto-uploaded after fetch)
+└── odds/
+    ├── fanduel_lines_2026-01-02.csv
+    ├── fanduel_lines_2026-01-03.csv
+    └── ...                        # Historical daily snapshots
+```
+
+### CSV Archive Schema
+
+| Column | Description |
+|--------|-------------|
+| game_date | Game date (YYYY-MM-DD) |
+| player_id | Our player ID |
+| player_name | Player name |
+| team_name | Player's team |
+| opponent_name | Opponent |
+| fanduel_ou | FanDuel O/U line |
+| fanduel_over_odds | Over odds (-110, etc.) |
+| fanduel_under_odds | Under odds |
+| fanduel_fetched_at | When line was captured |
+| projected_ppg | Our projection (for reference) |
+
+### Odds Overwrite Behavior
+
+When re-fetching FanDuel lines (e.g., after an injury announcement):
+- **Database:** Lines are overwritten with latest values
+- **CSV Archive:** New snapshot replaces same-day file
+- **Comparison Logic:** Always uses most recent FanDuel odds
+
+This ensures comparisons reflect the final lines available before tip-off.
+
+---
+
 ## Streamlit Pages
 
 ### 1. FanDuel Compare (Pre-Game)
@@ -236,9 +296,10 @@ CREATE TABLE odds_player_aliases (
 
 | File | Purpose |
 |------|---------|
-| `odds_api.py` | The Odds API integration (~600 lines) |
+| `odds_api.py` | The Odds API integration + S3 archiving (~650 lines) |
 | `prediction_tracking.py` | Schema + comparison calculations |
 | `streamlit_app.py` | UI pages (FanDuel Compare, Model vs FanDuel) |
+| `s3_storage.py` | AWS S3 integration for cloud backup |
 | `.streamlit/secrets.toml` | API key storage (local) |
 
 ---
@@ -306,6 +367,7 @@ from typing import Optional, Dict, List
 |---------|---------|-------------|
 | The Odds API | FanDuel lines | `[theoddsapi].API_KEY` in secrets |
 | NBA API | Actual game results | No key required |
+| AWS S3 | Database backup + odds archive | `[aws]` credentials in secrets |
 | Streamlit Cloud | Hosting | GitHub integration |
 
 ---
