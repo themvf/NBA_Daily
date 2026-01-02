@@ -7362,7 +7362,7 @@ if selected_page == "FanDuel Compare":
                     button_label = "🔄 Refetch FanDuel Lines" if force_refetch else "🔄 Fetch FanDuel Lines"
                     if st.button(button_label, type="primary"):
                         with st.spinner("Fetching from The Odds API..."):
-                            result = odds_api.fetch_fanduel_lines_for_date(games_conn, compare_date)
+                            result = odds_api.fetch_fanduel_lines_for_date(games_conn, compare_date, force=force_refetch)
 
                             if result['success']:
                                 st.success(f"Fetched lines for {result['players_matched']} players using {result['api_requests_used']} API requests")

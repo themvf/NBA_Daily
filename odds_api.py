@@ -422,7 +422,8 @@ def log_fetch_attempt(
 
 def fetch_fanduel_lines_for_date(
     conn: sqlite3.Connection,
-    game_date: date
+    game_date: date,
+    force: bool = False
 ) -> Dict[str, Any]:
     """
     Fetch FanDuel player points lines for all games on a date.
@@ -432,6 +433,7 @@ def fetch_fanduel_lines_for_date(
     Args:
         conn: Database connection
         game_date: Date to fetch odds for
+        force: If True, bypass the "already fetched" safeguard (for injury updates)
 
     Returns:
         Dict with keys:
@@ -455,11 +457,12 @@ def fetch_fanduel_lines_for_date(
     create_odds_tables(conn)
     upgrade_predictions_for_fanduel(conn)
 
-    # Check if we should fetch
-    should_fetch, reason = should_fetch_odds(conn, game_date)
-    if not should_fetch:
-        result["error"] = reason
-        return result
+    # Check if we should fetch (unless force=True)
+    if not force:
+        should_fetch, reason = should_fetch_odds(conn, game_date)
+        if not should_fetch:
+            result["error"] = reason
+            return result
 
     api_key = get_api_key()
     if not api_key:
