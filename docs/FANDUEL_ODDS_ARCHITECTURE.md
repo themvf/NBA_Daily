@@ -243,6 +243,73 @@ CREATE TABLE odds_player_aliases (
 
 ---
 
+## Module: prediction_tracking.py (FanDuel Functions)
+
+### Schema Migration Functions
+
+| Function | Description |
+|----------|-------------|
+| `upgrade_predictions_table_for_fanduel()` | Adds FanDuel line columns (fanduel_ou, odds, etc.) |
+| `upgrade_predictions_table_for_fanduel_comparison()` | Adds comparison columns (ou_call_correct, we_were_closer, etc.) |
+
+### Calculation Functions
+
+| Function | Description |
+|----------|-------------|
+| `calculate_fanduel_comparison_metrics(conn, game_date=None)` | Calculates all comparison metrics for predictions with actuals |
+| `get_fanduel_comparison_summary(conn, start_date, end_date)` | Returns aggregate stats: O/U accuracy %, we_closer %, avg errors |
+
+### Comparison Logic
+
+```python
+# Over/Under call (what we implied)
+our_ou_call = 'over' if projected_ppg > fanduel_ou else 'under'
+
+# Actual result
+actual_ou_result = 'over' if actual_ppg > fanduel_ou else 'under'
+
+# Did we get it right?
+ou_call_correct = 1 if our_ou_call == actual_ou_result else 0
+
+# Who was closer?
+our_error = abs(actual_ppg - projected_ppg)
+fanduel_error = abs(actual_ppg - fanduel_ou)
+we_were_closer = 1 if our_error < fanduel_error else 0
+closer_margin = fanduel_error - our_error  # Positive = we won
+```
+
+---
+
+## Required Dependencies
+
+### Python Packages
+
+```python
+# odds_api.py
+from zoneinfo import ZoneInfo      # Timezone conversion (Python 3.9+)
+from rapidfuzz import fuzz         # Fuzzy name matching
+import requests                    # API calls
+
+# streamlit_app.py
+from datetime import date, datetime, timezone, timedelta
+import pandas as pd
+import streamlit as st
+
+# prediction_tracking.py
+import sqlite3
+from typing import Optional, Dict, List
+```
+
+### External Services
+
+| Service | Purpose | Credentials |
+|---------|---------|-------------|
+| The Odds API | FanDuel lines | `[theoddsapi].API_KEY` in secrets |
+| NBA API | Actual game results | No key required |
+| Streamlit Cloud | Hosting | GitHub integration |
+
+---
+
 ## Future Enhancements
 
 - [ ] Charts: O/U accuracy over time (7-day rolling)
