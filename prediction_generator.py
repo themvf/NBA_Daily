@@ -391,16 +391,19 @@ def _generate_predictions_for_game(
         ("Away", away_id, matchup["Away"]),
         ("Home", home_id, matchup["Home"]),
     ]:
-        # Get top 5 players
-        team_leaders = data['leaders_df'][
+        # Get all players for this team
+        all_team_players = data['leaders_df'][
             data['leaders_df']["team_id"] == team_id
-        ].nlargest(st_app.TOP_LEADERS_COUNT, data['score_column'])
+        ]
 
-        # Filter out injured players
+        # Filter out injured players FIRST
         if data['injured_player_ids']:
-            team_leaders = team_leaders[
-                ~team_leaders['player_id'].isin(data['injured_player_ids'])
+            all_team_players = all_team_players[
+                ~all_team_players['player_id'].isin(data['injured_player_ids'])
             ]
+
+        # THEN take top 5 from healthy players
+        team_leaders = all_team_players.nlargest(st_app.TOP_LEADERS_COUNT, data['score_column'])
 
         if team_leaders.empty:
             continue
