@@ -551,6 +551,10 @@ def fetch_fanduel_lines_for_date(
             remaining
         )
 
+        # Auto-backup to S3 after successful fetch (prevents data loss on reboot)
+        if result["players_matched"] > 0:
+            auto_backup_to_s3()
+
     except requests.RequestException as e:
         result["error"] = f"API request failed: {str(e)}"
         log_fetch_attempt(conn, game_date, 0, 0, total_requests, error_message=result["error"])
@@ -601,6 +605,108 @@ def get_comparison_data(
     ]
 
     return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+
+def archive_fanduel_lines_to_s3(conn: sqlite3.Connection, game_date: date) -> Dict[str, Any]:
+    """
+    Export FanDuel lines for a date to CSV and upload to S3.
+
+    Creates: s3://bucket/odds/fanduel_lines_YYYY-MM-DD.csv
+
+    Args:
+        conn: Database connection
+        game_date: Date to archive
+
+    Returns:
+        Dict with success status, rows archived, and S3 key
+    """
+    try:
+        import pandas as pd
+        from s3_storage import S3PredictionStorage
+    except ImportError as e:
+        return {'success': False, 'error': f'Missing dependency: {e}'}
+
+    # Query lines for the date
+    query = """
+        SELECT
+            game_date,
+            player_id,
+            player_name,
+            team_name,
+            opponent_name,
+            fanduel_ou,
+            fanduel_over_odds,
+            fanduel_under_odds,
+            fanduel_fetched_at,
+            projected_ppg,
+            proj_floor,
+            proj_ceiling
+        FROM predictions
+        WHERE game_date = ? AND fanduel_ou IS NOT NULL
+        ORDER BY fanduel_ou DESC
+    """
+
+    try:
+        df = pd.read_sql_query(query, conn, params=[str(game_date)])
+    except Exception as e:
+        return {'success': False, 'error': f'Query failed: {e}'}
+
+    if df.empty:
+        return {'success': False, 'error': 'No FanDuel lines found for this date'}
+
+    # Convert to CSV
+    csv_buffer = df.to_csv(index=False)
+
+    # Upload to S3
+    try:
+        storage = S3PredictionStorage()
+        if not storage.is_connected():
+            return {'success': False, 'error': 'S3 not configured'}
+
+        s3_key = f"odds/fanduel_lines_{game_date}.csv"
+        storage.s3.put_object(
+            Bucket=storage.bucket,
+            Key=s3_key,
+            Body=csv_buffer.encode('utf-8'),
+            ContentType='text/csv',
+            Metadata={
+                'game_date': str(game_date),
+                'rows': str(len(df)),
+                'archived_at': datetime.now().isoformat()
+            }
+        )
+
+        return {
+            'success': True,
+            'rows': len(df),
+            's3_key': s3_key,
+            'message': f'Archived {len(df)} lines to s3://{storage.bucket}/{s3_key}'
+        }
+
+    except Exception as e:
+        return {'success': False, 'error': f'S3 upload failed: {e}'}
+
+
+def auto_backup_to_s3(db_path: str = 'nba_stats.db') -> bool:
+    """
+    Trigger S3 backup of the database.
+
+    Called after successful FanDuel fetch to ensure data isn't lost.
+    """
+    try:
+        from s3_storage import S3PredictionStorage
+        from pathlib import Path
+
+        storage = S3PredictionStorage()
+        if storage.is_connected():
+            success, message = storage.upload_database(Path(db_path))
+            if success:
+                print(f"Auto-backup to S3: {message}")
+            return success
+        return False
+    except Exception as e:
+        print(f"Auto-backup failed: {e}")
+        return False
 
 
 if __name__ == "__main__":

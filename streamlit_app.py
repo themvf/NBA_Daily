@@ -7352,6 +7352,12 @@ if selected_page == "FanDuel Compare":
 
                             if result['success']:
                                 st.success(f"Fetched lines for {result['players_matched']} players using {result['api_requests_used']} API requests")
+
+                                # Archive to S3 CSV for historical record
+                                archive_result = odds_api.archive_fanduel_lines_to_s3(games_conn, compare_date)
+                                if archive_result.get('success'):
+                                    st.info(f"📁 Archived {archive_result['rows']} lines to S3")
+
                                 st.rerun()
                             else:
                                 st.error(f"Fetch failed: {result.get('error', 'Unknown error')}")
