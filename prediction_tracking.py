@@ -346,14 +346,24 @@ def calculate_fanduel_comparison_metrics(conn: sqlite3.Connection, game_date: Op
     """
     cursor = conn.cursor()
 
-    # Build query for predictions with both actuals and FanDuel lines
-    where_clause = """
-        WHERE actual_ppg IS NOT NULL
-        AND fanduel_ou IS NOT NULL
-        AND (ou_call_correct IS NULL OR fanduel_error IS NULL)
-    """
+    # Ensure comparison columns exist first
+    upgrade_predictions_table_for_fanduel_comparison(conn)
+
+    # Check which columns exist to build appropriate WHERE clause
+    cursor.execute("PRAGMA table_info(predictions)")
+    existing_columns = {row[1] for row in cursor.fetchall()}
+
+    # Build WHERE clause based on available columns
+    where_parts = ["actual_ppg IS NOT NULL", "fanduel_ou IS NOT NULL"]
+
+    # Only filter on comparison columns if they exist
+    if 'ou_call_correct' in existing_columns and 'fanduel_error' in existing_columns:
+        where_parts.append("(ou_call_correct IS NULL OR fanduel_error IS NULL)")
+
     if game_date:
-        where_clause += f" AND game_date = '{game_date}'"
+        where_parts.append(f"game_date = '{game_date}'")
+
+    where_clause = "WHERE " + " AND ".join(where_parts)
 
     # Get predictions that need calculation
     cursor.execute(f"""
