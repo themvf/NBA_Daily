@@ -7415,7 +7415,8 @@ if selected_page == "Model vs FanDuel":
     # Get database connection
     games_conn = get_connection(str(db_path))
 
-    # Ensure schema is up to date
+    # Ensure schema is up to date (must add fanduel columns before comparison columns)
+    pt.upgrade_predictions_table_for_fanduel(games_conn)
     pt.upgrade_predictions_table_for_fanduel_comparison(games_conn)
 
     # Date range selector
