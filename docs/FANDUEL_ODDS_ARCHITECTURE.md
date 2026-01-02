@@ -87,7 +87,7 @@ API_KEY = "your-api-key-here"
 | `get_nba_events()` | Fetch list of today's NBA games |
 | `get_player_props_for_event()` | Fetch player points props for one game |
 | `map_player_name_to_id()` | Fuzzy match FanDuel names to our player_id |
-| `fetch_fanduel_lines_for_date()` | Main entry point - fetches all lines for a date |
+| `fetch_fanduel_lines_for_date(force=False)` | Main entry point - fetches all lines for a date |
 | `should_fetch_odds()` | Check if we should fetch (budget, already fetched) |
 | `get_monthly_api_usage()` | Track API budget usage |
 | `archive_fanduel_lines_to_s3()` | Export lines to CSV and upload to S3 |
@@ -176,6 +176,16 @@ CREATE TABLE odds_player_aliases (
 | 80% (400) | Warning displayed in UI |
 | 95% (475) | Fetching blocked |
 | Already fetched today | Skip (use cached data) |
+
+### Force Refetch
+
+When lines need to be updated after an injury or lineup change:
+
+1. Check the **"Force refetch (update lines after injury news)"** checkbox
+2. A warning appears about additional API usage
+3. Click **"Refetch FanDuel Lines"** to bypass the safeguard
+
+**Technical:** Passes `force=True` to `fetch_fanduel_lines_for_date()`, which skips the `should_fetch_odds()` check.
 
 ---
 
