@@ -7345,8 +7345,22 @@ if selected_page == "FanDuel Compare":
             if api_key:
                 should_fetch, reason = odds_api.should_fetch_odds(games_conn, compare_date)
 
-                if should_fetch:
-                    if st.button("🔄 Fetch FanDuel Lines", type="primary"):
+                # Check if already fetched today (allow force refetch)
+                already_fetched = "Already fetched" in reason
+                force_refetch = False
+
+                if already_fetched:
+                    st.caption(f"ℹ️ {reason}")
+                    force_refetch = st.checkbox(
+                        "🔄 Force refetch (update lines after injury news)",
+                        help="Use this to get updated lines if there's been an injury or lineup change. Uses additional API quota."
+                    )
+                    if force_refetch:
+                        st.warning("⚠️ This will use additional API requests from your monthly quota.")
+
+                if should_fetch or force_refetch:
+                    button_label = "🔄 Refetch FanDuel Lines" if force_refetch else "🔄 Fetch FanDuel Lines"
+                    if st.button(button_label, type="primary"):
                         with st.spinner("Fetching from The Odds API..."):
                             result = odds_api.fetch_fanduel_lines_for_date(games_conn, compare_date)
 
@@ -7361,7 +7375,8 @@ if selected_page == "FanDuel Compare":
                                 st.rerun()
                             else:
                                 st.error(f"Fetch failed: {result.get('error', 'Unknown error')}")
-                else:
+                elif not already_fetched:
+                    # Show other reasons (like budget exceeded) without force option
                     st.caption(f"ℹ️ {reason}")
 
             # Filter based on toggle
