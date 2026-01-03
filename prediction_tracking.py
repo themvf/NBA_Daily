@@ -412,6 +412,88 @@ def calculate_fanduel_comparison_metrics(conn: sqlite3.Connection, game_date: Op
     return updated_count
 
 
+def get_overall_model_performance(conn: sqlite3.Connection,
+                                   start_date: Optional[str] = None,
+                                   end_date: Optional[str] = None) -> Dict:
+    """
+    Get overall model performance stats for ALL predictions with actuals.
+
+    This includes predictions without FanDuel lines.
+
+    Returns:
+        Dict with keys: total_predictions, with_actuals, avg_error, hit_rate,
+                       over_projected, under_projected, over_pct
+    """
+    cursor = conn.cursor()
+
+    where_clauses = ["actual_ppg IS NOT NULL"]
+    if start_date:
+        where_clauses.append(f"game_date >= '{start_date}'")
+    if end_date:
+        where_clauses.append(f"game_date <= '{end_date}'")
+
+    where_sql = " AND ".join(where_clauses)
+
+    # Get total predictions in date range (with and without actuals)
+    total_where = []
+    if start_date:
+        total_where.append(f"game_date >= '{start_date}'")
+    if end_date:
+        total_where.append(f"game_date <= '{end_date}'")
+    total_where_sql = " AND ".join(total_where) if total_where else "1=1"
+
+    cursor.execute(f"""
+        SELECT
+            COUNT(*) as total,
+            COUNT(actual_ppg) as with_actuals
+        FROM predictions
+        WHERE {total_where_sql}
+    """)
+    counts = cursor.fetchone()
+    total_predictions = counts[0] if counts else 0
+    with_actuals = counts[1] if counts else 0
+
+    # Get performance metrics for predictions with actuals
+    cursor.execute(f"""
+        SELECT
+            AVG(abs_error) as avg_error,
+            AVG(CASE WHEN hit_floor_ceiling = 1 THEN 1.0 ELSE 0.0 END) as hit_rate,
+            SUM(CASE WHEN error < 0 THEN 1 ELSE 0 END) as over_projected,
+            SUM(CASE WHEN error > 0 THEN 1 ELSE 0 END) as under_projected,
+            SUM(CASE WHEN error = 0 THEN 1 ELSE 0 END) as exact
+        FROM predictions
+        WHERE {where_sql}
+    """)
+
+    row = cursor.fetchone()
+
+    if row and with_actuals > 0:
+        avg_error = row[0] or 0
+        hit_rate = (row[1] or 0) * 100
+        over_projected = row[2] or 0
+        under_projected = row[3] or 0
+        exact = row[4] or 0
+        over_pct = (over_projected / with_actuals * 100) if with_actuals > 0 else 0
+    else:
+        avg_error = 0
+        hit_rate = 0
+        over_projected = 0
+        under_projected = 0
+        exact = 0
+        over_pct = 0
+
+    return {
+        'total_predictions': total_predictions,
+        'with_actuals': with_actuals,
+        'avg_error': avg_error,
+        'hit_rate': hit_rate,
+        'over_projected': over_projected,
+        'under_projected': under_projected,
+        'exact': exact,
+        'over_pct': over_pct
+    }
+
+
 def get_fanduel_comparison_summary(conn: sqlite3.Connection,
                                     start_date: Optional[str] = None,
                                     end_date: Optional[str] = None) -> Dict:

@@ -7463,6 +7463,70 @@ if selected_page == "Model vs FanDuel":
 
     st.divider()
 
+    # =========================================================================
+    # SECTION 1: Overall Model Performance (ALL predictions)
+    # =========================================================================
+    st.subheader("📊 Overall Model Performance")
+    st.caption("Performance across ALL predictions (not just those with FanDuel lines)")
+
+    overall = pt.get_overall_model_performance(
+        games_conn,
+        start_date=str(start_date),
+        end_date=str(end_date)
+    )
+
+    if overall['with_actuals'] == 0:
+        st.info("No completed predictions in this date range. Actuals are populated after games finish.")
+    else:
+        # Overall metrics row
+        ocol1, ocol2, ocol3, ocol4 = st.columns(4)
+
+        with ocol1:
+            st.metric(
+                "Predictions Scored",
+                f"{overall['with_actuals']} / {overall['total_predictions']}",
+                help="Predictions with actual results vs total predictions"
+            )
+
+        with ocol2:
+            st.metric(
+                "Avg Error",
+                f"{overall['avg_error']:.1f} PPG",
+                help="Average absolute error in points per game"
+            )
+
+        with ocol3:
+            st.metric(
+                "Hit Rate",
+                f"{overall['hit_rate']:.1f}%",
+                help="Percentage of predictions within floor-ceiling range"
+            )
+
+        with ocol4:
+            over_pct = overall['over_pct']
+            bias = "Over" if over_pct > 55 else "Under" if over_pct < 45 else "Balanced"
+            st.metric(
+                "Projection Bias",
+                bias,
+                delta=f"{over_pct:.0f}% over-projected" if over_pct != 50 else None,
+                delta_color="inverse" if abs(over_pct - 50) > 10 else "off"
+            )
+
+        # Show breakdown
+        with st.expander("📈 Over/Under Breakdown"):
+            st.write(f"**Over-projected:** {overall['over_projected']} predictions (actual was lower than projected)")
+            st.write(f"**Under-projected:** {overall['under_projected']} predictions (actual was higher than projected)")
+            if overall['exact'] > 0:
+                st.write(f"**Exact:** {overall['exact']} predictions")
+
+    st.divider()
+
+    # =========================================================================
+    # SECTION 2: vs FanDuel Comparison (subset with FD lines)
+    # =========================================================================
+    st.subheader("🎰 vs FanDuel Comparison")
+    st.caption("Head-to-head comparison with FanDuel lines (subset of predictions)")
+
     # Get summary stats
     summary = pt.get_fanduel_comparison_summary(
         games_conn,
