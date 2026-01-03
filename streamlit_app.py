@@ -7519,6 +7519,89 @@ if selected_page == "Model vs FanDuel":
             if overall['exact'] > 0:
                 st.write(f"**Exact:** {overall['exact']} predictions")
 
+        # Detailed table for ALL predictions
+        st.subheader("📋 All Predictions Detail")
+
+        # Query ALL predictions with actuals
+        all_preds_query = f"""
+            SELECT
+                game_date,
+                player_name,
+                team_name,
+                projected_ppg,
+                actual_ppg,
+                error,
+                abs_error,
+                hit_floor_ceiling,
+                proj_floor,
+                proj_ceiling,
+                fanduel_ou
+            FROM predictions
+            WHERE actual_ppg IS NOT NULL
+            AND game_date >= '{start_date}'
+            AND game_date <= '{end_date}'
+            ORDER BY game_date DESC, abs_error DESC
+        """
+
+        all_preds_df = pd.read_sql_query(all_preds_query, games_conn)
+
+        if not all_preds_df.empty:
+            # Format for display
+            all_display = all_preds_df.copy()
+            all_display['Date'] = all_display['game_date']
+            all_display['Player'] = all_display['player_name']
+            all_display['Team'] = all_display['team_name']
+            all_display['Our Proj'] = all_display['projected_ppg'].apply(lambda x: f"{x:.1f}")
+            all_display['Actual'] = all_display['actual_ppg'].apply(lambda x: f"{x:.1f}")
+            all_display['Error'] = all_display['error'].apply(lambda x: f"{x:+.1f}")
+            all_display['Abs Error'] = all_display['abs_error'].apply(lambda x: f"{x:.1f}")
+            all_display['In Range'] = all_display['hit_floor_ceiling'].apply(
+                lambda x: "✅" if x == 1 else "❌"
+            )
+            all_display['FD Line'] = all_display['fanduel_ou'].apply(
+                lambda x: f"{x:.1f}" if pd.notna(x) else "—"
+            )
+
+            # Show column selector
+            col_options = ['Date', 'Player', 'Team', 'Our Proj', 'Actual', 'Error', 'Abs Error', 'In Range', 'FD Line']
+            default_cols = ['Date', 'Player', 'Team', 'Our Proj', 'Actual', 'Error', 'In Range', 'FD Line']
+
+            selected_cols = st.multiselect(
+                "Columns to display",
+                options=col_options,
+                default=default_cols,
+                key="all_preds_cols"
+            )
+
+            # Filter options
+            filter_col1, filter_col2 = st.columns(2)
+            with filter_col1:
+                show_only_misses = st.checkbox("Show only big misses (>5 PPG error)", key="big_misses_filter")
+            with filter_col2:
+                show_only_fd = st.checkbox("Show only predictions with FD lines", key="fd_only_filter")
+
+            filtered_df = all_display.copy()
+            if show_only_misses:
+                filtered_df = filtered_df[all_preds_df['abs_error'] > 5]
+            if show_only_fd:
+                filtered_df = filtered_df[all_preds_df['fanduel_ou'].notna()]
+
+            st.dataframe(
+                filtered_df[selected_cols],
+                use_container_width=True,
+                hide_index=True,
+                height=400
+            )
+
+            # Download button
+            csv_data = all_preds_df.to_csv(index=False)
+            st.download_button(
+                "📥 Download All Predictions CSV",
+                csv_data,
+                file_name=f"all_predictions_{start_date}_to_{end_date}.csv",
+                mime="text/csv"
+            )
+
     st.divider()
 
     # =========================================================================
