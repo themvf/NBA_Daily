@@ -396,17 +396,11 @@ def _generate_predictions_for_game(
             data['leaders_df']["team_id"] == team_id
         ]
 
-        # Debug: Log player counts
-        total_before_filter = len(all_team_players)
-
         # Filter out injured players FIRST
         if data['injured_player_ids']:
             all_team_players = all_team_players[
                 ~all_team_players['player_id'].isin(data['injured_player_ids'])
             ]
-
-        total_after_filter = len(all_team_players)
-        print(f"DEBUG {team_name}: {total_before_filter} total players, {total_after_filter} after injury filter, taking top {st_app.TOP_LEADERS_COUNT}")
 
         # THEN take top 5 from healthy players
         team_leaders = all_team_players.nlargest(st_app.TOP_LEADERS_COUNT, data['score_column'])
