@@ -7615,41 +7615,69 @@ if selected_page == "Model vs FanDuel":
         # Detailed table for ALL predictions
         st.subheader("📋 All Predictions Detail")
 
-        # Query ALL predictions with actuals
-        all_preds_query = f"""
-            SELECT
-                game_date,
-                player_name,
-                team_name,
-                projected_ppg,
-                actual_ppg,
-                error,
-                abs_error,
-                hit_floor_ceiling,
-                proj_floor,
-                proj_ceiling,
-                fanduel_ou
-            FROM predictions
-            WHERE actual_ppg IS NOT NULL
-            AND game_date >= '{start_date}'
-            AND game_date <= '{end_date}'
-            ORDER BY game_date DESC, abs_error DESC
-        """
+        # Toggle to include unscored predictions
+        include_unscored = st.checkbox(
+            "Include predictions without actual results",
+            value=False,
+            key="include_unscored",
+            help="Show predictions for games that haven't been scored yet"
+        )
+
+        # Query predictions (optionally include unscored)
+        if include_unscored:
+            all_preds_query = f"""
+                SELECT
+                    game_date,
+                    player_name,
+                    team_name,
+                    projected_ppg,
+                    actual_ppg,
+                    error,
+                    abs_error,
+                    hit_floor_ceiling,
+                    proj_floor,
+                    proj_ceiling,
+                    fanduel_ou
+                FROM predictions
+                WHERE game_date >= '{start_date}'
+                AND game_date <= '{end_date}'
+                ORDER BY game_date DESC, projected_ppg DESC
+            """
+        else:
+            all_preds_query = f"""
+                SELECT
+                    game_date,
+                    player_name,
+                    team_name,
+                    projected_ppg,
+                    actual_ppg,
+                    error,
+                    abs_error,
+                    hit_floor_ceiling,
+                    proj_floor,
+                    proj_ceiling,
+                    fanduel_ou
+                FROM predictions
+                WHERE actual_ppg IS NOT NULL
+                AND game_date >= '{start_date}'
+                AND game_date <= '{end_date}'
+                ORDER BY game_date DESC, abs_error DESC
+            """
 
         all_preds_df = pd.read_sql_query(all_preds_query, games_conn)
 
         if not all_preds_df.empty:
-            # Format for display
+            # Format for display (handle NULL values for unscored predictions)
             all_display = all_preds_df.copy()
             all_display['Date'] = all_display['game_date']
             all_display['Player'] = all_display['player_name']
             all_display['Team'] = all_display['team_name']
-            all_display['Our Proj'] = all_display['projected_ppg'].apply(lambda x: f"{x:.1f}")
-            all_display['Actual'] = all_display['actual_ppg'].apply(lambda x: f"{x:.1f}")
-            all_display['Error'] = all_display['error'].apply(lambda x: f"{x:+.1f}")
-            all_display['Abs Error'] = all_display['abs_error'].apply(lambda x: f"{x:.1f}")
+            all_display['Our Proj'] = all_display['projected_ppg'].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "—")
+            all_display['Actual'] = all_display['actual_ppg'].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "pending")
+            all_display['Error'] = all_display['error'].apply(lambda x: f"{x:+.1f}" if pd.notna(x) else "—")
+            all_display['Abs Error'] = all_display['abs_error'].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "—")
             all_display['In Range'] = all_display['hit_floor_ceiling'].apply(
-                lambda x: "✅" if x == 1 else "❌"
+                lambda x: "✅" if x == 1 else ("❌" if x == 0 else "—")
             )
             all_display['FD Line'] = all_display['fanduel_ou'].apply(
                 lambda x: f"{x:.1f}" if pd.notna(x) else "—"
@@ -7675,7 +7703,8 @@ if selected_page == "Model vs FanDuel":
 
             filtered_df = all_display.copy()
             if show_only_misses:
-                filtered_df = filtered_df[all_preds_df['abs_error'] > 5]
+                # Filter for big misses (handle NaN for unscored predictions)
+                filtered_df = filtered_df[all_preds_df['abs_error'].fillna(0) > 5]
             if show_only_fd:
                 filtered_df = filtered_df[all_preds_df['fanduel_ou'].notna()]
 
