@@ -235,6 +235,29 @@ def clear_s3_and_db_caches():
     st.cache_data.clear()
 
 
+def force_refresh_from_s3() -> tuple[bool, str]:
+    """Force download from S3, bypassing timestamp checks."""
+    storage = s3_storage.S3PredictionStorage()
+
+    if not storage.is_connected():
+        return False, "S3 not configured"
+
+    # Delete local database to force fresh download
+    db_path = DEFAULT_DB_PATH
+    if db_path.exists():
+        db_path.unlink()
+
+    # Clear all caches
+    clear_s3_and_db_caches()
+
+    # Download fresh from S3
+    success, message = storage.download_database(db_path)
+    if success:
+        return True, f"✅ Force refreshed from S3 ({message})"
+    else:
+        return False, f"⚠️ Refresh failed: {message}"
+
+
 # Sidebar navigation
 st.sidebar.title("📊 Navigation")
 
@@ -2697,9 +2720,14 @@ with st.sidebar:
         st.warning(s3_sync_message)
 
     # Refresh button to re-download from S3
-    if st.button("🔄 Refresh from S3", help="Download latest database from S3"):
-        clear_s3_and_db_caches()
-        st.rerun()
+    if st.button("🔄 Refresh from S3", help="Force download latest database from S3"):
+        with st.spinner("Downloading from S3..."):
+            success, message = force_refresh_from_s3()
+        if success:
+            st.success(message)
+            st.rerun()
+        else:
+            st.error(message)
 
     st.divider()
 
