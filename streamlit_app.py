@@ -242,6 +242,10 @@ def force_refresh_from_s3() -> tuple[bool, str]:
     if not storage.is_connected():
         return False, "S3 not configured"
 
+    # Get S3 info before download for debugging
+    s3_info = storage.get_backup_info()
+    s3_size = s3_info.get('size_kb', 0) if s3_info.get('exists') else 0
+
     # Delete local database to force fresh download
     db_path = DEFAULT_DB_PATH
     if db_path.exists():
@@ -253,6 +257,18 @@ def force_refresh_from_s3() -> tuple[bool, str]:
     # Download fresh from S3
     success, message = storage.download_database(db_path)
     if success:
+        # Verify download by checking file size and latest prediction date
+        if db_path.exists():
+            local_size = db_path.stat().st_size / 1024
+            try:
+                import sqlite3
+                conn = sqlite3.connect(str(db_path))
+                cursor = conn.execute("SELECT MAX(game_date) FROM predictions")
+                max_date = cursor.fetchone()[0]
+                conn.close()
+                return True, f"✅ Downloaded {local_size:.1f} KB from S3. Latest prediction: {max_date}"
+            except Exception as e:
+                return True, f"✅ Downloaded {local_size:.1f} KB from S3 (could not verify date: {e})"
         return True, f"✅ Force refreshed from S3 ({message})"
     else:
         return False, f"⚠️ Refresh failed: {message}"
@@ -2728,6 +2744,41 @@ with st.sidebar:
             st.rerun()
         else:
             st.error(message)
+
+    # Debug info expander
+    with st.expander("🔍 Debug Info"):
+        storage = s3_storage.S3PredictionStorage()
+        if storage.is_connected():
+            s3_info = storage.get_backup_info()
+            if s3_info.get('exists'):
+                st.write(f"**S3 file modified:** {s3_info.get('last_modified')}")
+                st.write(f"**S3 file size:** {s3_info.get('size_kb', 0):.1f} KB")
+            else:
+                st.write("No S3 backup found")
+
+            db_path = DEFAULT_DB_PATH
+            if db_path.exists():
+                local_mtime = datetime.fromtimestamp(db_path.stat().st_mtime, tz=timezone.utc)
+                local_size = db_path.stat().st_size / 1024
+                st.write(f"**Local file modified:** {local_mtime}")
+                st.write(f"**Local file size:** {local_size:.1f} KB")
+
+                # Show max prediction date in database
+                try:
+                    conn = get_connection(str(db_path))
+                    max_date_df = pd.read_sql_query(
+                        "SELECT MAX(game_date) as max_date, COUNT(*) as count FROM predictions",
+                        conn
+                    )
+                    if not max_date_df.empty:
+                        st.write(f"**Latest prediction date:** {max_date_df['max_date'].iloc[0]}")
+                        st.write(f"**Total predictions:** {max_date_df['count'].iloc[0]}")
+                except Exception as e:
+                    st.write(f"Could not query predictions: {e}")
+            else:
+                st.write("No local database file")
+        else:
+            st.write("S3 not configured")
 
     st.divider()
 
