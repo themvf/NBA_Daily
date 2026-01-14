@@ -227,6 +227,14 @@ def sync_database_from_s3() -> tuple[bool, str]:
 # Run S3 sync on startup
 s3_sync_status, s3_sync_message = sync_database_from_s3()
 
+
+def clear_s3_and_db_caches():
+    """Clear all caches to force fresh S3 download."""
+    sync_database_from_s3.clear()
+    get_connection.clear()
+    st.cache_data.clear()
+
+
 # Sidebar navigation
 st.sidebar.title("📊 Navigation")
 
@@ -2687,6 +2695,12 @@ with st.sidebar:
         st.success(s3_sync_message)
     else:
         st.warning(s3_sync_message)
+
+    # Refresh button to re-download from S3
+    if st.button("🔄 Refresh from S3", help="Download latest database from S3"):
+        clear_s3_and_db_caches()
+        st.rerun()
+
     st.divider()
 
     st.header("Data Inputs")
