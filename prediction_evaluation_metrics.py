@@ -65,7 +65,7 @@ def calculate_enhanced_metrics(
             proj_floor,
             proj_ceiling,
             proj_confidence,
-            analytics_type,
+            analytics_used,
             game_date
         FROM predictions
         WHERE {date_filter}
@@ -171,7 +171,7 @@ def calculate_enhanced_metrics(
     under_pct = (under_projections / total_predictions) * 100
 
     # Analytics type breakdown
-    analytics_breakdown = df.groupby('analytics_type').agg({
+    analytics_breakdown = df.groupby('analytics_used').agg({
         'abs_error': ['mean', 'count'],
         'within_floor_ceiling': 'mean'
     }).round(2)
@@ -327,7 +327,7 @@ def get_worst_predictions(
             ABS(projected_ppg - actual_ppg) as abs_error,
             proj_floor,
             proj_ceiling,
-            analytics_type
+            analytics_used
         FROM predictions
         WHERE {date_filter}
           AND actual_ppg IS NOT NULL
