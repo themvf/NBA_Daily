@@ -8051,6 +8051,89 @@ if selected_page == "Model Review":
     st.divider()
 
     # =========================================================================
+    # SECTION 2.5: Bias Calibration Module
+    # =========================================================================
+    st.subheader("🔧 Bias Calibration")
+    st.caption("Compare calibration methods and see recommended formula")
+
+    import prediction_calibration as pcal
+    calibrator = pcal.PredictionCalibrator(review_conn)
+
+    try:
+        cal_summary = calibrator.get_calibration_summary(days_back)
+
+        if 'error' not in cal_summary:
+            # Show comparison table
+            st.write("**Calibration Method Comparison**")
+
+            cal_data = []
+            for method in ['raw', 'constant', 'linear', 'by_tier']:
+                m = cal_summary[method]
+                cal_data.append({
+                    'Method': method.replace('_', ' ').title(),
+                    'MAE': f"{m['mae']:.2f}",
+                    'Bias': f"{m['bias']:+.2f}",
+                    'RMSE': f"{m['rmse']:.2f}",
+                    'R²': f"{m.get('r_squared', 0):.3f}" if method != 'raw' else "—"
+                })
+
+            cal_comparison_df = pd.DataFrame(cal_data)
+            st.dataframe(cal_comparison_df, use_container_width=True, hide_index=True)
+
+            # Find best method
+            methods = ['constant', 'linear', 'by_tier']
+            best_method = min(methods, key=lambda x: cal_summary[x]['mae'])
+            improvement = cal_summary['raw']['mae'] - cal_summary[best_method]['mae']
+            improvement_pct = (improvement / cal_summary['raw']['mae']) * 100
+
+            st.success(f"✅ **Best method: {best_method.replace('_', ' ').title()}** — MAE improvement: {improvement:.2f} pts ({improvement_pct:.1f}%)")
+
+            # Show recommended formula
+            if best_method == 'linear':
+                params = cal_summary['linear']['params']
+                st.code(f"calibrated = {params['intercept']:.2f} + {params['slope']:.3f} × projected", language=None)
+            elif best_method == 'constant':
+                params = cal_summary['constant']['params']
+                st.code(f"calibrated = projected + ({params['intercept']:.2f})", language=None)
+            elif best_method == 'by_tier':
+                st.write("**Tier-specific formulas:**")
+                tier_params = cal_summary['by_tier']['params'].get('tier_params', {})
+                for tier, (a, b) in tier_params.items():
+                    st.code(f"{tier}: calibrated = {a:.2f} + {b:.3f} × projected", language=None)
+
+            # FanDuel diagnostic
+            with st.expander("🔍 FanDuel Comparison Diagnostic"):
+                fd_diag = calibrator.get_fanduel_diagnostic(days_back)
+                if not fd_diag.empty:
+                    st.write("**Our Error - FD Error by Team** (negative = we're better)")
+                    st.caption("If avg_error_diff is consistently positive, we're losing to FD. Low std suggests it's systematic, not noise.")
+
+                    fd_display = fd_diag.copy()
+                    fd_display['avg_error_diff'] = fd_display['avg_error_diff'].apply(lambda x: f"{x:+.2f}")
+                    fd_display['std_error_diff'] = fd_display['std_error_diff'].apply(lambda x: f"{x:.2f}")
+                    fd_display['our_mae'] = fd_display['our_mae'].apply(lambda x: f"{x:.2f}")
+                    fd_display['fd_mae'] = fd_display['fd_mae'].apply(lambda x: f"{x:.2f}")
+                    fd_display['win_rate'] = fd_display['win_rate'].apply(lambda x: f"{x:.0f}%")
+                    fd_display.columns = ['Team', 'Avg Diff', 'Std Dev', 'Games', 'Wins', 'Our MAE', 'FD MAE', 'Win Rate']
+
+                    # Add warning for small samples
+                    fd_display['⚠️'] = fd_display['Games'].apply(lambda x: '⚠️' if int(x) < 20 else '')
+                    st.dataframe(fd_display, use_container_width=True, hide_index=True)
+
+                    # Summary insight
+                    avg_diff = fd_diag['avg_error_diff'].mean()
+                    if avg_diff > 0:
+                        st.warning(f"⚠️ On average, our error is {avg_diff:.2f} pts HIGHER than FanDuel's. The bias correction above should help.")
+                    else:
+                        st.success(f"✅ On average, our error is {abs(avg_diff):.2f} pts LOWER than FanDuel's.")
+                else:
+                    st.info("No FanDuel comparison data available")
+    except Exception as e:
+        st.error(f"Calibration analysis error: {e}")
+
+    st.divider()
+
+    # =========================================================================
     # SECTION 3: Breakdown Analysis (Tabs)
     # =========================================================================
     st.subheader("📋 Performance Breakdowns")
