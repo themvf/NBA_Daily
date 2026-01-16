@@ -89,6 +89,7 @@ class Top3Ranker:
                 p.proj_ceiling,
                 p.proj_confidence,
                 p.season_avg_ppg,
+                p.recent_avg_3,
                 p.recent_avg_5,
                 p.dfs_score,
                 p.dfs_grade,
@@ -204,21 +205,30 @@ class Top3Ranker:
         ceiling_bonus = min(ceiling_upside * 0.5, 8.0)  # Cap at +8
         components['ceiling_bonus'] = ceiling_bonus
 
-        # 3. Hot streak bonus: L5 vs season average
+        # 3. Hot streak bonus: L5 vs season average + L3 acceleration
+        hot_bonus = 0.0
         if row['season_avg_ppg'] and row['season_avg_ppg'] > 0 and row['recent_avg_5']:
+            # Base: L5 vs Season
             hot_ratio = row['recent_avg_5'] / row['season_avg_ppg']
             hot_bonus = max(0, (hot_ratio - 1.0) * 30)  # +6 for 20% above season
             hot_bonus = min(hot_bonus, 6.0)  # Cap at +6
-        else:
-            hot_bonus = 0.0
+
+            # Acceleration bonus: L3 > L5 means getting hotter
+            if row.get('recent_avg_3') and row['recent_avg_3'] > row['recent_avg_5']:
+                acceleration = (row['recent_avg_3'] / row['recent_avg_5']) - 1.0
+                accel_bonus = min(acceleration * 20, 3.0)  # Up to +3 for accelerating
+                hot_bonus += accel_bonus
         components['hot_streak_bonus'] = hot_bonus
 
-        # 4. Minutes confidence bonus: high confidence starters
+        # 4. Minutes/Usage trend bonus: recent opportunity increases
+        minutes_bonus = 0.0
         confidence = row['proj_confidence'] if row['proj_confidence'] else 0.7
+
+        # Base confidence bonus
         if row['projected_ppg'] > 20:
-            minutes_bonus = confidence * 4  # Stars get up to +4
+            minutes_bonus = confidence * 3  # Stars get up to +3
         else:
-            minutes_bonus = confidence * 2  # Role players get up to +2
+            minutes_bonus = confidence * 1.5  # Role players get up to +1.5
         components['minutes_confidence_bonus'] = minutes_bonus
 
         # 5. Injury beneficiary bonus

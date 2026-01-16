@@ -6827,8 +6827,8 @@ if selected_page == "Tournament Strategy":
                 |-----------|-------|-------------|
                 | **Cal Base** | ~15-30 | Calibrated projection (fixes historical over-prediction bias) |
                 | **Ceil+** | 0-8 | Upside bonus: `(Ceiling - Projection) × 0.5`, capped at +8 |
-                | **Hot+** | 0-6 | Hot streak: `(L5/Season - 1) × 30`, capped at +6 |
-                | **Min+** | 0-4 | Minutes confidence: Stars get `conf × 4`, others `conf × 2` |
+                | **Hot+** | 0-9 | Hot streak: `(L5/Season - 1) × 30` (up to +6) PLUS acceleration if L3 > L5 (up to +3) |
+                | **Min+** | 0-3 | Minutes confidence: Stars get `conf × 3`, others `conf × 1.5` |
                 | **Inj+** | 0-7 | Injury beneficiary: teammate out (+4 max) or opponent star out (+3 max) |
                 | **Risk-** | 0 to -10 | Penalties: Questionable (-5), Blowout risk (-3), B2B (-2) |
                 """)
@@ -6864,8 +6864,8 @@ if selected_page == "Tournament Strategy":
                 |-----------|-------|-------------|
                 | **Cal Base** | ~15-30 | Calibrated projection (fixes historical over-prediction bias) |
                 | **Ceil+** | 0-8 | Upside bonus: `(Ceiling - Projection) × 0.5`, capped at +8 |
-                | **Hot+** | 0-6 | Hot streak: `(L5/Season - 1) × 30`, capped at +6 |
-                | **Min+** | 0-4 | Minutes confidence: Stars get `conf × 4`, others `conf × 2` |
+                | **Hot+** | 0-9 | Hot streak: `(L5/Season - 1) × 30` (up to +6) PLUS acceleration if L3 > L5 (up to +3) |
+                | **Min+** | 0-3 | Minutes confidence: Stars get `conf × 3`, others `conf × 1.5` |
                 | **Inj+** | 0-7 | Injury beneficiary: teammate out (+4 max) or opponent star out (+3 max) |
                 | **Risk-** | 0 to -10 | Penalties: Questionable (-5), Blowout risk (-3), B2B (-2) |
                 """)
