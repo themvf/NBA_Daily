@@ -84,6 +84,7 @@ class Top3Ranker:
                 p.player_name,
                 p.team_name,
                 p.opponent_name,
+                p.opponent_def_rating,
                 p.projected_ppg,
                 p.proj_floor,
                 p.proj_ceiling,
@@ -191,72 +192,159 @@ class Top3Ranker:
         """
         Calculate TopScorerScore optimized for top-3 identification.
 
+        Philosophy: Focus on SUSTAINABLE factors, not chasing misleading hot streaks.
+
+        Key principles:
+        1. Calibrated projection is the foundation (fixes historical bias)
+        2. Ceiling matters for tournaments (high variance = good)
+        3. Only trust "hot streaks" if the role is SUSTAINABLE
+        4. TODAY's matchup matters more than last week's opponents
+        5. Injury beneficiary bonus only if teammate is STILL out
+
         Returns:
             Tuple of (score, component_breakdown)
         """
         components = {}
 
-        # 1. Calibrated base projection
+        # =================================================================
+        # 1. CALIBRATED BASE (Foundation - ~60% of score)
+        # =================================================================
+        # This is our best estimate of true scoring ability TODAY
+        # Already accounts for matchup, recent form via projection model
         calibrated_ppg = cal_intercept + cal_slope * row['projected_ppg']
         components['calibrated_base'] = calibrated_ppg
 
-        # 2. Ceiling bonus: reward upside potential
+        # =================================================================
+        # 2. CEILING BONUS (Tournament Edge - up to +8)
+        # =================================================================
+        # High ceiling = high variance = good for tournaments
+        # But we scale by projection to avoid overrating low-volume players
         ceiling_upside = row['proj_ceiling'] - row['projected_ppg']
-        ceiling_bonus = min(ceiling_upside * 0.5, 8.0)  # Cap at +8
+        # Only give full bonus if projection is high enough (20+ PPG)
+        proj_factor = min(row['projected_ppg'] / 25.0, 1.0)  # Scales 0-1 for 0-25 PPG
+        ceiling_bonus = min(ceiling_upside * 0.5 * proj_factor, 8.0)
         components['ceiling_bonus'] = ceiling_bonus
 
-        # 3. Hot streak bonus: L5 vs season average + L3 acceleration
-        hot_bonus = 0.0
-        if row['season_avg_ppg'] and row['season_avg_ppg'] > 0 and row['recent_avg_5']:
-            # Base: L5 vs Season
-            hot_ratio = row['recent_avg_5'] / row['season_avg_ppg']
-            hot_bonus = max(0, (hot_ratio - 1.0) * 30)  # +6 for 20% above season
-            hot_bonus = min(hot_bonus, 6.0)  # Cap at +6
+        # =================================================================
+        # 3. SUSTAINABLE ROLE SCORE (Replaces naive hot streak)
+        # =================================================================
+        # We ONLY reward recent performance if it's sustainable
+        # Key question: Is this player's recent elevated play their TRUE role?
+        role_score = 0.0
 
-            # Acceleration bonus: L3 > L5 means getting hotter
-            if row.get('recent_avg_3') and row['recent_avg_3'] > row['recent_avg_5']:
-                acceleration = (row['recent_avg_3'] / row['recent_avg_5']) - 1.0
-                accel_bonus = min(acceleration * 20, 3.0)  # Up to +3 for accelerating
-                hot_bonus += accel_bonus
-        components['hot_streak_bonus'] = hot_bonus
+        if row['season_avg_ppg'] and row['season_avg_ppg'] > 0:
+            # Check if this player is an injury beneficiary whose boost is ENDING
+            is_injury_beneficiary_today = (
+                row.get('injury_adjusted') and
+                row.get('injury_adjustment_amount') and
+                row['injury_adjustment_amount'] > 0
+            )
 
-        # 4. Minutes/Usage trend bonus: recent opportunity increases
-        minutes_bonus = 0.0
-        confidence = row['proj_confidence'] if row['proj_confidence'] else 0.7
+            # Get recent vs season ratio
+            recent_avg = row.get('recent_avg_5') or row['season_avg_ppg']
+            hot_ratio = recent_avg / row['season_avg_ppg']
 
-        # Base confidence bonus
-        if row['projected_ppg'] > 20:
-            minutes_bonus = confidence * 3  # Stars get up to +3
-        else:
-            minutes_bonus = confidence * 1.5  # Role players get up to +1.5
-        components['minutes_confidence_bonus'] = minutes_bonus
+            if is_injury_beneficiary_today:
+                # Teammate is OUT today - their elevated role continues
+                # Trust the hot streak IF it aligns with injury timeline
+                if hot_ratio > 1.05:
+                    # Recent stats are elevated AND teammate still out = trust it
+                    role_score = min((hot_ratio - 1.0) * 25, 5.0)
+            else:
+                # No injury boost today - be skeptical of elevated recent stats
+                # They might have been filling in for someone who's back
+                if hot_ratio > 1.15:
+                    # Very elevated without injury context = suspicious
+                    # Could be: weak opponents, teammate was out but now back
+                    # Give minimal credit, let projection handle it
+                    role_score = min((hot_ratio - 1.0) * 10, 2.0)
+                elif hot_ratio > 1.05:
+                    # Modestly elevated = could be real improvement
+                    role_score = min((hot_ratio - 1.0) * 15, 2.0)
+                elif hot_ratio < 0.90:
+                    # Cold streak for non-injury-beneficiary = real concern
+                    role_score = max((hot_ratio - 1.0) * 15, -3.0)
 
-        # 5. Injury beneficiary bonus
+        components['role_sustainability'] = role_score
+
+        # =================================================================
+        # 4. TODAY'S MATCHUP QUALITY (up to +5)
+        # =================================================================
+        # Opponent defense rating matters for TODAY, not what happened last week
+        matchup_bonus = 0.0
+        opp_def = row.get('opponent_def_rating')
+        if opp_def:
+            # League average is ~112. Higher = worse defense = bonus
+            if opp_def >= 116:
+                matchup_bonus = 5.0  # Elite matchup (bad defense)
+            elif opp_def >= 114:
+                matchup_bonus = 3.0  # Good matchup
+            elif opp_def >= 112:
+                matchup_bonus = 1.0  # Neutral
+            elif opp_def <= 108:
+                matchup_bonus = -3.0  # Tough matchup (elite defense)
+            elif opp_def <= 110:
+                matchup_bonus = -1.5  # Difficult matchup
+        components['matchup_today'] = matchup_bonus
+
+        # =================================================================
+        # 5. INJURY BENEFICIARY (Only if teammate STILL out - up to +4)
+        # =================================================================
         injury_boost = 0.0
-        if row['injury_adjusted'] and row['injury_adjustment_amount']:
-            injury_boost = min(row['injury_adjustment_amount'] * 0.5, 4.0)
-        if row['opponent_injury_detected'] and row['opponent_injury_boost_projection']:
-            injury_boost += min(row['opponent_injury_boost_projection'] * 10, 3.0)
-        components['injury_beneficiary_bonus'] = injury_boost
+        if row.get('injury_adjusted') and row.get('injury_adjustment_amount'):
+            # Teammate is confirmed OUT today
+            injury_boost = min(row['injury_adjustment_amount'] * 0.4, 4.0)
 
-        # 6. Risk penalty (calculated separately via detect_risk_flags)
+        # Opponent star out = easier scoring
+        if row.get('opponent_injury_detected') and row.get('opponent_injury_boost_projection'):
+            injury_boost += min(row['opponent_injury_boost_projection'] * 8, 2.0)
+
+        components['injury_opportunity'] = injury_boost
+
+        # =================================================================
+        # 6. STAR POWER BONUS (Established scorers - up to +3)
+        # =================================================================
+        # Stars with 25+ season avg are more likely to have big games
+        # They get more shots in close games, clutch situations
+        star_bonus = 0.0
+        if row['season_avg_ppg'] >= 28:
+            star_bonus = 3.0  # Elite star
+        elif row['season_avg_ppg'] >= 25:
+            star_bonus = 2.0  # All-star level
+        elif row['season_avg_ppg'] >= 22:
+            star_bonus = 1.0  # Borderline star
+        components['star_power'] = star_bonus
+
+        # =================================================================
+        # 7. RISK PENALTIES (up to -10)
+        # =================================================================
         risk_penalty = 0.0
+
+        # Questionable/Doubtful = might not play or limited minutes
         if row.get('injury_status') and row['injury_status'] in ('questionable', 'doubtful'):
             risk_penalty += 5.0
+
+        # Blowout risk = stars get benched in 4th quarter
         if row.get('blowout_risk'):
             risk_penalty += 3.0
+
+        # Back-to-back = fatigue, sometimes rest
         if row.get('back_to_back'):
             risk_penalty += 2.0
+
         components['risk_penalty'] = -risk_penalty
 
-        # Total score
+        # =================================================================
+        # TOTAL SCORE
+        # =================================================================
         total = (
-            calibrated_ppg +
-            ceiling_bonus +
-            hot_bonus +
-            minutes_bonus +
-            injury_boost -
-            risk_penalty
+            calibrated_ppg +      # Foundation (~60%)
+            ceiling_bonus +        # Tournament edge (+0-8)
+            role_score +           # Sustainable role (+/- 5)
+            matchup_bonus +        # Today's matchup (+/- 5)
+            injury_boost +         # Opportunity (+0-6)
+            star_bonus +           # Star power (+0-3)
+            risk_penalty           # Risks (-0-10)
         )
 
         return total, components

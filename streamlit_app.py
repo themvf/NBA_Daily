@@ -6698,8 +6698,8 @@ if selected_page == "Tournament Strategy":
                         # Merge TopScorerScore into main dataframe
                         df = df.merge(
                             tss_df[['player_id', 'top_scorer_score', 'calibrated_base', 'ceiling_bonus',
-                                   'hot_streak_bonus', 'minutes_confidence_bonus', 'injury_beneficiary_bonus',
-                                   'risk_penalty']],
+                                   'role_sustainability', 'matchup_today', 'injury_opportunity',
+                                   'star_power', 'risk_penalty']],
                             on='player_id',
                             how='left'
                         )
@@ -6779,9 +6779,10 @@ if selected_page == "Tournament Strategy":
             'p_top3_pct': 'P(Top3)%',
             'calibrated_base': 'Cal Base',
             'ceiling_bonus': 'Ceil+',
-            'hot_streak_bonus': 'Hot+',
-            'minutes_confidence_bonus': 'Min+',
-            'injury_beneficiary_bonus': 'Inj+',
+            'role_sustainability': 'Role',
+            'matchup_today': 'Matchup',
+            'injury_opportunity': 'Opp+',
+            'star_power': 'Star',
             'risk_penalty': 'Risk-'
         })
 
@@ -6821,21 +6822,25 @@ if selected_page == "Tournament Strategy":
             # Add component breakdown in expander - ALWAYS show
             with st.expander("📊 TopScorerScore Formula & Component Breakdown", expanded=True):
                 st.markdown("""
-                **TSS = Calibrated Base + Ceiling Bonus + Hot Streak + Minutes Confidence + Injury Boost - Risk Penalty**
+                **TSS = Cal Base + Ceiling + Role + Matchup + Opportunity + Star Power - Risk**
 
                 | Component | Range | Description |
                 |-----------|-------|-------------|
                 | **Cal Base** | ~15-30 | Calibrated projection (fixes historical over-prediction bias) |
-                | **Ceil+** | 0-8 | Upside bonus: `(Ceiling - Projection) × 0.5`, capped at +8 |
-                | **Hot+** | 0-9 | Hot streak: `(L5/Season - 1) × 30` (up to +6) PLUS acceleration if L3 > L5 (up to +3) |
-                | **Min+** | 0-3 | Minutes confidence: Stars get `conf × 3`, others `conf × 1.5` |
-                | **Inj+** | 0-7 | Injury beneficiary: teammate out (+4 max) or opponent star out (+3 max) |
+                | **Ceil+** | 0-8 | Upside bonus scaled by projection (high ceiling + high volume) |
+                | **Role** | -3 to +5 | **Sustainable role score** - only rewards hot streaks if role is stable |
+                | **Matchup** | -3 to +5 | TODAY's opponent defense (not last week's matchups) |
+                | **Opp+** | 0-6 | Injury opportunity: teammate OUT today (+4) or opponent star out (+2) |
+                | **Star** | 0-3 | Star power bonus: 28+ PPG = +3, 25+ = +2, 22+ = +1 |
                 | **Risk-** | 0 to -10 | Penalties: Questionable (-5), Blowout risk (-3), B2B (-2) |
+
+                ⚠️ **Anti-Chase Logic**: Role score is SKEPTICAL of hot streaks without context.
+                If L5 is elevated but no teammate is currently OUT, we discount it (could be temporary fill-in role).
                 """)
 
                 if 'Cal Base' in display_df.columns:
                     st.markdown("#### Component Values by Player")
-                    component_cols = ['Player', 'TSS', 'Cal Base', 'Ceil+', 'Hot+', 'Min+', 'Inj+', 'Risk-']
+                    component_cols = ['Player', 'TSS', 'Cal Base', 'Ceil+', 'Role', 'Matchup', 'Opp+', 'Star', 'Risk-']
                     available_cols = [c for c in component_cols if c in display_df.columns]
                     # Round component values for display
                     comp_df = display_df[available_cols].head(20).copy()
@@ -6858,21 +6863,25 @@ if selected_page == "Tournament Strategy":
             # Add component breakdown in expander
             with st.expander("📊 TopScorerScore Formula & Component Breakdown", expanded=False):
                 st.markdown("""
-                **TSS = Calibrated Base + Ceiling Bonus + Hot Streak + Minutes Confidence + Injury Boost - Risk Penalty**
+                **TSS = Cal Base + Ceiling + Role + Matchup + Opportunity + Star Power - Risk**
 
                 | Component | Range | Description |
                 |-----------|-------|-------------|
                 | **Cal Base** | ~15-30 | Calibrated projection (fixes historical over-prediction bias) |
-                | **Ceil+** | 0-8 | Upside bonus: `(Ceiling - Projection) × 0.5`, capped at +8 |
-                | **Hot+** | 0-9 | Hot streak: `(L5/Season - 1) × 30` (up to +6) PLUS acceleration if L3 > L5 (up to +3) |
-                | **Min+** | 0-3 | Minutes confidence: Stars get `conf × 3`, others `conf × 1.5` |
-                | **Inj+** | 0-7 | Injury beneficiary: teammate out (+4 max) or opponent star out (+3 max) |
+                | **Ceil+** | 0-8 | Upside bonus scaled by projection (high ceiling + high volume) |
+                | **Role** | -3 to +5 | **Sustainable role score** - only rewards hot streaks if role is stable |
+                | **Matchup** | -3 to +5 | TODAY's opponent defense (not last week's matchups) |
+                | **Opp+** | 0-6 | Injury opportunity: teammate OUT today (+4) or opponent star out (+2) |
+                | **Star** | 0-3 | Star power bonus: 28+ PPG = +3, 25+ = +2, 22+ = +1 |
                 | **Risk-** | 0 to -10 | Penalties: Questionable (-5), Blowout risk (-3), B2B (-2) |
+
+                ⚠️ **Anti-Chase Logic**: Role score is SKEPTICAL of hot streaks without context.
+                If L5 is elevated but no teammate is currently OUT, we discount it (could be temporary fill-in role).
                 """)
 
                 if 'Cal Base' in display_df.columns:
                     st.markdown("#### Component Values by Player")
-                    component_cols = ['Player', 'TSS', 'Cal Base', 'Ceil+', 'Hot+', 'Min+', 'Inj+', 'Risk-']
+                    component_cols = ['Player', 'TSS', 'Cal Base', 'Ceil+', 'Role', 'Matchup', 'Opp+', 'Star', 'Risk-']
                     available_cols = [c for c in component_cols if c in display_df.columns]
                     comp_df = display_df[available_cols].head(20).copy()
                     for col in available_cols:
