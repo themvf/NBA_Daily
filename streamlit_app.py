@@ -6609,6 +6609,9 @@ if selected_page == "Tournament Strategy":
         st.subheader(f"🎯 Ceiling Candidates ({selected_date})")
         st.caption("Players ranked by explosive scoring potential (proj_ceiling)")
 
+        # DEBUG: Early checkpoint
+        st.caption(f"DEBUG EARLY: Starting GPP calculations for {len(df)} players...")
+
         # Calculate Opponent Defense Grade for each player
         def calculate_opp_def_grade_row(row):
             try:
@@ -6681,6 +6684,8 @@ if selected_page == "Tournament Strategy":
             )
         else:
             df['proj_anchor_score'] = 0  # Fallback if all projections are identical
+
+        st.caption(f"DEBUG: GPP calculations complete. df has {len(df)} rows")
 
         # ========== TOP 3 SCORER RANKING INTEGRATION ==========
         # Use the new top3_ranking module for optimized top-3 identification
