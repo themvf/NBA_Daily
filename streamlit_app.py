@@ -1176,7 +1176,8 @@ def _calculate_tournament_dfs_score(
 
     if opp_team_id is not None:
         # Priority 1: Use position-specific PPM ceiling factor (most accurate)
-        if def_ppm_df is not None and player_position and player_position in ['Guard', 'Forward', 'Center'] and conn is not None:
+        # TEMPORARILY DISABLED - causing performance issues with per-player queries
+        if False and def_ppm_df is not None and player_position and player_position in ['Guard', 'Forward', 'Center'] and conn is not None:
             try:
                 # Get team overall PPM for blending
                 opp_def_ppm_row = def_ppm_df[def_ppm_df['team_id'] == opp_team_id]
