@@ -6684,6 +6684,9 @@ if selected_page == "Tournament Strategy":
 
         # ========== TOP 3 SCORER RANKING INTEGRATION ==========
         # Use the new top3_ranking module for optimized top-3 identification
+        # DEBUG: Show dataframe state before ranking integration
+        st.caption(f"DEBUG: {len(df)} players before ranking integration")
+
         if ranking_mode != "GPP Score (Legacy)":
             try:
                 ranker = top3_ranking.Top3Ranker(tourn_conn)
@@ -6718,6 +6721,9 @@ if selected_page == "Tournament Strategy":
                 st.warning(f"⚠️ Top3Ranker error: {rank_error}. Falling back to GPP Score.")
                 ranking_mode = "GPP Score (Legacy)"
 
+        # DEBUG: Show dataframe state after ranking integration
+        st.caption(f"DEBUG: {len(df)} players after ranking integration")
+
         # Apply risk filters if enabled
         if exclude_questionable:
             # Filter out questionable/doubtful players
@@ -6731,6 +6737,9 @@ if selected_page == "Tournament Strategy":
         # Apply confidence filter
         if 'proj_confidence' in df.columns:
             df = df[df['proj_confidence'].fillna(0.7) >= min_confidence]
+            st.caption(f"DEBUG: {len(df)} players after confidence filter (min: {min_confidence})")
+        else:
+            st.caption("DEBUG: proj_confidence column not found, skipping filter")
 
         # Sort by appropriate column based on ranking mode
         if ranking_mode == "TopScorerScore":
@@ -6745,6 +6754,9 @@ if selected_page == "Tournament Strategy":
         else:
             # GPP Score (Legacy) - original behavior
             df = df.sort_values('tourn_score', ascending=False)
+
+        # DEBUG: Show final dataframe state
+        st.caption(f"DEBUG: {len(df)} players after sorting, columns: {list(df.columns)[:10]}...")
 
         # Format display dataframe
         display_df = df.copy()
@@ -6854,56 +6866,66 @@ if selected_page == "Tournament Strategy":
 
         # ========== TOP 3 PICKS HIGHLIGHT ==========
         st.subheader("🏆 Today's Top 3 Picks")
-        top3_df = display_df.head(3)
-        if not top3_df.empty:
-            # Determine score column name based on ranking mode
-            score_col = 'TSS' if 'TSS' in top3_df.columns else 'GPP Score'
-            prob_col = 'P(Top3)%' if 'P(Top3)%' in top3_df.columns else None
 
-            pick_cols = st.columns(3)
-            for idx, (_, player) in enumerate(top3_df.iterrows()):
-                with pick_cols[idx]:
-                    medal = ["🥇", "🥈", "🥉"][idx]
-                    st.markdown(f"### {medal} {player['Player']}")
-                    st.markdown(f"**{player['Team']}** vs {player['Opponent']}")
+        # DEBUG: Show display_df info
+        st.caption(f"DEBUG: display_df has {len(display_df)} rows, columns: {len(display_df.columns)}")
+        st.caption(f"DEBUG: display_columns = {display_columns[:5]}...")
 
-                    # Show key stats
-                    score_display = f"{player[score_col]:.0f}" if pd.notna(player.get(score_col)) else "N/A"
-                    ceiling_display = f"{player['Ceiling']:.1f}" if pd.notna(player.get('Ceiling')) else "N/A"
-                    proj_display = f"{player['Proj PPG']:.1f}" if pd.notna(player.get('Proj PPG')) else "N/A"
+        try:
+            top3_df = display_df.head(3)
+            if not top3_df.empty:
+                # Determine score column name based on ranking mode
+                score_col = 'TSS' if 'TSS' in top3_df.columns else 'GPP Score'
+                prob_col = 'P(Top3)%' if 'P(Top3)%' in top3_df.columns else None
 
-                    if ranking_mode in ["TopScorerScore", "Both"]:
-                        st.metric("TopScorerScore", score_display)
-                    elif ranking_mode == "Simulation P(Top3)":
-                        prob_display = f"{player['P(Top3)%']:.1f}%" if pd.notna(player.get('P(Top3)%')) else "N/A"
-                        st.metric("P(Top 3)", prob_display)
-                    else:
-                        st.metric("GPP Score", score_display)
+                pick_cols = st.columns(3)
+                for idx, (_, player) in enumerate(top3_df.iterrows()):
+                    with pick_cols[idx]:
+                        medal = ["🥇", "🥈", "🥉"][idx]
+                        st.markdown(f"### {medal} {player['Player']}")
+                        st.markdown(f"**{player['Team']}** vs {player['Opponent']}")
 
-                    st.caption(f"Ceiling: {ceiling_display} | Proj: {proj_display}")
+                        # Show key stats
+                        score_display = f"{player[score_col]:.0f}" if pd.notna(player.get(score_col)) else "N/A"
+                        ceiling_display = f"{player['Ceiling']:.1f}" if pd.notna(player.get('Ceiling')) else "N/A"
+                        proj_display = f"{player['Proj PPG']:.1f}" if pd.notna(player.get('Proj PPG')) else "N/A"
 
-            # Show combined stats for the 3 picks
-            combined_ceiling = top3_df['Ceiling'].sum() if 'Ceiling' in top3_df.columns else 0
-            combined_proj = top3_df['Proj PPG'].sum() if 'Proj PPG' in top3_df.columns else 0
+                        if ranking_mode in ["TopScorerScore", "Both"]:
+                            st.metric("TopScorerScore", score_display)
+                        elif ranking_mode == "Simulation P(Top3)":
+                            prob_display = f"{player['P(Top3)%']:.1f}%" if pd.notna(player.get('P(Top3)%')) else "N/A"
+                            st.metric("P(Top 3)", prob_display)
+                        else:
+                            st.metric("GPP Score", score_display)
 
-            st.markdown(f"**Combined Ceiling:** {combined_ceiling:.1f} PPG | **Combined Proj:** {combined_proj:.1f} PPG")
+                        st.caption(f"Ceiling: {ceiling_display} | Proj: {proj_display}")
 
-            if ranking_mode in ["Simulation P(Top3)", "Both"] and prob_col and prob_col in top3_df.columns:
-                # Probability that at least one of our picks is in actual top 3
-                probs = top3_df[prob_col].fillna(0).values / 100
-                p_at_least_one = 1 - np.prod(1 - probs) if len(probs) > 0 else 0
-                st.caption(f"P(≥1 in Top 3): {p_at_least_one * 100:.1f}%")
+                # Show combined stats for the 3 picks
+                combined_ceiling = top3_df['Ceiling'].sum() if 'Ceiling' in top3_df.columns else 0
+                combined_proj = top3_df['Proj PPG'].sum() if 'Proj PPG' in top3_df.columns else 0
 
-        st.divider()
+                st.markdown(f"**Combined Ceiling:** {combined_ceiling:.1f} PPG | **Combined Proj:** {combined_proj:.1f} PPG")
 
-        # Full player table
-        st.subheader("📋 All Ranked Players")
-        st.dataframe(
-            display_df[display_columns],
-            use_container_width=True,
-            hide_index=True,
-            height=400
-        )
+                if ranking_mode in ["Simulation P(Top3)", "Both"] and prob_col and prob_col in top3_df.columns:
+                    # Probability that at least one of our picks is in actual top 3
+                    probs = top3_df[prob_col].fillna(0).values / 100
+                    p_at_least_one = 1 - np.prod(1 - probs) if len(probs) > 0 else 0
+                    st.caption(f"P(≥1 in Top 3): {p_at_least_one * 100:.1f}%")
+
+            st.divider()
+
+            # Full player table
+            st.subheader("📋 All Ranked Players")
+            st.dataframe(
+                display_df[display_columns],
+                use_container_width=True,
+                hide_index=True,
+                height=400
+            )
+        except Exception as display_error:
+            st.error(f"❌ Error displaying players: {display_error}")
+            st.write("display_df columns:", list(display_df.columns) if 'display_df' in dir() else "not defined")
+            st.write("display_columns:", display_columns if 'display_columns' in dir() else "not defined")
 
         # Insight box with updated guide
         st.info("""
