@@ -6612,6 +6612,9 @@ if selected_page == "Tournament Strategy":
         # DEBUG: Early checkpoint
         st.caption(f"DEBUG EARLY: Starting GPP calculations for {len(df)} players...")
 
+        # DEBUG: Step 1 - Opponent Defense Grade
+        st.caption("DEBUG STEP 1: Calculating opponent defense grades...")
+
         # Calculate Opponent Defense Grade for each player
         def calculate_opp_def_grade_row(row):
             try:
@@ -6623,6 +6626,9 @@ if selected_page == "Tournament Strategy":
                 return "C Neutral"
 
         df['opp_def_grade'] = df.apply(calculate_opp_def_grade_row, axis=1)
+
+        # DEBUG: Step 2 - Tournament Score
+        st.caption("DEBUG STEP 2: Calculating tournament scores...")
 
         # Calculate Tournament DFS Score for each player (different from cash game score)
         def calculate_tournament_score_row(row):
@@ -6661,6 +6667,9 @@ if selected_page == "Tournament Strategy":
                 return pd.Series({'tourn_score': 50.0, 'tourn_grade': '✓ Playable', 'tourn_explanation': ''})
 
         df[['tourn_score', 'tourn_grade', 'tourn_explanation']] = df.apply(calculate_tournament_score_row, axis=1)
+
+        # DEBUG: Step 3 - Projection Anchor
+        st.caption("DEBUG STEP 3: Adding projection anchor...")
 
         # ADD PROJECTION ANCHOR (15% weight)
         # Prevents low-projection players from ranking high on ceiling narrative alone
