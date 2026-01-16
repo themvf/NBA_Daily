@@ -6610,11 +6610,6 @@ if selected_page == "Tournament Strategy":
         st.subheader(f"🎯 Ceiling Candidates ({selected_date})")
         st.caption("Players ranked by explosive scoring potential (proj_ceiling)")
 
-        # DEBUG: Early checkpoint
-        st.caption(f"DEBUG EARLY: Starting GPP calculations for {len(df)} players...")
-
-        # DEBUG: Step 1 - Opponent Defense Grade
-        st.caption("DEBUG STEP 1: Calculating opponent defense grades...")
 
         # Calculate Opponent Defense Grade for each player
         def calculate_opp_def_grade_row(row):
@@ -6627,9 +6622,6 @@ if selected_page == "Tournament Strategy":
                 return "C Neutral"
 
         df['opp_def_grade'] = df.apply(calculate_opp_def_grade_row, axis=1)
-
-        # DEBUG: Step 2 - Tournament Score
-        st.caption("DEBUG STEP 2: Calculating tournament scores...")
 
         # Calculate Tournament DFS Score for each player (different from cash game score)
         def calculate_tournament_score_row(row):
@@ -6669,9 +6661,6 @@ if selected_page == "Tournament Strategy":
 
         df[['tourn_score', 'tourn_grade', 'tourn_explanation']] = df.apply(calculate_tournament_score_row, axis=1)
 
-        # DEBUG: Step 3 - Projection Anchor
-        st.caption("DEBUG STEP 3: Adding projection anchor...")
-
         # ADD PROJECTION ANCHOR (15% weight)
         # Prevents low-projection players from ranking high on ceiling narrative alone
         # Formula: (Player Proj - Min Proj) / (Max Proj - Min Proj) × 15
@@ -6695,12 +6684,8 @@ if selected_page == "Tournament Strategy":
         else:
             df['proj_anchor_score'] = 0  # Fallback if all projections are identical
 
-        st.caption(f"DEBUG: GPP calculations complete. df has {len(df)} rows")
-
         # ========== TOP 3 SCORER RANKING INTEGRATION ==========
         # Use the new top3_ranking module for optimized top-3 identification
-        # DEBUG: Show dataframe state before ranking integration
-        st.caption(f"DEBUG: {len(df)} players before ranking integration")
 
         if ranking_mode != "GPP Score (Legacy)":
             try:
@@ -6736,9 +6721,6 @@ if selected_page == "Tournament Strategy":
                 st.warning(f"⚠️ Top3Ranker error: {rank_error}. Falling back to GPP Score.")
                 ranking_mode = "GPP Score (Legacy)"
 
-        # DEBUG: Show dataframe state after ranking integration
-        st.caption(f"DEBUG: {len(df)} players after ranking integration")
-
         # Apply risk filters if enabled
         if exclude_questionable:
             # Filter out questionable/doubtful players
@@ -6752,9 +6734,6 @@ if selected_page == "Tournament Strategy":
         # Apply confidence filter
         if 'proj_confidence' in df.columns:
             df = df[df['proj_confidence'].fillna(0.7) >= min_confidence]
-            st.caption(f"DEBUG: {len(df)} players after confidence filter (min: {min_confidence})")
-        else:
-            st.caption("DEBUG: proj_confidence column not found, skipping filter")
 
         # Sort by appropriate column based on ranking mode
         if ranking_mode == "TopScorerScore":
@@ -6769,9 +6748,6 @@ if selected_page == "Tournament Strategy":
         else:
             # GPP Score (Legacy) - original behavior
             df = df.sort_values('tourn_score', ascending=False)
-
-        # DEBUG: Show final dataframe state
-        st.caption(f"DEBUG: {len(df)} players after sorting, columns: {list(df.columns)[:10]}...")
 
         # Format display dataframe
         display_df = df.copy()
@@ -6842,12 +6818,33 @@ if selected_page == "Tournament Strategy":
                 'Player', 'Pos', 'Team', 'Opponent', 'Ceiling', 'L5 Avg', 'Proj PPG',
                 'TSS', 'GPP Score', 'Opp Def Grade'
             ]
-            # Add component breakdown in expander
-            if 'Cal Base' in display_df.columns:
-                with st.expander("📊 TopScorerScore Component Breakdown", expanded=False):
+            # Add component breakdown in expander - ALWAYS show
+            with st.expander("📊 TopScorerScore Formula & Component Breakdown", expanded=True):
+                st.markdown("""
+                **TSS = Calibrated Base + Ceiling Bonus + Hot Streak + Minutes Confidence + Injury Boost - Risk Penalty**
+
+                | Component | Range | Description |
+                |-----------|-------|-------------|
+                | **Cal Base** | ~15-30 | Calibrated projection (fixes historical over-prediction bias) |
+                | **Ceil+** | 0-8 | Upside bonus: `(Ceiling - Projection) × 0.5`, capped at +8 |
+                | **Hot+** | 0-6 | Hot streak: `(L5/Season - 1) × 30`, capped at +6 |
+                | **Min+** | 0-4 | Minutes confidence: Stars get `conf × 4`, others `conf × 2` |
+                | **Inj+** | 0-7 | Injury beneficiary: teammate out (+4 max) or opponent star out (+3 max) |
+                | **Risk-** | 0 to -10 | Penalties: Questionable (-5), Blowout risk (-3), B2B (-2) |
+                """)
+
+                if 'Cal Base' in display_df.columns:
+                    st.markdown("#### Component Values by Player")
                     component_cols = ['Player', 'TSS', 'Cal Base', 'Ceil+', 'Hot+', 'Min+', 'Inj+', 'Risk-']
                     available_cols = [c for c in component_cols if c in display_df.columns]
-                    st.dataframe(display_df[available_cols].head(20), use_container_width=True, hide_index=True)
+                    # Round component values for display
+                    comp_df = display_df[available_cols].head(20).copy()
+                    for col in available_cols:
+                        if col != 'Player' and col in comp_df.columns:
+                            comp_df[col] = comp_df[col].round(1)
+                    st.dataframe(comp_df, use_container_width=True, hide_index=True)
+                else:
+                    st.warning("Component data not available. TSS columns: " + str([c for c in display_df.columns if 'TSS' in c or 'Cal' in c or 'bonus' in c.lower()]))
         elif ranking_mode == "Simulation P(Top3)":
             base_columns = [
                 'Player', 'Pos', 'Team', 'Opponent', 'Ceiling', 'L5 Avg', 'Proj PPG',
@@ -6859,11 +6856,29 @@ if selected_page == "Tournament Strategy":
                 'TSS', 'P(Top3)%', 'GPP Score', 'Opp Def Grade'
             ]
             # Add component breakdown in expander
-            if 'Cal Base' in display_df.columns:
-                with st.expander("📊 TopScorerScore Component Breakdown", expanded=False):
+            with st.expander("📊 TopScorerScore Formula & Component Breakdown", expanded=False):
+                st.markdown("""
+                **TSS = Calibrated Base + Ceiling Bonus + Hot Streak + Minutes Confidence + Injury Boost - Risk Penalty**
+
+                | Component | Range | Description |
+                |-----------|-------|-------------|
+                | **Cal Base** | ~15-30 | Calibrated projection (fixes historical over-prediction bias) |
+                | **Ceil+** | 0-8 | Upside bonus: `(Ceiling - Projection) × 0.5`, capped at +8 |
+                | **Hot+** | 0-6 | Hot streak: `(L5/Season - 1) × 30`, capped at +6 |
+                | **Min+** | 0-4 | Minutes confidence: Stars get `conf × 4`, others `conf × 2` |
+                | **Inj+** | 0-7 | Injury beneficiary: teammate out (+4 max) or opponent star out (+3 max) |
+                | **Risk-** | 0 to -10 | Penalties: Questionable (-5), Blowout risk (-3), B2B (-2) |
+                """)
+
+                if 'Cal Base' in display_df.columns:
+                    st.markdown("#### Component Values by Player")
                     component_cols = ['Player', 'TSS', 'Cal Base', 'Ceil+', 'Hot+', 'Min+', 'Inj+', 'Risk-']
                     available_cols = [c for c in component_cols if c in display_df.columns]
-                    st.dataframe(display_df[available_cols].head(20), use_container_width=True, hide_index=True)
+                    comp_df = display_df[available_cols].head(20).copy()
+                    for col in available_cols:
+                        if col != 'Player' and col in comp_df.columns:
+                            comp_df[col] = comp_df[col].round(1)
+                    st.dataframe(comp_df, use_container_width=True, hide_index=True)
 
         # Filter to only existing columns
         base_columns = [c for c in base_columns if c in display_df.columns]
@@ -6881,10 +6896,6 @@ if selected_page == "Tournament Strategy":
 
         # ========== TOP 3 PICKS HIGHLIGHT ==========
         st.subheader("🏆 Today's Top 3 Picks")
-
-        # DEBUG: Show display_df info
-        st.caption(f"DEBUG: display_df has {len(display_df)} rows, columns: {len(display_df.columns)}")
-        st.caption(f"DEBUG: display_columns = {display_columns[:5]}...")
 
         try:
             top3_df = display_df.head(3)
