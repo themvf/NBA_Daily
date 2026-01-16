@@ -11,6 +11,7 @@ from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Tuple, Optional
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -32,6 +33,8 @@ import prediction_generator as pg
 import s3_storage
 import ppm_stats
 import position_ppm_stats
+import top3_ranking
+import top3_tracking
 
 DEFAULT_DB_PATH = Path(__file__).with_name("nba_stats.db")
 DEFAULT_PREDICTIONS_PATH = Path(__file__).with_name("predictions.csv")
@@ -6449,6 +6452,38 @@ if selected_page == "Tournament Strategy":
             help="Filter for explosive scoring potential"
         )
 
+    # Top 3 Ranking Mode selector
+    st.divider()
+    st.markdown("### 🎯 Top 3 Scorer Ranking")
+    st.caption("Optimized for picking the daily top 3 scorers")
+
+    rank_col1, rank_col2, rank_col3 = st.columns([1, 1, 1])
+
+    with rank_col1:
+        ranking_mode = st.selectbox(
+            "Ranking Method",
+            options=["GPP Score (Legacy)", "TopScorerScore", "Simulation P(Top3)", "Both"],
+            index=1,
+            help="TopScorerScore: Fast heuristic optimized for top-3 identification. Simulation: Monte Carlo estimation of P(top 3)."
+        )
+
+    with rank_col2:
+        exclude_questionable = st.checkbox(
+            "Exclude Questionable/Doubtful",
+            value=False,
+            help="Filter out players with questionable or doubtful injury status"
+        )
+
+    with rank_col3:
+        min_confidence = st.slider(
+            "Min Confidence",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.5,
+            step=0.1,
+            help="Minimum projection confidence threshold"
+        )
+
     st.divider()
 
     # Query ceiling candidates (include injury data for tournament score bonus)
@@ -6647,8 +6682,69 @@ if selected_page == "Tournament Strategy":
         else:
             df['proj_anchor_score'] = 0  # Fallback if all projections are identical
 
-        # Sort by tournament score (not ceiling) for better tournament prioritization
-        df = df.sort_values('tourn_score', ascending=False)
+        # ========== TOP 3 SCORER RANKING INTEGRATION ==========
+        # Use the new top3_ranking module for optimized top-3 identification
+        if ranking_mode != "GPP Score (Legacy)":
+            try:
+                ranker = top3_ranking.Top3Ranker(tourn_conn)
+
+                # Get rankings based on selected method
+                if ranking_mode in ["TopScorerScore", "Both"]:
+                    tss_df = ranker.rank_by_top_scorer_score(selected_date, include_components=True)
+                    if not tss_df.empty:
+                        # Merge TopScorerScore into main dataframe
+                        df = df.merge(
+                            tss_df[['player_id', 'top_scorer_score', 'calibrated_base', 'ceiling_bonus',
+                                   'hot_streak_bonus', 'minutes_confidence_bonus', 'injury_beneficiary_bonus',
+                                   'risk_penalty']],
+                            on='player_id',
+                            how='left'
+                        )
+                        df['top_scorer_score'] = df['top_scorer_score'].fillna(0)
+
+                if ranking_mode in ["Simulation P(Top3)", "Both"]:
+                    with st.spinner("Running Monte Carlo simulation (10,000 iterations)..."):
+                        sim_df = ranker.simulate_top3_probability(selected_date, n_simulations=10000)
+                    if not sim_df.empty:
+                        df = df.merge(
+                            sim_df[['player_id', 'p_top3', 'p_top3_pct']],
+                            on='player_id',
+                            how='left'
+                        )
+                        df['p_top3'] = df['p_top3'].fillna(0)
+                        df['p_top3_pct'] = df['p_top3_pct'].fillna(0)
+
+            except Exception as rank_error:
+                st.warning(f"⚠️ Top3Ranker error: {rank_error}. Falling back to GPP Score.")
+                ranking_mode = "GPP Score (Legacy)"
+
+        # Apply risk filters if enabled
+        if exclude_questionable:
+            # Filter out questionable/doubtful players
+            df = df[~df['player_id'].isin(
+                pd.read_sql_query(
+                    "SELECT player_id FROM injury_list WHERE status IN ('questionable', 'doubtful')",
+                    tourn_conn
+                )['player_id'].tolist() if tourn_conn else []
+            )]
+
+        # Apply confidence filter
+        if 'proj_confidence' in df.columns:
+            df = df[df['proj_confidence'].fillna(0.7) >= min_confidence]
+
+        # Sort by appropriate column based on ranking mode
+        if ranking_mode == "TopScorerScore":
+            sort_col = 'top_scorer_score' if 'top_scorer_score' in df.columns else 'tourn_score'
+            df = df.sort_values(sort_col, ascending=False)
+        elif ranking_mode == "Simulation P(Top3)":
+            sort_col = 'p_top3' if 'p_top3' in df.columns else 'tourn_score'
+            df = df.sort_values(sort_col, ascending=False)
+        elif ranking_mode == "Both":
+            sort_col = 'top_scorer_score' if 'top_scorer_score' in df.columns else 'tourn_score'
+            df = df.sort_values(sort_col, ascending=False)
+        else:
+            # GPP Score (Legacy) - original behavior
+            df = df.sort_values('tourn_score', ascending=False)
 
         # Format display dataframe
         display_df = df.copy()
@@ -6674,7 +6770,16 @@ if selected_page == "Tournament Strategy":
             'avg_def_ppm': 'Opp Def PPM',
             'def_ppm_grade': 'Opp PPM Grade',
             'ceiling_factor': 'Ceiling Factor',
-            'std_def_ppm': 'PPM StdDev'
+            'std_def_ppm': 'PPM StdDev',
+            # Top3 ranking columns
+            'top_scorer_score': 'TSS',
+            'p_top3_pct': 'P(Top3)%',
+            'calibrated_base': 'Cal Base',
+            'ceiling_bonus': 'Ceil+',
+            'hot_streak_bonus': 'Hot+',
+            'minutes_confidence_bonus': 'Min+',
+            'injury_beneficiary_bonus': 'Inj+',
+            'risk_penalty': 'Risk-'
         })
 
         # Round numeric columns
@@ -6693,12 +6798,48 @@ if selected_page == "Tournament Strategy":
             display_df['Ceiling Factor'] = display_df['Ceiling Factor'].round(3)
         if 'PPM StdDev' in display_df.columns:
             display_df['PPM StdDev'] = display_df['PPM StdDev'].round(3)
+        # Round Top3 ranking columns (if available)
+        if 'TSS' in display_df.columns:
+            display_df['TSS'] = display_df['TSS'].round(1)
+        if 'P(Top3)%' in display_df.columns:
+            display_df['P(Top3)%'] = display_df['P(Top3)%'].round(1)
 
-        # Select and reorder columns for display (include PPM if available)
-        base_columns = [
-            'Player', 'Pos', 'Team', 'Opponent', 'Ceiling', 'L5 Avg', 'Proj PPG',
-            'GPP Score', 'GPP Grade', 'GPP Factors', 'Opp Def Grade'
-        ]
+        # Select and reorder columns for display based on ranking mode
+        if ranking_mode == "GPP Score (Legacy)":
+            base_columns = [
+                'Player', 'Pos', 'Team', 'Opponent', 'Ceiling', 'L5 Avg', 'Proj PPG',
+                'GPP Score', 'GPP Grade', 'GPP Factors', 'Opp Def Grade'
+            ]
+        elif ranking_mode == "TopScorerScore":
+            base_columns = [
+                'Player', 'Pos', 'Team', 'Opponent', 'Ceiling', 'L5 Avg', 'Proj PPG',
+                'TSS', 'GPP Score', 'Opp Def Grade'
+            ]
+            # Add component breakdown in expander
+            if 'Cal Base' in display_df.columns:
+                with st.expander("📊 TopScorerScore Component Breakdown", expanded=False):
+                    component_cols = ['Player', 'TSS', 'Cal Base', 'Ceil+', 'Hot+', 'Min+', 'Inj+', 'Risk-']
+                    available_cols = [c for c in component_cols if c in display_df.columns]
+                    st.dataframe(display_df[available_cols].head(20), use_container_width=True, hide_index=True)
+        elif ranking_mode == "Simulation P(Top3)":
+            base_columns = [
+                'Player', 'Pos', 'Team', 'Opponent', 'Ceiling', 'L5 Avg', 'Proj PPG',
+                'P(Top3)%', 'GPP Score', 'Opp Def Grade'
+            ]
+        else:  # Both
+            base_columns = [
+                'Player', 'Pos', 'Team', 'Opponent', 'Ceiling', 'L5 Avg', 'Proj PPG',
+                'TSS', 'P(Top3)%', 'GPP Score', 'Opp Def Grade'
+            ]
+            # Add component breakdown in expander
+            if 'Cal Base' in display_df.columns:
+                with st.expander("📊 TopScorerScore Component Breakdown", expanded=False):
+                    component_cols = ['Player', 'TSS', 'Cal Base', 'Ceil+', 'Hot+', 'Min+', 'Inj+', 'Risk-']
+                    available_cols = [c for c in component_cols if c in display_df.columns]
+                    st.dataframe(display_df[available_cols].head(20), use_container_width=True, hide_index=True)
+
+        # Filter to only existing columns
+        base_columns = [c for c in base_columns if c in display_df.columns]
 
         # Add PPM columns if they exist
         ppm_columns = []
@@ -6709,7 +6850,54 @@ if selected_page == "Tournament Strategy":
         remaining_columns = ['Opp Def', 'Range', 'Variance']
 
         display_columns = base_columns + ppm_columns + remaining_columns
+        display_columns = [c for c in display_columns if c in display_df.columns]
 
+        # ========== TOP 3 PICKS HIGHLIGHT ==========
+        st.subheader("🏆 Today's Top 3 Picks")
+        top3_df = display_df.head(3)
+        if not top3_df.empty:
+            # Determine score column name based on ranking mode
+            score_col = 'TSS' if 'TSS' in top3_df.columns else 'GPP Score'
+            prob_col = 'P(Top3)%' if 'P(Top3)%' in top3_df.columns else None
+
+            pick_cols = st.columns(3)
+            for idx, (_, player) in enumerate(top3_df.iterrows()):
+                with pick_cols[idx]:
+                    medal = ["🥇", "🥈", "🥉"][idx]
+                    st.markdown(f"### {medal} {player['Player']}")
+                    st.markdown(f"**{player['Team']}** vs {player['Opponent']}")
+
+                    # Show key stats
+                    score_display = f"{player[score_col]:.0f}" if pd.notna(player.get(score_col)) else "N/A"
+                    ceiling_display = f"{player['Ceiling']:.1f}" if pd.notna(player.get('Ceiling')) else "N/A"
+                    proj_display = f"{player['Proj PPG']:.1f}" if pd.notna(player.get('Proj PPG')) else "N/A"
+
+                    if ranking_mode in ["TopScorerScore", "Both"]:
+                        st.metric("TopScorerScore", score_display)
+                    elif ranking_mode == "Simulation P(Top3)":
+                        prob_display = f"{player['P(Top3)%']:.1f}%" if pd.notna(player.get('P(Top3)%')) else "N/A"
+                        st.metric("P(Top 3)", prob_display)
+                    else:
+                        st.metric("GPP Score", score_display)
+
+                    st.caption(f"Ceiling: {ceiling_display} | Proj: {proj_display}")
+
+            # Show combined stats for the 3 picks
+            combined_ceiling = top3_df['Ceiling'].sum() if 'Ceiling' in top3_df.columns else 0
+            combined_proj = top3_df['Proj PPG'].sum() if 'Proj PPG' in top3_df.columns else 0
+
+            st.markdown(f"**Combined Ceiling:** {combined_ceiling:.1f} PPG | **Combined Proj:** {combined_proj:.1f} PPG")
+
+            if ranking_mode in ["Simulation P(Top3)", "Both"] and prob_col and prob_col in top3_df.columns:
+                # Probability that at least one of our picks is in actual top 3
+                probs = top3_df[prob_col].fillna(0).values / 100
+                p_at_least_one = 1 - np.prod(1 - probs) if len(probs) > 0 else 0
+                st.caption(f"P(≥1 in Top 3): {p_at_least_one * 100:.1f}%")
+
+        st.divider()
+
+        # Full player table
+        st.subheader("📋 All Ranked Players")
         st.dataframe(
             display_df[display_columns],
             use_container_width=True,
@@ -6752,6 +6940,84 @@ if selected_page == "Tournament Strategy":
             st.caption("**Opp Def Grade Distribution:**")
             grade_summary = " | ".join([f"{grade}: {count}" for grade, count in grade_counts.head(5).items()])
             st.caption(grade_summary)
+
+        st.divider()
+
+        # ========== TOP-3 PERFORMANCE TRACKING ==========
+        st.subheader("📊 Top-3 Prediction Performance")
+        st.caption("Track how well our top-3 picks perform against actual results")
+
+        try:
+            tracker = top3_tracking.Top3Tracker(tourn_conn)
+
+            # Get performance summary
+            perf_summary = tracker.get_performance_summary(days_back=30)
+
+            if perf_summary.get('total_days', 0) > 0:
+                perf_cols = st.columns(4)
+                with perf_cols[0]:
+                    st.metric(
+                        "Avg Top-3 Recall",
+                        f"{perf_summary['avg_recall']:.2f}/3",
+                        help="Average number of actual top 3 scorers we correctly identified"
+                    )
+                with perf_cols[1]:
+                    st.metric(
+                        "Hit Rate",
+                        f"{perf_summary['hit_rate']:.1f}%",
+                        help="Percentage of days we got at least 1 of the top 3"
+                    )
+                with perf_cols[2]:
+                    st.metric(
+                        "Mean Rank of #1",
+                        f"#{perf_summary['mean_rank_of_1']:.1f}" if perf_summary.get('mean_rank_of_1') else "N/A",
+                        help="Average rank we assigned to the actual top scorer"
+                    )
+                with perf_cols[3]:
+                    st.metric(
+                        "Days Analyzed",
+                        perf_summary['total_days'],
+                        help="Number of days with tracked performance"
+                    )
+
+                # Show daily performance history
+                with st.expander("📈 Daily Performance History", expanded=False):
+                    daily_perf = tracker.get_daily_performance(days_back=30)
+                    if not daily_perf.empty:
+                        st.dataframe(
+                            daily_perf[['game_date', 'actual_top3_names', 'predicted_top3_names',
+                                       'top3_recall', 'actual_1_our_rank', 'method_used']].rename(columns={
+                                'game_date': 'Date',
+                                'actual_top3_names': 'Actual Top 3',
+                                'predicted_top3_names': 'Our Picks',
+                                'top3_recall': 'Correct',
+                                'actual_1_our_rank': '#1 Rank',
+                                'method_used': 'Method'
+                            }),
+                            use_container_width=True,
+                            hide_index=True
+                        )
+                    else:
+                        st.info("No daily performance data available yet.")
+
+                # Backfill button for historical data
+                if st.button("🔄 Backfill Performance Data (Last 30 Days)", key="backfill_perf"):
+                    with st.spinner("Backfilling performance data..."):
+                        method = 'top_scorer_score' if ranking_mode in ['TopScorerScore', 'Both'] else 'simulation'
+                        backfill_result = tracker.backfill_performance(days_back=30, method=method)
+                        st.success(f"Backfilled {backfill_result.get('dates_processed', 0)} days of data!")
+                        st.rerun()
+            else:
+                st.info("📊 No performance data available yet. Click 'Backfill Performance Data' to analyze historical predictions.")
+                if st.button("🔄 Backfill Performance Data (Last 30 Days)", key="backfill_perf_initial"):
+                    with st.spinner("Backfilling performance data..."):
+                        method = 'top_scorer_score' if ranking_mode in ['TopScorerScore', 'Both'] else 'simulation'
+                        backfill_result = tracker.backfill_performance(days_back=30, method=method)
+                        st.success(f"Backfilled {backfill_result.get('dates_processed', 0)} days of data!")
+                        st.rerun()
+
+        except Exception as perf_error:
+            st.warning(f"⚠️ Performance tracking unavailable: {perf_error}")
 
         st.divider()
 
