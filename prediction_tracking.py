@@ -364,13 +364,22 @@ def create_backtest_table(conn: sqlite3.Connection) -> None:
             slate_date TEXT NOT NULL,
             strategy_name TEXT NOT NULL,
 
-            -- Our picks
+            -- Our picks (with diagnostics)
             picked1_id INTEGER,
             picked1_name TEXT,
+            picked1_pts REAL,
+            picked1_finish INTEGER,
+            picked1_pred_rank INTEGER,
             picked2_id INTEGER,
             picked2_name TEXT,
+            picked2_pts REAL,
+            picked2_finish INTEGER,
+            picked2_pred_rank INTEGER,
             picked3_id INTEGER,
             picked3_name TEXT,
+            picked3_pts REAL,
+            picked3_finish INTEGER,
+            picked3_pred_rank INTEGER,
 
             -- Actual top 3
             actual1_id INTEGER,
@@ -391,6 +400,9 @@ def create_backtest_table(conn: sqlite3.Connection) -> None:
             hit_1 INTEGER,
             tie_friendly_overlap INTEGER,
 
+            -- Closeness metrics
+            closest_miss REAL,
+
             -- Ranking quality metrics
             pred_rank_a1 INTEGER,
             pred_rank_a2 INTEGER,
@@ -408,6 +420,26 @@ def create_backtest_table(conn: sqlite3.Connection) -> None:
             UNIQUE(slate_date, strategy_name)
         )
     """)
+
+    # Add columns if they don't exist (for schema upgrades)
+    new_columns = [
+        ('picked1_pts', 'REAL'),
+        ('picked1_finish', 'INTEGER'),
+        ('picked1_pred_rank', 'INTEGER'),
+        ('picked2_pts', 'REAL'),
+        ('picked2_finish', 'INTEGER'),
+        ('picked2_pred_rank', 'INTEGER'),
+        ('picked3_pts', 'REAL'),
+        ('picked3_finish', 'INTEGER'),
+        ('picked3_pred_rank', 'INTEGER'),
+        ('closest_miss', 'REAL'),
+    ]
+
+    for col_name, col_type in new_columns:
+        try:
+            cursor.execute(f"ALTER TABLE backtest_daily_results ADD COLUMN {col_name} {col_type}")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
 
     cursor.execute("""
         CREATE INDEX IF NOT EXISTS idx_backtest_date

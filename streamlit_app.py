@@ -8009,24 +8009,55 @@ if selected_page == "Backtest Analysis":
 
         st.divider()
 
-        # Summary metrics
+        # Summary metrics - Row 1
         st.subheader("📈 Summary Metrics")
         met_cols = st.columns(5)
 
         with met_cols[0]:
-            st.metric("Hit #1 Rate", f"{stats['hit_1_rate']*100:.1f}%",
+            st.metric("Picked Actual #1", f"{stats['hit_1_rate']*100:.1f}%",
                      help="% of slates where we picked the actual top scorer")
         with met_cols[1]:
-            st.metric("Hit Any Rate", f"{stats['hit_any_rate']*100:.1f}%",
+            st.metric("Hit Any (1+)", f"{stats['hit_any_rate']*100:.1f}%",
                      help="% of slates with at least 1 correct pick")
         with met_cols[2]:
             st.metric("Avg Overlap", f"{stats['avg_overlap']:.2f}/3",
                      help="Average correct picks per slate")
         with met_cols[3]:
             st.metric("Avg Rank of #1", f"{stats['avg_rank_a1']:.1f}" if stats.get('avg_rank_a1') else "N/A",
-                     help="How high we ranked the actual top scorer")
+                     help="How high we ranked the actual top scorer (lower is better)")
         with met_cols[4]:
             st.metric("Total Slates", f"{stats['n_slates']}")
+
+        # Summary metrics - Row 2 (closeness metrics)
+        met_cols2 = st.columns(5)
+        with met_cols2[0]:
+            st.metric("Hit 2+", f"{stats['hit_2plus_rate']*100:.1f}%",
+                     help="% of slates with 2 or more correct")
+        with met_cols2[1]:
+            st.metric("Perfect (3/3)", f"{stats['hit_exact_rate']*100:.1f}%",
+                     help="% of slates with all 3 correct")
+        with met_cols2[2]:
+            # Calculate avg closest miss from results
+            if 'closest_miss' in results_df.columns:
+                avg_closest = results_df['closest_miss'].mean()
+                st.metric("Avg Closest Miss", f"{avg_closest:+.1f} pts",
+                         help="How close our best pick was to the #3 threshold (positive = beat it)")
+            else:
+                st.metric("Avg Closest Miss", "N/A")
+        with met_cols2[3]:
+            # Tie-friendly avg
+            if 'tie_friendly_overlap' in results_df.columns:
+                tie_avg = results_df['tie_friendly_overlap'].mean()
+                st.metric("Tie-Friendly Overlap", f"{tie_avg:.2f}/3",
+                         help="Overlap counting all picks that beat the #3 threshold")
+            else:
+                st.metric("Tie-Friendly Overlap", "N/A")
+        with met_cols2[4]:
+            # Close misses (within 5 pts)
+            if 'closest_miss' in results_df.columns:
+                close_misses = ((results_df['closest_miss'] < 0) & (results_df['closest_miss'] >= -5)).sum()
+                st.metric("Close Misses (≤5pts)", f"{close_misses}",
+                         help="Days where our best pick was within 5 pts of making top 3")
 
         # Daily trend chart
         if not results_df.empty:
@@ -8050,28 +8081,138 @@ if selected_page == "Backtest Analysis":
             fig.update_layout(yaxis_range=[0, 3.5])
             st.plotly_chart(fig, use_container_width=True)
 
-            # Daily results table
+            # Daily results table - ENHANCED DIAGNOSTICS
             st.divider()
-            st.subheader("📋 Daily Results")
+            st.subheader("📋 Daily Results - Diagnostic View")
 
-            display_results = results_df[[
-                'slate_date', 'overlap', 'hit_1',
-                'picked1_name', 'picked2_name', 'picked3_name',
-                'actual1_name', 'actual2_name', 'actual3_name',
-                'actual1_points', 'pred_rank_a1'
-            ]].copy()
+            # Sort by date descending for display
+            sorted_results = results_df.sort_values('slate_date', ascending=False)
 
-            display_results.columns = [
-                'Date', 'Overlap', 'Hit #1',
-                'Pick 1', 'Pick 2', 'Pick 3',
-                'Actual #1', 'Actual #2', 'Actual #3',
-                '#1 Points', 'Our Rank of #1'
-            ]
+            for _, row in sorted_results.iterrows():
+                date_str = row['slate_date']
+                overlap = int(row['overlap'])
+                tie_friendly = int(row.get('tie_friendly_overlap', overlap))
+                hit_1 = int(row['hit_1'])
+                closest_miss = row.get('closest_miss', 0)
+                actual_3rd_pts = row.get('actual_3rd_points', 0)
 
-            # Sort by date descending
-            display_results = display_results.sort_values('Date', ascending=False)
+                # Color for overlap
+                overlap_colors = {0: '🔴', 1: '🟡', 2: '🟢', 3: '💚'}
+                overlap_icon = overlap_colors.get(overlap, '⚪')
 
-            st.dataframe(display_results, use_container_width=True, hide_index=True)
+                # Hit #1 indicator
+                hit1_icon = '✅' if hit_1 else '❌'
+
+                # Closeness indicator
+                if closest_miss >= 0:
+                    closeness_text = f"✓ Best pick beat threshold by {closest_miss:.0f}"
+                    closeness_color = "green"
+                elif closest_miss >= -5:
+                    closeness_text = f"Close! Missed by {abs(closest_miss):.0f} pts"
+                    closeness_color = "orange"
+                else:
+                    closeness_text = f"Far off: {abs(closest_miss):.0f} pts short"
+                    closeness_color = "red"
+
+                # Build compact picks display: "Name (pts, #finish)"
+                picks_display = []
+                for i in range(1, 4):
+                    name = row.get(f'picked{i}_name', '')
+                    pts = row.get(f'picked{i}_pts', 0)
+                    finish = row.get(f'picked{i}_finish', 99)
+                    if name:
+                        # Highlight if finished top 3
+                        if finish <= 3:
+                            picks_display.append(f"**{name}** ({pts:.0f}pts, #{finish})")
+                        else:
+                            picks_display.append(f"{name} ({pts:.0f}pts, #{finish})")
+
+                # Build compact actuals display: "Name (pts) - we ranked #X"
+                actuals_display = []
+                for i, rank_key in enumerate(['pred_rank_a1', 'pred_rank_a2', 'pred_rank_a3'], 1):
+                    name = row.get(f'actual{i}_name', '')
+                    pts = row.get(f'actual{i}_points', 0)
+                    our_rank = row.get(rank_key, 99)
+                    if name:
+                        if our_rank <= 3:
+                            actuals_display.append(f"**{name}** ({pts:.0f}pts) - we ranked #{our_rank}")
+                        elif our_rank <= 10:
+                            actuals_display.append(f"{name} ({pts:.0f}pts) - we ranked #{our_rank}")
+                        else:
+                            actuals_display.append(f"{name} ({pts:.0f}pts) - we ranked #{our_rank} ⚠️")
+
+                # Create expandable row for each date
+                with st.expander(f"{overlap_icon} **{date_str}** | Overlap: {overlap}/3 | Picked #1: {hit1_icon} | Threshold: {actual_3rd_pts:.0f}pts", expanded=False):
+                    col1, col2 = st.columns(2)
+
+                    with col1:
+                        st.markdown("**Our Picks** (pts, finish rank):")
+                        for pick in picks_display:
+                            st.markdown(f"  • {pick}")
+
+                        st.markdown(f"**Closeness:** :{closeness_color}[{closeness_text}]")
+                        if tie_friendly != overlap:
+                            st.markdown(f"**Tie-friendly overlap:** {tie_friendly}/3")
+
+                    with col2:
+                        st.markdown("**Actual Top 3** (our predicted rank):")
+                        for actual in actuals_display:
+                            st.markdown(f"  • {actual}")
+
+                    # Drilldown button
+                    if st.button(f"🔍 Full Drilldown", key=f"drill_{date_str}"):
+                        st.session_state[f'drilldown_date'] = date_str
+
+                    # Show drilldown if requested
+                    if st.session_state.get('drilldown_date') == date_str:
+                        st.divider()
+                        st.markdown("#### 🔬 Detailed Analysis")
+
+                        try:
+                            context = backtest_top3.get_drilldown_context(
+                                backtest_conn, date_str, strategy, top_n=15
+                            )
+
+                            drill_col1, drill_col2 = st.columns(2)
+
+                            with drill_col1:
+                                st.markdown("**Our Top 15 Ranked:**")
+                                our_top_df = pd.DataFrame(context['our_top_ranked'])
+                                if not our_top_df.empty:
+                                    our_top_df = our_top_df.rename(columns={
+                                        'rank': 'Rank', 'name': 'Player', 'proj_ppg': 'Proj',
+                                        'actual_pts': 'Actual', 'finish_rank': 'Finish'
+                                    })
+                                    # Highlight top 3 finishers
+                                    st.dataframe(
+                                        our_top_df[['Rank', 'Player', 'Proj', 'Actual', 'Finish']].head(15),
+                                        use_container_width=True, hide_index=True
+                                    )
+
+                            with drill_col2:
+                                st.markdown("**Actual Top 15 Scorers:**")
+                                actual_top_df = pd.DataFrame(context['actual_top_scorers'])
+                                if not actual_top_df.empty:
+                                    actual_top_df = actual_top_df.rename(columns={
+                                        'finish_rank': 'Finish', 'name': 'Player',
+                                        'actual_pts': 'Actual', 'our_pred_rank': 'Our Rank'
+                                    })
+                                    st.dataframe(
+                                        actual_top_df[['Finish', 'Player', 'Actual', 'Our Rank']].head(15),
+                                        use_container_width=True, hide_index=True
+                                    )
+
+                            # Slate stats
+                            slate = context['slate_stats']
+                            st.markdown(f"""
+                            **Slate Stats:** {slate.get('total_players', 0)} players |
+                            Avg: {slate.get('avg_points', 0):.1f} pts |
+                            Max: {slate.get('max_points', 0):.0f} pts |
+                            Top-3 threshold: {slate.get('top3_threshold', 0):.0f} pts
+                            """)
+
+                        except Exception as e:
+                            st.error(f"Drilldown error: {e}")
 
     else:
         # No results yet

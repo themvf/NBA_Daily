@@ -441,20 +441,58 @@ def backtest_date(
     overlap_metrics = score_overlap(picked3, actual_top3, actuals)
     ranking_metrics = score_ranking(preds_ranked, actual_top3)
 
+    # Build actual finish rank lookup (1st, 2nd, ... by actual points)
+    actuals_sorted = break_ties(actuals)
+    actuals_sorted['finish_rank'] = range(1, len(actuals_sorted) + 1)
+    finish_rank_lookup = dict(zip(actuals_sorted['player_id'], actuals_sorted['finish_rank']))
+    actual_pts_lookup = dict(zip(actuals_sorted['player_id'], actuals_sorted['actual_ppg']))
+
+    # Build pred rank lookup
+    pred_rank_lookup = dict(zip(preds_ranked['player_id'], preds_ranked['pred_rank']))
+
+    # Compute diagnostic metrics for each pick
+    pick_diagnostics = []
+    pick_points = []
+    for player_id, player_name in picked3:
+        pts = actual_pts_lookup.get(player_id, 0)
+        finish = finish_rank_lookup.get(player_id, len(actuals) + 1)
+        pred = pred_rank_lookup.get(player_id, len(preds) + 1)
+        pick_diagnostics.append({
+            'pts': pts,
+            'finish': finish,
+            'pred_rank': pred
+        })
+        pick_points.append(pts)
+
+    # Closest miss: how far short was our best pick from the #3 threshold?
+    actual_3rd = actual_top3['actual_3rd_points']
+    closest_miss = max(pick_points) - actual_3rd if pick_points else -999
+
     # Build result row
     result = {
         'slate_date': game_date,
         'strategy_name': strategy,
 
-        # Our picks
+        # Our picks with diagnostics
         'picked1_id': picked3[0][0] if len(picked3) > 0 else None,
         'picked1_name': picked3[0][1] if len(picked3) > 0 else None,
+        'picked1_pts': pick_diagnostics[0]['pts'] if len(pick_diagnostics) > 0 else None,
+        'picked1_finish': pick_diagnostics[0]['finish'] if len(pick_diagnostics) > 0 else None,
+        'picked1_pred_rank': pick_diagnostics[0]['pred_rank'] if len(pick_diagnostics) > 0 else None,
+
         'picked2_id': picked3[1][0] if len(picked3) > 1 else None,
         'picked2_name': picked3[1][1] if len(picked3) > 1 else None,
+        'picked2_pts': pick_diagnostics[1]['pts'] if len(pick_diagnostics) > 1 else None,
+        'picked2_finish': pick_diagnostics[1]['finish'] if len(pick_diagnostics) > 1 else None,
+        'picked2_pred_rank': pick_diagnostics[1]['pred_rank'] if len(pick_diagnostics) > 1 else None,
+
         'picked3_id': picked3[2][0] if len(picked3) > 2 else None,
         'picked3_name': picked3[2][1] if len(picked3) > 2 else None,
+        'picked3_pts': pick_diagnostics[2]['pts'] if len(pick_diagnostics) > 2 else None,
+        'picked3_finish': pick_diagnostics[2]['finish'] if len(pick_diagnostics) > 2 else None,
+        'picked3_pred_rank': pick_diagnostics[2]['pred_rank'] if len(pick_diagnostics) > 2 else None,
 
-        # Actual top 3
+        # Actual top 3 with our predicted ranks
         'actual1_id': actual_top3['top3'][0][0],
         'actual1_name': actual_top3['top3'][0][1],
         'actual1_points': actual_top3['top3'][0][2],
@@ -471,6 +509,9 @@ def backtest_date(
         # Ranking metrics
         **ranking_metrics,
 
+        # Closeness metrics
+        'closest_miss': closest_miss,
+
         # Context
         'n_pred_players': len(preds),
         'actual_3rd_points': actual_top3['actual_3rd_points'],
@@ -478,6 +519,109 @@ def backtest_date(
     }
 
     return result
+
+
+def compute_baseline_overlap(conn: sqlite3.Connection, game_date: str) -> Dict:
+    """
+    Compute baseline overlap for projection_only and ceiling_only strategies.
+
+    Returns dict with baseline overlaps to compare against the main strategy.
+    """
+    baselines = {}
+
+    for baseline_strategy in ['projection_only', 'ceiling_only']:
+        result = backtest_date(conn, game_date, baseline_strategy)
+        if result:
+            baselines[baseline_strategy] = {
+                'overlap': result['overlap'],
+                'tie_friendly_overlap': result['tie_friendly_overlap'],
+                'pred_rank_a1': result['pred_rank_a1']
+            }
+        else:
+            baselines[baseline_strategy] = {
+                'overlap': None,
+                'tie_friendly_overlap': None,
+                'pred_rank_a1': None
+            }
+
+    return baselines
+
+
+def get_drilldown_context(conn: sqlite3.Connection, game_date: str, strategy: str, top_n: int = 15) -> Dict:
+    """
+    Get detailed context for drilldown analysis of a specific date.
+
+    Returns:
+    - our_top_ranked: Our top N ranked players with their predictions
+    - actual_top_scorers: Actual top N scorers with our predicted ranks
+    - slate_stats: Overall slate statistics
+    """
+    if strategy not in STRATEGIES:
+        strategy = 'projection_only'
+
+    ranking_field = STRATEGIES[strategy]['ranking_field']
+
+    # Load data
+    preds = load_predictions(conn, game_date)
+    actuals = load_actuals(conn, game_date)
+
+    if preds.empty or actuals.empty:
+        return {'our_top_ranked': [], 'actual_top_scorers': [], 'slate_stats': {}}
+
+    # Rank predictions
+    preds_ranked = rank_predictions(preds, ranking_field)
+
+    # Build finish rank lookup
+    actuals_sorted = break_ties(actuals)
+    actuals_sorted['finish_rank'] = range(1, len(actuals_sorted) + 1)
+    finish_rank_lookup = dict(zip(actuals_sorted['player_id'], actuals_sorted['finish_rank']))
+    actual_pts_lookup = dict(zip(actuals_sorted['player_id'], actuals_sorted['actual_ppg']))
+
+    # Our top N ranked players
+    our_top = []
+    for _, row in preds_ranked.head(top_n).iterrows():
+        player_id = row['player_id']
+        our_top.append({
+            'rank': int(row['pred_rank']),
+            'name': row['player_name'],
+            'proj_ppg': row.get('projected_ppg', 0),
+            'ceiling': row.get('proj_ceiling', 0),
+            'actual_pts': actual_pts_lookup.get(player_id, 0),
+            'finish_rank': finish_rank_lookup.get(player_id, 999),
+            'p_top3': row.get('p_top3', 0),
+            'p_top1': row.get('p_top1', 0),
+        })
+
+    # Build pred rank lookup
+    pred_rank_lookup = dict(zip(preds_ranked['player_id'], preds_ranked['pred_rank']))
+
+    # Actual top N scorers
+    actual_top = []
+    for _, row in actuals_sorted.head(top_n).iterrows():
+        player_id = row['player_id']
+        pred_row = preds_ranked[preds_ranked['player_id'] == player_id]
+        actual_top.append({
+            'finish_rank': int(row['finish_rank']),
+            'name': row['player_name'],
+            'actual_pts': row['actual_ppg'],
+            'our_pred_rank': int(pred_rank_lookup.get(player_id, len(preds) + 1)),
+            'proj_ppg': pred_row['projected_ppg'].iloc[0] if not pred_row.empty else 0,
+            'ceiling': pred_row['proj_ceiling'].iloc[0] if not pred_row.empty else 0,
+        })
+
+    # Slate stats
+    slate_stats = {
+        'total_players': len(actuals),
+        'avg_points': actuals['actual_ppg'].mean(),
+        'max_points': actuals['actual_ppg'].max(),
+        'top3_threshold': actuals_sorted.iloc[2]['actual_ppg'] if len(actuals_sorted) >= 3 else 0,
+    }
+
+    return {
+        'our_top_ranked': our_top,
+        'actual_top_scorers': actual_top,
+        'slate_stats': slate_stats
+    }
 
 
 def store_result(conn: sqlite3.Connection, result: Dict) -> None:
