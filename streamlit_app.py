@@ -35,6 +35,7 @@ import ppm_stats
 import position_ppm_stats
 import top3_ranking
 import top3_tracking
+import backtest_top3
 
 DEFAULT_DB_PATH = Path(__file__).with_name("nba_stats.db")
 DEFAULT_PREDICTIONS_PATH = Path(__file__).with_name("predictions.csv")
@@ -297,6 +298,7 @@ tab_titles = [
     "Injury Admin",
     "Admin Panel",
     "Tournament Strategy",
+    "Backtest Analysis",
     "FanDuel Compare",
     "Model vs FanDuel",
     "Model Review",
@@ -7860,6 +7862,273 @@ if selected_page == "Tournament Strategy":
                         st.markdown(text)
             else:
                 st.caption("No players selected yet")
+
+# Backtest Analysis tab --------------------------------------------------------
+if selected_page == "Backtest Analysis":
+    st.header("📊 Backtest Analysis - Top 3 Scorer Performance")
+    st.caption("Evaluate how well your ranking strategies identify top 3 daily scorers")
+
+    # Get database connection
+    backtest_conn = get_connection(str(db_path))
+
+    # Ensure backtest table exists
+    pt.create_backtest_table(backtest_conn)
+
+    # Controls row
+    ctrl_col1, ctrl_col2, ctrl_col3 = st.columns([1, 1, 1])
+
+    with ctrl_col1:
+        days_options = {
+            "Last 7 days": 7,
+            "Last 14 days": 14,
+            "Last 30 days": 30,
+            "Last 60 days": 60,
+            "All available": 365
+        }
+        selected_period = st.selectbox(
+            "Date Range",
+            options=list(days_options.keys()),
+            index=2,
+            key="backtest_period"
+        )
+        days_back = days_options[selected_period]
+
+    with ctrl_col2:
+        strategy_options = {
+            "Simulation P(Top-3)": "sim_p_top3",
+            "Simulation P(#1)": "sim_p_first",
+            "TopScorerScore": "top_scorer_score",
+            "Projection Only (baseline)": "projection_only",
+            "Ceiling Only": "ceiling_only"
+        }
+        selected_strategy_name = st.selectbox(
+            "Primary Strategy",
+            options=list(strategy_options.keys()),
+            index=0,
+            key="backtest_strategy"
+        )
+        selected_strategy = strategy_options[selected_strategy_name]
+
+    with ctrl_col3:
+        compare_all = st.checkbox(
+            "Compare All Strategies",
+            value=False,
+            help="Run backtest for all strategies and show comparison"
+        )
+
+    # Date range
+    end_date = datetime.now().strftime('%Y-%m-%d')
+    start_date = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
+
+    # Run backtest button
+    if st.button("🚀 Run Backtest", type="primary", key="run_backtest_btn"):
+        with st.spinner("Running backtest..."):
+            if compare_all:
+                # Run all strategies
+                all_results = {}
+                all_stats = {}
+                for strat_name, strat_key in strategy_options.items():
+                    results_df = backtest_top3.run_backtest(
+                        backtest_conn, start_date, end_date, strat_key,
+                        store_results=True, verbose=False
+                    )
+                    all_results[strat_key] = results_df
+                    all_stats[strat_key] = backtest_top3.compute_summary_stats(results_df)
+
+                # Store in session state
+                st.session_state['backtest_all_results'] = all_results
+                st.session_state['backtest_all_stats'] = all_stats
+                st.session_state['backtest_compare_mode'] = True
+            else:
+                # Single strategy
+                results_df = backtest_top3.run_backtest(
+                    backtest_conn, start_date, end_date, selected_strategy,
+                    store_results=True, verbose=False
+                )
+                stats = backtest_top3.compute_summary_stats(results_df)
+
+                st.session_state['backtest_results'] = results_df
+                st.session_state['backtest_stats'] = stats
+                st.session_state['backtest_strategy'] = selected_strategy
+                st.session_state['backtest_compare_mode'] = False
+
+        st.success("Backtest complete!")
+        st.rerun()
+
+    # Display results if available
+    if st.session_state.get('backtest_compare_mode', False) and 'backtest_all_stats' in st.session_state:
+        # Comparison mode
+        all_stats = st.session_state['backtest_all_stats']
+        all_results = st.session_state['backtest_all_results']
+
+        st.divider()
+        st.subheader("📊 Strategy Comparison")
+
+        # Build comparison dataframe
+        comparison_data = []
+        for strat_key, stats in all_stats.items():
+            strat_display = [k for k, v in strategy_options.items() if v == strat_key][0]
+            comparison_data.append({
+                'Strategy': strat_display,
+                'Slates': stats['n_slates'],
+                'Hit #1': f"{stats['hit_1_rate']*100:.1f}%",
+                'Hit Any': f"{stats['hit_any_rate']*100:.1f}%",
+                'Hit 2+': f"{stats['hit_2plus_rate']*100:.1f}%",
+                'Overlap': f"{stats['avg_overlap']:.2f}/3",
+                'Avg Rank #1': f"{stats['avg_rank_a1']:.1f}" if stats.get('avg_rank_a1') else "N/A"
+            })
+
+        # Sort by overlap descending
+        comparison_df = pd.DataFrame(comparison_data)
+        comparison_df['_overlap_val'] = [all_stats[strategy_options[row['Strategy']]]['avg_overlap'] for _, row in comparison_df.iterrows()]
+        comparison_df = comparison_df.sort_values('_overlap_val', ascending=False).drop(columns=['_overlap_val'])
+
+        st.dataframe(comparison_df, use_container_width=True, hide_index=True)
+
+        # Bar chart comparison
+        import plotly.express as px
+
+        chart_data = pd.DataFrame([
+            {'Strategy': [k for k, v in strategy_options.items() if v == strat_key][0],
+             'Avg Overlap': stats['avg_overlap'],
+             'Hit #1 Rate': stats['hit_1_rate'] * 100}
+            for strat_key, stats in all_stats.items()
+        ]).sort_values('Avg Overlap', ascending=False)
+
+        fig = px.bar(chart_data, x='Strategy', y='Avg Overlap',
+                     title='Average Overlap by Strategy (higher is better)',
+                     color='Avg Overlap', color_continuous_scale='Greens')
+        fig.update_layout(showlegend=False)
+        st.plotly_chart(fig, use_container_width=True)
+
+    elif 'backtest_stats' in st.session_state:
+        # Single strategy mode
+        stats = st.session_state['backtest_stats']
+        results_df = st.session_state['backtest_results']
+        strategy = st.session_state['backtest_strategy']
+
+        st.divider()
+
+        # Summary metrics
+        st.subheader("📈 Summary Metrics")
+        met_cols = st.columns(5)
+
+        with met_cols[0]:
+            st.metric("Hit #1 Rate", f"{stats['hit_1_rate']*100:.1f}%",
+                     help="% of slates where we picked the actual top scorer")
+        with met_cols[1]:
+            st.metric("Hit Any Rate", f"{stats['hit_any_rate']*100:.1f}%",
+                     help="% of slates with at least 1 correct pick")
+        with met_cols[2]:
+            st.metric("Avg Overlap", f"{stats['avg_overlap']:.2f}/3",
+                     help="Average correct picks per slate")
+        with met_cols[3]:
+            st.metric("Avg Rank of #1", f"{stats['avg_rank_a1']:.1f}" if stats.get('avg_rank_a1') else "N/A",
+                     help="How high we ranked the actual top scorer")
+        with met_cols[4]:
+            st.metric("Total Slates", f"{stats['n_slates']}")
+
+        # Daily trend chart
+        if not results_df.empty:
+            st.divider()
+            st.subheader("📈 Daily Overlap Trend")
+
+            import plotly.express as px
+
+            trend_df = results_df[['slate_date', 'overlap']].copy()
+            trend_df['slate_date'] = pd.to_datetime(trend_df['slate_date'])
+            trend_df = trend_df.sort_values('slate_date')
+
+            # Color mapping for overlap
+            color_map = {0: '#FF4444', 1: '#FFAA00', 2: '#88CC88', 3: '#22AA22'}
+            trend_df['color'] = trend_df['overlap'].map(color_map)
+
+            fig = px.bar(trend_df, x='slate_date', y='overlap',
+                        title='Daily Overlap (0-3)',
+                        labels={'slate_date': 'Date', 'overlap': 'Overlap'})
+            fig.update_traces(marker_color=trend_df['color'].tolist())
+            fig.update_layout(yaxis_range=[0, 3.5])
+            st.plotly_chart(fig, use_container_width=True)
+
+            # Daily results table
+            st.divider()
+            st.subheader("📋 Daily Results")
+
+            display_results = results_df[[
+                'slate_date', 'overlap', 'hit_1',
+                'picked1_name', 'picked2_name', 'picked3_name',
+                'actual1_name', 'actual2_name', 'actual3_name',
+                'actual1_points', 'pred_rank_a1'
+            ]].copy()
+
+            display_results.columns = [
+                'Date', 'Overlap', 'Hit #1',
+                'Pick 1', 'Pick 2', 'Pick 3',
+                'Actual #1', 'Actual #2', 'Actual #3',
+                '#1 Points', 'Our Rank of #1'
+            ]
+
+            # Sort by date descending
+            display_results = display_results.sort_values('Date', ascending=False)
+
+            st.dataframe(display_results, use_container_width=True, hide_index=True)
+
+    else:
+        # No results yet
+        st.info("👆 Select your settings and click 'Run Backtest' to analyze strategy performance.")
+
+        # Show available data info
+        try:
+            available_dates = backtest_top3.get_available_dates(backtest_conn)
+            if available_dates:
+                st.markdown(f"""
+                **Data Available:**
+                - Dates with actual results: **{len(available_dates)}**
+                - Date range: **{min(available_dates)}** to **{max(available_dates)}**
+                """)
+            else:
+                st.warning("No predictions with actual results found. Run predictions and wait for games to complete.")
+        except Exception as e:
+            st.error(f"Error checking data: {e}")
+
+    # Explanation expander
+    with st.expander("ℹ️ How Backtest Metrics Work", expanded=False):
+        st.markdown("""
+        ### Overlap Metrics (Tournament-Style)
+
+        | Metric | Description |
+        |--------|-------------|
+        | **Overlap** | How many of our 3 picks were in the actual top 3 (0-3) |
+        | **Hit #1** | Did we pick the actual top scorer? |
+        | **Hit Any** | Did we get at least 1 correct? |
+        | **Hit 2+** | Did we get 2 or more correct? |
+
+        ### Ranking Quality Metrics
+
+        | Metric | Description |
+        |--------|-------------|
+        | **Rank of #1** | What rank did we give the actual top scorer? Lower is better. |
+        | **Avg Rank Top 3** | Average rank we gave to the actual top 3 scorers |
+
+        ### Strategy Definitions
+
+        | Strategy | Ranking By |
+        |----------|------------|
+        | **Simulation P(Top-3)** | Monte Carlo probability of finishing top 3 |
+        | **Simulation P(#1)** | Monte Carlo probability of being #1 scorer |
+        | **TopScorerScore** | Heuristic combining projection, ceiling, matchup |
+        | **Projection Only** | Raw projected points (baseline) |
+        | **Ceiling Only** | Scoring ceiling (max upside) |
+
+        ### Tie Handling
+
+        When multiple players tie at the #3 spot, we use deterministic tie-breaking:
+        1. Higher points wins
+        2. Lower player_id breaks remaining ties
+
+        **Tie-Friendly Overlap** counts picks that scored ≥ the #3 threshold,
+        avoiding false negatives when ties exist.
+        """)
 
 # FanDuel Compare tab --------------------------------------------------------
 if selected_page == "FanDuel Compare":

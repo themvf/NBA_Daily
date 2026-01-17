@@ -354,6 +354,74 @@ def upgrade_predictions_table_for_minutes(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def create_backtest_table(conn: sqlite3.Connection) -> None:
+    """Create backtest_daily_results table for storing backtest metrics."""
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS backtest_daily_results (
+            result_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slate_date TEXT NOT NULL,
+            strategy_name TEXT NOT NULL,
+
+            -- Our picks
+            picked1_id INTEGER,
+            picked1_name TEXT,
+            picked2_id INTEGER,
+            picked2_name TEXT,
+            picked3_id INTEGER,
+            picked3_name TEXT,
+
+            -- Actual top 3
+            actual1_id INTEGER,
+            actual1_name TEXT,
+            actual1_points REAL,
+            actual2_id INTEGER,
+            actual2_name TEXT,
+            actual2_points REAL,
+            actual3_id INTEGER,
+            actual3_name TEXT,
+            actual3_points REAL,
+
+            -- Overlap metrics (tournament-style)
+            overlap INTEGER,
+            hit_any INTEGER,
+            hit_2plus INTEGER,
+            hit_exact INTEGER,
+            hit_1 INTEGER,
+            tie_friendly_overlap INTEGER,
+
+            -- Ranking quality metrics
+            pred_rank_a1 INTEGER,
+            pred_rank_a2 INTEGER,
+            pred_rank_a3 INTEGER,
+            avg_rank_actual_top3 REAL,
+            best_rank_actual_top3 INTEGER,
+
+            -- Context
+            n_pred_players INTEGER,
+            actual_3rd_points REAL,
+            ties_at_3rd INTEGER,
+
+            created_at TEXT DEFAULT (datetime('now')),
+
+            UNIQUE(slate_date, strategy_name)
+        )
+    """)
+
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_backtest_date
+        ON backtest_daily_results(slate_date)
+    """)
+
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_backtest_strategy
+        ON backtest_daily_results(strategy_name)
+    """)
+
+    conn.commit()
+
+
 def calculate_fanduel_comparison_metrics(conn: sqlite3.Connection, game_date: Optional[str] = None) -> int:
     """
     Calculate FanDuel comparison metrics for predictions with actuals.
