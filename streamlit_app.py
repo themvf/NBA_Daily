@@ -8093,8 +8093,14 @@ if selected_page == "Backtest Analysis":
                 overlap = int(row['overlap'])
                 tie_friendly = int(row.get('tie_friendly_overlap', overlap))
                 hit_1 = int(row['hit_1'])
-                closest_miss = row.get('closest_miss', 0)
-                actual_3rd_pts = row.get('actual_3rd_points', 0)
+                closest_miss = row.get('closest_miss', 0) or 0
+                actual_3rd_pts = row.get('actual_3rd_points', 0) or 0
+                actual_1st_pts = row.get('actual1_points', 0) or 0
+                ties_at_3rd = row.get('ties_at_3rd', 0)
+
+                # Get best pick points for closeness display
+                pick_pts_list = [row.get(f'picked{i}_pts', 0) or 0 for i in range(1, 4)]
+                best_pick_pts = max(pick_pts_list) if pick_pts_list else 0
 
                 # Color for overlap
                 overlap_colors = {0: '🔴', 1: '🟡', 2: '🟢', 3: '💚'}
@@ -8103,63 +8109,147 @@ if selected_page == "Backtest Analysis":
                 # Hit #1 indicator
                 hit1_icon = '✅' if hit_1 else '❌'
 
-                # Closeness indicator
-                if closest_miss >= 0:
-                    closeness_text = f"✓ Best pick beat threshold by {closest_miss:.0f}"
-                    closeness_color = "green"
-                elif closest_miss >= -5:
-                    closeness_text = f"Close! Missed by {abs(closest_miss):.0f} pts"
-                    closeness_color = "orange"
-                else:
-                    closeness_text = f"Far off: {abs(closest_miss):.0f} pts short"
-                    closeness_color = "red"
+                # Get ranking metrics for diagnosis
+                pred_rank_a1 = row.get('pred_rank_a1', 99) or 99
+                pred_rank_a2 = row.get('pred_rank_a2', 99) or 99
+                pred_rank_a3 = row.get('pred_rank_a3', 99) or 99
+                best_actual_rank = min(pred_rank_a1, pred_rank_a2, pred_rank_a3)
 
-                # Build compact picks display: "Name (pts, #finish)"
+                # Determine diagnosis: ranking vs selection failure
+                if overlap == 3:
+                    diagnosis = "✅ Perfect: All 3 correct!"
+                    diagnosis_color = "green"
+                elif overlap >= 1:
+                    diagnosis = f"Partial hit ({overlap}/3)"
+                    diagnosis_color = "blue"
+                elif best_actual_rank <= 5:
+                    # We ranked at least one actual top-3 player highly, but picked others
+                    diagnosis = f"❌ Selection failure (actual #1 ranked #{pred_rank_a1}, but we picked others)"
+                    diagnosis_color = "orange"
+                else:
+                    # We didn't rank the actual top scorers highly at all
+                    diagnosis = f"❌ Ranking failure (actual #1 ranked #{pred_rank_a1})"
+                    diagnosis_color = "red"
+
+                # Build compact picks display with prediction metric
                 picks_display = []
                 for i in range(1, 4):
                     name = row.get(f'picked{i}_name', '')
                     pts = row.get(f'picked{i}_pts', 0) or 0
                     finish = row.get(f'picked{i}_finish', 99) or 99
+                    pred_rank = row.get(f'picked{i}_pred_rank', i) or i
                     if name:
                         # Check if player didn't play (no actual data)
                         if finish >= 99 or (pts == 0 and finish > 50):
-                            picks_display.append(f"~~{name}~~ (DNP)")
+                            picks_display.append(f"~~{name}~~ (DNP) — ranked #{pred_rank}")
                         elif finish <= 3:
-                            picks_display.append(f"**{name}** ({pts:.0f}pts, #{finish})")
+                            picks_display.append(f"**{name}** ({pts:.0f}pts, #{finish}) — ranked #{pred_rank}")
                         else:
-                            picks_display.append(f"{name} ({pts:.0f}pts, #{finish})")
+                            picks_display.append(f"{name} ({pts:.0f}pts, #{finish}) — ranked #{pred_rank}")
 
-                # Build compact actuals display: "Name (pts) - we ranked #X"
+                # Build compact actuals display with proper warning icons
                 actuals_display = []
                 for i, rank_key in enumerate(['pred_rank_a1', 'pred_rank_a2', 'pred_rank_a3'], 1):
                     name = row.get(f'actual{i}_name', '')
-                    pts = row.get(f'actual{i}_points', 0)
-                    our_rank = row.get(rank_key, 99)
+                    pts = row.get(f'actual{i}_points', 0) or 0
+                    our_rank = row.get(rank_key, 99) or 99
                     if name:
+                        # Proper warning thresholds: ≤10 ✅, 11-25 ⚠️, >25 🔴
                         if our_rank <= 3:
-                            actuals_display.append(f"**{name}** ({pts:.0f}pts) - we ranked #{our_rank}")
+                            icon = "✅"
+                            actuals_display.append(f"**{name}** ({pts:.0f}pts) — we ranked #{our_rank} {icon}")
                         elif our_rank <= 10:
-                            actuals_display.append(f"{name} ({pts:.0f}pts) - we ranked #{our_rank}")
+                            icon = "✅"
+                            actuals_display.append(f"{name} ({pts:.0f}pts) — we ranked #{our_rank} {icon}")
+                        elif our_rank <= 25:
+                            icon = "⚠️"
+                            actuals_display.append(f"{name} ({pts:.0f}pts) — we ranked #{our_rank} {icon}")
                         else:
-                            actuals_display.append(f"{name} ({pts:.0f}pts) - we ranked #{our_rank} ⚠️")
+                            icon = "🔴"
+                            actuals_display.append(f"{name} ({pts:.0f}pts) — we ranked #{our_rank} {icon}")
 
-                # Create expandable row for each date
-                with st.expander(f"{overlap_icon} **{date_str}** | Overlap: {overlap}/3 | Picked #1: {hit1_icon} | Threshold: {actual_3rd_pts:.0f}pts", expanded=False):
+                # Build model's top 5 for context
+                model_top5 = []
+                for i in range(1, 4):
+                    name = row.get(f'picked{i}_name', '')
+                    if name:
+                        model_top5.append(name.split()[-1])  # Last name only for brevity
+
+                # Cutoff label with tie info
+                cutoff_label = f"{actual_3rd_pts:.0f}"
+                if ties_at_3rd:
+                    cutoff_label += " (tie)"
+
+                # Create expandable row with enhanced header
+                header = f"{overlap_icon} **{date_str}** | Overlap: {overlap}/3 | #1: {hit1_icon} | Cutoff: {cutoff_label}pts"
+
+                with st.expander(header, expanded=False):
+                    # Diagnosis badge at top
+                    st.markdown(f"**Diagnosis:** :{diagnosis_color}[{diagnosis}]")
+
                     col1, col2 = st.columns(2)
 
                     with col1:
-                        st.markdown("**Our Picks** (pts, finish rank):")
+                        st.markdown("**Our Picks** (actual pts, finish):")
                         for pick in picks_display:
                             st.markdown(f"  • {pick}")
 
-                        st.markdown(f"**Closeness:** :{closeness_color}[{closeness_text}]")
+                        # Enhanced closeness display
+                        st.markdown("---")
+                        st.markdown("**Closeness Analysis:**")
+                        st.markdown(f"  • Best pick scored: **{best_pick_pts:.0f}** pts")
+                        st.markdown(f"  • Top-3 cutoff: **{actual_3rd_pts:.0f}** pts")
+                        if closest_miss >= 0:
+                            st.markdown(f"  • Result: :green[✅ Beat cutoff by {closest_miss:.0f} pts]")
+                        elif closest_miss >= -5:
+                            st.markdown(f"  • Result: :orange[⚠️ Missed by {abs(closest_miss):.0f} pts (close!)]")
+                        else:
+                            st.markdown(f"  • Result: :red[❌ Short by {abs(closest_miss):.0f} pts]")
+
                         if tie_friendly != overlap:
-                            st.markdown(f"**Tie-friendly overlap:** {tie_friendly}/3")
+                            st.markdown(f"  • Tie-friendly overlap: {tie_friendly}/3")
 
                     with col2:
                         st.markdown("**Actual Top 3** (our predicted rank):")
                         for actual in actuals_display:
                             st.markdown(f"  • {actual}")
+
+                        # Show #1 vs cutoff spread
+                        st.markdown("---")
+                        st.markdown("**Scoring Context:**")
+                        st.markdown(f"  • #1 scored: **{actual_1st_pts:.0f}** pts")
+                        st.markdown(f"  • #3 cutoff: **{actual_3rd_pts:.0f}** pts")
+                        spread = actual_1st_pts - actual_3rd_pts
+                        st.markdown(f"  • Top-3 spread: {spread:.0f} pts")
+
+                    # Model Top 5 quick context (always shown)
+                    st.markdown("---")
+                    top5_names = []
+                    for i in range(1, 4):
+                        name = row.get(f'picked{i}_name', '')
+                        if name:
+                            top5_names.append(name.split()[-1])  # Last name for brevity
+                    if top5_names:
+                        st.markdown(f"**Model's picks:** {', '.join(top5_names)}")
+
+                    # Baseline comparison
+                    try:
+                        baselines = backtest_top3.compute_baseline_overlap(backtest_conn, date_str)
+                        proj_overlap = baselines.get('projection_only', {}).get('overlap', '?')
+                        ceil_overlap = baselines.get('ceiling_only', {}).get('overlap', '?')
+                        if proj_overlap is not None and ceil_overlap is not None:
+                            comparison_text = f"vs Projection: {proj_overlap}/3 | vs Ceiling: {ceil_overlap}/3"
+                            # Show if we beat baselines
+                            beat_proj = overlap > proj_overlap if proj_overlap is not None else False
+                            beat_ceil = overlap > ceil_overlap if ceil_overlap is not None else False
+                            if beat_proj and beat_ceil:
+                                st.markdown(f"**Baseline comparison:** :green[{comparison_text}] ✅ beat both")
+                            elif beat_proj or beat_ceil:
+                                st.markdown(f"**Baseline comparison:** :blue[{comparison_text}]")
+                            else:
+                                st.markdown(f"**Baseline comparison:** :gray[{comparison_text}]")
+                    except Exception:
+                        pass  # Baseline comparison is optional
 
                     # Drilldown button
                     if st.button(f"🔍 Full Drilldown", key=f"drill_{date_str}"):
@@ -8175,6 +8265,17 @@ if selected_page == "Backtest Analysis":
                                 backtest_conn, date_str, strategy, top_n=15
                             )
 
+                            # Model's Top 5 ranked context
+                            our_top = context.get('our_top_ranked', [])[:5]
+                            if our_top:
+                                top5_summary = []
+                                for p in our_top:
+                                    name = p.get('name', '?').split()[-1]
+                                    finish = p.get('finish_rank', 999)
+                                    finish_str = f"#{finish}" if finish < 100 else "DNP"
+                                    top5_summary.append(f"{name}({finish_str})")
+                                st.markdown(f"**Model's Top 5:** {' | '.join(top5_summary)}")
+
                             drill_col1, drill_col2 = st.columns(2)
 
                             with drill_col1:
@@ -8185,7 +8286,6 @@ if selected_page == "Backtest Analysis":
                                         'rank': 'Rank', 'name': 'Player', 'proj_ppg': 'Proj',
                                         'actual_pts': 'Actual', 'finish_rank': 'Finish'
                                     })
-                                    # Highlight top 3 finishers
                                     st.dataframe(
                                         our_top_df[['Rank', 'Player', 'Proj', 'Actual', 'Finish']].head(15),
                                         use_container_width=True, hide_index=True
@@ -8210,7 +8310,7 @@ if selected_page == "Backtest Analysis":
                             **Slate Stats:** {slate.get('total_players', 0)} players |
                             Avg: {slate.get('avg_points', 0):.1f} pts |
                             Max: {slate.get('max_points', 0):.0f} pts |
-                            Top-3 threshold: {slate.get('top3_threshold', 0):.0f} pts
+                            Top-3 cutoff: {slate.get('top3_threshold', 0):.0f} pts
                             """)
 
                         except Exception as e:
