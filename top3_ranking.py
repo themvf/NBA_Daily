@@ -194,16 +194,22 @@ class Top3Ranker:
 
         Philosophy: Focus on SUSTAINABLE factors, not chasing misleading hot streaks.
 
-        Key principles:
-        1. Calibrated projection is the foundation (fixes historical bias)
-        2. Ceiling matters for tournaments (high variance = good)
-        3. Only trust "hot streaks" if the role is SUSTAINABLE
-        4. TODAY's matchup matters more than last week's opponents
-        5. Injury beneficiary bonus only if teammate is STILL out
+        Priority order (most to least important):
+        1. Calibrated projection - foundation (~60% of score)
+        2. Ceiling/upside - tournament edge
+        3. Today's matchup quality - what matters NOW
+        4. Role sustainability - GATED hot streak (ValidityFactor pattern)
+        5. Star power - established scorers are more reliable
 
         Returns:
             Tuple of (score, component_breakdown)
         """
+        # Convert to dict for safe .get() access (sqlite3.Row doesn't always support .get())
+        if hasattr(row, 'to_dict'):
+            row = row.to_dict()
+        else:
+            row = dict(row)
+
         components = {}
 
         # =================================================================
@@ -226,46 +232,66 @@ class Top3Ranker:
         components['ceiling_bonus'] = ceiling_bonus
 
         # =================================================================
-        # 3. SUSTAINABLE ROLE SCORE (Replaces naive hot streak)
+        # 3. SUSTAINABLE ROLE SCORE (ValidityFactor pattern)
         # =================================================================
-        # We ONLY reward recent performance if it's sustainable
-        # Key question: Is this player's recent elevated play their TRUE role?
+        # Formula: RoleScore = RawHotBonus * ValidityFactor
+        # ValidityFactor (0-1) crushes fake streaks
+        #
+        # Key insight: Don't add hot bonuses conditionally - multiply by validity
+        # This prevents noise from competing with ceiling/matchup
         role_score = 0.0
 
-        if row['season_avg_ppg'] and row['season_avg_ppg'] > 0:
-            # Check if this player is an injury beneficiary whose boost is ENDING
+        season_avg = row.get('season_avg_ppg') or 0
+        if season_avg > 0:
+            # Calculate raw hot bonus (what we WOULD give if trend is valid)
+            recent_avg = row.get('recent_avg_5') or season_avg
+            hot_ratio = recent_avg / season_avg
+
+            # Raw bonus: +4 max for 20%+ above season (before validity gate)
+            if hot_ratio > 1.05:
+                raw_hot_bonus = min((hot_ratio - 1.0) * 20, 4.0)  # Cap at +4
+            elif hot_ratio < 0.90:
+                raw_hot_bonus = max((hot_ratio - 1.0) * 15, -3.0)  # Cold penalty
+            else:
+                raw_hot_bonus = 0.0
+
+            # =============================================================
+            # VALIDITY FACTOR (0.0 to 1.0) - gates the hot bonus
+            # =============================================================
+            validity_factor = 1.0  # Start at full validity
+
+            # Check 1: STAR RETURNS DISCOUNT (most important)
+            # If player's recent spike was during teammate absence, but teammate is back
             is_injury_beneficiary_today = (
                 row.get('injury_adjusted') and
                 row.get('injury_adjustment_amount') and
-                row['injury_adjustment_amount'] > 0
+                row.get('injury_adjustment_amount') > 0
             )
 
-            # Get recent vs season ratio
-            recent_avg = row.get('recent_avg_5') or row['season_avg_ppg']
-            hot_ratio = recent_avg / row['season_avg_ppg']
+            # If elevated stats but NO injury boost today = role likely contracting
+            if hot_ratio > 1.10 and not is_injury_beneficiary_today:
+                # Spike without ongoing injury context = very suspicious
+                # Star teammate might have been out, now back
+                validity_factor *= 0.25  # Crush to 25%
 
-            if is_injury_beneficiary_today:
-                # Teammate is OUT today - their elevated role continues
-                # Trust the hot streak IF it aligns with injury timeline
-                if hot_ratio > 1.05:
-                    # Recent stats are elevated AND teammate still out = trust it
-                    role_score = min((hot_ratio - 1.0) * 25, 5.0)
-            else:
-                # No injury boost today - be skeptical of elevated recent stats
-                # They might have been filling in for someone who's back
-                if hot_ratio > 1.15:
-                    # Very elevated without injury context = suspicious
-                    # Could be: weak opponents, teammate was out but now back
-                    # Give minimal credit, let projection handle it
-                    role_score = min((hot_ratio - 1.0) * 10, 2.0)
-                elif hot_ratio > 1.05:
-                    # Modestly elevated = could be real improvement
-                    role_score = min((hot_ratio - 1.0) * 15, 2.0)
-                elif hot_ratio < 0.90:
-                    # Cold streak for non-injury-beneficiary = real concern
-                    role_score = max((hot_ratio - 1.0) * 15, -3.0)
+            # Check 2: MINUTES STABILITY
+            # Only trust hot streaks if minutes support it
+            # Note: We don't have L5 minutes in current schema, so we use
+            # proj_confidence as a proxy (high confidence = stable minutes expectation)
+            proj_confidence = row.get('proj_confidence') or 0.5
+            if proj_confidence < 0.6 and hot_ratio > 1.10:
+                # Low confidence in minutes + elevated stats = suspect
+                validity_factor *= 0.5
 
-        components['role_sustainability'] = role_score
+            # Check 3: IF injury boost IS active, trust the streak more
+            if is_injury_beneficiary_today and hot_ratio > 1.05:
+                # Teammate still out, recent play elevated = makes sense
+                validity_factor = max(validity_factor, 0.8)  # At least 80%
+
+            # Apply validity factor to raw bonus
+            role_score = raw_hot_bonus * validity_factor
+
+        components['role_sustainability'] = round(role_score, 2)
 
         # =================================================================
         # 4. TODAY'S MATCHUP QUALITY (up to +5)

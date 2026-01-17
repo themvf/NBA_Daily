@@ -6828,14 +6828,19 @@ if selected_page == "Tournament Strategy":
                 |-----------|-------|-------------|
                 | **Cal Base** | ~15-30 | Calibrated projection (fixes historical over-prediction bias) |
                 | **Ceil+** | 0-8 | Upside bonus scaled by projection (high ceiling + high volume) |
-                | **Role** | -3 to +5 | **Sustainable role score** - only rewards hot streaks if role is stable |
-                | **Matchup** | -3 to +5 | TODAY's opponent defense (not last week's matchups) |
+                | **Role** | -3 to +4 | **ValidityFactor-gated** hot streak bonus (see below) |
+                | **Matchup** | -3 to +5 | TODAY's opponent defense rating (higher = weaker defense = bonus) |
                 | **Opp+** | 0-6 | Injury opportunity: teammate OUT today (+4) or opponent star out (+2) |
                 | **Star** | 0-3 | Star power bonus: 28+ PPG = +3, 25+ = +2, 22+ = +1 |
                 | **Risk-** | 0 to -10 | Penalties: Questionable (-5), Blowout risk (-3), B2B (-2) |
 
-                ⚠️ **Anti-Chase Logic**: Role score is SKEPTICAL of hot streaks without context.
-                If L5 is elevated but no teammate is currently OUT, we discount it (could be temporary fill-in role).
+                🎯 **ValidityFactor Pattern** (Role Score):
+                - **Formula**: `RoleScore = RawHotBonus × ValidityFactor`
+                - **ValidityFactor** (0.0 to 1.0) crushes fake streaks:
+                  - **Star Returns Discount**: L5 elevated but NO injury boost today? → ValidityFactor × 0.25
+                  - **Minutes Stability**: Low confidence + elevated stats? → ValidityFactor × 0.5
+                  - **Ongoing Opportunity**: Injury beneficiary still active → ValidityFactor ≥ 0.8
+                - Hot streaks without context are crushed. Ceiling and matchup dominate.
                 """)
 
                 if 'Cal Base' in display_df.columns:
@@ -6869,14 +6874,15 @@ if selected_page == "Tournament Strategy":
                 |-----------|-------|-------------|
                 | **Cal Base** | ~15-30 | Calibrated projection (fixes historical over-prediction bias) |
                 | **Ceil+** | 0-8 | Upside bonus scaled by projection (high ceiling + high volume) |
-                | **Role** | -3 to +5 | **Sustainable role score** - only rewards hot streaks if role is stable |
-                | **Matchup** | -3 to +5 | TODAY's opponent defense (not last week's matchups) |
+                | **Role** | -3 to +4 | **ValidityFactor-gated** hot streak bonus (see below) |
+                | **Matchup** | -3 to +5 | TODAY's opponent defense rating (higher = weaker defense = bonus) |
                 | **Opp+** | 0-6 | Injury opportunity: teammate OUT today (+4) or opponent star out (+2) |
                 | **Star** | 0-3 | Star power bonus: 28+ PPG = +3, 25+ = +2, 22+ = +1 |
                 | **Risk-** | 0 to -10 | Penalties: Questionable (-5), Blowout risk (-3), B2B (-2) |
 
-                ⚠️ **Anti-Chase Logic**: Role score is SKEPTICAL of hot streaks without context.
-                If L5 is elevated but no teammate is currently OUT, we discount it (could be temporary fill-in role).
+                🎯 **ValidityFactor Pattern** (Role Score):
+                - **Formula**: `RoleScore = RawHotBonus × ValidityFactor`
+                - Hot streaks without context are crushed. Ceiling and matchup dominate.
                 """)
 
                 if 'Cal Base' in display_df.columns:
