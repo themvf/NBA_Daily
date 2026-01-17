@@ -139,10 +139,13 @@ def get_available_dates(conn: sqlite3.Connection) -> List[str]:
 
 def load_predictions(conn: sqlite3.Connection, game_date: str) -> pd.DataFrame:
     """
-    Load predictions for a specific date.
+    Load ALL predictions for a specific date (for ranking/picking).
 
     Returns DataFrame with all prediction columns needed for ranking.
     Handles missing columns gracefully (simulation fields may not exist in historical data).
+
+    NOTE: This loads ALL predictions, not just those with actual_ppg.
+    We pick based on what we predicted, then check results separately.
     """
     # First, check which columns exist in the predictions table
     cursor = conn.cursor()
@@ -159,11 +162,12 @@ def load_predictions(conn: sqlite3.Connection, game_date: str) -> pd.DataFrame:
         if col in existing_columns:
             select_cols.append(f'p.{col}')
 
+    # Load ALL predictions - we want to pick based on what we predicted,
+    # not just players who ended up with actual results
     query = f"""
         SELECT {', '.join(select_cols)}
         FROM predictions p
         WHERE p.game_date = ?
-          AND p.actual_ppg IS NOT NULL
     """
     df = pd.read_sql_query(query, conn, params=[game_date])
 

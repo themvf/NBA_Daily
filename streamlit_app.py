@@ -8118,11 +8118,13 @@ if selected_page == "Backtest Analysis":
                 picks_display = []
                 for i in range(1, 4):
                     name = row.get(f'picked{i}_name', '')
-                    pts = row.get(f'picked{i}_pts', 0)
-                    finish = row.get(f'picked{i}_finish', 99)
+                    pts = row.get(f'picked{i}_pts', 0) or 0
+                    finish = row.get(f'picked{i}_finish', 99) or 99
                     if name:
-                        # Highlight if finished top 3
-                        if finish <= 3:
+                        # Check if player didn't play (no actual data)
+                        if finish >= 99 or (pts == 0 and finish > 50):
+                            picks_display.append(f"~~{name}~~ (DNP)")
+                        elif finish <= 3:
                             picks_display.append(f"**{name}** ({pts:.0f}pts, #{finish})")
                         else:
                             picks_display.append(f"{name} ({pts:.0f}pts, #{finish})")
