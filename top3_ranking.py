@@ -16,11 +16,196 @@ Usage:
 """
 
 import sqlite3
+import math
 import numpy as np
 import pandas as pd
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+
+def _safe_get(row: dict, key: str, default: float = 0.0) -> float:
+    """
+    Safely get numeric value, handling None, NaN, and string edge cases.
+
+    Handles:
+    - None values
+    - NaN (float)
+    - Empty strings
+    - String representations of None/NaN
+    - Numeric strings (converts to float)
+    """
+    val = row.get(key, None)
+    if val is None:
+        return default
+
+    # Handle string edge cases from SQLite
+    if isinstance(val, str):
+        val = val.strip()
+        if val in ('', 'nan', 'None', 'null', 'NaN'):
+            return default
+        try:
+            val = float(val)
+        except ValueError:
+            return default
+
+    # Handle NaN
+    if isinstance(val, float) and math.isnan(val):
+        return default
+
+    return float(val)
+
+
+def calculate_projected_minutes(player_data: dict) -> Tuple[float, float]:
+    """
+    Calculate projected minutes using weighted average + role guardrails + context.
+
+    Returns:
+        Tuple of (proj_minutes, minutes_confidence)
+
+    Formula:
+        base_min = 0.55 * L5 + 0.25 * L10 + 0.20 * season
+        + role guardrails (clamp by starter/rotation/bench)
+        + context adjustments (B2B, blowout, injury boost)
+    """
+    # Step A: Weighted baseline
+    l5_min = _safe_get(player_data, 'avg_minutes_last5') or _safe_get(player_data, 'avg_minutes', 0)
+    l10_min = _safe_get(player_data, 'avg_minutes_last10') or l5_min
+    season_min = _safe_get(player_data, 'avg_minutes', 0)
+
+    if l5_min == 0 and season_min == 0:
+        # No minutes data at all
+        return 0.0, 0.0
+
+    base_min = 0.55 * l5_min + 0.25 * l10_min + 0.20 * season_min
+
+    # Step B: Role guardrails (prevent insane values)
+    starts_last_5 = _safe_get(player_data, 'starts_last_5', 0)
+    starter_est = (l5_min >= 28) or (starts_last_5 >= 3)
+
+    if starter_est:
+        base_min = max(28, min(40, base_min))  # Clamp starters to [28, 40]
+    elif l5_min >= 18:
+        base_min = max(18, min(32, base_min))  # Rotation: [18, 32]
+    else:
+        base_min = max(0, min(22, base_min))   # Deep bench: [0, 22]
+
+    # Step C: Context adjustments
+    proj_min = base_min
+
+    # Back-to-back penalty
+    if player_data.get('back_to_back'):
+        proj_min -= 1.5
+
+    # Blowout risk (spread-based, not binary)
+    spread = abs(_safe_get(player_data, 'vegas_spread', 0))
+    if spread >= 12:
+        proj_min -= min((spread - 10) * 0.3, 4.0)  # Up to -4 for 24+ spread
+
+    # Injury beneficiary boost
+    injury_minutes_boost = _safe_get(player_data, 'injury_minutes_delta', 0)
+    if injury_minutes_boost == 0:
+        # Fallback: use injury_adjustment_amount as proxy
+        injury_adj = _safe_get(player_data, 'injury_adjustment_amount', 0)
+        if injury_adj > 0:
+            injury_minutes_boost = injury_adj * 0.5  # Rough conversion
+    proj_min += min(injury_minutes_boost, 6.0)  # Cap at +6
+
+    # Questionable/minutes restriction cap
+    injury_status = player_data.get('injury_status')
+    if injury_status and str(injury_status).lower() in ('questionable', 'doubtful'):
+        proj_min = min(proj_min, 26)
+
+    # Step D: Confidence (based on L5 volatility)
+    l5_stddev = _safe_get(player_data, 'l5_minutes_stddev', 0)
+    if l5_stddev > 8:
+        minutes_confidence = 0.4  # Very volatile
+    elif l5_stddev > 5:
+        minutes_confidence = 0.6  # Somewhat volatile
+    else:
+        minutes_confidence = 0.85  # Stable
+
+    return max(0, proj_min), minutes_confidence
+
+
+def classify_tier(proj_minutes: float, proj_ppg: float, proj_ceiling: float,
+                  usg_pct: Optional[float] = None) -> str:
+    """
+    Classify player into tier for tournament strategy.
+
+    Tiers:
+        STAR: High minutes + high offensive control (top scorer candidates)
+        SIXTH_MAN: Bench but live for top-3 (tournament darts)
+        ROLE: Starter or solid rotation player
+        BENCH: Minutes-limited (unlikely top scorer)
+
+    Returns: 'STAR', 'ROLE', 'SIXTH_MAN', 'BENCH'
+    """
+    # STAR: High minutes AND high offensive control
+    if proj_minutes >= 34:
+        if (usg_pct and usg_pct >= 28) or proj_ppg >= 24 or proj_ceiling >= 45:
+            return 'STAR'
+
+    # SIXTH_MAN: Bench minutes but live for top-3 (tournament dart)
+    if 24 <= proj_minutes < 30:
+        if (usg_pct and usg_pct >= 26) or proj_ceiling >= 38:
+            return 'SIXTH_MAN'
+
+    # ROLE: Starter or solid rotation
+    if proj_minutes >= 24 or (proj_minutes >= 20 and proj_ppg >= 15):
+        return 'ROLE'
+
+    # BENCH: Minutes-limited
+    return 'BENCH'
+
+
+def detect_role_change(l5_min: float, season_min: float) -> bool:
+    """
+    Detect if player's role has recently changed (minutes spike).
+
+    A +6 minute jump from season average is significant.
+    """
+    if season_min <= 0:
+        return False
+    return l5_min >= season_min + 6
+
+
+def estimate_scoring_stddev(player: dict) -> float:
+    """
+    Estimate scoring variance from available data.
+
+    Higher variance = better for top-3 probability (tail event).
+
+    Uses ceiling-floor spread as primary signal, adjusted for:
+    - Minutes volatility (uncertain minutes = higher variance)
+    - Injury beneficiary status (fill-in role = higher variance)
+    """
+    # Primary: use ceiling-floor spread
+    ceiling = _safe_get(player, 'proj_ceiling', 0)
+    floor = _safe_get(player, 'proj_floor', 0)
+    proj_ppg = _safe_get(player, 'projected_ppg', 20)
+
+    if ceiling and floor and ceiling > floor:
+        base_std = (ceiling - floor) / 3.29  # 99% confidence interval
+    else:
+        base_std = proj_ppg * 0.25  # 25% of projection as fallback
+
+    # Adjust for minutes volatility (uncertain minutes = higher variance)
+    minutes_conf = _safe_get(player, 'minutes_confidence', 0.7)
+    if minutes_conf < 0.5:
+        base_std *= 1.3  # More volatile
+
+    # Adjust for injury beneficiary (temporary role = higher variance)
+    injury_adjusted = player.get('injury_adjusted')
+    role_change = player.get('role_change')
+    if injury_adjusted and not role_change:
+        base_std *= 1.2  # Fill-in role is volatile
+
+    return max(base_std, 2.0)
 
 
 @dataclass
@@ -423,15 +608,22 @@ class Top3Ranker:
     def simulate_top3_probability(
         self,
         game_date: str,
-        n_simulations: int = 10000,
-        use_calibration: bool = True
+        n_simulations: int = 5000,
+        use_calibration: bool = True,
+        include_minutes: bool = True
     ) -> pd.DataFrame:
         """
         Estimate P(top 3) for each player via Monte Carlo simulation.
 
-        Assumes each player's points follow a truncated normal distribution:
+        Key insight: Top-3 is a TAIL EVENT. Higher variance = better probability
+        of reaching the tail, even with lower mean.
+
+        Distribution model:
         - Mean = calibrated projection
-        - Std = (ceiling - floor) / 3.29  (99% within floor-ceiling)
+        - Std = estimate_scoring_stddev() incorporating:
+          * Ceiling-floor spread (primary)
+          * Minutes volatility (more uncertain = higher variance)
+          * Injury beneficiary status (temporary role = higher variance)
 
         Returns DataFrame with player info and p_top3 column.
         """
@@ -446,47 +638,76 @@ class Top3Ranker:
         else:
             cal_intercept, cal_slope = 0.0, 1.0
 
-        # Prepare player data
+        # Prepare player data with improved variance estimation
         player_ids = df['player_id'].tolist()
         means = []
         stds = []
+        tiers = []
 
         for _, row in df.iterrows():
-            mean = cal_intercept + cal_slope * row['projected_ppg']
-            # Standard deviation: assume 99% of outcomes within floor-ceiling
-            # 99% is ±2.576 std, but we use 3.29 for a bit more spread
-            ceiling = row['proj_ceiling'] if row['proj_ceiling'] else mean * 1.3
-            floor = row['proj_floor'] if row['proj_floor'] else mean * 0.7
-            std = max((ceiling - floor) / 3.29, 2.0)  # Minimum std of 2 pts
+            # Convert row to dict for helper functions
+            row_dict = row.to_dict() if hasattr(row, 'to_dict') else dict(row)
+
+            # Calculate mean (calibrated projection)
+            mean = cal_intercept + cal_slope * _safe_get(row_dict, 'projected_ppg', 20)
+
+            # Calculate variance using improved estimation
+            std = estimate_scoring_stddev(row_dict)
+
+            # Calculate projected minutes and tier if enabled
+            if include_minutes:
+                proj_min, min_conf = calculate_projected_minutes(row_dict)
+                row_dict['proj_minutes'] = proj_min
+                row_dict['minutes_confidence'] = min_conf
+
+                tier = classify_tier(
+                    proj_min,
+                    _safe_get(row_dict, 'projected_ppg', 0),
+                    _safe_get(row_dict, 'proj_ceiling', 0),
+                    _safe_get(row_dict, 'avg_usg_last5')
+                )
+            else:
+                tier = 'ROLE'
+                proj_min = 30.0
 
             means.append(mean)
             stds.append(std)
+            tiers.append(tier)
 
         means = np.array(means)
         stds = np.array(stds)
 
-        # Run simulation
+        # Run simulation (vectorized for speed)
         top3_counts = np.zeros(len(player_ids))
+        top1_counts = np.zeros(len(player_ids))  # Track #1 scorer too
 
         for _ in range(n_simulations):
             # Sample points for all players (truncated at 0)
             sampled_points = np.maximum(0, np.random.normal(means, stds))
 
-            # Find indices of top 3
-            top3_indices = np.argsort(sampled_points)[-3:]
+            # Find indices of top 3 (highest last)
+            sorted_indices = np.argsort(sampled_points)
+            top3_indices = sorted_indices[-3:]
+            top1_idx = sorted_indices[-1]
 
             # Increment counters
             for idx in top3_indices:
                 top3_counts[idx] += 1
+            top1_counts[top1_idx] += 1
 
         # Convert to probabilities
-        probabilities = top3_counts / n_simulations
+        p_top3 = top3_counts / n_simulations
+        p_top1 = top1_counts / n_simulations
 
         # Add to dataframe
-        df['p_top3'] = probabilities
-        df['p_top3_pct'] = (probabilities * 100).round(1)
+        df['p_top3'] = p_top3
+        df['p_top3_pct'] = (p_top3 * 100).round(1)
+        df['p_top1'] = p_top1
+        df['p_top1_pct'] = (p_top1 * 100).round(1)
+        df['scoring_stddev'] = stds
+        df['tier'] = tiers
 
-        # Sort by probability
+        # Sort by top-3 probability
         df = df.sort_values('p_top3', ascending=False).reset_index(drop=True)
         df['rank'] = range(1, len(df) + 1)
 

@@ -325,6 +325,35 @@ def upgrade_predictions_table_for_fanduel_comparison(conn: sqlite3.Connection) -
     conn.commit()
 
 
+def upgrade_predictions_table_for_minutes(conn: sqlite3.Connection) -> None:
+    """Add projected minutes and tier columns to predictions table if they don't exist."""
+    cursor = conn.cursor()
+
+    # Check which columns already exist
+    cursor.execute("PRAGMA table_info(predictions)")
+    existing_columns = {row[1] for row in cursor.fetchall()}
+
+    # Define new minutes/tier columns
+    new_columns = {
+        'proj_minutes': 'REAL DEFAULT NULL',           # Projected minutes
+        'l5_minutes_avg': 'REAL DEFAULT NULL',         # Last 5 games avg minutes
+        'l5_minutes_stddev': 'REAL DEFAULT NULL',      # Last 5 games minutes stddev
+        'season_minutes_avg': 'REAL DEFAULT NULL',     # Season avg minutes
+        'starter_est': 'INTEGER DEFAULT NULL',         # 1 if estimated starter
+        'tier': 'TEXT DEFAULT NULL',                   # 'STAR', 'ROLE', 'SIXTH_MAN', 'BENCH'
+        'minutes_confidence': 'REAL DEFAULT NULL',     # Confidence in minutes projection
+        'role_change': 'INTEGER DEFAULT NULL',         # 1 if recent role change detected
+    }
+
+    # Add missing columns
+    for col_name, col_type in new_columns.items():
+        if col_name not in existing_columns:
+            cursor.execute(f"ALTER TABLE predictions ADD COLUMN {col_name} {col_type}")
+            print(f"Added minutes/tier column: {col_name}")
+
+    conn.commit()
+
+
 def calculate_fanduel_comparison_metrics(conn: sqlite3.Connection, game_date: Optional[str] = None) -> int:
     """
     Calculate FanDuel comparison metrics for predictions with actuals.

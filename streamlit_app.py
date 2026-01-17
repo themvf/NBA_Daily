@@ -458,6 +458,18 @@ def aggregate_player_scoring(
                 return None
             return subset.mean()
 
+        def calc_recent_stddev(window: int, column: str) -> float | None:
+            """Calculate standard deviation for recent games."""
+            subset = player_df.head(window)[column].dropna()
+            if len(subset) < 2:
+                return None
+            return subset.std()
+
+        def calc_starts_last_n(window: int, minutes_threshold: float = 28.0) -> int:
+            """Count games with minutes >= threshold (proxy for 'started')."""
+            subset = player_df.head(window)["minutes_float"].dropna()
+            return int((subset >= minutes_threshold).sum())
+
         recent_records.append(
             {
                 "player_id": player_id,
@@ -466,6 +478,9 @@ def aggregate_player_scoring(
                 "avg_fg3m_last3": calc_recent(3, "fg3m"),
                 "avg_fg3m_last5": calc_recent(5, "fg3m"),
                 "avg_minutes_last5": calc_recent(5, "minutes_float"),
+                "avg_minutes_last10": calc_recent(10, "minutes_float"),
+                "l5_minutes_stddev": calc_recent_stddev(5, "minutes_float"),
+                "starts_last_5": calc_starts_last_n(5, 28.0),
                 "avg_usg_last5": calc_recent(5, "usg_pct"),
             }
         )
@@ -480,6 +495,9 @@ def aggregate_player_scoring(
                 "avg_fg3m_last3",
                 "avg_fg3m_last5",
                 "avg_minutes_last5",
+                "avg_minutes_last10",
+                "l5_minutes_stddev",
+                "starts_last_5",
                 "avg_usg_last5",
             ]
         )
@@ -2983,7 +3001,8 @@ try:
     pt.create_predictions_table(games_conn)
     pt.upgrade_predictions_table_for_injuries(games_conn)
     pt.upgrade_predictions_table_for_refresh(games_conn)
-    pt.upgrade_predictions_table_for_opponent_injury(games_conn)  # NEW: Opponent injury impact tracking
+    pt.upgrade_predictions_table_for_opponent_injury(games_conn)  # Opponent injury impact tracking
+    pt.upgrade_predictions_table_for_minutes(games_conn)  # Minutes projection and tier tracking
 
 except Exception as init_exc:
     st.warning(f"Could not initialize injury tracking tables: {init_exc}")
@@ -6777,6 +6796,10 @@ if selected_page == "Tournament Strategy":
             # Top3 ranking columns
             'top_scorer_score': 'TSS',
             'p_top3_pct': 'P(Top3)%',
+            'p_top1_pct': 'P(#1)%',
+            'tier': 'Tier',
+            'proj_minutes': 'Proj Min',
+            'scoring_stddev': 'Variance',
             'calibrated_base': 'Cal Base',
             'ceiling_bonus': 'Ceil+',
             'role_sustainability': 'Role',
@@ -6857,13 +6880,35 @@ if selected_page == "Tournament Strategy":
                     st.warning("Component data not available. TSS columns: " + str([c for c in display_df.columns if 'TSS' in c or 'Cal' in c or 'bonus' in c.lower()]))
         elif ranking_mode == "Simulation P(Top3)":
             base_columns = [
-                'Player', 'Pos', 'Team', 'Opponent', 'Ceiling', 'L5 Avg', 'Proj PPG',
-                'P(Top3)%', 'GPP Score', 'Opp Def Grade'
+                'Player', 'Pos', 'Team', 'Opponent', 'Tier', 'Ceiling', 'L5 Avg', 'Proj PPG',
+                'P(Top3)%', 'P(#1)%', 'Variance', 'GPP Score', 'Opp Def Grade'
             ]
+            # Add explanation of simulation approach
+            with st.expander("🎲 P(Top-3) Simulation Explained", expanded=False):
+                st.markdown("""
+                **Why Simulation > Heuristics for Top-3**
+
+                Top-3 scoring is a **tail event**. A player with lower expected points but higher variance
+                can actually have a **better** chance of finishing top-3 than a higher-mean, lower-variance player.
+
+                **Simulation Method (5,000 iterations):**
+                1. Sample each player's scoring from a normal distribution
+                2. Mean = calibrated projection
+                3. StdDev = f(ceiling-floor, minutes volatility, injury role)
+                4. Count how often each player finishes in top 3
+
+                **Tier Classifications:**
+                - ⭐ **STAR**: 34+ min, high usage/ceiling (top scorer candidates)
+                - 🎯 **SIXTH_MAN**: 24-30 min, high ceiling (tournament darts)
+                - 👤 **ROLE**: 20-24 min, solid rotation
+                - 🪑 **BENCH**: <20 min (rarely win top-3)
+
+                **Key Insight**: High variance + decent floor = good tournament play
+                """)
         else:  # Both
             base_columns = [
-                'Player', 'Pos', 'Team', 'Opponent', 'Ceiling', 'L5 Avg', 'Proj PPG',
-                'TSS', 'P(Top3)%', 'GPP Score', 'Opp Def Grade'
+                'Player', 'Pos', 'Team', 'Opponent', 'Tier', 'Ceiling', 'L5 Avg', 'Proj PPG',
+                'TSS', 'P(Top3)%', 'P(#1)%', 'GPP Score', 'Opp Def Grade'
             ]
             # Add component breakdown in expander
             with st.expander("📊 TopScorerScore Formula & Component Breakdown", expanded=False):
