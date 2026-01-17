@@ -7949,7 +7949,7 @@ if selected_page == "Backtest Analysis":
 
                 st.session_state['backtest_results'] = results_df
                 st.session_state['backtest_stats'] = stats
-                st.session_state['backtest_strategy'] = selected_strategy
+                st.session_state['backtest_selected_strategy'] = selected_strategy
                 st.session_state['backtest_compare_mode'] = False
 
         st.success("Backtest complete!")
@@ -8005,7 +8005,7 @@ if selected_page == "Backtest Analysis":
         # Single strategy mode
         stats = st.session_state['backtest_stats']
         results_df = st.session_state['backtest_results']
-        strategy = st.session_state['backtest_strategy']
+        strategy = st.session_state.get('backtest_selected_strategy', 'unknown')
 
         st.divider()
 
