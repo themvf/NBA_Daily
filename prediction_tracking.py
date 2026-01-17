@@ -426,12 +426,18 @@ def create_backtest_table(conn: sqlite3.Connection) -> None:
         ('picked1_pts', 'REAL'),
         ('picked1_finish', 'INTEGER'),
         ('picked1_pred_rank', 'INTEGER'),
+        ('picked1_proj', 'REAL'),
+        ('picked1_p_top1', 'REAL'),
         ('picked2_pts', 'REAL'),
         ('picked2_finish', 'INTEGER'),
         ('picked2_pred_rank', 'INTEGER'),
+        ('picked2_proj', 'REAL'),
+        ('picked2_p_top1', 'REAL'),
         ('picked3_pts', 'REAL'),
         ('picked3_finish', 'INTEGER'),
         ('picked3_pred_rank', 'INTEGER'),
+        ('picked3_proj', 'REAL'),
+        ('picked3_p_top1', 'REAL'),
         ('closest_miss', 'REAL'),
     ]
 

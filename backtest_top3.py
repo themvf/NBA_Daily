@@ -454,6 +454,11 @@ def backtest_date(
     # Build pred rank lookup
     pred_rank_lookup = dict(zip(preds_ranked['player_id'], preds_ranked['pred_rank']))
 
+    # Build lookups for "why we picked" metrics
+    proj_ppg_lookup = dict(zip(preds_ranked['player_id'], preds_ranked.get('projected_ppg', pd.Series([0]*len(preds_ranked)))))
+    p_top1_lookup = dict(zip(preds_ranked['player_id'], preds_ranked.get('p_top1', pd.Series([0]*len(preds_ranked)))))
+    p_top3_lookup = dict(zip(preds_ranked['player_id'], preds_ranked.get('p_top3', pd.Series([0]*len(preds_ranked)))))
+
     # Compute diagnostic metrics for each pick
     pick_diagnostics = []
     pick_points = []
@@ -461,10 +466,16 @@ def backtest_date(
         pts = actual_pts_lookup.get(player_id, 0)
         finish = finish_rank_lookup.get(player_id, len(actuals) + 1)
         pred = pred_rank_lookup.get(player_id, len(preds) + 1)
+        proj = proj_ppg_lookup.get(player_id, 0) or 0
+        p1 = p_top1_lookup.get(player_id, 0) or 0
+        p3 = p_top3_lookup.get(player_id, 0) or 0
         pick_diagnostics.append({
             'pts': pts,
             'finish': finish,
-            'pred_rank': pred
+            'pred_rank': pred,
+            'proj_ppg': proj,
+            'p_top1': p1,
+            'p_top3': p3
         })
         pick_points.append(pts)
 
@@ -483,18 +494,24 @@ def backtest_date(
         'picked1_pts': pick_diagnostics[0]['pts'] if len(pick_diagnostics) > 0 else None,
         'picked1_finish': pick_diagnostics[0]['finish'] if len(pick_diagnostics) > 0 else None,
         'picked1_pred_rank': pick_diagnostics[0]['pred_rank'] if len(pick_diagnostics) > 0 else None,
+        'picked1_proj': pick_diagnostics[0]['proj_ppg'] if len(pick_diagnostics) > 0 else None,
+        'picked1_p_top1': pick_diagnostics[0]['p_top1'] if len(pick_diagnostics) > 0 else None,
 
         'picked2_id': picked3[1][0] if len(picked3) > 1 else None,
         'picked2_name': picked3[1][1] if len(picked3) > 1 else None,
         'picked2_pts': pick_diagnostics[1]['pts'] if len(pick_diagnostics) > 1 else None,
         'picked2_finish': pick_diagnostics[1]['finish'] if len(pick_diagnostics) > 1 else None,
         'picked2_pred_rank': pick_diagnostics[1]['pred_rank'] if len(pick_diagnostics) > 1 else None,
+        'picked2_proj': pick_diagnostics[1]['proj_ppg'] if len(pick_diagnostics) > 1 else None,
+        'picked2_p_top1': pick_diagnostics[1]['p_top1'] if len(pick_diagnostics) > 1 else None,
 
         'picked3_id': picked3[2][0] if len(picked3) > 2 else None,
         'picked3_name': picked3[2][1] if len(picked3) > 2 else None,
         'picked3_pts': pick_diagnostics[2]['pts'] if len(pick_diagnostics) > 2 else None,
         'picked3_finish': pick_diagnostics[2]['finish'] if len(pick_diagnostics) > 2 else None,
         'picked3_pred_rank': pick_diagnostics[2]['pred_rank'] if len(pick_diagnostics) > 2 else None,
+        'picked3_proj': pick_diagnostics[2]['proj_ppg'] if len(pick_diagnostics) > 2 else None,
+        'picked3_p_top1': pick_diagnostics[2]['p_top1'] if len(pick_diagnostics) > 2 else None,
 
         # Actual top 3 with our predicted ranks
         'actual1_id': actual_top3['top3'][0][0],

@@ -8085,6 +8085,9 @@ if selected_page == "Backtest Analysis":
             st.divider()
             st.subheader("📋 Daily Results - Diagnostic View")
 
+            # Icon legend
+            st.caption("**Legend:** ✅ rank ≤10 (good) | ⚠️ rank 11-25 (warning) | 🔴 rank >25 (bad)")
+
             # Sort by date descending for display
             sorted_results = results_df.sort_values('slate_date', ascending=False)
 
@@ -8096,6 +8099,7 @@ if selected_page == "Backtest Analysis":
                 closest_miss = row.get('closest_miss', 0) or 0
                 actual_3rd_pts = row.get('actual_3rd_points', 0) or 0
                 actual_1st_pts = row.get('actual1_points', 0) or 0
+                actual_2nd_pts = row.get('actual2_points', 0) or 0
                 ties_at_3rd = row.get('ties_at_3rd', 0)
 
                 # Get best pick points for closeness display
@@ -8115,37 +8119,55 @@ if selected_page == "Backtest Analysis":
                 pred_rank_a3 = row.get('pred_rank_a3', 99) or 99
                 best_actual_rank = min(pred_rank_a1, pred_rank_a2, pred_rank_a3)
 
-                # Determine diagnosis: ranking vs selection failure
+                # Two-dimensional diagnosis: ranking vs selection vs variance
                 if overlap == 3:
                     diagnosis = "✅ Perfect: All 3 correct!"
                     diagnosis_color = "green"
                 elif overlap >= 1:
-                    diagnosis = f"Partial hit ({overlap}/3)"
+                    # Partial hit - check if it was close
+                    if best_actual_rank <= 5:
+                        diagnosis = f"Partial ({overlap}/3) — model saw them (best actual ranked #{best_actual_rank})"
+                    else:
+                        diagnosis = f"Partial ({overlap}/3) — lucky hit? (best actual ranked #{best_actual_rank})"
                     diagnosis_color = "blue"
                 elif best_actual_rank <= 5:
-                    # We ranked at least one actual top-3 player highly, but picked others
-                    diagnosis = f"❌ Selection failure (actual #1 ranked #{pred_rank_a1}, but we picked others)"
+                    # Selection failure: model ranked actual top-3 well but picked others
+                    diagnosis = f"Selection failure — best actual ranked #{best_actual_rank}, but we used #1-3"
+                    diagnosis_color = "orange"
+                elif best_actual_rank <= 15:
+                    # Variance/coinflip: model was in the neighborhood
+                    diagnosis = f"Variance miss — best actual ranked #{best_actual_rank} (near-miss)"
                     diagnosis_color = "orange"
                 else:
-                    # We didn't rank the actual top scorers highly at all
-                    diagnosis = f"❌ Ranking failure (actual #1 ranked #{pred_rank_a1})"
+                    # Pure ranking failure: model had no clue
+                    diagnosis = f"Ranking failure — best actual ranked #{best_actual_rank} (blind)"
                     diagnosis_color = "red"
 
-                # Build compact picks display with prediction metric
+                # Build compact picks display with prediction metric ("why we picked")
                 picks_display = []
                 for i in range(1, 4):
                     name = row.get(f'picked{i}_name', '')
                     pts = row.get(f'picked{i}_pts', 0) or 0
                     finish = row.get(f'picked{i}_finish', 99) or 99
                     pred_rank = row.get(f'picked{i}_pred_rank', i) or i
+                    proj = row.get(f'picked{i}_proj', 0) or 0
+                    p_top1 = row.get(f'picked{i}_p_top1', 0) or 0
                     if name:
+                        # "Why we picked" metric: show P(#1) if available, else proj pts
+                        if p_top1 > 0:
+                            why = f"P#1={p_top1*100:.1f}%"
+                        elif proj > 0:
+                            why = f"proj={proj:.0f}"
+                        else:
+                            why = ""
+
                         # Check if player didn't play (no actual data)
                         if finish >= 99 or (pts == 0 and finish > 50):
-                            picks_display.append(f"~~{name}~~ (DNP) — ranked #{pred_rank}")
+                            picks_display.append(f"~~{name}~~ (DNP) — {why}" if why else f"~~{name}~~ (DNP)")
                         elif finish <= 3:
-                            picks_display.append(f"**{name}** ({pts:.0f}pts, #{finish}) — ranked #{pred_rank}")
+                            picks_display.append(f"**{name}** ({pts:.0f}pts, #{finish}) — {why}" if why else f"**{name}** ({pts:.0f}pts, #{finish})")
                         else:
-                            picks_display.append(f"{name} ({pts:.0f}pts, #{finish}) — ranked #{pred_rank}")
+                            picks_display.append(f"{name} ({pts:.0f}pts, #{finish}) — {why}" if why else f"{name} ({pts:.0f}pts, #{finish})")
 
                 # Build compact actuals display with proper warning icons
                 actuals_display = []
@@ -8194,43 +8216,54 @@ if selected_page == "Backtest Analysis":
                         for pick in picks_display:
                             st.markdown(f"  • {pick}")
 
-                        # Enhanced closeness display
+                        # Enhanced closeness display (score-space + rank-space)
                         st.markdown("---")
-                        st.markdown("**Closeness Analysis:**")
-                        st.markdown(f"  • Best pick scored: **{best_pick_pts:.0f}** pts")
-                        st.markdown(f"  • Top-3 cutoff: **{actual_3rd_pts:.0f}** pts")
+                        st.markdown("**Closeness (score-space):**")
+                        st.markdown(f"  Best pick: **{best_pick_pts:.0f}** → Cutoff: **{actual_3rd_pts:.0f}** → ", unsafe_allow_html=False)
                         if closest_miss >= 0:
-                            st.markdown(f"  • Result: :green[✅ Beat cutoff by {closest_miss:.0f} pts]")
+                            st.markdown(f"  :green[✅ +{closest_miss:.0f} pts (beat cutoff)]")
                         elif closest_miss >= -5:
-                            st.markdown(f"  • Result: :orange[⚠️ Missed by {abs(closest_miss):.0f} pts (close!)]")
+                            st.markdown(f"  :orange[⚠️ {closest_miss:.0f} pts (close!)]")
                         else:
-                            st.markdown(f"  • Result: :red[❌ Short by {abs(closest_miss):.0f} pts]")
+                            st.markdown(f"  :red[❌ {closest_miss:.0f} pts]")
+
+                        # Rank-space closeness
+                        st.markdown(f"**Closeness (rank-space):** best actual top-3 was our #{best_actual_rank}")
+                        if best_actual_rank <= 5:
+                            st.markdown(f"  :orange[Model saw them but picked #1-3 instead]")
+                        elif best_actual_rank <= 15:
+                            st.markdown(f"  :orange[Model was in the neighborhood]")
+                        else:
+                            st.markdown(f"  :red[Model missed entirely]")
 
                         if tie_friendly != overlap:
-                            st.markdown(f"  • Tie-friendly overlap: {tie_friendly}/3")
+                            st.markdown(f"  Tie-friendly: {tie_friendly}/3")
 
                     with col2:
-                        st.markdown("**Actual Top 3** (our predicted rank):")
+                        st.markdown("**Actual Top 3** (our rank):")
                         for actual in actuals_display:
                             st.markdown(f"  • {actual}")
 
-                        # Show #1 vs cutoff spread
+                        # Compact scoring context
                         st.markdown("---")
-                        st.markdown("**Scoring Context:**")
-                        st.markdown(f"  • #1 scored: **{actual_1st_pts:.0f}** pts")
-                        st.markdown(f"  • #3 cutoff: **{actual_3rd_pts:.0f}** pts")
                         spread = actual_1st_pts - actual_3rd_pts
-                        st.markdown(f"  • Top-3 spread: {spread:.0f} pts")
+                        if spread == 0:
+                            st.markdown(f"**Top-3 pts:** {actual_1st_pts:.0f} / {actual_2nd_pts:.0f} / {actual_3rd_pts:.0f} (tie), spread 0")
+                        else:
+                            st.markdown(f"**Top-3 pts:** {actual_1st_pts:.0f} / {actual_2nd_pts:.0f} / {actual_3rd_pts:.0f}, spread {spread:.0f}")
 
-                    # Model Top 5 quick context (always shown)
+                    # Model Top 3 quick context with finish ranks
                     st.markdown("---")
-                    top5_names = []
+                    top3_context = []
                     for i in range(1, 4):
                         name = row.get(f'picked{i}_name', '')
+                        finish = row.get(f'picked{i}_finish', 99) or 99
                         if name:
-                            top5_names.append(name.split()[-1])  # Last name for brevity
-                    if top5_names:
-                        st.markdown(f"**Model's picks:** {', '.join(top5_names)}")
+                            last_name = name.split()[-1]
+                            finish_str = f"#{finish}" if finish < 99 else "DNP"
+                            top3_context.append(f"{last_name}({finish_str})")
+                    if top3_context:
+                        st.markdown(f"**Model's top 3:** {' | '.join(top3_context)}")
 
                     # Baseline comparison
                     try:
