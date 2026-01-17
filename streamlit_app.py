@@ -452,17 +452,36 @@ def aggregate_player_scoring(
     for player_id, player_df in logs_df.groupby("player_id"):
         player_df = player_df.sort_values("game_date", ascending=False)
 
-        def calc_recent(window: int, column: str) -> float | None:
+        def calc_recent(window: int, column: str, normalize_ot: bool = False) -> float | None:
+            """Calculate recent average with optional OT normalization."""
             subset = player_df.head(window)[column].dropna()
             if subset.empty:
                 return None
+            # OT normalization: cap any single game at 48 minutes (regulation max)
+            if normalize_ot and column == "minutes_float":
+                subset = subset.clip(upper=48.0)
             return subset.mean()
 
-        def calc_recent_stddev(window: int, column: str) -> float | None:
+        def calc_recent_trimmed(window: int, column: str, normalize_ot: bool = False) -> float | None:
+            """Calculate trimmed mean (drop lowest value to handle foul trouble/injury exit)."""
+            subset = player_df.head(window)[column].dropna()
+            if len(subset) < 3:
+                # Not enough data for trimmed mean, fall back to regular mean
+                return subset.mean() if not subset.empty else None
+            # OT normalization: cap any single game at 48 minutes
+            if normalize_ot and column == "minutes_float":
+                subset = subset.clip(upper=48.0)
+            # Sort and drop the lowest value (foul trouble / injury exit / DNP)
+            return subset.sort_values().iloc[1:].mean()
+
+        def calc_recent_stddev(window: int, column: str, normalize_ot: bool = False) -> float | None:
             """Calculate standard deviation for recent games."""
             subset = player_df.head(window)[column].dropna()
             if len(subset) < 2:
                 return None
+            # OT normalization for minutes
+            if normalize_ot and column == "minutes_float":
+                subset = subset.clip(upper=48.0)
             return subset.std()
 
         def calc_starts_last_n(window: int, minutes_threshold: float = 28.0) -> int:
@@ -477,9 +496,10 @@ def aggregate_player_scoring(
                 "avg_pts_last5": calc_recent(5, "points"),
                 "avg_fg3m_last3": calc_recent(3, "fg3m"),
                 "avg_fg3m_last5": calc_recent(5, "fg3m"),
-                "avg_minutes_last5": calc_recent(5, "minutes_float"),
-                "avg_minutes_last10": calc_recent(10, "minutes_float"),
-                "l5_minutes_stddev": calc_recent_stddev(5, "minutes_float"),
+                # Minutes: use OT normalization (cap at 48) + trimmed mean for robustness
+                "avg_minutes_last5": calc_recent_trimmed(5, "minutes_float", normalize_ot=True),
+                "avg_minutes_last10": calc_recent_trimmed(10, "minutes_float", normalize_ot=True),
+                "l5_minutes_stddev": calc_recent_stddev(5, "minutes_float", normalize_ot=True),
                 "starts_last_5": calc_starts_last_n(5, 28.0),
                 "avg_usg_last5": calc_recent(5, "usg_pct"),
             }
@@ -6728,13 +6748,14 @@ if selected_page == "Tournament Strategy":
                     with st.spinner("Running Monte Carlo simulation (10,000 iterations)..."):
                         sim_df = ranker.simulate_top3_probability(selected_date, n_simulations=10000)
                     if not sim_df.empty:
-                        df = df.merge(
-                            sim_df[['player_id', 'p_top3', 'p_top3_pct']],
-                            on='player_id',
-                            how='left'
-                        )
+                        # Merge all simulation columns for transparency
+                        sim_cols = ['player_id', 'p_top3', 'p_top3_pct', 'p_top1', 'p_top1_pct',
+                                   'scoring_stddev', 'tier', 'stddev_calibrated']
+                        sim_cols = [c for c in sim_cols if c in sim_df.columns]
+                        df = df.merge(sim_df[sim_cols], on='player_id', how='left')
                         df['p_top3'] = df['p_top3'].fillna(0)
                         df['p_top3_pct'] = df['p_top3_pct'].fillna(0)
+                        df['p_top1_pct'] = df['p_top1_pct'].fillna(0) if 'p_top1_pct' in df.columns else 0
 
             except Exception as rank_error:
                 st.warning(f"⚠️ Top3Ranker error: {rank_error}. Falling back to GPP Score.")
@@ -6891,20 +6912,152 @@ if selected_page == "Tournament Strategy":
                 Top-3 scoring is a **tail event**. A player with lower expected points but higher variance
                 can actually have a **better** chance of finishing top-3 than a higher-mean, lower-variance player.
 
-                **Simulation Method (5,000 iterations):**
-                1. Sample each player's scoring from a normal distribution
-                2. Mean = calibrated projection
-                3. StdDev = f(ceiling-floor, minutes volatility, injury role)
-                4. Count how often each player finishes in top 3
+                **Simulation Method (10,000 iterations):**
+                1. Draw game-level factors (±8% swing per game - positive correlation)
+                2. Sample each player's scoring with game factor applied
+                3. Apply team usage constraint (when one teammate spikes, suppress others 5%)
+                4. Count how often each player finishes in top 3 or #1
 
-                **Tier Classifications:**
-                - ⭐ **STAR**: 34+ min, high usage/ceiling (top scorer candidates)
-                - 🎯 **SIXTH_MAN**: 24-30 min, high ceiling (tournament darts)
-                - 👤 **ROLE**: 20-24 min, solid rotation
+                **Tier Classifications (Non-Circular):**
+                - ⭐ **STAR**: 34+ min + 3+ starts + high usage/ceiling
+                - 🎯 **SIXTH_MAN**: 24-30 min + bench role + high offensive potential
+                - 👤 **ROLE**: 24+ min, solid rotation
                 - 🪑 **BENCH**: <20 min (rarely win top-3)
+
+                **Variance Calibration:**
+                - Uses 60-day historical residuals by tier + minutes band when available
+                - Falls back to ceiling-floor estimate if insufficient historical data
+                - Adjusted for minutes volatility and injury beneficiary status
 
                 **Key Insight**: High variance + decent floor = good tournament play
                 """)
+
+            # ========== TRANSPARENCY EXPANDERS ==========
+            with st.expander("📊 Minutes Breakdown", expanded=False):
+                st.markdown("""
+                ### How Projected Minutes is Calculated
+
+                **Formula:** `proj_min = 0.55×L5 + 0.25×L10 + 0.20×Season`
+
+                **OT Normalization:** Single games capped at 48 minutes
+                **Trimmed Mean:** Drops lowest value (handles foul trouble/injury exit)
+
+                **Role Guardrails:**
+                - Starters: clamped to [28, 40]
+                - Rotation: clamped to [18, 32]
+                - Bench: clamped to [0, 22]
+
+                **Context Adjustments:**
+                - B2B: -1.5 min
+                - Blowout (spread 8+): sigmoid-scaled reduction up to -4 min (softer for stars)
+                - Injury beneficiary: up to +6 min
+                """)
+                # Show minutes breakdown if data available
+                min_cols = ['Player', 'Team']
+                if 'avg_minutes_last5' in df.columns:
+                    df['L5 Min'] = df['avg_minutes_last5'].round(1)
+                    min_cols.append('L5 Min')
+                if 'avg_minutes_last10' in df.columns:
+                    df['L10 Min'] = df['avg_minutes_last10'].round(1)
+                    min_cols.append('L10 Min')
+                if 'avg_minutes' in df.columns:
+                    df['Season Min'] = df['avg_minutes'].round(1)
+                    min_cols.append('Season Min')
+                if 'Tier' in display_df.columns:
+                    min_cols.append('Tier')
+
+                if len(min_cols) > 2:
+                    min_display = display_df[['Player', 'Team']].copy()
+                    for col in ['L5 Min', 'L10 Min', 'Season Min']:
+                        if col in df.columns:
+                            min_display[col] = df[col].values[:len(min_display)]
+                    if 'Tier' in display_df.columns:
+                        min_display['Tier'] = display_df['Tier'].values
+                    st.dataframe(min_display.head(20), use_container_width=True, hide_index=True)
+                else:
+                    st.info("Minutes breakdown data not available in current dataset.")
+
+            with st.expander("📈 Variance Components", expanded=False):
+                st.markdown("""
+                ### How Scoring Variance is Estimated
+
+                **Calibrated σ:** From 60-day historical residuals by tier + minutes band
+                - Grouped by tier (STAR/ROLE/SIXTH_MAN/BENCH) and minutes band (e.g., 32-36, 28-32)
+                - Requires 20+ samples for exact match, 10+ for tier average
+                - Falls back to ceiling-floor estimate if insufficient data
+
+                **Fallback σ:** `(ceiling - floor) / 3.29` (99% CI estimate)
+
+                **Adjustments:**
+                - Minutes volatility (L5 stddev > 5): ×1.3
+                - Injury beneficiary role: ×1.2
+
+                **Why variance matters:** Higher variance = better P(top-3) for tail events
+                Even if expected points are lower, variance creates more winning scenarios.
+                """)
+                # Show variance breakdown if data available
+                var_cols = ['Player', 'Team', 'Tier']
+                if 'Variance' in display_df.columns:
+                    var_cols.append('Variance')
+                if 'stddev_calibrated' in df.columns:
+                    df['σ Calibrated'] = df['stddev_calibrated'].apply(lambda x: '✓' if x else '—')
+                    var_cols.append('σ Calibrated')
+                if 'Ceiling' in display_df.columns:
+                    var_cols.append('Ceiling')
+                if 'Floor' in display_df.columns:
+                    var_cols.append('Floor')
+
+                if 'Variance' in display_df.columns:
+                    var_display = display_df[['Player', 'Team']].copy()
+                    if 'Tier' in display_df.columns:
+                        var_display['Tier'] = display_df['Tier'].values
+                    var_display['Variance'] = display_df['Variance'].values
+                    if 'σ Calibrated' in df.columns:
+                        var_display['σ Calibrated'] = df['σ Calibrated'].values[:len(var_display)]
+                    var_display['Ceiling'] = display_df['Ceiling'].values
+                    var_display['Floor'] = display_df['Floor'].values
+                    st.dataframe(var_display.head(20), use_container_width=True, hide_index=True)
+                else:
+                    st.info("Variance data not available in current dataset.")
+
+            with st.expander("🔗 Game Correlation Info", expanded=False):
+                st.markdown("""
+                ### How Games Affect Player Correlation
+
+                **Game Factor (Positive Correlation):**
+                - Each game gets a random multiplier (~±8% typical swing)
+                - Scaled by implied total (high-pace games have higher variance)
+                - All players in a game are affected by the same game factor
+                - High-scoring environment → everyone elevated
+
+                **Team Usage Constraint (Negative Correlation):**
+                - When one teammate spikes (>1.2× their mean), suppress others by 5%
+                - Prevents unrealistic scenarios where 2+ teammates both go off
+                - Ensures P(#1) concentrates on realistic candidates
+
+                **Why This Matters:**
+                - Without correlation, teammates can both show high P(#1) - unrealistic!
+                - Game environment affects everyone (blowout, pace, OT)
+                - Usage is finite - one player's spike reduces teammates' opportunity
+                """)
+                # Show game context if data available
+                game_cols = ['Player', 'Team', 'Opponent']
+                if 'vegas_spread' in df.columns:
+                    df['Spread'] = df['vegas_spread'].abs().round(1)
+                    game_cols.append('Spread')
+                if 'implied_total' in df.columns:
+                    df['Total'] = df['implied_total'].round(1)
+                    game_cols.append('Total')
+
+                if len(game_cols) > 3:
+                    game_display = display_df[['Player', 'Team', 'Opponent']].copy()
+                    if 'Spread' in df.columns:
+                        game_display['Spread'] = df['Spread'].values[:len(game_display)]
+                    if 'Total' in df.columns:
+                        game_display['Total'] = df['Total'].values[:len(game_display)]
+                    st.dataframe(game_display.head(20), use_container_width=True, hide_index=True)
+                else:
+                    st.info("Game context data (spread, total) not available.")
         else:  # Both
             base_columns = [
                 'Player', 'Pos', 'Team', 'Opponent', 'Tier', 'Ceiling', 'L5 Avg', 'Proj PPG',

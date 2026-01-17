@@ -101,10 +101,23 @@ def calculate_projected_minutes(player_data: dict) -> Tuple[float, float]:
     if player_data.get('back_to_back'):
         proj_min -= 1.5
 
-    # Blowout risk (spread-based, not binary)
+    # Blowout risk - use softer approach that mostly affects minutes TAIL, not mean
+    # Key insight: Stars still produce in 3 quarters; don't kill their mean projection
+    # Use sigmoid for probability: p_blowout = 1 / (1 + exp(-(spread-8)/3))
     spread = abs(_safe_get(player_data, 'vegas_spread', 0))
-    if spread >= 12:
-        proj_min -= min((spread - 10) * 0.3, 4.0)  # Up to -4 for 24+ spread
+    if spread >= 8:
+        # Calculate blowout probability (smooth sigmoid)
+        p_blowout = 1 / (1 + math.exp(-(spread - 8) / 3))
+        # Calculate minutes ceiling reduction (stars lose less because they produce in 3Q)
+        minutes_ceiling_reduction = p_blowout * 4.0  # Max -4 minutes at high spreads
+
+        # Apply reduction scaled by role (starters/stars impacted less)
+        if starter_est:
+            # Starters still get ~32-34 mins even in blowouts; reduce less
+            proj_min -= minutes_ceiling_reduction * 0.5
+        else:
+            # Bench players might get MORE minutes in blowouts, but projection stays conservative
+            proj_min -= minutes_ceiling_reduction * 0.3
 
     # Injury beneficiary boost
     injury_minutes_boost = _safe_get(player_data, 'injury_minutes_delta', 0)
@@ -132,31 +145,44 @@ def calculate_projected_minutes(player_data: dict) -> Tuple[float, float]:
     return max(0, proj_min), minutes_confidence
 
 
-def classify_tier(proj_minutes: float, proj_ppg: float, proj_ceiling: float,
+def classify_tier(proj_minutes: float, starts_last_5: int, proj_ceiling: float,
                   usg_pct: Optional[float] = None) -> str:
     """
-    Classify player into tier for tournament strategy.
+    Non-circular tier classification based on minutes and role, NOT proj_ppg.
 
     Tiers:
-        STAR: High minutes + high offensive control (top scorer candidates)
+        STAR: High minutes + starter + high offensive control
         SIXTH_MAN: Bench but live for top-3 (tournament darts)
         ROLE: Starter or solid rotation player
         BENCH: Minutes-limited (unlikely top scorer)
 
+    Key insight: Tier drives variance estimation -> affects P(top-3).
+    Using proj_ppg here would create circular logic.
+
+    Primary drivers:
+    1. Projected minutes (most important)
+    2. Starter status (from starts_last_5)
+    3. Usage % (if available)
+    4. Ceiling (tie-breaker only)
+
     Returns: 'STAR', 'ROLE', 'SIXTH_MAN', 'BENCH'
     """
-    # STAR: High minutes AND high offensive control
-    if proj_minutes >= 34:
-        if (usg_pct and usg_pct >= 28) or proj_ppg >= 24 or proj_ceiling >= 45:
+    # STAR: High minutes + starter + either high usage or high ceiling
+    if proj_minutes >= 34 and starts_last_5 >= 3:
+        if (usg_pct and usg_pct >= 28) or proj_ceiling >= 45:
             return 'STAR'
+        # High minutes starter but not elite usage/ceiling -> still ROLE
+        return 'ROLE'
 
-    # SIXTH_MAN: Bench minutes but live for top-3 (tournament dart)
-    if 24 <= proj_minutes < 30:
-        if (usg_pct and usg_pct >= 26) or proj_ceiling >= 38:
+    # SIXTH_MAN: Bench minutes (24-30) + NOT starter + high offensive potential
+    if 24 <= proj_minutes < 30 and starts_last_5 <= 2:
+        if (usg_pct and usg_pct >= 26) or proj_ceiling >= 40:
             return 'SIXTH_MAN'
 
-    # ROLE: Starter or solid rotation
-    if proj_minutes >= 24 or (proj_minutes >= 20 and proj_ppg >= 15):
+    # ROLE: Solid rotation player (24+ minutes OR 20+ with starter status)
+    if proj_minutes >= 24:
+        return 'ROLE'
+    if proj_minutes >= 20 and starts_last_5 >= 2:
         return 'ROLE'
 
     # BENCH: Minutes-limited
@@ -174,25 +200,185 @@ def detect_role_change(l5_min: float, season_min: float) -> bool:
     return l5_min >= season_min + 6
 
 
-def estimate_scoring_stddev(player: dict) -> float:
+def get_minutes_band(proj_minutes: float) -> str:
+    """Categorize projected minutes into bands for calibration lookup."""
+    if proj_minutes >= 36:
+        return '36-40'
+    elif proj_minutes >= 32:
+        return '32-36'
+    elif proj_minutes >= 28:
+        return '28-32'
+    elif proj_minutes >= 24:
+        return '24-28'
+    elif proj_minutes >= 20:
+        return '20-24'
+    else:
+        return '<20'
+
+
+def calculate_historical_stddev(conn: sqlite3.Connection, days_back: int = 60) -> pd.DataFrame:
     """
-    Estimate scoring variance from available data.
+    Calculate actual scoring stddev by tier and minutes band from historical data.
+
+    This provides calibrated variance estimates based on real prediction residuals,
+    rather than guessing from ceiling-floor spread.
+
+    Returns DataFrame with columns:
+    - tier, minutes_band, residual_std, mean_actual, sample_size
+
+    Note: Requires predictions table to have tier and actual_ppg populated.
+    """
+    query = f"""
+        SELECT
+            p.tier,
+            p.proj_minutes,
+            p.projected_ppg,
+            p.actual_ppg,
+            p.actual_ppg - p.projected_ppg as residual
+        FROM predictions p
+        WHERE p.actual_ppg IS NOT NULL
+          AND p.tier IS NOT NULL
+          AND p.proj_minutes IS NOT NULL
+          AND p.game_date >= date('now', '-{days_back} days')
+    """
+
+    try:
+        df = pd.read_sql_query(query, conn)
+    except Exception:
+        # Table might not have required columns yet
+        return pd.DataFrame()
+
+    if df.empty or len(df) < 20:
+        return pd.DataFrame()
+
+    # Add minutes band
+    df['minutes_band'] = df['proj_minutes'].apply(get_minutes_band)
+
+    # Group by tier and minutes band
+    result = df.groupby(['tier', 'minutes_band']).agg(
+        residual_std=('residual', 'std'),
+        mean_actual=('actual_ppg', 'mean'),
+        mean_projected=('projected_ppg', 'mean'),
+        sample_size=('residual', 'count')
+    ).reset_index()
+
+    return result
+
+
+# Global cache for calibration table (refreshed once per session)
+_CALIBRATION_TABLE: Optional[pd.DataFrame] = None
+_CALIBRATION_CONN_ID: Optional[int] = None
+
+
+def get_calibration_table(conn: sqlite3.Connection, days_back: int = 60) -> pd.DataFrame:
+    """Get cached calibration table, computing if needed."""
+    global _CALIBRATION_TABLE, _CALIBRATION_CONN_ID
+
+    conn_id = id(conn)
+    if _CALIBRATION_TABLE is None or _CALIBRATION_CONN_ID != conn_id:
+        _CALIBRATION_TABLE = calculate_historical_stddev(conn, days_back)
+        _CALIBRATION_CONN_ID = conn_id
+
+    return _CALIBRATION_TABLE
+
+
+def get_calibrated_stddev(tier: str, proj_minutes: float,
+                          calibration_table: pd.DataFrame,
+                          fallback_std: float = 6.0) -> Tuple[float, bool]:
+    """
+    Look up calibrated stddev from historical data.
+
+    Returns:
+        Tuple of (stddev, is_calibrated)
+        - stddev: The calibrated or fallback standard deviation
+        - is_calibrated: True if from real data, False if fallback
+
+    Fallback hierarchy:
+    1. Exact tier + minutes band match (sample >= 20)
+    2. Same tier, adjacent minutes band (sample >= 10)
+    3. Same minutes band, any tier (sample >= 20)
+    4. Default fallback value
+    """
+    if calibration_table is None or calibration_table.empty:
+        return fallback_std, False
+
+    minutes_band = get_minutes_band(proj_minutes)
+
+    # Try exact match
+    row = calibration_table[
+        (calibration_table['tier'] == tier) &
+        (calibration_table['minutes_band'] == minutes_band)
+    ]
+
+    if len(row) > 0 and row['sample_size'].iloc[0] >= 20:
+        return row['residual_std'].iloc[0], True
+
+    # Try same tier, any minutes band with enough samples
+    tier_rows = calibration_table[
+        (calibration_table['tier'] == tier) &
+        (calibration_table['sample_size'] >= 10)
+    ]
+    if len(tier_rows) > 0:
+        # Use weighted average by sample size
+        weights = tier_rows['sample_size']
+        avg_std = (tier_rows['residual_std'] * weights).sum() / weights.sum()
+        return avg_std, True
+
+    # Try same minutes band, any tier
+    band_rows = calibration_table[
+        (calibration_table['minutes_band'] == minutes_band) &
+        (calibration_table['sample_size'] >= 20)
+    ]
+    if len(band_rows) > 0:
+        return band_rows['residual_std'].mean(), True
+
+    # Fallback
+    return fallback_std, False
+
+
+def estimate_scoring_stddev(player: dict,
+                            calibration_table: Optional[pd.DataFrame] = None) -> Tuple[float, bool]:
+    """
+    Estimate scoring variance, preferring calibrated historical data.
 
     Higher variance = better for top-3 probability (tail event).
 
-    Uses ceiling-floor spread as primary signal, adjusted for:
+    Hierarchy:
+    1. Calibrated stddev from historical residuals (if available + sufficient samples)
+    2. Ceiling-floor spread / 3.29 (99% CI estimate)
+    3. 25% of projected ppg as last resort
+
+    Additional adjustments:
     - Minutes volatility (uncertain minutes = higher variance)
     - Injury beneficiary status (fill-in role = higher variance)
+
+    Returns:
+        Tuple of (stddev, is_calibrated)
     """
-    # Primary: use ceiling-floor spread
+    tier = player.get('tier', 'ROLE')
+    proj_minutes = _safe_get(player, 'proj_minutes', 30)
     ceiling = _safe_get(player, 'proj_ceiling', 0)
     floor = _safe_get(player, 'proj_floor', 0)
     proj_ppg = _safe_get(player, 'projected_ppg', 20)
 
-    if ceiling and floor and ceiling > floor:
-        base_std = (ceiling - floor) / 3.29  # 99% confidence interval
+    # Try calibrated stddev first
+    is_calibrated = False
+    if calibration_table is not None and not calibration_table.empty:
+        # Calculate ceiling-floor fallback for get_calibrated_stddev
+        if ceiling and floor and ceiling > floor:
+            fallback = (ceiling - floor) / 3.29
+        else:
+            fallback = proj_ppg * 0.25
+
+        base_std, is_calibrated = get_calibrated_stddev(
+            tier, proj_minutes, calibration_table, fallback_std=max(fallback, 4.0)
+        )
     else:
-        base_std = proj_ppg * 0.25  # 25% of projection as fallback
+        # No calibration table - use ceiling-floor estimate
+        if ceiling and floor and ceiling > floor:
+            base_std = (ceiling - floor) / 3.29  # 99% confidence interval
+        else:
+            base_std = proj_ppg * 0.25  # 25% of projection as fallback
 
     # Adjust for minutes volatility (uncertain minutes = higher variance)
     minutes_conf = _safe_get(player, 'minutes_confidence', 0.7)
@@ -205,7 +391,7 @@ def estimate_scoring_stddev(player: dict) -> float:
     if injury_adjusted and not role_change:
         base_std *= 1.2  # Fill-in role is volatile
 
-    return max(base_std, 2.0)
+    return max(base_std, 2.0), is_calibrated
 
 
 @dataclass
@@ -638,23 +824,21 @@ class Top3Ranker:
         else:
             cal_intercept, cal_slope = 0.0, 1.0
 
+        # Get historical stddev calibration table
+        calibration_table = get_calibration_table(self.conn, days_back=60)
+
         # Prepare player data with improved variance estimation
         player_ids = df['player_id'].tolist()
         means = []
         stds = []
         tiers = []
+        is_calibrated_flags = []
 
         for _, row in df.iterrows():
             # Convert row to dict for helper functions
             row_dict = row.to_dict() if hasattr(row, 'to_dict') else dict(row)
 
-            # Calculate mean (calibrated projection)
-            mean = cal_intercept + cal_slope * _safe_get(row_dict, 'projected_ppg', 20)
-
-            # Calculate variance using improved estimation
-            std = estimate_scoring_stddev(row_dict)
-
-            # Calculate projected minutes and tier if enabled
+            # Calculate projected minutes and tier FIRST (needed for stddev lookup)
             if include_minutes:
                 proj_min, min_conf = calculate_projected_minutes(row_dict)
                 row_dict['proj_minutes'] = proj_min
@@ -662,30 +846,100 @@ class Top3Ranker:
 
                 tier = classify_tier(
                     proj_min,
-                    _safe_get(row_dict, 'projected_ppg', 0),
+                    int(_safe_get(row_dict, 'starts_last_5', 0)),
                     _safe_get(row_dict, 'proj_ceiling', 0),
                     _safe_get(row_dict, 'avg_usg_last5')
                 )
+                row_dict['tier'] = tier
             else:
                 tier = 'ROLE'
                 proj_min = 30.0
+                row_dict['tier'] = tier
+                row_dict['proj_minutes'] = proj_min
+
+            # Calculate mean (calibrated projection)
+            mean = cal_intercept + cal_slope * _safe_get(row_dict, 'projected_ppg', 20)
+
+            # Calculate variance using calibrated historical data when available
+            std, is_calibrated = estimate_scoring_stddev(row_dict, calibration_table)
 
             means.append(mean)
             stds.append(std)
             tiers.append(tier)
+            is_calibrated_flags.append(is_calibrated)
 
         means = np.array(means)
         stds = np.array(stds)
 
-        # Run simulation (vectorized for speed)
+        # Build game and team groupings for correlated simulation
+        # Game key = (team, opponent) - used for game-level factors
+        # Team key = team - used for usage cannibalization
+        player_teams = df['team_name'].tolist()
+        player_opponents = df['opponent_name'].tolist()
+        player_implied_totals = [
+            _safe_get(row.to_dict() if hasattr(row, 'to_dict') else dict(row),
+                      'implied_total', 220)
+            for _, row in df.iterrows()
+        ]
+
+        # Create indices for quick team/game lookup
+        team_to_indices = {}
+        game_to_indices = {}
+        for idx, (team, opp) in enumerate(zip(player_teams, player_opponents)):
+            # Team grouping (for usage constraint)
+            if team not in team_to_indices:
+                team_to_indices[team] = []
+            team_to_indices[team].append(idx)
+
+            # Game grouping (for game factor)
+            game_key = tuple(sorted([team, opp]))  # Normalize so MIA-BOS = BOS-MIA
+            if game_key not in game_to_indices:
+                game_to_indices[game_key] = []
+            game_to_indices[game_key].append(idx)
+
+        # Run simulation with correlation
         top3_counts = np.zeros(len(player_ids))
         top1_counts = np.zeros(len(player_ids))  # Track #1 scorer too
 
         for _ in range(n_simulations):
-            # Sample points for all players (truncated at 0)
-            sampled_points = np.maximum(0, np.random.normal(means, stds))
+            # Step 1: Draw game factors (positive correlation within games)
+            # Each game gets a random factor affecting all players
+            # Factor drawn from normal(1.0, 0.08) = ±8% typical swing
+            # Scaled by implied total (high-pace games have higher variance)
+            game_factors = {}
+            for game_key, indices in game_to_indices.items():
+                # Use first player's implied total as game proxy
+                implied_total = player_implied_totals[indices[0]]
+                pace_factor = implied_total / 220  # Normalize to ~1.0
+                game_factors[game_key] = np.random.normal(pace_factor, 0.08)
 
-            # Find indices of top 3 (highest last)
+            # Step 2: Sample base points with game factor applied
+            sampled_points = np.zeros(len(player_ids))
+            for idx in range(len(player_ids)):
+                team = player_teams[idx]
+                opp = player_opponents[idx]
+                game_key = tuple(sorted([team, opp]))
+                gf = game_factors.get(game_key, 1.0)
+
+                # Sample from normal distribution with game factor applied to mean
+                base_mean = means[idx] * gf
+                sampled = max(0, np.random.normal(base_mean, stds[idx]))
+                sampled_points[idx] = sampled
+
+            # Step 3: Apply team usage constraint (negative correlation)
+            # When one teammate spikes (>1.2x mean), suppress others slightly
+            for team, indices in team_to_indices.items():
+                if len(indices) < 2:
+                    continue  # No teammates to cannibalize
+
+                for i, idx in enumerate(indices):
+                    if sampled_points[idx] > means[idx] * 1.2:
+                        # This player spiked - suppress teammates by 5%
+                        for j, teammate_idx in enumerate(indices):
+                            if i != j:
+                                sampled_points[teammate_idx] *= 0.95
+
+            # Step 4: Find top scorers
             sorted_indices = np.argsort(sampled_points)
             top3_indices = sorted_indices[-3:]
             top1_idx = sorted_indices[-1]
@@ -706,6 +960,7 @@ class Top3Ranker:
         df['p_top1_pct'] = (p_top1 * 100).round(1)
         df['scoring_stddev'] = stds
         df['tier'] = tiers
+        df['stddev_calibrated'] = is_calibrated_flags
 
         # Sort by top-3 probability
         df = df.sort_values('p_top3', ascending=False).reset_index(drop=True)
