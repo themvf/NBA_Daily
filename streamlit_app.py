@@ -8118,29 +8118,47 @@ if selected_page == "Backtest Analysis":
                 pred_rank_a2 = row.get('pred_rank_a2', 99) or 99
                 pred_rank_a3 = row.get('pred_rank_a3', 99) or 99
                 best_actual_rank = min(pred_rank_a1, pred_rank_a2, pred_rank_a3)
+                n_players = row.get('n_pred_players', 0) or 0
 
-                # Two-dimensional diagnosis: ranking vs selection vs variance
+                # Count how many actual top-3 we ranked badly (>25)
+                ranks_over_25 = sum(1 for r in [pred_rank_a1, pred_rank_a2, pred_rank_a3] if r > 25)
+                ranks_over_40 = sum(1 for r in [pred_rank_a1, pred_rank_a2, pred_rank_a3] if r > 40)
+
+                # Correct diagnosis logic:
+                # - If 2+ of actual top 3 ranked >25 → Ranking failure
+                # - If actual #1 ranked ≤10 but not picked → Selection failure
+                # - If best actual rank 11-20 and cutoff is low/tied → Variance
+                # - If all actual top3 ranked 21-40 → Blind spot
                 if overlap == 3:
                     diagnosis = "✅ Perfect: All 3 correct!"
                     diagnosis_color = "green"
                 elif overlap >= 1:
-                    # Partial hit - check if it was close
-                    if best_actual_rank <= 5:
-                        diagnosis = f"Partial ({overlap}/3) — model saw them (best actual ranked #{best_actual_rank})"
+                    # Partial hit
+                    if ranks_over_25 >= 2:
+                        diagnosis = f"Partial ({overlap}/3) + ranking failure ({ranks_over_25}/3 ranked >25)"
+                        diagnosis_color = "orange"
                     else:
-                        diagnosis = f"Partial ({overlap}/3) — lucky hit? (best actual ranked #{best_actual_rank})"
-                    diagnosis_color = "blue"
-                elif best_actual_rank <= 5:
-                    # Selection failure: model ranked actual top-3 well but picked others
-                    diagnosis = f"Selection failure — best actual ranked #{best_actual_rank}, but we used #1-3"
+                        diagnosis = f"Partial ({overlap}/3)"
+                        diagnosis_color = "blue"
+                elif ranks_over_25 >= 2:
+                    # Ranking failure: 2+ actual top-3 ranked terribly
+                    diagnosis = f"Ranking failure — {ranks_over_25}/3 actual top-3 ranked >25"
+                    diagnosis_color = "red"
+                elif pred_rank_a1 <= 10:
+                    # Selection failure: we saw #1 but picked others
+                    diagnosis = f"Selection failure — actual #1 was our #{pred_rank_a1}, but we picked others"
                     diagnosis_color = "orange"
-                elif best_actual_rank <= 15:
-                    # Variance/coinflip: model was in the neighborhood
-                    diagnosis = f"Variance miss — best actual ranked #{best_actual_rank} (near-miss)"
+                elif best_actual_rank <= 20:
+                    # Variance/coinflip: model was genuinely close
+                    diagnosis = f"Variance miss — best actual ranked #{best_actual_rank}"
                     diagnosis_color = "orange"
+                elif all(21 <= r <= 40 for r in [pred_rank_a1, pred_rank_a2, pred_rank_a3]):
+                    # Blind spot: model consistently missed but wasn't catastrophic
+                    diagnosis = f"Blind spot — all actual top-3 ranked 21-40"
+                    diagnosis_color = "red"
                 else:
-                    # Pure ranking failure: model had no clue
-                    diagnosis = f"Ranking failure — best actual ranked #{best_actual_rank} (blind)"
+                    # Pure ranking failure
+                    diagnosis = f"Ranking failure — best actual ranked #{best_actual_rank}"
                     diagnosis_color = "red"
 
                 # Build compact picks display with prediction metric ("why we picked")
@@ -8202,12 +8220,16 @@ if selected_page == "Backtest Analysis":
                 if ties_at_3rd:
                     cutoff_label += " (tie)"
 
-                # Create expandable row with enhanced header
-                header = f"{overlap_icon} **{date_str}** | Overlap: {overlap}/3 | #1: {hit1_icon} | Cutoff: {cutoff_label}pts"
+                # Create expandable row with enhanced header (includes slate size)
+                slate_size_str = f" | N={n_players}" if n_players > 0 else ""
+                header = f"{overlap_icon} **{date_str}** | Overlap: {overlap}/3 | #1: {hit1_icon} | Cutoff: {cutoff_label}pts{slate_size_str}"
 
                 with st.expander(header, expanded=False):
                     # Diagnosis badge at top
                     st.markdown(f"**Diagnosis:** :{diagnosis_color}[{diagnosis}]")
+
+                    # One-line truth: diagnosis breakdown
+                    st.markdown(f"`Actual top-3 ranks: {pred_rank_a1} / {pred_rank_a2} / {pred_rank_a3} | Best: #{best_actual_rank} | Cutoff: {actual_3rd_pts:.0f}pts | Best pick: {best_pick_pts:.0f}pts ({closest_miss:+.0f})`")
 
                     col1, col2 = st.columns(2)
 
@@ -8216,28 +8238,9 @@ if selected_page == "Backtest Analysis":
                         for pick in picks_display:
                             st.markdown(f"  • {pick}")
 
-                        # Enhanced closeness display (score-space + rank-space)
-                        st.markdown("---")
-                        st.markdown("**Closeness (score-space):**")
-                        st.markdown(f"  Best pick: **{best_pick_pts:.0f}** → Cutoff: **{actual_3rd_pts:.0f}** → ", unsafe_allow_html=False)
-                        if closest_miss >= 0:
-                            st.markdown(f"  :green[✅ +{closest_miss:.0f} pts (beat cutoff)]")
-                        elif closest_miss >= -5:
-                            st.markdown(f"  :orange[⚠️ {closest_miss:.0f} pts (close!)]")
-                        else:
-                            st.markdown(f"  :red[❌ {closest_miss:.0f} pts]")
-
-                        # Rank-space closeness
-                        st.markdown(f"**Closeness (rank-space):** best actual top-3 was our #{best_actual_rank}")
-                        if best_actual_rank <= 5:
-                            st.markdown(f"  :orange[Model saw them but picked #1-3 instead]")
-                        elif best_actual_rank <= 15:
-                            st.markdown(f"  :orange[Model was in the neighborhood]")
-                        else:
-                            st.markdown(f"  :red[Model missed entirely]")
-
+                        # Tie-friendly overlap
                         if tie_friendly != overlap:
-                            st.markdown(f"  Tie-friendly: {tie_friendly}/3")
+                            st.markdown(f"  Tie-friendly overlap: {tie_friendly}/3")
 
                     with col2:
                         st.markdown("**Actual Top 3** (our rank):")
@@ -8248,39 +8251,50 @@ if selected_page == "Backtest Analysis":
                         st.markdown("---")
                         spread = actual_1st_pts - actual_3rd_pts
                         if spread == 0:
-                            st.markdown(f"**Top-3 pts:** {actual_1st_pts:.0f} / {actual_2nd_pts:.0f} / {actual_3rd_pts:.0f} (tie), spread 0")
+                            st.markdown(f"**Top-3 pts:** {actual_1st_pts:.0f} / {actual_2nd_pts:.0f} / {actual_3rd_pts:.0f} (tie)")
                         else:
-                            st.markdown(f"**Top-3 pts:** {actual_1st_pts:.0f} / {actual_2nd_pts:.0f} / {actual_3rd_pts:.0f}, spread {spread:.0f}")
+                            st.markdown(f"**Top-3 pts:** {actual_1st_pts:.0f} / {actual_2nd_pts:.0f} / {actual_3rd_pts:.0f} (spread {spread:.0f})")
 
-                    # Model Top 3 quick context with finish ranks
+                    # Model picks with actual finishes (clarified display)
                     st.markdown("---")
-                    top3_context = []
+                    picks_summary = []
+                    finishes = []
                     for i in range(1, 4):
                         name = row.get(f'picked{i}_name', '')
                         finish = row.get(f'picked{i}_finish', 99) or 99
                         if name:
                             last_name = name.split()[-1]
-                            finish_str = f"#{finish}" if finish < 99 else "DNP"
-                            top3_context.append(f"{last_name}({finish_str})")
-                    if top3_context:
-                        st.markdown(f"**Model's top 3:** {' | '.join(top3_context)}")
+                            picks_summary.append(last_name)
+                            finishes.append(f"#{finish}" if finish < 99 else "DNP")
+                    if picks_summary:
+                        st.markdown(f"**Model picks:** {', '.join(picks_summary)} — actual finishes: {'/'.join(finishes)}")
 
-                    # Baseline comparison
+                    # Baseline comparison with Hit #1 indicator
                     try:
                         baselines = backtest_top3.compute_baseline_overlap(backtest_conn, date_str)
-                        proj_overlap = baselines.get('projection_only', {}).get('overlap', '?')
-                        ceil_overlap = baselines.get('ceiling_only', {}).get('overlap', '?')
+                        proj_data = baselines.get('projection_only', {})
+                        ceil_data = baselines.get('ceiling_only', {})
+                        proj_overlap = proj_data.get('overlap', 0)
+                        ceil_overlap = ceil_data.get('overlap', 0)
+                        proj_hit1 = proj_data.get('pred_rank_a1', 99) <= 3
+                        ceil_hit1 = ceil_data.get('pred_rank_a1', 99) <= 3
+
                         if proj_overlap is not None and ceil_overlap is not None:
-                            comparison_text = f"vs Projection: {proj_overlap}/3 | vs Ceiling: {ceil_overlap}/3"
-                            # Show if we beat baselines
-                            beat_proj = overlap > proj_overlap if proj_overlap is not None else False
-                            beat_ceil = overlap > ceil_overlap if ceil_overlap is not None else False
-                            if beat_proj and beat_ceil:
-                                st.markdown(f"**Baseline comparison:** :green[{comparison_text}] ✅ beat both")
-                            elif beat_proj or beat_ceil:
-                                st.markdown(f"**Baseline comparison:** :blue[{comparison_text}]")
+                            # Build comparison with Hit #1 indicators
+                            proj_hit1_icon = "✅" if proj_hit1 else "❌"
+                            ceil_hit1_icon = "✅" if ceil_hit1 else "❌"
+                            comparison_text = f"Proj: {proj_overlap}/3 (hit#1:{proj_hit1_icon}) | Ceil: {ceil_overlap}/3 (hit#1:{ceil_hit1_icon})"
+
+                            # Determine if this was a brutal slate
+                            best_baseline = max(proj_overlap or 0, ceil_overlap or 0)
+                            if best_baseline == 0 and overlap == 0:
+                                st.markdown(f"**Baselines:** {comparison_text} — brutal slate (no baseline hit)")
+                            elif overlap > best_baseline:
+                                st.markdown(f"**Baselines:** :green[{comparison_text}] — beat baselines")
+                            elif overlap == best_baseline:
+                                st.markdown(f"**Baselines:** {comparison_text} — matched")
                             else:
-                                st.markdown(f"**Baseline comparison:** :gray[{comparison_text}]")
+                                st.markdown(f"**Baselines:** :red[{comparison_text}] — baselines beat us")
                     except Exception:
                         pass  # Baseline comparison is optional
 
