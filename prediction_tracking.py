@@ -270,6 +270,131 @@ def upgrade_predictions_table_for_opponent_injury(conn: sqlite3.Connection) -> N
     conn.commit()
 
 
+def ensure_prediction_sim_columns(conn: sqlite3.Connection) -> None:
+    """
+    Add Monte Carlo simulation columns to predictions table.
+
+    These columns store the simulation outputs that are used for ranking:
+    - p_top3: Probability of finishing in top 3 scorers
+    - p_top1: Probability of being the #1 scorer
+    - top_scorer_score: Heuristic score for top scorer potential
+    - sim_*: Metadata for reproducibility
+
+    CRITICAL: Without these columns, backtest falls back to projected_ppg ranking,
+    which causes star burial issues (e.g., Murray #76, Shai #41).
+    """
+    cursor = conn.cursor()
+
+    # Check which columns already exist
+    cursor.execute("PRAGMA table_info(predictions)")
+    existing_columns = {row[1] for row in cursor.fetchall()}
+
+    # Define simulation output columns
+    sim_columns = {
+        # Core ranking fields (used by backtest)
+        'p_top3': 'REAL DEFAULT NULL',
+        'p_top1': 'REAL DEFAULT NULL',
+        'top_scorer_score': 'REAL DEFAULT NULL',
+        # Simulation metadata (for reproducibility)
+        'sim_sigma': 'REAL DEFAULT NULL',           # Variance used in simulation
+        'sim_tier': 'TEXT DEFAULT NULL',            # Player tier (STAR/ROLE/BENCH)
+        'sim_n': 'INTEGER DEFAULT NULL',            # Number of simulations
+        'sim_seed': 'INTEGER DEFAULT NULL',         # Random seed (if set)
+        'sim_version': 'TEXT DEFAULT NULL',         # Algorithm version
+        'sim_created_at': 'TEXT DEFAULT NULL',      # When simulation was run
+        'sim_status': 'TEXT DEFAULT NULL',          # OK/FAILED/PENDING
+    }
+
+    # Add missing columns
+    added = []
+    for col_name, col_type in sim_columns.items():
+        if col_name not in existing_columns:
+            try:
+                cursor.execute(f"ALTER TABLE predictions ADD COLUMN {col_name} {col_type}")
+                added.append(col_name)
+            except Exception as e:
+                print(f"Warning: Could not add column {col_name}: {e}")
+
+    if added:
+        print(f"Added simulation columns: {', '.join(added)}")
+
+    # Create indexes for common ranking queries
+    try:
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_predictions_p_top3
+            ON predictions(game_date, p_top3)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_predictions_top_scorer_score
+            ON predictions(game_date, top_scorer_score)
+        """)
+    except Exception as e:
+        print(f"Warning: Could not create indexes: {e}")
+
+    conn.commit()
+
+
+def persist_sim_results(
+    conn: sqlite3.Connection,
+    game_date: str,
+    df: 'pd.DataFrame',
+    sim_n: int = 10000,
+    sim_seed: int = None,
+    sim_version: str = 'v1.0'
+) -> int:
+    """
+    Persist simulation results back into predictions table.
+
+    Args:
+        conn: Database connection
+        game_date: Game date (YYYY-MM-DD)
+        df: DataFrame with columns: player_id, p_top3, p_top1, top_scorer_score,
+            optionally: scoring_stddev, tier
+        sim_n: Number of simulations run
+        sim_seed: Random seed used (if any)
+        sim_version: Algorithm version string
+
+    Returns:
+        Number of rows updated
+    """
+    cursor = conn.cursor()
+
+    rows = []
+    for _, r in df.iterrows():
+        rows.append((
+            float(r.get('p_top3', 0) or 0),
+            float(r.get('p_top1', 0) or 0),
+            float(r.get('top_scorer_score', 0) or 0),
+            float(r.get('scoring_stddev', 0) or 0) if 'scoring_stddev' in r else None,
+            str(r.get('tier', '')) if 'tier' in r else None,
+            sim_n,
+            sim_seed,
+            sim_version,
+            'OK',  # sim_status
+            game_date,
+            int(r['player_id']),
+        ))
+
+    cursor.executemany("""
+        UPDATE predictions
+        SET p_top3 = ?,
+            p_top1 = ?,
+            top_scorer_score = ?,
+            sim_sigma = ?,
+            sim_tier = ?,
+            sim_n = ?,
+            sim_seed = ?,
+            sim_version = ?,
+            sim_status = ?,
+            sim_created_at = datetime('now')
+        WHERE game_date = ?
+          AND player_id = ?
+    """, rows)
+
+    conn.commit()
+    return cursor.rowcount
+
+
 def upgrade_predictions_table_for_fanduel(conn: sqlite3.Connection) -> None:
     """Add FanDuel odds fields to existing predictions table if they don't exist."""
     cursor = conn.cursor()

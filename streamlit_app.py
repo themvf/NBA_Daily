@@ -108,6 +108,17 @@ def generate_predictions_ui(pred_date: date, db_path: Path, builder_config: Dict
                 f"Avg DFS score: {result['summary']['avg_dfs_score']:.1f}"
             )
 
+            # Show simulation status
+            sim_status = result['summary'].get('sim_status', 'not_run')
+            sim_updated = result['summary'].get('sim_players_updated', 0)
+
+            if sim_status == 'ok' and sim_updated > 0:
+                st.sidebar.success(f"🎲 Simulation: {sim_updated} players computed")
+            elif sim_status == 'failed':
+                st.sidebar.warning("⚠️ Simulation failed - backtest will use fallback ranking")
+            elif sim_status == 'skip' or sim_updated == 0:
+                st.sidebar.info("ℹ️ Simulation skipped - no players to simulate")
+
             # Trigger S3 backup if configured
             try:
                 storage = s3_storage.S3PredictionStorage()
@@ -7873,6 +7884,33 @@ if selected_page == "Backtest Analysis":
 
     # Ensure backtest table exists
     pt.create_backtest_table(backtest_conn)
+
+    # Check for missing simulation data and show warning
+    try:
+        sim_check = backtest_conn.execute("""
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN p_top3 IS NOT NULL THEN 1 ELSE 0 END) as with_sim
+            FROM predictions
+            WHERE game_date >= date('now', '-60 days')
+        """).fetchone()
+        total_preds, preds_with_sim = sim_check
+        if total_preds > 0:
+            sim_coverage = preds_with_sim / total_preds * 100
+            if sim_coverage < 50:
+                st.warning(
+                    f"⚠️ **Low Simulation Coverage**: Only {sim_coverage:.0f}% of predictions "
+                    f"({preds_with_sim:,}/{total_preds:,}) have simulation data.\n\n"
+                    "Strategies using `sim_p_top3` or `sim_p_first` will fall back to `projected_ppg` for missing data.\n\n"
+                    "**To fix:** Run `python backfill_sim_probs.py` to populate historical simulation values."
+                )
+            elif sim_coverage < 90:
+                st.info(
+                    f"ℹ️ **Partial Simulation Coverage**: {sim_coverage:.0f}% of predictions have simulation data. "
+                    "Some dates may use fallback ranking for missing simulation values."
+                )
+    except Exception:
+        pass  # Schema might not have p_top3 column yet
 
     # Controls row
     ctrl_col1, ctrl_col2, ctrl_col3 = st.columns([1, 1, 1])

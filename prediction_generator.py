@@ -187,6 +187,27 @@ def generate_predictions_for_date(
             # Log but don't fail predictions for odds errors
             result['errors'].append(f"FanDuel fetch warning: {str(e)[:50]}")
 
+        # Step 5: Run Monte Carlo simulation and persist results
+        # This ensures p_top3, p_top1, top_scorer_score are populated for backtest
+        if progress_callback:
+            progress_callback(total_games, total_games, "Running top-3 simulation...")
+
+        try:
+            sim_result = _run_and_persist_simulation(
+                conn=data['games_conn'],
+                game_date=str(game_date),
+                sim_n=10000,
+                progress_callback=progress_callback
+            )
+            result['summary']['sim_status'] = sim_result.get('status', 'unknown')
+            result['summary']['sim_players_updated'] = sim_result.get('updated', 0)
+            if sim_result.get('error'):
+                result['errors'].append(f"Simulation warning: {sim_result['error']}")
+        except Exception as e:
+            # Log but don't fail predictions for simulation errors
+            result['errors'].append(f"Simulation failed: {str(e)[:50]}")
+            result['summary']['sim_status'] = 'failed'
+
         return result
 
     except Exception as e:
@@ -473,6 +494,77 @@ def _generate_predictions_for_game(
                 # Don't append to errors here - let game-level handler deal with it
 
     return (predictions_logged, predictions_failed, player_stats)
+
+
+def _run_and_persist_simulation(
+    conn: sqlite3.Connection,
+    game_date: str,
+    sim_n: int = 10000,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None
+) -> Dict[str, Any]:
+    """
+    Run Monte Carlo simulation and persist results to predictions table.
+
+    This step computes p_top3, p_top1, top_scorer_score and writes them back
+    to the predictions table so they're available for backtest.
+
+    Args:
+        conn: Database connection
+        game_date: Game date string (YYYY-MM-DD)
+        sim_n: Number of simulation iterations
+        progress_callback: Optional progress callback
+
+    Returns:
+        Dict with keys:
+            - status: 'ok', 'skip', 'failed'
+            - updated: Number of rows updated
+            - error: Error message if any
+    """
+    try:
+        import top3_ranking as t3r
+
+        # Ensure simulation columns exist in predictions table
+        pt.ensure_prediction_sim_columns(conn)
+
+        # Create ranker and run simulation
+        ranker = t3r.Top3Ranker(conn)
+
+        # Run Monte Carlo simulation
+        sim_df = ranker.simulate_top3_probability(
+            game_date,
+            n_simulations=sim_n,
+            use_calibration=True,
+            include_minutes=True
+        )
+
+        if sim_df.empty:
+            return {'status': 'skip', 'updated': 0, 'error': None}
+
+        # Also calculate TopScorerScore for the same players
+        score_df = ranker.rank_by_top_scorer_score(game_date, include_components=False)
+
+        # Merge top_scorer_score into sim_df
+        if not score_df.empty and 'top_scorer_score' in score_df.columns:
+            sim_df = sim_df.merge(
+                score_df[['player_id', 'top_scorer_score']],
+                on='player_id',
+                how='left'
+            )
+
+        # Persist simulation results back to predictions table
+        updated = pt.persist_sim_results(
+            conn=conn,
+            game_date=game_date,
+            df=sim_df,
+            sim_n=sim_n,
+            sim_seed=None,
+            sim_version='pipeline-v1.0'
+        )
+
+        return {'status': 'ok', 'updated': updated, 'error': None}
+
+    except Exception as e:
+        return {'status': 'failed', 'updated': 0, 'error': str(e)}
 
 
 def _generate_prediction_for_player(
