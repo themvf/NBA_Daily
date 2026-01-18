@@ -8323,6 +8323,52 @@ if selected_page == "Backtest Analysis":
                                     top5_summary.append(f"{name}({finish_str})")
                                 st.markdown(f"**Model's Top 5:** {' | '.join(top5_summary)}")
 
+                            # Ranking field diagnostics expander
+                            ranking_diag = context.get('ranking_diagnostics', {})
+                            slate_stats = context.get('slate_stats', {})
+                            actual_top_list = context.get('actual_top_scorers', [])
+
+                            # Check for issues that need warnings
+                            nan_pct = ranking_diag.get('nan_pct', 0)
+                            zero_pct = ranking_diag.get('zero_pct', 0)
+                            sim_missing_count = sum(1 for p in actual_top_list[:3] if p.get('sim_missing', False))
+                            not_predicted_count = sum(1 for p in actual_top_list[:3] if p.get('not_predicted', False))
+
+                            # Show critical warnings first
+                            if not_predicted_count > 0:
+                                st.error(f"🚨 {not_predicted_count}/3 actual top scorers were NOT IN PREDICTIONS!")
+                            if sim_missing_count > 0 and not_predicted_count < sim_missing_count:
+                                st.warning(f"⚠️ {sim_missing_count - not_predicted_count}/3 actual top scorers have MISSING SIM VALUES (used fallback ranking)")
+                            if nan_pct > 10:
+                                st.warning(f"⚠️ {nan_pct:.1f}% of {ranking_diag.get('field', 'ranking field')} values are NaN")
+
+                            with st.expander("🔍 Ranking Field Diagnostics", expanded=False):
+                                diag_col1, diag_col2 = st.columns(2)
+                                with diag_col1:
+                                    st.markdown(f"""
+                                    **Ranking Field:** `{ranking_diag.get('field', 'unknown')}`
+                                    - Total players: {ranking_diag.get('total_players', 0)}
+                                    - NaN count: {ranking_diag.get('nan_count', 0)} ({nan_pct:.1f}%)
+                                    - Zero count: {ranking_diag.get('zero_count', 0)} ({zero_pct:.1f}%)
+                                    """)
+                                with diag_col2:
+                                    st.markdown(f"""
+                                    **Value Range:**
+                                    - Min: {ranking_diag.get('min', 'N/A')}
+                                    - Max: {ranking_diag.get('max', 'N/A')}
+                                    - Mean: {ranking_diag.get('mean', 'N/A')}
+                                    - Median: {ranking_diag.get('median', 'N/A')}
+                                    """)
+
+                                if nan_pct > 0 or zero_pct > 20:
+                                    st.markdown("""
+                                    ---
+                                    **⚠️ Interpretation:**
+                                    - High NaN% → Simulation didn't run or failed for these players
+                                    - High Zero% → Simulation ran but assigned 0 probability (unusual for stars)
+                                    - Players with NaN use `projected_ppg` as fallback for ranking
+                                    """)
+
                             drill_col1, drill_col2 = st.columns(2)
 
                             with drill_col1:
@@ -8377,6 +8423,17 @@ if selected_page == "Backtest Analysis":
                                     actual_top_df['season_avg'] = pd.to_numeric(actual_top_df.get('season_avg', 0), errors='coerce')
                                     actual_top_df['proj_confidence'] = pd.to_numeric(actual_top_df.get('proj_confidence', 0), errors='coerce')
 
+                                    # Add Status column combining not_predicted and sim_missing flags
+                                    def get_status(row):
+                                        if row.get('not_predicted', False):
+                                            return '❌ NO PRED'
+                                        elif row.get('sim_missing', False):
+                                            return '⚠️ NO SIM'
+                                        elif row.get('used_fallback', False):
+                                            return '📊 FALLBACK'
+                                        return '✅'
+                                    actual_top_df['Status'] = actual_top_df.apply(get_status, axis=1)
+
                                     actual_top_df = actual_top_df.rename(columns={
                                         'finish_rank': 'Finish', 'name': 'Player',
                                         'actual_pts': 'Actual', 'our_pred_rank': 'Rank',
@@ -8384,10 +8441,10 @@ if selected_page == "Backtest Analysis":
                                         'season_avg': 'SznAvg', 'proj_confidence': 'Conf',
                                         'dfs_grade': 'Grade'
                                     })
-                                    # Show diagnostic columns: Actual vs Proj vs SznAvg vs σ to spot projection bugs
-                                    # Key insight: if Proj << SznAvg or σ=0, model may have bad data
+                                    # Show diagnostic columns with Status indicator
+                                    # Status: ❌ = not predicted, ⚠️ = sim missing, 📊 = used fallback, ✅ = ok
                                     st.dataframe(
-                                        actual_top_df[['Finish', 'Player', 'Actual', 'Rank', 'Proj', 'Ceil', 'σ', 'SznAvg', 'Grade']].head(15),
+                                        actual_top_df[['Finish', 'Player', 'Actual', 'Rank', 'Status', 'Proj', 'Ceil', 'σ', 'SznAvg']].head(15),
                                         use_container_width=True, hide_index=True,
                                         column_config={
                                             "Actual": st.column_config.NumberColumn(format="%.0f"),
@@ -8399,15 +8456,15 @@ if selected_page == "Backtest Analysis":
                                             "SznAvg": st.column_config.NumberColumn(format="%.1f"),
                                         }
                                     )
-                                    # Flag missing players
-                                    missing = actual_top_df[actual_top_df['Rank'] >= 999]
-                                    if not missing.empty:
-                                        st.warning(f"⚠️ {len(missing)} actual top scorers were NOT in our predictions!")
+
+                                    # Legend for status icons
+                                    st.caption("**Status:** ✅ OK | ⚠️ NO SIM (used fallback) | ❌ NOT PREDICTED")
 
                                     # Flag projection anomalies: Proj << SznAvg suggests bad data
                                     anomalies = actual_top_df[
-                                        (actual_top_df['Rank'] < 999) &
-                                        (actual_top_df['Proj'] < actual_top_df['SznAvg'] * 0.7)
+                                        (actual_top_df['Rank'] < 900) &
+                                        (actual_top_df['Proj'] < actual_top_df['SznAvg'] * 0.7) &
+                                        (actual_top_df['SznAvg'] > 0)
                                     ]
                                     if not anomalies.empty and len(anomalies) > 0:
                                         low_proj_names = anomalies['Player'].tolist()[:3]

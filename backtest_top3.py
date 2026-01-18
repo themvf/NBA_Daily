@@ -178,41 +178,68 @@ def load_predictions(conn: sqlite3.Connection, game_date: str) -> pd.DataFrame:
     """
     df = pd.read_sql_query(query, conn, params=[game_date])
 
-    # Add missing optional columns with default values
+    # Add missing optional columns as NaN (NOT 0!)
+    # This is critical: "unknown" should NOT become "worst possible"
     for col in optional_columns:
         if col not in df.columns:
-            df[col] = 0.0
+            df[col] = np.nan  # Keep as NaN, rank_predictions will handle
 
     # Add missing diagnostic columns with default values
     for col in diagnostic_columns:
         if col not in df.columns:
             df[col] = None  # Use None so we can distinguish missing from zero
 
-    # Fill NaN ranking fields with 0
-    for col in ['top_scorer_score', 'p_top3', 'p_top1']:
-        if col in df.columns:
-            df[col] = df[col].fillna(0)
+    # DO NOT fillna(0) for ranking fields!
+    # The rank_predictions() function will handle NaN by using fallback field
+    # This prevents "missing sim output" from being treated as "worst rank"
 
     return df
 
 
 def load_actuals(conn: sqlite3.Connection, game_date: str) -> pd.DataFrame:
     """
-    Load actual scoring results for a specific date.
+    Load actual scoring results from player_game_logs (ground truth).
 
-    Returns DataFrame with player_id, player_name, actual_ppg, sorted by points DESC.
+    IMPORTANT: This uses player_game_logs, NOT the predictions table.
+    Using predictions would create survivor bias: players not predicted
+    could never be in the actual top 3, hiding our worst misses.
+
+    Returns DataFrame with player_id, player_name, actual_ppg, minutes.
     """
+    # First try player_game_logs (ground truth)
     query = """
         SELECT
             player_id,
             player_name,
-            actual_ppg
-        FROM predictions
+            points as actual_ppg,
+            minutes,
+            team_abbreviation as team_name
+        FROM player_game_logs
         WHERE game_date = ?
-          AND actual_ppg IS NOT NULL
-        ORDER BY actual_ppg DESC
+          AND points IS NOT NULL
+          AND minutes > 0
+        ORDER BY points DESC
     """
-    return pd.read_sql_query(query, conn, params=[game_date])
+    df = pd.read_sql_query(query, conn, params=[game_date])
+
+    # Fallback to predictions table if player_game_logs is empty
+    # (for backwards compatibility with older data)
+    if df.empty:
+        fallback_query = """
+            SELECT
+                player_id,
+                player_name,
+                actual_ppg,
+                actual_minutes as minutes,
+                team_name
+            FROM predictions
+            WHERE game_date = ?
+              AND actual_ppg IS NOT NULL
+            ORDER BY actual_ppg DESC
+        """
+        df = pd.read_sql_query(fallback_query, conn, params=[game_date])
+
+    return df
 
 
 # =============================================================================
@@ -273,22 +300,84 @@ def compute_actual_top3(actuals: pd.DataFrame) -> Dict:
 # RANKING
 # =============================================================================
 
+def diagnose_ranking_field(preds: pd.DataFrame, ranking_field: str) -> Dict:
+    """
+    Diagnose ranking field quality before ranking.
+    Call this to understand why stars might be ranked low.
+
+    Returns dict with NaN count, zero count, min/max/mean stats.
+    """
+    if ranking_field not in preds.columns:
+        return {'error': f'{ranking_field} not in dataframe', 'field': ranking_field}
+
+    col = preds[ranking_field]
+    total = len(preds)
+
+    return {
+        'field': ranking_field,
+        'total_players': total,
+        'nan_count': int(col.isna().sum()),
+        'nan_pct': round(col.isna().sum() / total * 100, 1) if total > 0 else 0,
+        'zero_count': int((col == 0).sum()),
+        'zero_pct': round((col == 0).sum() / total * 100, 1) if total > 0 else 0,
+        'min': round(float(col.min()), 4) if not col.isna().all() else None,
+        'max': round(float(col.max()), 4) if not col.isna().all() else None,
+        'mean': round(float(col.mean()), 4) if not col.isna().all() else None,
+        'median': round(float(col.median()), 4) if not col.isna().all() else None,
+    }
+
+
 def rank_predictions(preds: pd.DataFrame, ranking_field: str) -> pd.DataFrame:
     """
-    Rank predictions by the specified field.
+    Rank predictions by the specified field with proper NaN handling.
+
+    KEY FIX: NaN values use fallback field (projected_ppg) instead of being
+    treated as 0 (which would bury stars with missing sim output).
 
     Adds 'pred_rank' column (1 = highest ranked).
     Returns sorted DataFrame.
+
+    Tie-breaking order (deterministic):
+    1. ranking_field DESC (primary sort)
+    2. projected_ppg DESC (secondary - higher projection wins ties)
+    3. player_id ASC (tertiary - deterministic final breaker)
     """
+    preds = preds.copy()
+
     if ranking_field not in preds.columns:
         # Fallback to projected_ppg if field doesn't exist
         ranking_field = 'projected_ppg'
 
-    # Sort descending by ranking field
-    ranked = preds.sort_values(ranking_field, ascending=False).reset_index(drop=True)
+    # Check for NaN prevalence and warn
+    nan_count = preds[ranking_field].isna().sum()
+    nan_pct = nan_count / len(preds) * 100 if len(preds) > 0 else 0
+
+    if nan_pct > 10:
+        import warnings
+        warnings.warn(
+            f"⚠️ {nan_pct:.1f}% of {ranking_field} values are NaN - "
+            f"using projected_ppg as fallback for those players"
+        )
+
+    # Create effective ranking value: use fallback for NaN
+    # This is the KEY FIX: NaN becomes projected_ppg, not 0
+    preds['_rank_value'] = preds[ranking_field].fillna(preds['projected_ppg'])
+
+    # Track which players used fallback (for diagnostics)
+    preds['_used_fallback'] = preds[ranking_field].isna()
+
+    # Sort with deterministic tie-breaker
+    ranked = preds.sort_values(
+        ['_rank_value', 'projected_ppg', 'player_id'],
+        ascending=[False, False, True]
+    ).reset_index(drop=True)
 
     # Assign ranks (1-indexed)
     ranked['pred_rank'] = range(1, len(ranked) + 1)
+
+    # Clean up temp columns but keep fallback flag for diagnostics
+    ranked = ranked.drop(columns=['_rank_value'])
+    ranked = ranked.rename(columns={'_used_fallback': 'ranking_used_fallback'})
 
     return ranked
 
@@ -378,6 +467,8 @@ def score_ranking(
     - pred_rank_a3: our rank for actual #3 scorer
     - avg_rank_actual_top3: mean of above
     - best_rank_actual_top3: min of above
+    - not_predicted_count: how many of actual top 3 weren't in predictions (0-3)
+    - used_fallback_count: how many of actual top 3 used fallback ranking (sim was NaN)
     """
     if not actual_top3['top3']:
         return {
@@ -385,7 +476,9 @@ def score_ranking(
             'pred_rank_a2': None,
             'pred_rank_a3': None,
             'avg_rank_actual_top3': None,
-            'best_rank_actual_top3': None
+            'best_rank_actual_top3': None,
+            'not_predicted_count': 0,
+            'used_fallback_count': 0
         }
 
     # Build rank lookup
@@ -394,12 +487,29 @@ def score_ranking(
         for _, row in preds_ranked.iterrows()
     }
 
+    # Build fallback flag lookup (if column exists)
+    fallback_lookup = {}
+    if 'ranking_used_fallback' in preds_ranked.columns:
+        fallback_lookup = {
+            row['player_id']: row['ranking_used_fallback']
+            for _, row in preds_ranked.iterrows()
+        }
+
     n_players = len(preds_ranked)
     ranks = []
+    not_predicted_count = 0
+    used_fallback_count = 0
 
     for i, (player_id, _, _) in enumerate(actual_top3['top3']):
-        # If player not in predictions, assign rank = n_players + 1
-        rank = rank_lookup.get(player_id, n_players + 1)
+        if player_id in rank_lookup:
+            rank = rank_lookup[player_id]
+            # Check if this player used fallback ranking (sim was NaN)
+            if fallback_lookup.get(player_id, False):
+                used_fallback_count += 1
+        else:
+            # Player not in predictions at all - this is a MISS
+            rank = n_players + 1
+            not_predicted_count += 1
         ranks.append(rank)
 
     pred_rank_a1 = ranks[0] if len(ranks) > 0 else None
@@ -413,7 +523,9 @@ def score_ranking(
         'pred_rank_a2': pred_rank_a2,
         'pred_rank_a3': pred_rank_a3,
         'avg_rank_actual_top3': np.mean(valid_ranks) if valid_ranks else None,
-        'best_rank_actual_top3': min(valid_ranks) if valid_ranks else None
+        'best_rank_actual_top3': min(valid_ranks) if valid_ranks else None,
+        'not_predicted_count': not_predicted_count,
+        'used_fallback_count': used_fallback_count
     }
 
 
@@ -636,6 +748,17 @@ def get_drilldown_context(conn: sqlite3.Connection, game_date: str, strategy: st
     # Build pred rank lookup
     pred_rank_lookup = dict(zip(preds_ranked['player_id'], preds_ranked['pred_rank']))
 
+    # Build fallback flag lookup (players whose rank came from fallback, not primary ranking field)
+    fallback_lookup = {}
+    if 'ranking_used_fallback' in preds_ranked.columns:
+        fallback_lookup = {
+            row['player_id']: row['ranking_used_fallback']
+            for _, row in preds_ranked.iterrows()
+        }
+
+    # Get ranking field diagnostics
+    ranking_diag = diagnose_ranking_field(preds_ranked, ranking_field)
+
     # Actual top N scorers with full diagnostic info
     actual_top = []
     for _, row in actuals_sorted.head(top_n).iterrows():
@@ -647,6 +770,13 @@ def get_drilldown_context(conn: sqlite3.Connection, game_date: str, strategy: st
             ceiling_val = pr.get('proj_ceiling', 0) or 0
             floor_val = pr.get('proj_floor', 0) or 0
             sigma = (ceiling_val - floor_val) / 2 if ceiling_val > floor_val else 0
+
+            # Check if this player's sim values are missing (used fallback)
+            used_fallback = fallback_lookup.get(player_id, False)
+            p_top1_val = pr.get('p_top1')
+            p_top3_val = pr.get('p_top3')
+            sim_missing = pd.isna(p_top1_val) or pd.isna(p_top3_val)
+
             actual_top.append({
                 'finish_rank': int(row['finish_rank']),
                 'name': row['player_name'],
@@ -661,41 +791,53 @@ def get_drilldown_context(conn: sqlite3.Connection, game_date: str, strategy: st
                 'dfs_grade': pr.get('dfs_grade', '') or '',
                 'recent_avg_3': pr.get('recent_avg_3', 0) or 0,
                 'recent_avg_5': pr.get('recent_avg_5', 0) or 0,
-                'p_top1': pr.get('p_top1', 0) or 0,
-                'p_top3': pr.get('p_top3', 0) or 0,
+                'p_top1': p_top1_val if not pd.isna(p_top1_val) else 0,
+                'p_top3': p_top3_val if not pd.isna(p_top3_val) else 0,
+                'not_predicted': False,
+                'sim_missing': sim_missing,
+                'used_fallback': used_fallback,
             })
         else:
-            # Player not in our predictions - flag it
+            # Player not in our predictions - this is a MISS
             actual_top.append({
                 'finish_rank': int(row['finish_rank']),
                 'name': row['player_name'],
                 'actual_pts': row['actual_ppg'],
-                'our_pred_rank': 999,  # Not in predictions
+                'our_pred_rank': len(preds) + 1,  # N+1, not 999
                 'proj_ppg': 0,
                 'ceiling': 0,
                 'floor': 0,
                 'sigma': 0,
                 'season_avg': 0,
                 'proj_confidence': 0,
-                'dfs_grade': '❌ NO PRED',
+                'dfs_grade': '❌ NOT PREDICTED',
                 'recent_avg_3': 0,
                 'recent_avg_5': 0,
                 'p_top1': 0,
                 'p_top3': 0,
+                'not_predicted': True,
+                'sim_missing': True,
+                'used_fallback': False,
             })
 
-    # Slate stats
+    # Slate stats with ranking diagnostics
     slate_stats = {
         'total_players': len(actuals),
+        'total_predicted': len(preds),
         'avg_points': actuals['actual_ppg'].mean(),
         'max_points': actuals['actual_ppg'].max(),
         'top3_threshold': actuals_sorted.iloc[2]['actual_ppg'] if len(actuals_sorted) >= 3 else 0,
+        # Ranking field diagnostics
+        'ranking_field': ranking_field,
+        'ranking_nan_pct': ranking_diag.get('nan_pct', 0),
+        'ranking_zero_pct': ranking_diag.get('zero_pct', 0),
     }
 
     return {
         'our_top_ranked': our_top,
         'actual_top_scorers': actual_top,
-        'slate_stats': slate_stats
+        'slate_stats': slate_stats,
+        'ranking_diagnostics': ranking_diag,
     }
 
 
