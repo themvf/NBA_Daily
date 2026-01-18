@@ -845,15 +845,32 @@ def store_result(conn: sqlite3.Connection, result: Dict) -> None:
     """Store a backtest result row in the database."""
     cursor = conn.cursor()
 
+    # Get actual table columns to filter result dict
+    cursor.execute("PRAGMA table_info(backtest_daily_results)")
+    table_columns = {row[1] for row in cursor.fetchall()}
+
+    # Filter result to only include columns that exist in table
+    # and exclude complex nested objects (dicts, lists)
+    filtered_result = {}
+    for key, value in result.items():
+        if key in table_columns:
+            # Skip complex types that can't be stored in SQLite
+            if isinstance(value, (dict, list)):
+                continue
+            filtered_result[key] = value
+
+    if not filtered_result:
+        return  # Nothing to store
+
     # Use INSERT OR REPLACE to handle UNIQUE constraint
-    columns = list(result.keys())
+    columns = list(filtered_result.keys())
     placeholders = ', '.join(['?' for _ in columns])
     col_names = ', '.join(columns)
 
     cursor.execute(f"""
         INSERT OR REPLACE INTO backtest_daily_results ({col_names})
         VALUES ({placeholders})
-    """, list(result.values()))
+    """, list(filtered_result.values()))
 
     conn.commit()
 
