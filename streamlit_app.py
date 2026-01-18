@@ -8333,17 +8333,20 @@ if selected_page == "Backtest Analysis":
                                     our_top_df['rank'] = pd.to_numeric(our_top_df['rank'], errors='coerce').astype('Int64')
                                     our_top_df['proj_ppg'] = pd.to_numeric(our_top_df['proj_ppg'], errors='coerce')
                                     our_top_df['ceiling'] = pd.to_numeric(our_top_df.get('ceiling', 0), errors='coerce')
+                                    our_top_df['sigma'] = pd.to_numeric(our_top_df.get('sigma', 0), errors='coerce')
+                                    our_top_df['season_avg'] = pd.to_numeric(our_top_df.get('season_avg', 0), errors='coerce')
                                     our_top_df['actual_pts'] = pd.to_numeric(our_top_df['actual_pts'], errors='coerce')
                                     our_top_df['finish_rank'] = pd.to_numeric(our_top_df['finish_rank'], errors='coerce').astype('Int64')
                                     our_top_df['p_top1'] = pd.to_numeric(our_top_df.get('p_top1', 0), errors='coerce')
 
                                     our_top_df = our_top_df.rename(columns={
                                         'rank': 'Rank', 'name': 'Player', 'proj_ppg': 'Proj',
-                                        'ceiling': 'Ceil', 'actual_pts': 'Actual', 'finish_rank': 'Finish',
-                                        'p_top1': 'P#1'
+                                        'ceiling': 'Ceil', 'sigma': 'σ', 'season_avg': 'SznAvg',
+                                        'actual_pts': 'Actual', 'finish_rank': 'Finish',
+                                        'p_top1': 'P#1', 'dfs_grade': 'Grade'
                                     })
-                                    # Show Proj, Ceil, Actual, Finish, P#1 for debugging
-                                    display_cols = ['Rank', 'Player', 'Proj', 'Ceil', 'Actual', 'Finish']
+                                    # Show diagnostic columns: Proj, Ceil, σ (sigma), SznAvg, Actual, Finish
+                                    display_cols = ['Rank', 'Player', 'Proj', 'Ceil', 'σ', 'SznAvg', 'Actual', 'Finish']
                                     if 'P#1' in our_top_df.columns and our_top_df['P#1'].sum() > 0:
                                         display_cols.append('P#1')
                                     st.dataframe(
@@ -8352,6 +8355,8 @@ if selected_page == "Backtest Analysis":
                                         column_config={
                                             "Proj": st.column_config.NumberColumn(format="%.1f"),
                                             "Ceil": st.column_config.NumberColumn(format="%.0f"),
+                                            "σ": st.column_config.NumberColumn(format="%.1f"),
+                                            "SznAvg": st.column_config.NumberColumn(format="%.1f"),
                                             "Actual": st.column_config.NumberColumn(format="%.0f"),
                                             "Finish": st.column_config.NumberColumn(format="%d"),
                                             "P#1": st.column_config.NumberColumn(format="%.1f%%"),
@@ -8368,24 +8373,45 @@ if selected_page == "Backtest Analysis":
                                     actual_top_df['our_pred_rank'] = pd.to_numeric(actual_top_df['our_pred_rank'], errors='coerce').astype('Int64')
                                     actual_top_df['proj_ppg'] = pd.to_numeric(actual_top_df.get('proj_ppg', 0), errors='coerce')
                                     actual_top_df['ceiling'] = pd.to_numeric(actual_top_df.get('ceiling', 0), errors='coerce')
+                                    actual_top_df['sigma'] = pd.to_numeric(actual_top_df.get('sigma', 0), errors='coerce')
+                                    actual_top_df['season_avg'] = pd.to_numeric(actual_top_df.get('season_avg', 0), errors='coerce')
+                                    actual_top_df['proj_confidence'] = pd.to_numeric(actual_top_df.get('proj_confidence', 0), errors='coerce')
 
                                     actual_top_df = actual_top_df.rename(columns={
                                         'finish_rank': 'Finish', 'name': 'Player',
-                                        'actual_pts': 'Actual', 'our_pred_rank': 'Our Rank',
-                                        'proj_ppg': 'Our Proj', 'ceiling': 'Our Ceil'
+                                        'actual_pts': 'Actual', 'our_pred_rank': 'Rank',
+                                        'proj_ppg': 'Proj', 'ceiling': 'Ceil', 'sigma': 'σ',
+                                        'season_avg': 'SznAvg', 'proj_confidence': 'Conf',
+                                        'dfs_grade': 'Grade'
                                     })
-                                    # Show Our Proj and Our Ceil to debug why stars are ranked low
+                                    # Show diagnostic columns: Actual vs Proj vs SznAvg vs σ to spot projection bugs
+                                    # Key insight: if Proj << SznAvg or σ=0, model may have bad data
                                     st.dataframe(
-                                        actual_top_df[['Finish', 'Player', 'Actual', 'Our Rank', 'Our Proj', 'Our Ceil']].head(15),
+                                        actual_top_df[['Finish', 'Player', 'Actual', 'Rank', 'Proj', 'Ceil', 'σ', 'SznAvg', 'Grade']].head(15),
                                         use_container_width=True, hide_index=True,
                                         column_config={
                                             "Actual": st.column_config.NumberColumn(format="%.0f"),
                                             "Finish": st.column_config.NumberColumn(format="%d"),
-                                            "Our Rank": st.column_config.NumberColumn(format="%d"),
-                                            "Our Proj": st.column_config.NumberColumn(format="%.1f"),
-                                            "Our Ceil": st.column_config.NumberColumn(format="%.0f"),
+                                            "Rank": st.column_config.NumberColumn(format="%d"),
+                                            "Proj": st.column_config.NumberColumn(format="%.1f"),
+                                            "Ceil": st.column_config.NumberColumn(format="%.0f"),
+                                            "σ": st.column_config.NumberColumn(format="%.1f"),
+                                            "SznAvg": st.column_config.NumberColumn(format="%.1f"),
                                         }
                                     )
+                                    # Flag missing players
+                                    missing = actual_top_df[actual_top_df['Rank'] >= 999]
+                                    if not missing.empty:
+                                        st.warning(f"⚠️ {len(missing)} actual top scorers were NOT in our predictions!")
+
+                                    # Flag projection anomalies: Proj << SznAvg suggests bad data
+                                    anomalies = actual_top_df[
+                                        (actual_top_df['Rank'] < 999) &
+                                        (actual_top_df['Proj'] < actual_top_df['SznAvg'] * 0.7)
+                                    ]
+                                    if not anomalies.empty and len(anomalies) > 0:
+                                        low_proj_names = anomalies['Player'].tolist()[:3]
+                                        st.info(f"📊 Low projections: {', '.join(low_proj_names)} - Proj << SznAvg")
 
                             # Slate stats
                             slate = context['slate_stats']

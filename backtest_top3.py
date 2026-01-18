@@ -153,11 +153,18 @@ def load_predictions(conn: sqlite3.Connection, game_date: str) -> pd.DataFrame:
     existing_columns = {row[1] for row in cursor.fetchall()}
 
     # Build query with only existing columns
+    # Include diagnostic fields for debugging why stars might be ranked low
     base_columns = ['player_id', 'player_name', 'team_name', 'projected_ppg',
                     'proj_ceiling', 'proj_floor', 'actual_ppg', 'dfs_score']
+    # Additional diagnostic columns to identify projection bugs
+    diagnostic_columns = ['season_avg_ppg', 'proj_confidence', 'dfs_grade',
+                          'recent_avg_3', 'recent_avg_5', 'opponent_def_rating']
     optional_columns = ['top_scorer_score', 'p_top3', 'p_top1']
 
     select_cols = ['p.' + col for col in base_columns if col in existing_columns]
+    for col in diagnostic_columns:
+        if col in existing_columns:
+            select_cols.append(f'p.{col}')
     for col in optional_columns:
         if col in existing_columns:
             select_cols.append(f'p.{col}')
@@ -175,6 +182,11 @@ def load_predictions(conn: sqlite3.Connection, game_date: str) -> pd.DataFrame:
     for col in optional_columns:
         if col not in df.columns:
             df[col] = 0.0
+
+    # Add missing diagnostic columns with default values
+    for col in diagnostic_columns:
+        if col not in df.columns:
+            df[col] = None  # Use None so we can distinguish missing from zero
 
     # Fill NaN ranking fields with 0
     for col in ['top_scorer_score', 'p_top3', 'p_top1']:
@@ -602,33 +614,75 @@ def get_drilldown_context(conn: sqlite3.Connection, game_date: str, strategy: st
     our_top = []
     for _, row in preds_ranked.head(top_n).iterrows():
         player_id = row['player_id']
+        ceiling_val = row.get('proj_ceiling', 0) or 0
+        floor_val = row.get('proj_floor', 0) or 0
+        sigma = (ceiling_val - floor_val) / 2 if ceiling_val > floor_val else 0
         our_top.append({
             'rank': int(row['pred_rank']),
             'name': row['player_name'],
-            'proj_ppg': row.get('projected_ppg', 0),
-            'ceiling': row.get('proj_ceiling', 0),
+            'proj_ppg': row.get('projected_ppg', 0) or 0,
+            'ceiling': ceiling_val,
+            'floor': floor_val,
+            'sigma': sigma,
+            'season_avg': row.get('season_avg_ppg', 0) or 0,
+            'proj_confidence': row.get('proj_confidence', 0) or 0,
+            'dfs_grade': row.get('dfs_grade', '') or '',
             'actual_pts': actual_pts_lookup.get(player_id, 0),
             'finish_rank': finish_rank_lookup.get(player_id, 999),
-            'p_top3': row.get('p_top3', 0),
-            'p_top1': row.get('p_top1', 0),
+            'p_top3': row.get('p_top3', 0) or 0,
+            'p_top1': row.get('p_top1', 0) or 0,
         })
 
     # Build pred rank lookup
     pred_rank_lookup = dict(zip(preds_ranked['player_id'], preds_ranked['pred_rank']))
 
-    # Actual top N scorers
+    # Actual top N scorers with full diagnostic info
     actual_top = []
     for _, row in actuals_sorted.head(top_n).iterrows():
         player_id = row['player_id']
         pred_row = preds_ranked[preds_ranked['player_id'] == player_id]
-        actual_top.append({
-            'finish_rank': int(row['finish_rank']),
-            'name': row['player_name'],
-            'actual_pts': row['actual_ppg'],
-            'our_pred_rank': int(pred_rank_lookup.get(player_id, len(preds) + 1)),
-            'proj_ppg': pred_row['projected_ppg'].iloc[0] if not pred_row.empty else 0,
-            'ceiling': pred_row['proj_ceiling'].iloc[0] if not pred_row.empty else 0,
-        })
+        if not pred_row.empty:
+            pr = pred_row.iloc[0]
+            # Calculate sigma (spread) from ceiling - floor
+            ceiling_val = pr.get('proj_ceiling', 0) or 0
+            floor_val = pr.get('proj_floor', 0) or 0
+            sigma = (ceiling_val - floor_val) / 2 if ceiling_val > floor_val else 0
+            actual_top.append({
+                'finish_rank': int(row['finish_rank']),
+                'name': row['player_name'],
+                'actual_pts': row['actual_ppg'],
+                'our_pred_rank': int(pred_rank_lookup.get(player_id, len(preds) + 1)),
+                'proj_ppg': pr.get('projected_ppg', 0) or 0,
+                'ceiling': ceiling_val,
+                'floor': floor_val,
+                'sigma': sigma,
+                'season_avg': pr.get('season_avg_ppg', 0) or 0,
+                'proj_confidence': pr.get('proj_confidence', 0) or 0,
+                'dfs_grade': pr.get('dfs_grade', '') or '',
+                'recent_avg_3': pr.get('recent_avg_3', 0) or 0,
+                'recent_avg_5': pr.get('recent_avg_5', 0) or 0,
+                'p_top1': pr.get('p_top1', 0) or 0,
+                'p_top3': pr.get('p_top3', 0) or 0,
+            })
+        else:
+            # Player not in our predictions - flag it
+            actual_top.append({
+                'finish_rank': int(row['finish_rank']),
+                'name': row['player_name'],
+                'actual_pts': row['actual_ppg'],
+                'our_pred_rank': 999,  # Not in predictions
+                'proj_ppg': 0,
+                'ceiling': 0,
+                'floor': 0,
+                'sigma': 0,
+                'season_avg': 0,
+                'proj_confidence': 0,
+                'dfs_grade': '❌ NO PRED',
+                'recent_avg_3': 0,
+                'recent_avg_5': 0,
+                'p_top1': 0,
+                'p_top3': 0,
+            })
 
     # Slate stats
     slate_stats = {
