@@ -8329,26 +8329,62 @@ if selected_page == "Backtest Analysis":
                                 st.markdown("**Our Top 15 Ranked:**")
                                 our_top_df = pd.DataFrame(context['our_top_ranked'])
                                 if not our_top_df.empty:
+                                    # Ensure numeric types for proper sorting
+                                    our_top_df['rank'] = pd.to_numeric(our_top_df['rank'], errors='coerce').astype('Int64')
+                                    our_top_df['proj_ppg'] = pd.to_numeric(our_top_df['proj_ppg'], errors='coerce')
+                                    our_top_df['ceiling'] = pd.to_numeric(our_top_df.get('ceiling', 0), errors='coerce')
+                                    our_top_df['actual_pts'] = pd.to_numeric(our_top_df['actual_pts'], errors='coerce')
+                                    our_top_df['finish_rank'] = pd.to_numeric(our_top_df['finish_rank'], errors='coerce').astype('Int64')
+                                    our_top_df['p_top1'] = pd.to_numeric(our_top_df.get('p_top1', 0), errors='coerce')
+
                                     our_top_df = our_top_df.rename(columns={
                                         'rank': 'Rank', 'name': 'Player', 'proj_ppg': 'Proj',
-                                        'actual_pts': 'Actual', 'finish_rank': 'Finish'
+                                        'ceiling': 'Ceil', 'actual_pts': 'Actual', 'finish_rank': 'Finish',
+                                        'p_top1': 'P#1'
                                     })
+                                    # Show Proj, Ceil, Actual, Finish, P#1 for debugging
+                                    display_cols = ['Rank', 'Player', 'Proj', 'Ceil', 'Actual', 'Finish']
+                                    if 'P#1' in our_top_df.columns and our_top_df['P#1'].sum() > 0:
+                                        display_cols.append('P#1')
                                     st.dataframe(
-                                        our_top_df[['Rank', 'Player', 'Proj', 'Actual', 'Finish']].head(15),
-                                        use_container_width=True, hide_index=True
+                                        our_top_df[display_cols].head(15),
+                                        use_container_width=True, hide_index=True,
+                                        column_config={
+                                            "Proj": st.column_config.NumberColumn(format="%.1f"),
+                                            "Ceil": st.column_config.NumberColumn(format="%.0f"),
+                                            "Actual": st.column_config.NumberColumn(format="%.0f"),
+                                            "Finish": st.column_config.NumberColumn(format="%d"),
+                                            "P#1": st.column_config.NumberColumn(format="%.1f%%"),
+                                        }
                                     )
 
                             with drill_col2:
-                                st.markdown("**Actual Top 15 Scorers:**")
+                                st.markdown("**Actual Top 15 Scorers (with our projections):**")
                                 actual_top_df = pd.DataFrame(context['actual_top_scorers'])
                                 if not actual_top_df.empty:
+                                    # Ensure numeric types for proper sorting
+                                    actual_top_df['finish_rank'] = pd.to_numeric(actual_top_df['finish_rank'], errors='coerce').astype('Int64')
+                                    actual_top_df['actual_pts'] = pd.to_numeric(actual_top_df['actual_pts'], errors='coerce')
+                                    actual_top_df['our_pred_rank'] = pd.to_numeric(actual_top_df['our_pred_rank'], errors='coerce').astype('Int64')
+                                    actual_top_df['proj_ppg'] = pd.to_numeric(actual_top_df.get('proj_ppg', 0), errors='coerce')
+                                    actual_top_df['ceiling'] = pd.to_numeric(actual_top_df.get('ceiling', 0), errors='coerce')
+
                                     actual_top_df = actual_top_df.rename(columns={
                                         'finish_rank': 'Finish', 'name': 'Player',
-                                        'actual_pts': 'Actual', 'our_pred_rank': 'Our Rank'
+                                        'actual_pts': 'Actual', 'our_pred_rank': 'Our Rank',
+                                        'proj_ppg': 'Our Proj', 'ceiling': 'Our Ceil'
                                     })
+                                    # Show Our Proj and Our Ceil to debug why stars are ranked low
                                     st.dataframe(
-                                        actual_top_df[['Finish', 'Player', 'Actual', 'Our Rank']].head(15),
-                                        use_container_width=True, hide_index=True
+                                        actual_top_df[['Finish', 'Player', 'Actual', 'Our Rank', 'Our Proj', 'Our Ceil']].head(15),
+                                        use_container_width=True, hide_index=True,
+                                        column_config={
+                                            "Actual": st.column_config.NumberColumn(format="%.0f"),
+                                            "Finish": st.column_config.NumberColumn(format="%d"),
+                                            "Our Rank": st.column_config.NumberColumn(format="%d"),
+                                            "Our Proj": st.column_config.NumberColumn(format="%.1f"),
+                                            "Our Ceil": st.column_config.NumberColumn(format="%.0f"),
+                                        }
                                     )
 
                             # Slate stats
