@@ -6364,6 +6364,9 @@ if selected_page == "Admin Panel":
         admin_conn = get_connection(str(db_path))
         cursor = admin_conn.cursor()
 
+        # FIRST: Ensure simulation columns exist (idempotent migration)
+        pt.ensure_prediction_sim_columns(admin_conn)
+
         # Check simulation coverage
         cursor.execute("""
             SELECT
