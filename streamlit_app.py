@@ -108,16 +108,26 @@ def generate_predictions_ui(pred_date: date, db_path: Path, builder_config: Dict
                 f"Avg DFS score: {result['summary']['avg_dfs_score']:.1f}"
             )
 
-            # Show simulation status
+            # Show simulation status with guardrail warnings
             sim_status = result['summary'].get('sim_status', 'not_run')
             sim_updated = result['summary'].get('sim_players_updated', 0)
 
             if sim_status == 'ok' and sim_updated > 0:
                 st.sidebar.success(f"🎲 Simulation: {sim_updated} players computed")
             elif sim_status == 'failed':
-                st.sidebar.warning("⚠️ Simulation failed - backtest will use fallback ranking")
+                st.sidebar.error(
+                    "❌ **Simulation FAILED** - backtest will use fallback ranking\n\n"
+                    "Check errors below for details."
+                )
             elif sim_status == 'skip' or sim_updated == 0:
                 st.sidebar.info("ℹ️ Simulation skipped - no players to simulate")
+
+            # Show any simulation warnings from errors list
+            sim_errors = [e for e in result.get('errors', []) if 'Simulation' in e or 'p_top3' in e]
+            if sim_errors:
+                with st.sidebar.expander("⚠️ Simulation Warnings", expanded=True):
+                    for err in sim_errors:
+                        st.warning(err)
 
             # Trigger S3 backup if configured
             try:
@@ -6343,6 +6353,172 @@ if selected_page == "Admin Panel":
 
     except Exception as e:
         st.error(f"Error checking position data: {e}")
+
+    st.divider()
+
+    # Simulation Backfill Section
+    st.subheader("🎲 Simulation Data Backfill")
+    st.write("Populate p_top3, p_top1, and top_scorer_score for historical predictions")
+
+    try:
+        admin_conn = get_connection(str(db_path))
+        cursor = admin_conn.cursor()
+
+        # Check simulation coverage
+        cursor.execute("""
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN p_top3 IS NOT NULL THEN 1 ELSE 0 END) as with_sim,
+                MIN(game_date) as min_date,
+                MAX(game_date) as max_date
+            FROM predictions
+        """)
+        total, with_sim, min_date, max_date = cursor.fetchone()
+        coverage_pct = (with_sim / total * 100) if total > 0 else 0
+
+        # Get dates needing backfill
+        cursor.execute("""
+            SELECT COUNT(DISTINCT game_date)
+            FROM predictions
+            WHERE p_top3 IS NULL
+        """)
+        dates_needing_backfill = cursor.fetchone()[0]
+
+        col_sim1, col_sim2 = st.columns(2)
+
+        with col_sim1:
+            st.metric("Simulation Coverage", f"{coverage_pct:.1f}%")
+            st.metric("Predictions with Sim Data", f"{with_sim:,}/{total:,}")
+            st.metric("Dates Needing Backfill", dates_needing_backfill)
+
+            if coverage_pct < 50:
+                st.error("⚠️ LOW COVERAGE - Backtest will use fallback ranking")
+            elif coverage_pct < 90:
+                st.warning("ℹ️ Partial coverage - some dates use fallback")
+            else:
+                st.success("✅ Good coverage")
+
+        with col_sim2:
+            st.write("**Backfill Options:**")
+
+            # Date range for backfill
+            backfill_days = st.selectbox(
+                "Date Range",
+                options=[7, 14, 30, 60, "All"],
+                index=2,
+                key="backfill_days_select"
+            )
+
+            sim_count = st.selectbox(
+                "Simulations per date",
+                options=[2000, 5000, 10000],
+                index=1,
+                key="sim_count_select"
+            )
+
+            if st.button("🚀 Run Backfill", type="primary", use_container_width=True, key="run_backfill_btn"):
+                import backfill_sim_probs as bsp
+
+                with st.spinner("Running simulation backfill..."):
+                    try:
+                        # Calculate date range
+                        if backfill_days == "All":
+                            date_from = min_date
+                        else:
+                            from datetime import datetime, timedelta
+                            date_from = (datetime.now() - timedelta(days=backfill_days)).strftime('%Y-%m-%d')
+
+                        # Ensure columns exist
+                        pt.ensure_prediction_sim_columns(admin_conn)
+
+                        # Get dates needing backfill
+                        dates = bsp.get_dates_needing_backfill(admin_conn, date_from=date_from)
+
+                        if not dates:
+                            st.success("✅ All dates already have simulation data!")
+                        else:
+                            progress_bar = st.progress(0)
+                            status_text = st.empty()
+
+                            stats = {'ok': 0, 'failed': 0, 'total_rows': 0}
+
+                            for i, (game_date, total_players, sim_players) in enumerate(dates, 1):
+                                status_text.text(f"Processing {game_date} ({i}/{len(dates)})...")
+                                progress_bar.progress(i / len(dates))
+
+                                result = bsp.backfill_date(
+                                    admin_conn,
+                                    game_date,
+                                    sim_n=sim_count,
+                                    verbose=False
+                                )
+
+                                if result['status'] == 'ok':
+                                    stats['ok'] += 1
+                                    stats['total_rows'] += result['count']
+                                else:
+                                    stats['failed'] += 1
+
+                            progress_bar.empty()
+                            status_text.empty()
+
+                            st.success(
+                                f"✅ Backfill complete!\n\n"
+                                f"- Dates processed: {stats['ok']}\n"
+                                f"- Failed: {stats['failed']}\n"
+                                f"- Rows updated: {stats['total_rows']:,}"
+                            )
+
+                            # Rerun to update metrics
+                            st.rerun()
+
+                    except Exception as e:
+                        st.error(f"❌ Backfill failed: {str(e)}")
+                        import traceback
+                        with st.expander("🔍 Error Details"):
+                            st.code(traceback.format_exc())
+
+            # Verify button
+            if st.button("🔍 Run Verification", use_container_width=True, key="run_verify_btn"):
+                import backfill_sim_probs as bsp
+
+                with st.spinner("Running verification checks..."):
+                    results = bsp.run_all_verifications(admin_conn)
+
+                    # Display results
+                    st.subheader("Verification Results")
+
+                    # Coverage
+                    cov = results['coverage']
+                    if cov['status'] == 'PASS':
+                        st.success(f"✅ Coverage: {cov['coverage_pct']:.1f}% ({cov['with_sim']:,}/{cov['total']:,})")
+                    else:
+                        st.error(f"❌ Coverage: {cov['coverage_pct']:.1f}% - {cov['missing_sim']:,} missing")
+
+                    # Sanity
+                    san = results['sanity']
+                    if san['status'] == 'PASS':
+                        st.success(f"✅ Probability Sanity: {san['slates_checked']} slates checked")
+                    else:
+                        st.warning(f"⚠️ Probability Sanity: {san['slates_with_issues']} slates with issues")
+                        if san['issues']:
+                            with st.expander("View Issues"):
+                                for issue in san['issues']:
+                                    st.write(f"- {issue['game_date']}: {', '.join(issue['issues'])}")
+
+                    # Sorting
+                    sort = results['sorting']
+                    if sort['status'] == 'PASS':
+                        st.success(f"✅ Star Burial Check: {sort['stars_checked']} stars verified")
+                    else:
+                        st.error(f"❌ Star Burial Check: {sort['stars_missing_sim']} missing sim, {sort['stars_buried']} buried")
+                        if sort['details']:
+                            with st.expander("View Details"):
+                                for detail in sort['details']:
+                                    st.write(f"- {detail['date']} - {detail['player']}: {detail['issue']}")
+
+    except Exception as e:
+        st.error(f"Error checking simulation data: {e}")
 
 # ============================================================================
 # TOURNAMENT STRATEGY TAB - PHASE 1: BASIC CEILING ANALYSIS

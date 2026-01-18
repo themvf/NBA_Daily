@@ -561,10 +561,88 @@ def _run_and_persist_simulation(
             sim_version='pipeline-v1.0'
         )
 
-        return {'status': 'ok', 'updated': updated, 'error': None}
+        # GUARDRAIL: Verify simulation coverage after persist
+        verification = _verify_simulation_coverage(conn, game_date)
+        nan_pct = verification.get('nan_pct', 0)
+        warnings = []
+
+        if nan_pct > 5.0:
+            # Critical: fail the simulation
+            return {
+                'status': 'failed',
+                'updated': updated,
+                'error': f'CRITICAL: {nan_pct:.1f}% of predictions missing p_top3 (threshold: 5%)',
+                'nan_pct': nan_pct,
+                'verification': verification
+            }
+        elif nan_pct > 1.0:
+            # Warning: continue but flag the issue
+            warnings.append(f'{nan_pct:.1f}% of predictions missing p_top3')
+
+        # Check probability sanity
+        if verification.get('sum_p_top1') is not None:
+            sum_p1 = verification['sum_p_top1']
+            if abs(sum_p1 - 1.0) > 0.15:
+                warnings.append(f'sum(p_top1)={sum_p1:.3f} (expected ~1.0)')
+
+            max_p1 = verification.get('max_p_top1', 0)
+            if max_p1 > 0.50:
+                warnings.append(f'max(p_top1)={max_p1:.1%} (may indicate variance issue)')
+
+        return {
+            'status': 'ok',
+            'updated': updated,
+            'error': '; '.join(warnings) if warnings else None,
+            'nan_pct': nan_pct,
+            'verification': verification
+        }
 
     except Exception as e:
         return {'status': 'failed', 'updated': 0, 'error': str(e)}
+
+
+def _verify_simulation_coverage(conn: sqlite3.Connection, game_date: str) -> Dict[str, Any]:
+    """
+    Verify simulation coverage for a specific date.
+
+    Returns dict with:
+        - total: Total predictions for date
+        - with_sim: Predictions with p_top3
+        - nan_pct: Percentage missing p_top3
+        - sum_p_top1: Sum of p_top1 (should be ~1.0)
+        - max_p_top1: Max p_top1 (should be <50%)
+    """
+    cursor = conn.cursor()
+
+    # Coverage check
+    cursor.execute("""
+        SELECT
+            COUNT(*) as total,
+            SUM(CASE WHEN p_top3 IS NOT NULL THEN 1 ELSE 0 END) as with_sim
+        FROM predictions
+        WHERE game_date = ?
+    """, [game_date])
+    total, with_sim = cursor.fetchone()
+
+    nan_pct = ((total - with_sim) / total * 100) if total > 0 else 0
+
+    # Probability sanity check
+    cursor.execute("""
+        SELECT
+            SUM(p_top1) as sum_p1,
+            MAX(p_top1) as max_p1
+        FROM predictions
+        WHERE game_date = ? AND p_top1 IS NOT NULL
+    """, [game_date])
+    sum_p1, max_p1 = cursor.fetchone()
+
+    return {
+        'total': total,
+        'with_sim': with_sim,
+        'nan_pct': nan_pct,
+        'sum_p_top1': sum_p1,
+        'max_p_top1': max_p1
+    }
 
 
 def _generate_prediction_for_player(

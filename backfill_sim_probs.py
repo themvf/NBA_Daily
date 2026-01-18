@@ -17,6 +17,12 @@ Usage:
 
     # Dry run (show what would be done)
     python backfill_sim_probs.py --dry-run
+
+    # Verify only (run sanity checks without backfilling)
+    python backfill_sim_probs.py --verify-only
+
+    # Backfill + verify
+    python backfill_sim_probs.py --verify
 """
 
 import sqlite3
@@ -29,6 +35,276 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent))
 
 import prediction_tracking as pt
+
+
+# =============================================================================
+# VERIFICATION FUNCTIONS
+# =============================================================================
+
+def verify_coverage(conn: sqlite3.Connection, date_from: str = None, date_to: str = None) -> dict:
+    """
+    Check A: Coverage should be near 100%.
+
+    Returns dict with coverage stats and pass/fail status.
+    """
+    query = """
+        SELECT
+            COUNT(*) as total,
+            SUM(CASE WHEN p_top3 IS NOT NULL THEN 1 ELSE 0 END) as with_sim,
+            SUM(CASE WHEN p_top3 IS NULL THEN 1 ELSE 0 END) as missing_sim
+        FROM predictions
+        WHERE 1=1
+    """
+    params = []
+    if date_from:
+        query += " AND game_date >= ?"
+        params.append(date_from)
+    if date_to:
+        query += " AND game_date <= ?"
+        params.append(date_to)
+
+    cursor = conn.execute(query, params)
+    total, with_sim, missing_sim = cursor.fetchone()
+
+    coverage_pct = (with_sim / total * 100) if total > 0 else 0
+
+    return {
+        'total': total,
+        'with_sim': with_sim,
+        'missing_sim': missing_sim,
+        'coverage_pct': coverage_pct,
+        'passed': coverage_pct >= 99.0,  # Pass if >= 99% coverage
+        'status': 'PASS' if coverage_pct >= 99.0 else ('WARN' if coverage_pct >= 90 else 'FAIL')
+    }
+
+
+def verify_probability_sanity(conn: sqlite3.Connection, date_from: str = None, date_to: str = None) -> dict:
+    """
+    Check B: Probabilities should be sane.
+
+    For each slate:
+    - sum(p_top1) should be ~1.0 (close, not exact if filtered)
+    - max(p_top1) should be 5-25% (if 80%+, variance model is broken)
+
+    Returns dict with sanity stats and issues found.
+    """
+    query = """
+        SELECT
+            game_date,
+            COUNT(*) as n_players,
+            SUM(p_top1) as sum_p_top1,
+            MAX(p_top1) as max_p_top1,
+            MIN(p_top1) as min_p_top1,
+            AVG(p_top1) as avg_p_top1
+        FROM predictions
+        WHERE p_top1 IS NOT NULL
+    """
+    params = []
+    if date_from:
+        query += " AND game_date >= ?"
+        params.append(date_from)
+    if date_to:
+        query += " AND game_date <= ?"
+        params.append(date_to)
+
+    query += " GROUP BY game_date ORDER BY game_date"
+
+    cursor = conn.execute(query, params)
+    rows = cursor.fetchall()
+
+    issues = []
+    slates_checked = 0
+    slates_with_issues = 0
+
+    for game_date, n_players, sum_p1, max_p1, min_p1, avg_p1 in rows:
+        slates_checked += 1
+        slate_issues = []
+
+        # Check 1: sum(p_top1) should be close to 1.0 (within 0.1)
+        if sum_p1 is not None and abs(sum_p1 - 1.0) > 0.15:
+            slate_issues.append(f"sum(p_top1)={sum_p1:.3f} (expected ~1.0)")
+
+        # Check 2: max(p_top1) should be reasonable (5-35%)
+        # Very high (>50%) suggests broken variance
+        if max_p1 is not None and max_p1 > 0.50:
+            slate_issues.append(f"max(p_top1)={max_p1:.1%} (too high, variance may be broken)")
+
+        # Check 3: max(p_top1) shouldn't be too low either (<3% with many players)
+        if max_p1 is not None and max_p1 < 0.03 and n_players > 30:
+            slate_issues.append(f"max(p_top1)={max_p1:.1%} (too low for {n_players} players)")
+
+        if slate_issues:
+            slates_with_issues += 1
+            issues.append({
+                'game_date': game_date,
+                'n_players': n_players,
+                'sum_p_top1': sum_p1,
+                'max_p_top1': max_p1,
+                'issues': slate_issues
+            })
+
+    passed = slates_with_issues == 0
+
+    return {
+        'slates_checked': slates_checked,
+        'slates_with_issues': slates_with_issues,
+        'issues': issues[:10],  # Limit to first 10 issues
+        'passed': passed,
+        'status': 'PASS' if passed else ('WARN' if slates_with_issues <= 2 else 'FAIL')
+    }
+
+
+def verify_sorting_fix(conn: sqlite3.Connection, sample_dates: int = 3) -> dict:
+    """
+    Check C: Sorting should now reflect probabilities.
+
+    For sample dates, check that:
+    - Stars (season_avg >= 25) have p_top3 values (not NULL)
+    - Their ranks by p_top3 are reasonable (not #76 for a star)
+
+    Returns dict with verification results.
+    """
+    # Get some recent dates with simulation data
+    cursor = conn.execute("""
+        SELECT DISTINCT game_date
+        FROM predictions
+        WHERE p_top3 IS NOT NULL
+        ORDER BY game_date DESC
+        LIMIT ?
+    """, [sample_dates])
+    dates = [row[0] for row in cursor.fetchall()]
+
+    if not dates:
+        return {
+            'dates_checked': 0,
+            'stars_checked': 0,
+            'stars_missing_sim': 0,
+            'stars_buried': 0,
+            'passed': False,
+            'status': 'FAIL',
+            'details': []
+        }
+
+    stars_checked = 0
+    stars_missing_sim = 0
+    stars_buried = 0  # Stars ranked worse than #20 by p_top3
+    details = []
+
+    for game_date in dates:
+        # Get stars (season_avg >= 25) for this date
+        cursor = conn.execute("""
+            SELECT
+                player_name,
+                season_avg_ppg,
+                projected_ppg,
+                p_top3,
+                p_top1,
+                RANK() OVER (ORDER BY COALESCE(p_top3, 0) DESC) as sim_rank
+            FROM predictions
+            WHERE game_date = ? AND season_avg_ppg >= 25
+            ORDER BY season_avg_ppg DESC
+        """, [game_date])
+
+        stars = cursor.fetchall()
+
+        for player_name, season_avg, proj, p_top3, p_top1, sim_rank in stars:
+            stars_checked += 1
+
+            if p_top3 is None:
+                stars_missing_sim += 1
+                details.append({
+                    'date': game_date,
+                    'player': player_name,
+                    'issue': 'MISSING SIM',
+                    'season_avg': season_avg
+                })
+            elif sim_rank > 20:
+                stars_buried += 1
+                details.append({
+                    'date': game_date,
+                    'player': player_name,
+                    'issue': f'BURIED (rank #{sim_rank})',
+                    'season_avg': season_avg,
+                    'p_top3': p_top3
+                })
+
+    passed = stars_missing_sim == 0 and stars_buried == 0
+
+    return {
+        'dates_checked': len(dates),
+        'stars_checked': stars_checked,
+        'stars_missing_sim': stars_missing_sim,
+        'stars_buried': stars_buried,
+        'passed': passed,
+        'status': 'PASS' if passed else 'FAIL',
+        'details': details[:10]
+    }
+
+
+def run_all_verifications(conn: sqlite3.Connection, date_from: str = None, date_to: str = None) -> dict:
+    """
+    Run all three verification checks and return combined results.
+    """
+    print("\n" + "=" * 60)
+    print("VERIFICATION CHECKS")
+    print("=" * 60)
+
+    results = {}
+    all_passed = True
+
+    # Check A: Coverage
+    print("\n[A] COVERAGE CHECK")
+    print("-" * 40)
+    coverage = verify_coverage(conn, date_from, date_to)
+    results['coverage'] = coverage
+    print(f"  Total predictions: {coverage['total']:,}")
+    print(f"  With simulation: {coverage['with_sim']:,}")
+    print(f"  Missing simulation: {coverage['missing_sim']:,}")
+    print(f"  Coverage: {coverage['coverage_pct']:.1f}%")
+    print(f"  Status: [{coverage['status']}]")
+    if coverage['status'] == 'FAIL':
+        all_passed = False
+
+    # Check B: Probability Sanity
+    print("\n[B] PROBABILITY SANITY CHECK")
+    print("-" * 40)
+    sanity = verify_probability_sanity(conn, date_from, date_to)
+    results['sanity'] = sanity
+    print(f"  Slates checked: {sanity['slates_checked']}")
+    print(f"  Slates with issues: {sanity['slates_with_issues']}")
+    if sanity['issues']:
+        print("  Issues found:")
+        for issue in sanity['issues'][:5]:
+            print(f"    {issue['game_date']}: {', '.join(issue['issues'])}")
+    print(f"  Status: [{sanity['status']}]")
+    if sanity['status'] == 'FAIL':
+        all_passed = False
+
+    # Check C: Sorting Fix
+    print("\n[C] STAR BURIAL CHECK")
+    print("-" * 40)
+    sorting = verify_sorting_fix(conn)
+    results['sorting'] = sorting
+    print(f"  Dates checked: {sorting['dates_checked']}")
+    print(f"  Stars checked: {sorting['stars_checked']}")
+    print(f"  Stars missing sim: {sorting['stars_missing_sim']}")
+    print(f"  Stars buried (rank > 20): {sorting['stars_buried']}")
+    if sorting['details']:
+        print("  Issues found:")
+        for detail in sorting['details'][:5]:
+            print(f"    {detail['date']} - {detail['player']}: {detail['issue']}")
+    print(f"  Status: [{sorting['status']}]")
+    if sorting['status'] == 'FAIL':
+        all_passed = False
+
+    # Overall
+    print("\n" + "=" * 60)
+    overall_status = 'PASS' if all_passed else 'FAIL'
+    print(f"OVERALL VERIFICATION: [{overall_status}]")
+    print("=" * 60)
+
+    results['overall_passed'] = all_passed
+    return results
 
 
 def get_dates_needing_backfill(conn: sqlite3.Connection, date_from: str = None, date_to: str = None) -> list:
@@ -134,6 +410,8 @@ def main():
     parser.add_argument('--sim-n', type=int, default=10000, help='Number of simulations')
     parser.add_argument('--dry-run', action='store_true', help='Show what would be done')
     parser.add_argument('--quiet', action='store_true', help='Minimal output')
+    parser.add_argument('--verify', action='store_true', help='Run verification after backfill')
+    parser.add_argument('--verify-only', action='store_true', help='Only run verification (no backfill)')
     args = parser.parse_args()
 
     # Connect to database
@@ -155,6 +433,12 @@ def main():
     print("Ensuring simulation columns exist...")
     pt.ensure_prediction_sim_columns(conn)
     print()
+
+    # Verify-only mode
+    if args.verify_only:
+        run_all_verifications(conn, args.date_from, args.date_to)
+        conn.close()
+        return
 
     # Get dates needing backfill
     print("Finding dates needing backfill...")
@@ -212,9 +496,9 @@ def main():
     print(f"  Failed: {stats['failed']}")
     print(f"  Total rows updated: {stats['total_rows']:,}")
 
-    # Verify
+    # Quick coverage check
     print()
-    print("Verification:")
+    print("Quick Coverage Check:")
     cursor = conn.execute("""
         SELECT
             COUNT(*) as total,
@@ -224,6 +508,10 @@ def main():
     total, with_sim = cursor.fetchone()
     pct = (with_sim / total * 100) if total > 0 else 0
     print(f"  {with_sim:,}/{total:,} predictions now have simulation values ({pct:.1f}%)")
+
+    # Run full verification if requested
+    if args.verify:
+        run_all_verifications(conn, args.date_from, args.date_to)
 
     conn.close()
 
