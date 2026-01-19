@@ -8181,18 +8181,28 @@ if selected_page == "Backtest Analysis":
         st.divider()
         st.subheader("📊 Strategy Comparison")
 
-        # Build comparison dataframe
+        # Helper: format count/total (pct%)
+        def fmt_count_pct_compare(count: int, total: int) -> str:
+            pct = (count / total * 100) if total else 0.0
+            return f"{count}/{total} ({pct:.1f}%)"
+
+        # Build comparison dataframe with counts
         comparison_data = []
         for strat_key, stats in all_stats.items():
             strat_display = [k for k, v in strategy_options.items() if v == strat_key][0]
+            n = stats.get('n_slates', 0)
+            rank_avg = stats.get('rank_a1_avg')  # New key from updated compute_summary_stats
+            if rank_avg is None:
+                rank_avg = stats.get('avg_rank_a1')  # Fallback to old key
+
             comparison_data.append({
                 'Strategy': strat_display,
-                'Slates': stats['n_slates'],
-                'Hit #1': f"{stats['hit_1_rate']*100:.1f}%",
-                'Hit Any': f"{stats['hit_any_rate']*100:.1f}%",
-                'Hit 2+': f"{stats['hit_2plus_rate']*100:.1f}%",
-                'Overlap': f"{stats['avg_overlap']:.2f}/3",
-                'Avg Rank #1': f"{stats['avg_rank_a1']:.1f}" if stats.get('avg_rank_a1') else "N/A"
+                'n': n,
+                'Hit #1': fmt_count_pct_compare(stats.get('hit_1_count', 0), n),
+                'Hit Any': fmt_count_pct_compare(stats.get('hit_any_count', 0), n),
+                'Hit 2+': fmt_count_pct_compare(stats.get('hit_2plus_count', 0), n),
+                'Overlap': f"{stats.get('avg_overlap', 0):.2f}/3",
+                'Avg Rank #1': f"{rank_avg:.1f}" if rank_avg else "N/A"
             })
 
         # Sort by overlap descending
@@ -8226,42 +8236,63 @@ if selected_page == "Backtest Analysis":
 
         st.divider()
 
+        # Helper: format count/total (pct%)
+        def fmt_count_pct(count: int, total: int) -> str:
+            pct = (count / total * 100) if total else 0.0
+            return f"{count}/{total} ({pct:.1f}%)"
+
         # Summary metrics - Row 1
         st.subheader("📈 Summary Metrics")
         met_cols = st.columns(5)
 
+        n_slates = stats.get('n_slates', 0)
+
         with met_cols[0]:
-            st.metric("Picked Actual #1", f"{stats['hit_1_rate']*100:.1f}%",
-                     help="% of slates where we picked the actual top scorer")
+            st.metric("Picked Actual #1",
+                     fmt_count_pct(stats.get('hit_1_count', 0), n_slates),
+                     help="How many slates we picked the actual top scorer")
         with met_cols[1]:
-            st.metric("Hit Any (1+)", f"{stats['hit_any_rate']*100:.1f}%",
-                     help="% of slates with at least 1 correct pick")
+            st.metric("Hit Any (1+)",
+                     fmt_count_pct(stats.get('hit_any_count', 0), n_slates),
+                     help="Slates with at least 1 correct pick")
         with met_cols[2]:
-            st.metric("Avg Overlap", f"{stats['avg_overlap']:.2f}/3",
+            st.metric("Avg Overlap", f"{stats.get('avg_overlap', 0):.2f}/3",
                      help="Average correct picks per slate")
         with met_cols[3]:
-            st.metric("Avg Rank of #1", f"{stats['avg_rank_a1']:.1f}" if stats.get('avg_rank_a1') else "N/A",
+            rank_avg = stats.get('rank_a1_avg')
+            st.metric("Avg Rank of #1", f"{rank_avg:.1f}" if rank_avg else "N/A",
                      help="How high we ranked the actual top scorer (lower is better)")
+            # Add rank distribution below
+            if stats.get('rank_a1_min') is not None:
+                st.caption(f"min: {stats['rank_a1_min']} | med: {stats['rank_a1_median']} | max: {stats['rank_a1_max']}")
         with met_cols[4]:
-            st.metric("Total Slates", f"{stats['n_slates']}")
+            st.metric("Total Slates", f"{n_slates}")
 
         # Summary metrics - Row 2 (closeness metrics)
         met_cols2 = st.columns(5)
         with met_cols2[0]:
-            st.metric("Hit 2+", f"{stats['hit_2plus_rate']*100:.1f}%",
-                     help="% of slates with 2 or more correct")
+            st.metric("Hit 2+",
+                     fmt_count_pct(stats.get('hit_2plus_count', 0), n_slates),
+                     help="Slates with 2 or more correct")
         with met_cols2[1]:
-            st.metric("Perfect (3/3)", f"{stats['hit_exact_rate']*100:.1f}%",
-                     help="% of slates with all 3 correct")
+            st.metric("Perfect (3/3)",
+                     fmt_count_pct(stats.get('hit_exact_count', 0), n_slates),
+                     help="Slates with all 3 correct")
         with met_cols2[2]:
-            # Calculate avg closest miss from results
-            if 'closest_miss' in results_df.columns:
-                avg_closest = results_df['closest_miss'].mean()
-                st.metric("Avg Closest Miss", f"{avg_closest:+.1f} pts",
-                         help="How close our best pick was to the #3 threshold (positive = beat it)")
+            # Shortfall to top-3 (clearer than "closest miss")
+            shortfall_avg = stats.get('avg_shortfall_to_top3')
+            if shortfall_avg is not None:
+                st.metric("Avg Shortfall to Top-3", f"{shortfall_avg:.1f} pts",
+                         help="How many points our best pick was short of the #3 cutoff (0 = we reached top-3)")
             else:
-                st.metric("Avg Closest Miss", "N/A")
+                st.metric("Avg Shortfall to Top-3", "N/A",
+                         help="How many points our best pick was short of the #3 cutoff")
         with met_cols2[3]:
+            # DNP in picks
+            dnp_total = stats.get('dnp_in_picks', 0)
+            st.metric("DNP in Picks", f"{dnp_total}",
+                     help="Total picks that Did Not Play (minutes=0)")
+        with met_cols2[4]:
             # Tie-friendly avg
             if 'tie_friendly_overlap' in results_df.columns:
                 tie_avg = results_df['tie_friendly_overlap'].mean()
@@ -8269,12 +8300,41 @@ if selected_page == "Backtest Analysis":
                          help="Overlap counting all picks that beat the #3 threshold")
             else:
                 st.metric("Tie-Friendly Overlap", "N/A")
-        with met_cols2[4]:
-            # Close misses (within 5 pts)
-            if 'closest_miss' in results_df.columns:
-                close_misses = ((results_df['closest_miss'] < 0) & (results_df['closest_miss'] >= -5)).sum()
-                st.metric("Close Misses (≤5pts)", f"{close_misses}",
-                         help="Days where our best pick was within 5 pts of making top 3")
+
+        # Worst slates quick view (for debugging)
+        if not results_df.empty and len(results_df) >= 3:
+            with st.expander("🔴 Worst 3 Slates (debugging)"):
+                # Sort by overlap ASC, then pred_rank_a1 DESC (high rank = bad)
+                sort_cols = ['overlap']
+                ascending = [True]
+                if 'pred_rank_a1' in results_df.columns:
+                    sort_cols.append('pred_rank_a1')
+                    ascending.append(False)  # High rank (bad) first
+
+                worst = results_df.sort_values(sort_cols, ascending=ascending).head(3)
+
+                for _, r in worst.iterrows():
+                    date_str = r.get('slate_date', '?')
+                    overlap_val = r.get('overlap', 0)
+                    rank_a1 = r.get('pred_rank_a1', '?')
+                    dnp = r.get('dnp_in_picks', 0)
+
+                    # Build picks summary
+                    picks_info = []
+                    for i in range(1, 4):
+                        name = r.get(f'picked{i}_name', '')
+                        finish = r.get(f'picked{i}_finish', 99)
+                        if name:
+                            last = name.split()[-1]
+                            finish_str = f"#{finish}" if finish and finish < 99 else "DNP"
+                            picks_info.append(f"{last}→{finish_str}")
+
+                    st.markdown(
+                        f"**{date_str}** — overlap {overlap_val}/3, rank(#1)={rank_a1}"
+                        + (f", DNP={dnp}" if dnp else "")
+                    )
+                    if picks_info:
+                        st.caption(f"Picks: {' | '.join(picks_info)}")
 
         # Daily trend chart
         if not results_df.empty:
@@ -8529,16 +8589,29 @@ if selected_page == "Backtest Analysis":
                                 backtest_conn, date_str, strategy, top_n=15
                             )
 
-                            # Model's Top 5 ranked context
+                            # Model's Top 5 ranked context (table for clarity)
                             our_top = context.get('our_top_ranked', [])[:5]
                             if our_top:
-                                top5_summary = []
-                                for p in our_top:
-                                    name = p.get('name', '?').split()[-1]
+                                st.markdown("**Model's Top 5 (by prediction rank):**")
+                                top5_data = []
+                                for i, p in enumerate(our_top, 1):
+                                    name = p.get('name', '?')
                                     finish = p.get('finish_rank', 999)
                                     finish_str = f"#{finish}" if finish < 100 else "DNP"
-                                    top5_summary.append(f"{name}({finish_str})")
-                                st.markdown(f"**Model's Top 5:** {' | '.join(top5_summary)}")
+                                    pts = p.get('actual_pts', 0) or 0
+                                    proj = p.get('proj_ppg', 0) or 0
+                                    top5_data.append({
+                                        "Pred": i,
+                                        "Player": name,
+                                        "Actual": finish_str,
+                                        "Pts": f"{pts:.0f}",
+                                        "Proj": f"{proj:.1f}"
+                                    })
+                                st.dataframe(
+                                    pd.DataFrame(top5_data),
+                                    hide_index=True,
+                                    use_container_width=False
+                                )
 
                             # Ranking field diagnostics expander
                             ranking_diag = context.get('ranking_diagnostics', {})

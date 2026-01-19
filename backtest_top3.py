@@ -97,6 +97,13 @@ def create_backtest_table(conn: sqlite3.Connection) -> None:
             avg_rank_actual_top3 REAL,
             best_rank_actual_top3 INTEGER,
 
+            -- Closeness metrics
+            closest_miss REAL,
+            shortfall_to_top3 REAL,
+
+            -- DNP tracking
+            dnp_in_picks INTEGER,
+
             -- Context
             n_pred_players INTEGER,
             actual_3rd_points REAL,
@@ -107,6 +114,18 @@ def create_backtest_table(conn: sqlite3.Connection) -> None:
             UNIQUE(slate_date, strategy_name)
         )
     """)
+
+    # Add new columns to existing tables (idempotent migrations)
+    new_columns = [
+        ('closest_miss', 'REAL'),
+        ('shortfall_to_top3', 'REAL'),
+        ('dnp_in_picks', 'INTEGER'),
+    ]
+    for col_name, col_type in new_columns:
+        try:
+            cursor.execute(f"ALTER TABLE backtest_daily_results ADD COLUMN {col_name} {col_type}")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
 
     cursor.execute("""
         CREATE INDEX IF NOT EXISTS idx_backtest_date
@@ -586,6 +605,8 @@ def backtest_date(
     # Compute diagnostic metrics for each pick
     pick_diagnostics = []
     pick_points = []
+    dnp_count = 0  # DNP = Did Not Play (not in actuals means minutes=0)
+
     for player_id, player_name in picked3:
         pts = actual_pts_lookup.get(player_id, 0)
         finish = finish_rank_lookup.get(player_id, len(actuals) + 1)
@@ -593,19 +614,33 @@ def backtest_date(
         proj = proj_ppg_lookup.get(player_id, 0) or 0
         p1 = p_top1_lookup.get(player_id, 0) or 0
         p3 = p_top3_lookup.get(player_id, 0) or 0
+
+        # DNP detection: if finish >= len(actuals) + 1, player wasn't in actuals
+        # (actuals already filters minutes > 0, so missing = DNP)
+        is_dnp = finish > len(actuals)
+        if is_dnp:
+            dnp_count += 1
+
         pick_diagnostics.append({
             'pts': pts,
             'finish': finish,
             'pred_rank': pred,
             'proj_ppg': proj,
             'p_top1': p1,
-            'p_top3': p3
+            'p_top3': p3,
+            'is_dnp': is_dnp
         })
         pick_points.append(pts)
 
     # Closest miss: how far short was our best pick from the #3 threshold?
     actual_3rd = actual_top3['actual_3rd_points']
     closest_miss = max(pick_points) - actual_3rd if pick_points else -999
+
+    # Shortfall to top-3: max(0, cutoff - best_pick_pts)
+    # Always >= 0: how many points we were short of the #3 cutoff
+    # 0 means we reached top-3 with at least one pick
+    best_pick_pts = max(pick_points) if pick_points else 0
+    shortfall_to_top3 = max(0, actual_3rd - best_pick_pts)
 
     # Build result row
     result = {
@@ -656,6 +691,10 @@ def backtest_date(
 
         # Closeness metrics
         'closest_miss': closest_miss,
+        'shortfall_to_top3': shortfall_to_top3,
+
+        # DNP tracking
+        'dnp_in_picks': dnp_count,
 
         # Context
         'n_pred_players': len(preds),
@@ -951,30 +990,77 @@ def run_compare_all(
 def compute_summary_stats(results_df: pd.DataFrame) -> Dict:
     """
     Compute summary statistics across all backtest dates.
-    """
-    if results_df.empty:
-        return {
-            'n_slates': 0,
-            'hit_1_rate': 0,
-            'hit_any_rate': 0,
-            'hit_2plus_rate': 0,
-            'hit_exact_rate': 0,
-            'avg_overlap': 0,
-            'avg_rank_a1': None,
-            'avg_rank_top3': None
-        }
 
-    n = len(results_df)
+    Returns counts alongside rates, plus rank distribution (min/med/max).
+    Robust to missing columns and NaN values.
+    """
+    if results_df is None or results_df.empty:
+        return {"n_slates": 0}
+
+    df = results_df.copy()
+    n = int(len(df))
+
+    def _sum_int(col: str) -> int:
+        """Sum a column as int, treating NaN/missing as 0."""
+        return int(df[col].fillna(0).astype(int).sum()) if col in df.columns else 0
+
+    # Counts
+    hit_1_count = _sum_int("hit_1")
+    hit_any_count = _sum_int("hit_any")
+    hit_2plus_count = _sum_int("hit_2plus")
+    hit_exact_count = _sum_int("hit_exact")
+
+    # Rank distribution for pred_rank_a1
+    rank_series = df["pred_rank_a1"] if "pred_rank_a1" in df.columns else pd.Series(dtype=float)
+    rank_series = pd.to_numeric(rank_series, errors="coerce").dropna()
+
+    rank_a1_avg = float(rank_series.mean()) if not rank_series.empty else None
+    rank_a1_min = int(rank_series.min()) if not rank_series.empty else None
+    rank_a1_med = int(rank_series.median()) if not rank_series.empty else None
+    rank_a1_max = int(rank_series.max()) if not rank_series.empty else None
+
+    # Avg rank of top 3
+    rank_top3_series = df["avg_rank_actual_top3"] if "avg_rank_actual_top3" in df.columns else pd.Series(dtype=float)
+    rank_top3_series = pd.to_numeric(rank_top3_series, errors="coerce").dropna()
+    rank_top3_avg = float(rank_top3_series.mean()) if not rank_top3_series.empty else None
+
+    # Shortfall: max(0, cutoff_3rd_pts - best_pick_pts) per slate
+    shortfall_series = None
+    if "shortfall_to_top3" in df.columns:
+        shortfall_series = pd.to_numeric(df["shortfall_to_top3"], errors="coerce")
+    shortfall_avg = float(shortfall_series.dropna().mean()) if shortfall_series is not None and not shortfall_series.dropna().empty else None
+
+    # DNP tracking
+    dnp_count = _sum_int("dnp_in_picks") if "dnp_in_picks" in df.columns else 0
+
+    # Overlap average
+    overlap_series = pd.to_numeric(df.get("overlap", pd.Series([0])), errors="coerce")
+    avg_overlap = float(overlap_series.mean()) if not overlap_series.empty else 0
 
     return {
-        'n_slates': n,
-        'hit_1_rate': results_df['hit_1'].mean(),
-        'hit_any_rate': results_df['hit_any'].mean(),
-        'hit_2plus_rate': results_df['hit_2plus'].mean(),
-        'hit_exact_rate': results_df['hit_exact'].mean(),
-        'avg_overlap': results_df['overlap'].mean(),
-        'avg_rank_a1': results_df['pred_rank_a1'].mean(),
-        'avg_rank_top3': results_df['avg_rank_actual_top3'].mean()
+        "n_slates": n,
+        # Counts (new)
+        "hit_1_count": hit_1_count,
+        "hit_any_count": hit_any_count,
+        "hit_2plus_count": hit_2plus_count,
+        "hit_exact_count": hit_exact_count,
+        # Rates (for backwards compatibility)
+        "hit_1_rate": hit_1_count / n if n else 0,
+        "hit_any_rate": hit_any_count / n if n else 0,
+        "hit_2plus_rate": hit_2plus_count / n if n else 0,
+        "hit_exact_rate": hit_exact_count / n if n else 0,
+        # Overlap
+        "avg_overlap": avg_overlap,
+        # Rank stats (existing + new distribution)
+        "avg_rank_a1": rank_a1_avg,
+        "rank_a1_min": rank_a1_min,
+        "rank_a1_median": rank_a1_med,
+        "rank_a1_max": rank_a1_max,
+        "avg_rank_top3": rank_top3_avg,
+        # Shortfall (new)
+        "avg_shortfall_to_top3": shortfall_avg,
+        # DNP (new)
+        "dnp_in_picks": dnp_count,
     }
 
 
