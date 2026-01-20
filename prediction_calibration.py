@@ -400,6 +400,275 @@ class PredictionCalibrator:
 
 
 # =========================================================================
+# Variance Calibrator
+# =========================================================================
+
+class VarianceCalibrator:
+    """
+    Build empirical scoring variance (sigma) from historical residuals.
+
+    The key insight: prediction residual variance differs by player tier and
+    minutes band. A star playing 36+ minutes has different variance than a
+    bench player with 15 minutes.
+
+    This calibrated sigma is critical for accurate Monte Carlo simulation
+    of P(top-3) and portfolio win probability.
+
+    Usage:
+        var_cal = VarianceCalibrator(conn)
+        var_cal.fit(days_back=60)
+        sigma, is_calibrated = var_cal.get_calibrated_sigma('STAR', 35.0)
+    """
+
+    # Minutes band definitions
+    MINUTES_BANDS = ['<20', '20-24', '24-28', '28-32', '32-36', '36-40']
+
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn = conn
+        self.calibration_table: Optional[pd.DataFrame] = None
+        self.fit_date: Optional[str] = None
+        self.days_back: int = 0
+
+    def _get_minutes_band(self, proj_minutes: float) -> str:
+        """Categorize projected minutes into bands."""
+        if proj_minutes >= 36:
+            return '36-40'
+        elif proj_minutes >= 32:
+            return '32-36'
+        elif proj_minutes >= 28:
+            return '28-32'
+        elif proj_minutes >= 24:
+            return '24-28'
+        elif proj_minutes >= 20:
+            return '20-24'
+        else:
+            return '<20'
+
+    def fit(self, days_back: int = 60) -> pd.DataFrame:
+        """
+        Fit variance parameters by tier and minutes band.
+
+        Computes the standard deviation of prediction residuals (actual - projected)
+        for each (tier, minutes_band) bucket.
+
+        Args:
+            days_back: Number of days of historical data to use
+
+        Returns:
+            DataFrame with columns: tier, minutes_band, residual_std, sample_size
+        """
+        end_date = datetime.now().date()
+        start_date = end_date - timedelta(days=days_back)
+
+        # Load historical predictions with actuals
+        # Need tier and proj_minutes columns (if available)
+        query = """
+            SELECT
+                p.projected_ppg,
+                p.actual_ppg,
+                p.proj_ceiling,
+                p.proj_floor,
+                p.proj_minutes,
+                p.tier,
+                (p.actual_ppg - p.projected_ppg) as residual
+            FROM predictions p
+            WHERE p.actual_ppg IS NOT NULL
+              AND p.projected_ppg IS NOT NULL
+              AND p.game_date >= ?
+              AND p.game_date <= ?
+        """
+
+        try:
+            df = pd.read_sql_query(query, self.conn, params=[str(start_date), str(end_date)])
+        except Exception as e:
+            print(f"Warning: Could not load calibration data: {e}")
+            self.calibration_table = pd.DataFrame()
+            return self.calibration_table
+
+        if df.empty or len(df) < 30:
+            self.calibration_table = pd.DataFrame()
+            return self.calibration_table
+
+        # If proj_minutes is not available, estimate from ceiling-floor spread
+        if 'proj_minutes' not in df.columns or df['proj_minutes'].isna().all():
+            # Estimate minutes from projection level (rough heuristic)
+            df['proj_minutes'] = df['projected_ppg'].apply(
+                lambda ppg: min(40, max(10, 20 + (ppg - 15) * 0.5))
+            )
+
+        # If tier is not available, classify from projected_ppg
+        if 'tier' not in df.columns or df['tier'].isna().all():
+            def classify_tier(ppg):
+                if ppg >= 25:
+                    return 'STAR'
+                elif ppg >= 18:
+                    return 'ROLE'
+                elif ppg >= 12:
+                    return 'SIXTH_MAN'
+                else:
+                    return 'BENCH'
+
+            df['tier'] = df['projected_ppg'].apply(classify_tier)
+
+        # Add minutes band
+        df['minutes_band'] = df['proj_minutes'].apply(self._get_minutes_band)
+
+        # Group by tier and minutes band, calculate statistics
+        result = df.groupby(['tier', 'minutes_band']).agg(
+            residual_std=('residual', 'std'),
+            residual_mean=('residual', 'mean'),
+            mean_actual=('actual_ppg', 'mean'),
+            mean_projected=('projected_ppg', 'mean'),
+            sample_size=('residual', 'count')
+        ).reset_index()
+
+        # Also compute overall tier-level statistics (fallback)
+        tier_fallback = df.groupby('tier').agg(
+            residual_std=('residual', 'std'),
+            sample_size=('residual', 'count')
+        ).reset_index()
+        tier_fallback['minutes_band'] = 'ALL'
+        tier_fallback['residual_mean'] = 0.0
+        tier_fallback['mean_actual'] = 0.0
+        tier_fallback['mean_projected'] = 0.0
+
+        # Combine
+        result = pd.concat([result, tier_fallback], ignore_index=True)
+
+        self.calibration_table = result
+        self.fit_date = str(datetime.now().date())
+        self.days_back = days_back
+
+        return result
+
+    def get_calibrated_sigma(
+        self,
+        tier: str,
+        proj_minutes: float,
+        fallback_sigma: float = 6.0
+    ) -> Tuple[float, bool]:
+        """
+        Get calibrated sigma (standard deviation) for a player.
+
+        Lookup hierarchy:
+        1. Exact (tier, minutes_band) match with sample_size >= 20
+        2. Same tier with ALL minutes bands (sample_size >= 30)
+        3. Any tier with same minutes_band (sample_size >= 20)
+        4. Global fallback
+
+        Args:
+            tier: Player tier ('STAR', 'ROLE', 'SIXTH_MAN', 'BENCH')
+            proj_minutes: Projected minutes
+            fallback_sigma: Default sigma if no calibration available
+
+        Returns:
+            Tuple of (sigma, is_calibrated)
+        """
+        if self.calibration_table is None or self.calibration_table.empty:
+            return fallback_sigma, False
+
+        minutes_band = self._get_minutes_band(proj_minutes)
+
+        # Try exact match
+        exact = self.calibration_table[
+            (self.calibration_table['tier'] == tier) &
+            (self.calibration_table['minutes_band'] == minutes_band)
+        ]
+
+        if len(exact) > 0 and exact['sample_size'].iloc[0] >= 20:
+            return float(exact['residual_std'].iloc[0]), True
+
+        # Try tier fallback (ALL minutes)
+        tier_all = self.calibration_table[
+            (self.calibration_table['tier'] == tier) &
+            (self.calibration_table['minutes_band'] == 'ALL')
+        ]
+
+        if len(tier_all) > 0 and tier_all['sample_size'].iloc[0] >= 30:
+            return float(tier_all['residual_std'].iloc[0]), True
+
+        # Try any tier with same minutes band
+        same_band = self.calibration_table[
+            (self.calibration_table['minutes_band'] == minutes_band) &
+            (self.calibration_table['sample_size'] >= 20)
+        ]
+
+        if len(same_band) > 0:
+            # Use weighted average by sample size
+            weights = same_band['sample_size']
+            weighted_std = (same_band['residual_std'] * weights).sum() / weights.sum()
+            return float(weighted_std), True
+
+        # Fallback
+        return fallback_sigma, False
+
+    def get_calibration_summary(self) -> Dict:
+        """Get summary of variance calibration."""
+        if self.calibration_table is None or self.calibration_table.empty:
+            return {'status': 'not_fitted', 'message': 'Call fit() first'}
+
+        # Get main buckets (excluding 'ALL' minutes band)
+        main_table = self.calibration_table[
+            self.calibration_table['minutes_band'] != 'ALL'
+        ].copy()
+
+        if main_table.empty:
+            return {'status': 'empty', 'message': 'No data available'}
+
+        summary = {
+            'status': 'fitted',
+            'fit_date': self.fit_date,
+            'days_back': self.days_back,
+            'total_samples': int(main_table['sample_size'].sum()),
+            'n_buckets': len(main_table),
+            'buckets_with_20plus': int((main_table['sample_size'] >= 20).sum()),
+            'avg_sigma_by_tier': {},
+            'min_sigma': float(main_table['residual_std'].min()),
+            'max_sigma': float(main_table['residual_std'].max()),
+        }
+
+        # Average sigma by tier
+        for tier in ['STAR', 'ROLE', 'SIXTH_MAN', 'BENCH']:
+            tier_data = main_table[main_table['tier'] == tier]
+            if len(tier_data) > 0:
+                weighted_std = (
+                    tier_data['residual_std'] * tier_data['sample_size']
+                ).sum() / tier_data['sample_size'].sum()
+                summary['avg_sigma_by_tier'][tier] = round(float(weighted_std), 2)
+
+        return summary
+
+    def print_calibration_table(self) -> None:
+        """Print the calibration table in a readable format."""
+        if self.calibration_table is None or self.calibration_table.empty:
+            print("No calibration data. Call fit() first.")
+            return
+
+        print(f"\n{'='*70}")
+        print(f"VARIANCE CALIBRATION TABLE (fitted {self.fit_date}, {self.days_back} days)")
+        print(f"{'='*70}")
+
+        # Print by tier
+        for tier in ['STAR', 'ROLE', 'SIXTH_MAN', 'BENCH']:
+            tier_data = self.calibration_table[
+                (self.calibration_table['tier'] == tier) &
+                (self.calibration_table['minutes_band'] != 'ALL')
+            ].sort_values('minutes_band')
+
+            if tier_data.empty:
+                continue
+
+            print(f"\n{tier}:")
+            print(f"  {'Minutes Band':<12} {'Sigma':<8} {'N':<6} {'Calibrated'}")
+            print(f"  {'-'*40}")
+
+            for _, row in tier_data.iterrows():
+                calibrated = 'Yes' if row['sample_size'] >= 20 else 'No (low N)'
+                print(f"  {row['minutes_band']:<12} {row['residual_std']:<8.2f} "
+                      f"{int(row['sample_size']):<6} {calibrated}")
+
+
+# =========================================================================
 # Convenience Functions
 # =========================================================================
 

@@ -348,10 +348,16 @@ def lineup_win_probability(
     support_weight: float = 0.5
 ) -> float:
     """
-    Calculate approximate probability that a lineup wins the slate.
+    Calculate approximate probability that a lineup contains the #1 individual scorer.
+
+    NOTE: This is NOT the correct contest win probability! For contests where the
+    winner is the lineup with highest COMBINED SUM, use lineup_sum_win_probability().
+
+    This function is useful for analyzing individual player value and exposure
+    to the top scorer, but should not be used for lineup optimization.
 
     Formula:
-    P(win) ≈ P(A is #1 OR B is #1 OR C is #1) × support_factor
+    P(contains #1) ≈ P(A is #1 OR B is #1 OR C is #1) × support_factor
 
     Where:
     - P(any is #1) = 1 - ∏(1 - p_top1[i])
@@ -363,7 +369,7 @@ def lineup_win_probability(
         support_weight: How much to weight support quality (0-1)
 
     Returns:
-        Estimated win probability (0-1)
+        Estimated probability of containing #1 scorer (0-1)
     """
     if not player_ids:
         return 0.0
@@ -391,6 +397,100 @@ def lineup_win_probability(
     win_prob = p_any_top1 * (1 - support_weight + support_weight * avg_support)
 
     return round(win_prob, 4)
+
+
+def lineup_sum_win_probability(
+    lineup_player_ids: List[int],
+    all_players: List[PlayerSlateInfo],
+    corr_matrix: np.ndarray = None,
+    n_sims: int = 10000,
+    random_seed: int = 42
+) -> float:
+    """
+    Calculate probability that a lineup wins based on highest COMBINED SUM.
+
+    This is the CORRECT win probability for contests where the winner is
+    determined by the lineup with the highest total points.
+
+    Mathematical approach:
+    1. Run Monte Carlo simulation with correlated (or independent) scores
+    2. For each trial:
+       a. Compute this lineup's SUM
+       b. Compute the optimal 3-player SUM (top 3 individual scores)
+       c. Win if our sum equals optimal sum (within tolerance)
+
+    Args:
+        lineup_player_ids: List of player IDs in the lineup (typically 3)
+        all_players: List of ALL PlayerSlateInfo objects on the slate
+        corr_matrix: Optional NxN correlation matrix. If None, uses independent sampling.
+        n_sims: Number of Monte Carlo simulations
+        random_seed: Random seed for reproducibility
+
+    Returns:
+        Estimated win probability (0-1) - probability this lineup has highest SUM
+    """
+    if not lineup_player_ids or len(all_players) < 3:
+        return 0.0
+
+    np.random.seed(random_seed)
+
+    n_players = len(all_players)
+    lineup_size = len(lineup_player_ids)
+
+    # Build player_id -> index mapping
+    id_to_idx = {p.player_id: i for i, p in enumerate(all_players)}
+
+    # Convert lineup to indices
+    lineup_indices = []
+    for pid in lineup_player_ids:
+        if pid in id_to_idx:
+            lineup_indices.append(id_to_idx[pid])
+        else:
+            warnings.warn(f"Player {pid} not found in all_players")
+
+    if len(lineup_indices) < lineup_size:
+        return 0.0
+
+    # Extract means and sigmas
+    means = np.array([p.mean_score for p in all_players])
+    sigmas = np.array([p.sigma for p in all_players])
+
+    # Generate samples
+    if corr_matrix is not None:
+        # Correlated sampling using Cholesky decomposition
+        try:
+            L = np.linalg.cholesky(corr_matrix)
+            z = np.random.standard_normal((n_sims, n_players))
+            correlated_z = z @ L.T
+            scores = means + sigmas * correlated_z
+        except np.linalg.LinAlgError:
+            # Fallback to independent
+            scores = means + sigmas * np.random.standard_normal((n_sims, n_players))
+    else:
+        # Independent sampling
+        scores = means + sigmas * np.random.standard_normal((n_sims, n_players))
+
+    # Floor at 0 (can't score negative)
+    scores = np.maximum(scores, 0)
+
+    # Count wins
+    wins = 0
+    for sim in range(n_sims):
+        sim_scores = scores[sim]
+
+        # Our lineup's SUM
+        lineup_sum = np.sum(sim_scores[lineup_indices])
+
+        # Optimal SUM: top 3 individual scores (with independence/positive correlation,
+        # the best 3-player SUM is always the top 3 scorers)
+        top3_indices = np.argsort(sim_scores)[-lineup_size:]
+        optimal_sum = np.sum(sim_scores[top3_indices])
+
+        # Win if our sum equals optimal (within tolerance)
+        if lineup_sum >= optimal_sum - 0.01:
+            wins += 1
+
+    return round(wins / n_sims, 4)
 
 
 def rank_lineups_by_win_prob(

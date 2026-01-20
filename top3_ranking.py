@@ -969,6 +969,183 @@ class Top3Ranker:
         return df
 
     # =========================================================================
+    # Portfolio Win Probability
+    # =========================================================================
+
+    def simulate_portfolio_win_probability(
+        self,
+        game_date: str,
+        lineups: List[List[int]],
+        n_simulations: int = 10000
+    ) -> Tuple[float, Dict]:
+        """
+        Calculate P(any of N lineups has highest SUM) via Monte Carlo.
+
+        This is the CORRECT win probability for winner-take-all contests where
+        the winner is determined by the lineup with the highest combined total.
+
+        Mathematical approach:
+        For each simulation:
+        1. Sample correlated scores for all players on the slate
+        2. Calculate each lineup's SUM
+        3. Calculate best possible 3-player SUM (top 3 individual scores)
+        4. Check if any portfolio lineup equals the best
+
+        Args:
+            game_date: Date to simulate
+            lineups: List of lineups, each lineup is a list of player_ids
+            n_simulations: Number of Monte Carlo trials
+
+        Returns:
+            Tuple of (win_probability, stats_dict) where stats_dict contains:
+            - wins_by_lineup: How many wins came from each lineup
+            - avg_shortfall: Average points below optimal when we don't win
+            - best_lineup_idx: Which lineup won most often
+        """
+        df = self.get_predictions_for_date(game_date)
+
+        if df.empty or len(lineups) == 0:
+            return 0.0, {}
+
+        # Get calibration params
+        cal_intercept, cal_slope = self.get_calibration_params()
+
+        # Get historical stddev calibration
+        calibration_table = get_calibration_table(self.conn, days_back=60)
+
+        # Build player data arrays
+        player_ids = df['player_id'].tolist()
+        id_to_idx = {pid: i for i, pid in enumerate(player_ids)}
+        n_players = len(player_ids)
+
+        means = np.zeros(n_players)
+        stds = np.zeros(n_players)
+
+        for idx, (_, row) in enumerate(df.iterrows()):
+            row_dict = row.to_dict() if hasattr(row, 'to_dict') else dict(row)
+
+            # Calculate projected minutes for tier classification
+            proj_min, min_conf = calculate_projected_minutes(row_dict)
+            row_dict['proj_minutes'] = proj_min
+            row_dict['minutes_confidence'] = min_conf
+
+            tier = classify_tier(
+                proj_min,
+                int(_safe_get(row_dict, 'starts_last_5', 0)),
+                _safe_get(row_dict, 'proj_ceiling', 0),
+                _safe_get(row_dict, 'avg_usg_last5')
+            )
+            row_dict['tier'] = tier
+
+            # Mean = calibrated projection
+            mean = cal_intercept + cal_slope * _safe_get(row_dict, 'projected_ppg', 20)
+            means[idx] = mean
+
+            # Variance from calibration or ceiling-floor
+            std, _ = estimate_scoring_stddev(row_dict, calibration_table)
+            stds[idx] = std
+
+        # Convert lineups to index arrays (filter out unknown players)
+        lineup_indices = []
+        for lineup in lineups:
+            indices = [id_to_idx[pid] for pid in lineup if pid in id_to_idx]
+            if len(indices) >= 3:  # Only include valid lineups
+                lineup_indices.append(indices[:3])  # Take first 3 if more
+
+        if not lineup_indices:
+            return 0.0, {}
+
+        n_lineups = len(lineup_indices)
+
+        # Build game/team structure for correlation
+        player_teams = df['team_name'].tolist()
+        player_opponents = df['opponent_name'].tolist()
+
+        team_to_indices = {}
+        game_to_indices = {}
+
+        for idx, (team, opp) in enumerate(zip(player_teams, player_opponents)):
+            if team not in team_to_indices:
+                team_to_indices[team] = []
+            team_to_indices[team].append(idx)
+
+            game_key = tuple(sorted([team, opp]))
+            if game_key not in game_to_indices:
+                game_to_indices[game_key] = []
+            game_to_indices[game_key].append(idx)
+
+        # Run Monte Carlo
+        portfolio_wins = 0
+        wins_by_lineup = np.zeros(n_lineups)
+        shortfalls = []  # Track how far off when we lose
+
+        np.random.seed(42)  # Reproducibility
+
+        for _ in range(n_simulations):
+            # Step 1: Game factors (same-game correlation)
+            game_factors = {}
+            for game_key in game_to_indices:
+                game_factors[game_key] = np.random.normal(1.0, 0.08)
+
+            # Step 2: Sample scores with game correlation
+            sampled = np.zeros(n_players)
+            for idx in range(n_players):
+                team = player_teams[idx]
+                opp = player_opponents[idx]
+                game_key = tuple(sorted([team, opp]))
+                gf = game_factors.get(game_key, 1.0)
+
+                base_mean = means[idx] * gf
+                sampled[idx] = max(0, np.random.normal(base_mean, stds[idx]))
+
+            # Step 3: Teammate usage constraint (negative correlation)
+            for team, indices in team_to_indices.items():
+                if len(indices) < 2:
+                    continue
+                for i, idx in enumerate(indices):
+                    if sampled[idx] > means[idx] * 1.2:
+                        for j, teammate_idx in enumerate(indices):
+                            if i != j:
+                                sampled[teammate_idx] *= 0.95
+
+            # Step 4: Calculate optimal 3-player sum (top 3 scorers)
+            top3_indices = np.argsort(sampled)[-3:]
+            optimal_sum = np.sum(sampled[top3_indices])
+
+            # Step 5: Calculate each lineup's sum, find our best
+            best_lineup_sum = -np.inf
+            best_lineup_idx = -1
+
+            for lineup_idx, indices in enumerate(lineup_indices):
+                lineup_sum = np.sum(sampled[indices])
+                if lineup_sum > best_lineup_sum:
+                    best_lineup_sum = lineup_sum
+                    best_lineup_idx = lineup_idx
+
+            # Step 6: Check if we won
+            if best_lineup_sum >= optimal_sum - 0.01:
+                portfolio_wins += 1
+                wins_by_lineup[best_lineup_idx] += 1
+            else:
+                shortfalls.append(optimal_sum - best_lineup_sum)
+
+        # Calculate statistics
+        win_prob = portfolio_wins / n_simulations
+
+        stats = {
+            'wins_by_lineup': wins_by_lineup.tolist(),
+            'total_wins': portfolio_wins,
+            'avg_shortfall': np.mean(shortfalls) if shortfalls else 0.0,
+            'max_shortfall': np.max(shortfalls) if shortfalls else 0.0,
+            'best_lineup_idx': int(np.argmax(wins_by_lineup)),
+            'best_lineup_wins': int(np.max(wins_by_lineup)),
+            'n_simulations': n_simulations,
+            'n_lineups_evaluated': n_lineups
+        }
+
+        return win_prob, stats
+
+    # =========================================================================
     # Combined Ranking
     # =========================================================================
 

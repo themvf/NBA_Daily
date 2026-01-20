@@ -289,23 +289,27 @@ class TournamentLineupOptimizer:
         """
         Calculate portfolio win probability via Monte Carlo simulation.
 
-        This correctly handles the correlation: all lineups are evaluated
-        on the SAME simulated slate outcome each trial.
+        CRITICAL: The contest winner is the lineup with the highest COMBINED SUM
+        of 3 players' points - NOT the lineup containing the #1 individual scorer.
 
-        P(portfolio wins) = (# trials where any lineup contains slate winner) / n_sims
+        This correctly handles:
+        1. All lineups evaluated on the SAME simulated slate outcome each trial
+        2. Portfolio wins if ANY of its lineups achieves the highest possible SUM
+
+        For efficiency: With independent/positively-correlated players, the optimal
+        3-player SUM is always the sum of the top 3 individual scorers in that trial.
+
+        P(portfolio wins) = (# trials where any lineup has optimal sum) / n_sims
         """
         if not lineups:
             return 0.0
 
-        # Get all players used in any lineup
-        all_player_ids = set()
-        for lineup in lineups:
-            all_player_ids.update(lineup.player_ids())
-
-        all_player_ids = sorted(all_player_ids)
+        # Get ALL players in the slate (not just those in our portfolio)
+        # This is needed to compute the global optimal 3-player sum
+        all_player_ids = sorted([p.player_id for p in self.pool_list])
         n_players = len(all_player_ids)
 
-        if n_players == 0:
+        if n_players < 3:
             return 0.0
 
         # Build id -> index mapping
@@ -325,30 +329,35 @@ class TournamentLineupOptimizer:
                 means[idx] = 20.0  # fallback
                 sigmas[idx] = 5.0
 
-        # Build lineup player index sets for fast lookup
-        lineup_idx_sets = []
+        # Build lineup player index lists for fast sum computation
+        lineup_idx_lists = []
         for lineup in lineups:
-            idx_set = frozenset(id_to_idx[pid] for pid in lineup.player_ids())
-            lineup_idx_sets.append(idx_set)
+            idx_list = [id_to_idx[pid] for pid in lineup.player_ids() if pid in id_to_idx]
+            lineup_idx_lists.append(idx_list)
 
         # Run Monte Carlo
-        # Simple version: uncorrelated sampling (correlation matrix requires more setup)
-        # For full accuracy, use correlation_model.sample_correlated_scores
         portfolio_wins = 0
-
         np.random.seed(42)  # reproducibility
+
         for _ in range(n_sims):
             # Sample player scores (using normal distribution)
             simulated_scores = means + sigmas * np.random.standard_normal(n_players)
 
-            # Find the slate winner (highest scorer)
-            winner_idx = np.argmax(simulated_scores)
+            # Compute the optimal 3-player SUM (top 3 individual scores summed)
+            # With independent/positive-correlated samples, this is always optimal
+            top3_indices = np.argsort(simulated_scores)[-3:]
+            optimal_sum = np.sum(simulated_scores[top3_indices])
 
-            # Check if any lineup contains the winner
-            for idx_set in lineup_idx_sets:
-                if winner_idx in idx_set:
-                    portfolio_wins += 1
-                    break  # Only count once per trial
+            # Compute our portfolio's best lineup SUM
+            best_portfolio_sum = -np.inf
+            for idx_list in lineup_idx_lists:
+                lineup_sum = np.sum(simulated_scores[idx_list])
+                if lineup_sum > best_portfolio_sum:
+                    best_portfolio_sum = lineup_sum
+
+            # Win if our best lineup equals the optimal (with small tolerance)
+            if best_portfolio_sum >= optimal_sum - 0.01:
+                portfolio_wins += 1
 
         return portfolio_wins / n_sims
 
