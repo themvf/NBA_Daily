@@ -555,12 +555,23 @@ class TournamentLineupOptimizer:
 
         if not stackable_games:
             warnings.warn("No stackable games found (stack_score >= threshold)")
-            # Fallback: use highest stack_score games available
+            # Fallback 1: use highest stack_score games available from game_envs
             stackable_games = sorted(
                 self.game_envs.keys(),
                 key=lambda g: self.game_envs[g].get('stack_score', 0),
                 reverse=True
             )[:3]
+
+        if not stackable_games:
+            # Fallback 2: use games from player pool (game_envs is empty)
+            stackable_games = list(self.players_by_game.keys())
+            if stackable_games:
+                warnings.warn(f"game_envs empty, using {len(stackable_games)} games from player pool")
+
+        if not stackable_games:
+            # No games available at all - skip stack bucket
+            warnings.warn("No games available for stacking. Skipping stack bucket.")
+            return []
 
         max_attempts = n * 3
         attempts = 0
@@ -568,8 +579,8 @@ class TournamentLineupOptimizer:
         while len(lineups) < n and attempts < max_attempts:
             attempts += 1
 
-            # Rotate through stackable games
-            game_id = stackable_games[len(lineups) % len(stackable_games)]
+            # Rotate through stackable games (use attempts for rotation to ensure progress)
+            game_id = stackable_games[(attempts - 1) % len(stackable_games)]
 
             # Get players from this game
             game_players = self.players_by_game.get(game_id, [])

@@ -8131,6 +8131,7 @@ if selected_page == "Tournament Strategy":
                                           help="Fetch spreads and totals for game environment")
 
             game_envs = {}
+            game_id_lookup = {}  # Maps normalized "{min_team}_{max_team}" to actual game_id
             if fetch_odds_btn and api_key:
                 try:
                     ensure_game_odds_table(tourn_conn)
@@ -8141,6 +8142,10 @@ if selected_page == "Tournament Strategy":
                         'blowout_risk': e.blowout_risk,
                         'pace_score': e.pace_score
                     } for e in envs}
+                    # Build lookup: normalized key -> actual game_id
+                    for e in envs:
+                        normalized = f"{min(e.away_team, e.home_team)}_{max(e.away_team, e.home_team)}"
+                        game_id_lookup[normalized] = e.game_id
                     st.success(f"✅ Fetched odds for {len(envs)} games")
 
                     # Show game environment table
@@ -8170,6 +8175,10 @@ if selected_page == "Tournament Strategy":
                             'blowout_risk': e.blowout_risk,
                             'pace_score': e.pace_score
                         } for gid, e in cached_envs.items()}
+                        # Build lookup for cached envs
+                        for gid, e in cached_envs.items():
+                            normalized = f"{min(e.away_team, e.home_team)}_{max(e.away_team, e.home_team)}"
+                            game_id_lookup[normalized] = gid
                         st.info(f"📊 Using cached odds for {len(cached_envs)} games")
                 except Exception:
                     st.caption("ℹ️ No Vegas odds available. Using default game environment.")
@@ -8230,7 +8239,10 @@ if selected_page == "Tournament Strategy":
                                 opponent = safe_get(row, 'opponent_team', 'UNK')
                                 if opponent == 0:
                                     opponent = 'UNK'
-                                game_id = f"{min(str(team), str(opponent))}_{max(str(team), str(opponent))}"
+                                # Create normalized key and look up actual game_id from Vegas odds
+                                normalized_key = f"{min(str(team), str(opponent))}_{max(str(team), str(opponent))}"
+                                # Use lookup if available, otherwise use normalized key
+                                game_id = game_id_lookup.get(normalized_key, normalized_key)
 
                                 player_pool.append(PlayerPool(
                                     player_id=row['player_id'],
