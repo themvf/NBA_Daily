@@ -8053,6 +8053,327 @@ if selected_page == "Tournament Strategy":
             else:
                 st.caption("No players selected yet")
 
+    # =========================================================================
+    # 20-LINEUP TOURNAMENT PORTFOLIO BUILDER
+    # =========================================================================
+    st.divider()
+    st.markdown("## 🚀 20-Lineup Tournament Portfolio")
+    st.caption("Automated portfolio builder using correlated simulation and win-probability optimization")
+
+    with st.expander("📊 Build 20-Lineup Portfolio (Advanced)", expanded=False):
+        try:
+            # Import the optimizer modules
+            from lineup_optimizer import (
+                TournamentLineupOptimizer,
+                create_player_pool_from_predictions,
+                format_portfolio_report,
+                OptimizerConfig,
+                PlayerPool
+            )
+            from correlation_model import (
+                PlayerCorrelationModel,
+                CorrelatedSimResult,
+                create_player_slate_info
+            )
+            from vegas_odds import (
+                VegasOddsClient,
+                compute_game_environment,
+                load_game_odds,
+                ensure_game_odds_table,
+                fetch_and_store_odds
+            )
+
+            # Configuration
+            st.markdown("### ⚙️ Portfolio Configuration")
+            config_cols = st.columns(4)
+
+            with config_cols[0]:
+                chalk_n = st.number_input("Chalk Lineups", min_value=0, max_value=10, value=6,
+                                         help="Lineups anchored on highest p(#1) stars")
+            with config_cols[1]:
+                stack_n = st.number_input("Stack Lineups", min_value=0, max_value=10, value=6,
+                                         help="Lineups with 2 players from same game")
+            with config_cols[2]:
+                leverage_n = st.number_input("Leverage Lineups", min_value=0, max_value=10, value=6,
+                                            help="High-variance contrarian plays")
+            with config_cols[3]:
+                news_n = st.number_input("News Lineups", min_value=0, max_value=10, value=2,
+                                        help="Questionable/injury beneficiary pivots")
+
+            total_lineups = chalk_n + stack_n + leverage_n + news_n
+            st.caption(f"Total lineups: {total_lineups}")
+
+            exposure_cols = st.columns(3)
+            with exposure_cols[0]:
+                max_exp_dominant = st.slider("Max Exposure (Stars)", 0.3, 0.8, 0.6,
+                                            help="Max % of lineups for p_top1 > 15%")
+            with exposure_cols[1]:
+                max_exp_strong = st.slider("Max Exposure (Strong)", 0.3, 0.7, 0.5,
+                                          help="Max % of lineups for p_top1 5-15%")
+            with exposure_cols[2]:
+                max_exp_leverage = st.slider("Max Exposure (Leverage)", 0.2, 0.5, 0.3,
+                                            help="Max % of lineups for p_top1 < 5%")
+
+            st.divider()
+
+            # Vegas Odds Section
+            st.markdown("### 🎰 Game Environment Data")
+            vegas_col1, vegas_col2 = st.columns([2, 1])
+
+            with vegas_col1:
+                api_key = st.text_input("TheOddsAPI Key (optional)",
+                                       type="password",
+                                       help="Enter your API key to fetch Vegas odds. Leave blank to skip.")
+
+            with vegas_col2:
+                fetch_odds_btn = st.button("🎲 Fetch Vegas Odds",
+                                          disabled=not api_key,
+                                          help="Fetch spreads and totals for game environment")
+
+            game_envs = {}
+            if fetch_odds_btn and api_key:
+                try:
+                    ensure_game_odds_table(tourn_conn)
+                    envs = fetch_and_store_odds(tourn_conn, api_key, selected_date)
+                    game_envs = {e.game_id: {
+                        'stack_score': e.stack_score,
+                        'ot_probability': e.ot_probability,
+                        'blowout_risk': e.blowout_risk,
+                        'pace_score': e.pace_score
+                    } for e in envs}
+                    st.success(f"✅ Fetched odds for {len(envs)} games")
+
+                    # Show game environment table
+                    env_df = pd.DataFrame([
+                        {
+                            'Game': f"{e.away_team} @ {e.home_team}",
+                            'Spread': f"{e.spread:+.1f}",
+                            'Total': f"{e.total:.1f}",
+                            'Stack Score': f"{e.stack_score:.2f}",
+                            'OT Prob': f"{e.ot_probability:.1%}",
+                            'Blowout Risk': f"{e.blowout_risk:.1%}"
+                        }
+                        for e in envs
+                    ])
+                    st.dataframe(env_df, hide_index=True, use_container_width=True)
+                except Exception as ve:
+                    st.error(f"❌ Failed to fetch odds: {ve}")
+            else:
+                # Try to load cached odds
+                try:
+                    ensure_game_odds_table(tourn_conn)
+                    cached_envs = load_game_odds(tourn_conn, selected_date)
+                    if cached_envs:
+                        game_envs = {gid: {
+                            'stack_score': e.stack_score,
+                            'ot_probability': e.ot_probability,
+                            'blowout_risk': e.blowout_risk,
+                            'pace_score': e.pace_score
+                        } for gid, e in cached_envs.items()}
+                        st.info(f"📊 Using cached odds for {len(cached_envs)} games")
+                except Exception:
+                    st.caption("ℹ️ No Vegas odds available. Using default game environment.")
+
+            st.divider()
+
+            # Generate Portfolio Button
+            if st.button("🚀 Generate 20-Lineup Portfolio", type="primary"):
+                with st.spinner("Running correlated simulation and building portfolio..."):
+                    try:
+                        # Load predictions for selected date
+                        pred_query = """
+                            SELECT p.*,
+                                   COALESCE(p.p_top1, 0) as p_top1,
+                                   COALESCE(p.p_top3, 0) as p_top3
+                            FROM predictions p
+                            WHERE p.game_date = ?
+                              AND p.projected_ppg IS NOT NULL
+                              AND p.proj_ceiling >= ?
+                        """
+                        pred_df = pd.read_sql_query(pred_query, tourn_conn, params=[selected_date, min_ceiling])
+
+                        if pred_df.empty:
+                            st.error("No predictions found for this date with the current filters.")
+                        else:
+                            # Create player pool
+                            player_pool = []
+                            for _, row in pred_df.iterrows():
+                                ceiling = row.get('proj_ceiling', 0) or 0
+                                floor = row.get('proj_floor', 0) or 0
+                                sigma = (ceiling - floor) / 4 if ceiling > floor else row.get('projected_ppg', 20) * 0.15
+
+                                # Determine game_id from matchup or team
+                                team = row.get('team_abbreviation', 'UNK')
+                                opponent = row.get('opponent_team', 'UNK')
+                                game_id = f"{min(team, opponent)}_{max(team, opponent)}"
+
+                                player_pool.append(PlayerPool(
+                                    player_id=row['player_id'],
+                                    player_name=row['player_name'],
+                                    team=team,
+                                    game_id=game_id,
+                                    projected_ppg=row.get('projected_ppg', 0) or 0,
+                                    sigma=max(sigma, 1.0),
+                                    ceiling=ceiling,
+                                    floor=floor,
+                                    p_top1=row.get('p_top1', 0) or 0,
+                                    p_top3=row.get('p_top3', 0) or 0,
+                                    support_score=0.5,  # Will be computed by simulation
+                                    expected_rank=50,
+                                    is_star=row.get('season_avg_ppg', 0) >= 25,
+                                    is_questionable=str(row.get('injury_status', '')).lower() == 'questionable',
+                                    is_injury_beneficiary=bool(row.get('injury_adjusted', False)),
+                                ))
+
+                            # Run correlated simulation if we have enough players
+                            if len(player_pool) >= 10:
+                                corr_model = PlayerCorrelationModel()
+                                slate_info = [
+                                    create_player_slate_info.__self__ if hasattr(create_player_slate_info, '__self__') else None
+                                    for _ in player_pool
+                                ]
+                                # Build simplified slate info
+                                from correlation_model import PlayerSlateInfo
+                                slate_players = [
+                                    PlayerSlateInfo(
+                                        player_id=p.player_id,
+                                        player_name=p.player_name,
+                                        team=p.team,
+                                        game_id=p.game_id,
+                                        mean_score=p.projected_ppg,
+                                        sigma=p.sigma,
+                                        is_star=p.is_star
+                                    )
+                                    for p in player_pool
+                                ]
+
+                                # Run simulation
+                                sim_results = corr_model.run_correlated_simulation(
+                                    slate_players, game_envs, n_sims=10000
+                                )
+                                sim_dict = {r.player_id: r for r in sim_results}
+
+                                # Update player pool with simulation results
+                                for p in player_pool:
+                                    if p.player_id in sim_dict:
+                                        r = sim_dict[p.player_id]
+                                        p.p_top1 = r.p_top1
+                                        p.p_top3 = r.p_top3
+                                        p.support_score = r.support_score
+                                        p.expected_rank = r.expected_rank
+
+                            # Configure and run optimizer
+                            config = OptimizerConfig(
+                                chalk_lineups=chalk_n,
+                                stack_lineups=stack_n,
+                                leverage_lineups=leverage_n,
+                                news_lineups=news_n,
+                                max_exposure_dominant=max_exp_dominant,
+                                max_exposure_strong=max_exp_strong,
+                                max_exposure_leverage=max_exp_leverage,
+                            )
+
+                            optimizer = TournamentLineupOptimizer(
+                                player_pool=player_pool,
+                                game_environments=game_envs,
+                                sim_results=sim_dict if 'sim_dict' in dir() else {},
+                                config=config
+                            )
+
+                            result = optimizer.optimize()
+
+                            # Store in session state
+                            st.session_state['portfolio_result'] = result
+                            st.session_state['portfolio_player_pool'] = {p.player_id: p for p in player_pool}
+
+                            st.success(f"✅ Generated {len(result.lineups)} lineups!")
+
+                    except Exception as e:
+                        st.error(f"❌ Portfolio generation failed: {e}")
+                        import traceback
+                        st.code(traceback.format_exc())
+
+            # Display results if available
+            if 'portfolio_result' in st.session_state:
+                result = st.session_state['portfolio_result']
+                player_pool_dict = st.session_state.get('portfolio_player_pool', {})
+
+                st.divider()
+                st.markdown("### 📊 Portfolio Results")
+
+                # Summary metrics
+                sum_cols = st.columns(4)
+                with sum_cols[0]:
+                    st.metric("Total Win Prob", f"{result.total_win_probability:.1%}",
+                             help="P(any of the lineups wins)")
+                with sum_cols[1]:
+                    st.metric("Unique Players", f"{result.unique_players}",
+                             help="Total unique players across all lineups")
+                with sum_cols[2]:
+                    st.metric("Lineups Built", f"{len(result.lineups)}/{total_lineups}")
+                with sum_cols[3]:
+                    bucket_str = f"C:{result.bucket_summary.get('chalk', 0)} S:{result.bucket_summary.get('stack', 0)} L:{result.bucket_summary.get('leverage', 0)} N:{result.bucket_summary.get('news', 0)}"
+                    st.metric("Bucket Split", bucket_str)
+
+                # Warnings
+                if result.warnings:
+                    with st.expander("⚠️ Warnings", expanded=True):
+                        for w in result.warnings:
+                            st.warning(w)
+
+                # Lineups by bucket
+                for bucket in ['chalk', 'stack', 'leverage', 'news']:
+                    bucket_lineups = [l for l in result.lineups if l.bucket == bucket]
+                    if bucket_lineups:
+                        bucket_icon = {'chalk': '🎯', 'stack': '🔗', 'leverage': '📈', 'news': '📰'}.get(bucket, '📋')
+                        with st.expander(f"{bucket_icon} {bucket.upper()} Lineups ({len(bucket_lineups)})", expanded=bucket=='chalk'):
+                            for i, lineup in enumerate(bucket_lineups, 1):
+                                cols = st.columns([3, 1, 1])
+                                with cols[0]:
+                                    names = ' | '.join([p.player_name for p in lineup.players])
+                                    st.markdown(f"**{i}.** {names}")
+                                with cols[1]:
+                                    st.caption(f"Win: {lineup.win_probability:.2%}")
+                                with cols[2]:
+                                    st.caption(f"Ceil: {lineup.total_ceiling():.0f}")
+                                if lineup.stack_game:
+                                    st.caption(f"   🔗 Stack: {lineup.stack_game}")
+
+                # Exposure report
+                with st.expander("📊 Player Exposure Report", expanded=False):
+                    exp_data = []
+                    for pid, data in sorted(result.exposure_report.items(),
+                                           key=lambda x: x[1]['count'], reverse=True):
+                        cap_status = "🔴 AT CAP" if data['at_cap'] else ""
+                        exp_data.append({
+                            'Player': data['player_name'],
+                            'Team': data['team'],
+                            'Count': data['count'],
+                            'Exposure': f"{data['pct']:.0%}",
+                            'Tier': data['tier'],
+                            'Status': cap_status
+                        })
+                    if exp_data:
+                        st.dataframe(pd.DataFrame(exp_data), hide_index=True, use_container_width=True)
+
+                # Export
+                st.divider()
+                if st.button("📋 Copy Lineups to Clipboard"):
+                    lines = []
+                    for i, lineup in enumerate(result.lineups, 1):
+                        names = ', '.join([p.player_name for p in lineup.players])
+                        lines.append(f"{i}. [{lineup.bucket}] {names}")
+                    st.code('\n'.join(lines))
+                    st.success("Lineups displayed above - copy manually")
+
+        except ImportError as ie:
+            st.error(f"❌ Required modules not found: {ie}")
+            st.info("Make sure vegas_odds.py, correlation_model.py, and lineup_optimizer.py are in the project directory.")
+        except Exception as e:
+            st.error(f"❌ Error loading portfolio builder: {e}")
+            import traceback
+            st.code(traceback.format_exc())
+
 # Backtest Analysis tab --------------------------------------------------------
 if selected_page == "Backtest Analysis":
     st.header("📊 Backtest Analysis - Top 3 Scorer Performance")
