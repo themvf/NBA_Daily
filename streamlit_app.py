@@ -8307,13 +8307,37 @@ if selected_page == "Tournament Strategy":
                                 proj_ppg = safe_get(row, 'projected_ppg', 20)
                                 sigma = (ceiling - floor) / 4 if ceiling > floor else proj_ppg * 0.15
 
+                                # Team name to abbreviation mapping
+                                TEAM_NAME_TO_ABBR = {
+                                    "Atlanta Hawks": "ATL", "Boston Celtics": "BOS", "Brooklyn Nets": "BKN",
+                                    "Charlotte Hornets": "CHA", "Chicago Bulls": "CHI", "Cleveland Cavaliers": "CLE",
+                                    "Dallas Mavericks": "DAL", "Denver Nuggets": "DEN", "Detroit Pistons": "DET",
+                                    "Golden State Warriors": "GSW", "Houston Rockets": "HOU", "Indiana Pacers": "IND",
+                                    "Los Angeles Clippers": "LAC", "Los Angeles Lakers": "LAL", "Memphis Grizzlies": "MEM",
+                                    "Miami Heat": "MIA", "Milwaukee Bucks": "MIL", "Minnesota Timberwolves": "MIN",
+                                    "New Orleans Pelicans": "NOP", "New York Knicks": "NYK", "Oklahoma City Thunder": "OKC",
+                                    "Orlando Magic": "ORL", "Philadelphia 76ers": "PHI", "Phoenix Suns": "PHX",
+                                    "Portland Trail Blazers": "POR", "Sacramento Kings": "SAC", "San Antonio Spurs": "SAS",
+                                    "Toronto Raptors": "TOR", "Utah Jazz": "UTA", "Washington Wizards": "WAS"
+                                }
+
                                 # Determine game_id from matchup or team
-                                team = safe_get(row, 'team_abbreviation', 'UNK')
-                                if team == 0:
-                                    team = 'UNK'
-                                opponent = safe_get(row, 'opponent_team', 'UNK')
-                                if opponent == 0:
+                                team_raw = safe_get(row, 'team_abbreviation', None)
+                                if not team_raw or team_raw == 0:
+                                    # Try team_name and convert
+                                    team_name = safe_get(row, 'team_name', 'UNK')
+                                    team = TEAM_NAME_TO_ABBR.get(str(team_name), str(team_name)[:3].upper() if team_name else 'UNK')
+                                else:
+                                    team = normalize_team(str(team_raw))
+
+                                # Get opponent (use opponent_name, convert to abbreviation)
+                                opponent_raw = safe_get(row, 'opponent_name', None)
+                                if opponent_raw and opponent_raw != 0:
+                                    opponent = TEAM_NAME_TO_ABBR.get(str(opponent_raw), str(opponent_raw)[:3].upper())
+                                else:
                                     opponent = 'UNK'
+                                opponent = normalize_team(opponent)
+
                                 # Create normalized key (includes date for collision safety)
                                 normalized_key = make_lookup_key(selected_date, team, opponent)
                                 # Use lookup if available, otherwise use normalized key
