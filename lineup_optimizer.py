@@ -563,10 +563,24 @@ class TournamentLineupOptimizer:
             )[:3]
 
         if not stackable_games:
-            # Fallback 2: use games from player pool (game_envs is empty)
-            stackable_games = list(self.players_by_game.keys())
+            # Fallback 2: use games from player pool, sorted by implied scoring potential
+            # (sum of top-2 p_top3 in the game = proxy for high-scoring environment)
+            def game_stack_proxy(game_id):
+                players = self.players_by_game.get(game_id, [])
+                if len(players) < 2:
+                    return 0
+                # Sort by p_top3 descending and sum top 2
+                sorted_p = sorted([p.p_top3 for p in players], reverse=True)
+                return sum(sorted_p[:2])
+
+            stackable_games = sorted(
+                self.players_by_game.keys(),
+                key=game_stack_proxy,
+                reverse=True
+            )
             if stackable_games:
-                warnings.warn(f"game_envs empty, using {len(stackable_games)} games from player pool")
+                warnings.warn(f"game_envs empty, using {len(stackable_games)} games from player pool "
+                             f"(sorted by implied scoring potential)")
 
         if not stackable_games:
             # No games available at all - skip stack bucket

@@ -8131,7 +8131,22 @@ if selected_page == "Tournament Strategy":
                                           help="Fetch spreads and totals for game environment")
 
             game_envs = {}
-            game_id_lookup = {}  # Maps normalized "{min_team}_{max_team}" to actual game_id
+            game_id_lookup = {}  # Maps normalized "{date}_{min_team}_{max_team}" to actual game_id
+
+            # Helper to normalize team abbreviations (handle PHX/PHO, BKN/BRK, etc.)
+            def normalize_team(abbr):
+                if not abbr:
+                    return 'UNK'
+                abbr = str(abbr).upper().strip()
+                # Handle common aliases
+                aliases = {'PHO': 'PHX', 'BRK': 'BKN', 'NOP': 'NOP', 'NOH': 'NOP'}
+                return aliases.get(abbr, abbr)
+
+            # Helper to build normalized lookup key (includes date for collision safety)
+            def make_lookup_key(date_str, team1, team2):
+                t1, t2 = normalize_team(team1), normalize_team(team2)
+                return f"{date_str}_{min(t1, t2)}_{max(t1, t2)}"
+
             if fetch_odds_btn and api_key:
                 try:
                     ensure_game_odds_table(tourn_conn)
@@ -8142,9 +8157,11 @@ if selected_page == "Tournament Strategy":
                         'blowout_risk': e.blowout_risk,
                         'pace_score': e.pace_score
                     } for e in envs}
-                    # Build lookup: normalized key -> actual game_id
+                    # Build lookup: normalized key -> actual game_id (with collision detection)
                     for e in envs:
-                        normalized = f"{min(e.away_team, e.home_team)}_{max(e.away_team, e.home_team)}"
+                        normalized = make_lookup_key(selected_date, e.away_team, e.home_team)
+                        if normalized in game_id_lookup and game_id_lookup[normalized] != e.game_id:
+                            st.warning(f"⚠️ game_id collision for {normalized}: {game_id_lookup[normalized]} vs {e.game_id}")
                         game_id_lookup[normalized] = e.game_id
                     st.success(f"✅ Fetched odds for {len(envs)} games")
 
@@ -8175,9 +8192,11 @@ if selected_page == "Tournament Strategy":
                             'blowout_risk': e.blowout_risk,
                             'pace_score': e.pace_score
                         } for gid, e in cached_envs.items()}
-                        # Build lookup for cached envs
+                        # Build lookup for cached envs (with collision detection)
                         for gid, e in cached_envs.items():
-                            normalized = f"{min(e.away_team, e.home_team)}_{max(e.away_team, e.home_team)}"
+                            normalized = make_lookup_key(selected_date, e.away_team, e.home_team)
+                            if normalized in game_id_lookup and game_id_lookup[normalized] != gid:
+                                st.warning(f"⚠️ game_id collision for {normalized}")
                             game_id_lookup[normalized] = gid
                         st.info(f"📊 Using cached odds for {len(cached_envs)} games")
                 except Exception:
@@ -8239,8 +8258,8 @@ if selected_page == "Tournament Strategy":
                                 opponent = safe_get(row, 'opponent_team', 'UNK')
                                 if opponent == 0:
                                     opponent = 'UNK'
-                                # Create normalized key and look up actual game_id from Vegas odds
-                                normalized_key = f"{min(str(team), str(opponent))}_{max(str(team), str(opponent))}"
+                                # Create normalized key (includes date for collision safety)
+                                normalized_key = make_lookup_key(selected_date, team, opponent)
                                 # Use lookup if available, otherwise use normalized key
                                 game_id = game_id_lookup.get(normalized_key, normalized_key)
 
@@ -8261,6 +8280,18 @@ if selected_page == "Tournament Strategy":
                                     is_questionable=str(safe_get(row, 'injury_status', '')).lower() == 'questionable',
                                     is_injury_beneficiary=bool(safe_get(row, 'injury_adjusted', False)),
                                 ))
+
+                            # Coverage metrics: check game_id matching between pool and envs
+                            pool_games = set(p.game_id for p in player_pool)
+                            env_games = set(game_envs.keys())
+                            matched_games = pool_games & env_games
+                            match_pct = len(matched_games) / len(pool_games) * 100 if pool_games else 0
+
+                            if match_pct < 50:
+                                st.warning(f"⚠️ Low game coverage: only {len(matched_games)}/{len(pool_games)} player pool games "
+                                          f"({match_pct:.0f}%) have Vegas odds. Stacking may be degraded.")
+                            elif match_pct < 95:
+                                st.caption(f"ℹ️ Game coverage: {len(matched_games)}/{len(pool_games)} games ({match_pct:.0f}%) have odds")
 
                             # Run correlated simulation if we have enough players
                             if len(player_pool) >= 10:
@@ -8318,6 +8349,15 @@ if selected_page == "Tournament Strategy":
                             )
 
                             result = optimizer.optimize()
+
+                            # Check for degraded strategy and warn user
+                            stack_built = result.bucket_summary.get('stack', 0)
+                            if stack_built == 0:
+                                st.warning("⚠️ **No stack lineups built!** This significantly reduces tournament edge. "
+                                          "Check: Vegas odds missing, game_id mismatch, or insufficient players per game.")
+                            elif stack_built < stack_n:
+                                st.warning(f"⚠️ Only {stack_built}/{stack_n} stack lineups built. "
+                                          "Some game environments may be missing.")
 
                             # Store in session state
                             st.session_state['portfolio_result'] = result
