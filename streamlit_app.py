@@ -8279,6 +8279,17 @@ if selected_page == "Tournament Strategy":
                         if pred_df.empty:
                             st.error("No predictions found for this date with the current filters.")
                         else:
+                            # Show predictions summary for debugging
+                            with st.expander("📋 Predictions Data Debug", expanded=False):
+                                st.write(f"**Columns in predictions:** {list(pred_df.columns)}")
+                                # Show unique team/opponent combinations
+                                if 'team_name' in pred_df.columns and 'opponent_name' in pred_df.columns:
+                                    matchups = pred_df.groupby(['team_name', 'opponent_name']).size().reset_index(name='players')
+                                    st.write("**Matchups in predictions:**")
+                                    st.dataframe(matchups, hide_index=True)
+                                else:
+                                    st.warning("Missing team_name or opponent_name columns!")
+
                             # Create player pool
                             player_pool = []
                             # Helper function to safely get scalar value from pandas row
@@ -8366,6 +8377,18 @@ if selected_page == "Tournament Strategy":
                             env_games = set(game_envs.keys())
                             matched_games = pool_games & env_games
                             match_pct = len(matched_games) / len(pool_games) * 100 if pool_games else 0
+
+                            # Debug: Show game_id diagnostics
+                            with st.expander("🔧 Game ID Debug", expanded=False):
+                                st.write("**Player Pool Games:**", sorted(pool_games))
+                                st.write("**Game Odds Games:**", sorted(env_games))
+                                st.write("**Lookup Keys:**", sorted(game_id_lookup.keys()) if game_id_lookup else "Empty")
+                                st.write("**Matched:**", sorted(matched_games) if matched_games else "None")
+                                # Sample of player game assignments
+                                sample_players = player_pool[:5]
+                                st.write("**Sample Players:**")
+                                for p in sample_players:
+                                    st.caption(f"  {p.player_name} ({p.team}) → game_id: {p.game_id}")
 
                             if match_pct < 50:
                                 st.warning(f"⚠️ Low game coverage: only {len(matched_games)}/{len(pool_games)} player pool games "
