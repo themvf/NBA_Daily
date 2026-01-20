@@ -8425,6 +8425,27 @@ if selected_page == "Tournament Strategy":
                     bucket_str = f"C:{result.bucket_summary.get('chalk', 0)} S:{result.bucket_summary.get('stack', 0)} L:{result.bucket_summary.get('leverage', 0)} N:{result.bucket_summary.get('news', 0)}"
                     st.metric("Bucket Split", bucket_str)
 
+                # Diversity metrics row
+                div_cols = st.columns(4)
+                with div_cols[0]:
+                    diversity = getattr(result, 'diversity_score', 1.0)
+                    diversity_color = "normal" if diversity >= 0.60 else "off"
+                    st.metric("Diversity Score", f"{diversity:.2f}",
+                             help="Avg pairwise Jaccard distance (higher = more diverse, ≥0.60 target)")
+                with div_cols[1]:
+                    core_sat = getattr(result, 'core_saturation', {})
+                    max_core = core_sat.get('max_core_usage', 0)
+                    st.metric("Max Core Usage", f"{max_core}",
+                             help="Most lineups sharing any 2-player core")
+                with div_cols[2]:
+                    saturated = core_sat.get('saturated_cores', 0)
+                    st.metric("Saturated Cores", f"{saturated}",
+                             help="2-player cores at max overlap limit")
+                with div_cols[3]:
+                    # Quality indicator
+                    quality = "🟢 Good" if diversity >= 0.60 and saturated <= 5 else "🟡 OK" if diversity >= 0.50 else "🔴 Low"
+                    st.metric("Portfolio Health", quality)
+
                 # Warnings
                 if result.warnings:
                     with st.expander("⚠️ Warnings", expanded=True):

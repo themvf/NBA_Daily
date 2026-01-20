@@ -58,6 +58,10 @@ class OptimizerConfig:
     lineup_size: int = 3                  # Players per lineup
     min_unique_players: int = 15          # Across all 20 lineups
 
+    # Duplication penalty - prevents correlated fates
+    max_core_overlap: int = 3             # Max lineups sharing same 2-player core
+    min_portfolio_diversity: float = 0.60  # Minimum avg pairwise Jaccard distance
+
 
 DEFAULT_CONFIG = OptimizerConfig()
 
@@ -117,6 +121,9 @@ class PortfolioResult:
     total_win_probability: float      # P(any lineup wins)
     unique_players: int
     warnings: List[str] = field(default_factory=list)
+    # Diversity metrics (duplication penalty)
+    diversity_score: float = 1.0      # Avg pairwise Jaccard distance (higher = more diverse)
+    core_saturation: Dict[str, Any] = field(default_factory=dict)  # Core usage report
 
 
 # ============================================================================
@@ -253,6 +260,10 @@ class TournamentLineupOptimizer:
         # Track unique lineups to prevent duplicates
         self.seen_lineups: Set[FrozenSet[int]] = set()
 
+        # Track 2-player cores to prevent correlated fates (duplication penalty)
+        # Key: frozenset of 2 player_ids, Value: count of lineups using this core
+        self.core_counts: Dict[FrozenSet[int], int] = defaultdict(int)
+
     def _calculate_lineup_win_prob(self, player_ids: List[int]) -> float:
         """Calculate win probability for a lineup."""
         if self.sim_results:
@@ -280,6 +291,89 @@ class TournamentLineupOptimizer:
             return False
         self.seen_lineups.add(lineup_key)
         return True
+
+    # =========================================================================
+    # DUPLICATION PENALTY - 2-Player Core Tracking
+    # =========================================================================
+
+    def _get_all_cores(self, player_ids: List[int]) -> List[FrozenSet[int]]:
+        """
+        Get all 2-player cores from a lineup.
+
+        For a 3-player lineup [A, B, C], returns cores:
+        - {A, B}, {A, C}, {B, C}
+        """
+        from itertools import combinations
+        return [frozenset(pair) for pair in combinations(player_ids, 2)]
+
+    def _can_add_lineup_core(self, player_ids: List[int]) -> bool:
+        """
+        Check if adding this lineup would violate core overlap limits.
+
+        Returns True if all 2-player cores have < max_core_overlap lineups.
+        """
+        max_overlap = self.config.max_core_overlap
+        for core in self._get_all_cores(player_ids):
+            if self.core_counts[core] >= max_overlap:
+                return False
+        return True
+
+    def _register_lineup_cores(self, player_ids: List[int]) -> None:
+        """Register all 2-player cores from a lineup."""
+        for core in self._get_all_cores(player_ids):
+            self.core_counts[core] += 1
+
+    def _calculate_portfolio_diversity(self, lineups: List[Lineup]) -> float:
+        """
+        Calculate average pairwise Jaccard distance across portfolio.
+
+        Jaccard distance = 1 - |A ∩ B| / |A ∪ B|
+
+        Higher = more diverse (0 = identical, 1 = no overlap)
+        """
+        if len(lineups) < 2:
+            return 1.0  # Single lineup = perfectly diverse (no overlap)
+
+        distances = []
+        for i in range(len(lineups)):
+            for j in range(i + 1, len(lineups)):
+                set_a = set(p.player_id for p in lineups[i].players)
+                set_b = set(p.player_id for p in lineups[j].players)
+                intersection = len(set_a & set_b)
+                union = len(set_a | set_b)
+                if union > 0:
+                    jaccard_distance = 1 - (intersection / union)
+                    distances.append(jaccard_distance)
+
+        return sum(distances) / len(distances) if distances else 1.0
+
+    def _get_core_saturation_report(self) -> Dict[str, Any]:
+        """
+        Report on core usage across portfolio.
+
+        Returns dict with:
+        - max_core_usage: highest count for any 2-player core
+        - saturated_cores: list of cores at max_core_overlap limit
+        - core_distribution: histogram of core counts
+        """
+        if not self.core_counts:
+            return {'max_core_usage': 0, 'saturated_cores': [], 'core_distribution': {}}
+
+        max_usage = max(self.core_counts.values())
+        saturated = [
+            core for core, count in self.core_counts.items()
+            if count >= self.config.max_core_overlap
+        ]
+
+        # Distribution: {count: num_cores_with_that_count}
+        from collections import Counter
+        dist = dict(Counter(self.core_counts.values()))
+
+        return {
+            'max_core_usage': max_usage,
+            'saturated_cores': len(saturated),
+            'core_distribution': dist
+        }
 
     def _calculate_portfolio_win_prob_montecarlo(
         self,
@@ -517,8 +611,13 @@ class TournamentLineupOptimizer:
             if not self._is_unique_lineup(player_ids):
                 continue  # Skip duplicate
 
-            # Register lineup and record exposure
+            # Check core overlap (duplication penalty)
+            if not self._can_add_lineup_core(player_ids):
+                continue  # Skip - would create too much correlated fate
+
+            # Register lineup, cores, and record exposure
             self._register_lineup(player_ids)
+            self._register_lineup_cores(player_ids)
             for p in players:
                 self.exposure_mgr.add_player(p.player_id)
 
@@ -684,8 +783,13 @@ class TournamentLineupOptimizer:
             if not self._is_unique_lineup(player_ids):
                 continue
 
-            # Register lineup and record exposure
+            # Check core overlap (duplication penalty)
+            if not self._can_add_lineup_core(player_ids):
+                continue  # Skip - would create too much correlated fate
+
+            # Register lineup, cores, and record exposure
             self._register_lineup(player_ids)
+            self._register_lineup_cores(player_ids)
             for p in players:
                 self.exposure_mgr.add_player(p.player_id)
 
@@ -780,8 +884,13 @@ class TournamentLineupOptimizer:
             if not self._is_unique_lineup(player_ids):
                 continue
 
-            # Register lineup and record exposure
+            # Check core overlap (duplication penalty)
+            if not self._can_add_lineup_core(player_ids):
+                continue  # Skip - would create too much correlated fate
+
+            # Register lineup, cores, and record exposure
             self._register_lineup(player_ids)
+            self._register_lineup_cores(player_ids)
             for p in players:
                 self.exposure_mgr.add_player(p.player_id)
 
@@ -867,8 +976,13 @@ class TournamentLineupOptimizer:
             if not self._is_unique_lineup(player_ids):
                 continue
 
-            # Register lineup and record exposure
+            # Check core overlap (duplication penalty)
+            if not self._can_add_lineup_core(player_ids):
+                continue  # Skip - would create too much correlated fate
+
+            # Register lineup, cores, and record exposure
             self._register_lineup(player_ids)
+            self._register_lineup_cores(player_ids)
             for p in players:
                 self.exposure_mgr.add_player(p.player_id)
 
@@ -948,6 +1062,20 @@ class TournamentLineupOptimizer:
                 f"Only {unique_players} unique players (target: {self.config.min_unique_players})"
             )
 
+        # Calculate diversity metrics (duplication penalty)
+        diversity_score = self._calculate_portfolio_diversity(all_lineups)
+        core_saturation = self._get_core_saturation_report()
+
+        if diversity_score < self.config.min_portfolio_diversity:
+            warnings_list.append(
+                f"Low portfolio diversity: {diversity_score:.2f} (target: {self.config.min_portfolio_diversity:.2f})"
+            )
+
+        if core_saturation.get('saturated_cores', 0) > 5:
+            warnings_list.append(
+                f"High core saturation: {core_saturation['saturated_cores']} cores at max overlap"
+            )
+
         return PortfolioResult(
             lineups=all_lineups,
             exposure_report=exposure_report,
@@ -959,7 +1087,9 @@ class TournamentLineupOptimizer:
             },
             total_win_probability=total_win_prob,
             unique_players=unique_players,
-            warnings=warnings_list
+            warnings=warnings_list,
+            diversity_score=diversity_score,
+            core_saturation=core_saturation
         )
 
 
@@ -1108,6 +1238,19 @@ def format_portfolio_report(result: PortfolioResult) -> str:
             f"  {data['player_name']:<25} {data['count']:>2}/{total_lineups} ({data['pct']:.0%}) "
             f"[{data['tier']}] {cap_indicator}"
         )
+
+    # Diversity metrics
+    lines.append(f"\n{'=' * 70}")
+    lines.append(f"DIVERSITY METRICS (Duplication Penalty)")
+    lines.append(f"{'=' * 70}")
+    lines.append(f"  Portfolio Diversity (Jaccard): {result.diversity_score:.2f}")
+    if result.core_saturation:
+        lines.append(f"  Max Core Usage: {result.core_saturation.get('max_core_usage', 0)} lineups")
+        lines.append(f"  Saturated Cores: {result.core_saturation.get('saturated_cores', 0)}")
+        core_dist = result.core_saturation.get('core_distribution', {})
+        if core_dist:
+            dist_str = ', '.join(f"{k}x:{v}" for k, v in sorted(core_dist.items()))
+            lines.append(f"  Core Distribution: {dist_str}")
 
     return '\n'.join(lines)
 
