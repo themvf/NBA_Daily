@@ -20,6 +20,109 @@ import prediction_tracking as pt
 import injury_adjustment as ia
 
 
+# ============================================================================
+# Uncertainty Multiplier for Tournament Strategy
+# ============================================================================
+
+def calculate_uncertainty_multiplier(
+    injury_status: str = None,
+    recent_minutes_cv: float = 0.0,
+    starter_changes_recent: int = 0,
+    traded_recently: bool = False,
+    questionable_teammate: bool = False
+) -> float:
+    """
+    Calculate sigma multiplier based on role uncertainty.
+
+    Higher multiplier = wider ceiling/floor spread = more variance.
+
+    This is valuable for tournament strategy because:
+    - Uncertain situations have fatter tails (more upside AND downside)
+    - DFS contestants underweight uncertainty
+    - News pivots can exploit these situations
+
+    Args:
+        injury_status: 'questionable', 'doubtful', 'probable', or None
+        recent_minutes_cv: Coefficient of variation of last 5 games' minutes
+        starter_changes_recent: Number of times starter status changed in L5
+        traded_recently: Player traded in last 2 weeks
+        questionable_teammate: Star teammate is questionable (usage uncertainty)
+
+    Returns:
+        Multiplier >= 1.0 to apply to sigma (ceiling - floor spread)
+    """
+    multiplier = 1.0
+
+    # Injury status uncertainty
+    if injury_status:
+        status_lower = str(injury_status).lower()
+        if status_lower == 'questionable':
+            multiplier += 0.20  # +20% sigma
+        elif status_lower == 'doubtful':
+            multiplier += 0.30  # +30% sigma (might not play at all)
+        elif status_lower == 'probable':
+            multiplier += 0.05  # Minor uncertainty
+
+    # Minutes volatility
+    # CV > 0.15 indicates inconsistent playing time
+    if recent_minutes_cv > 0.20:
+        multiplier += 0.20  # High volatility
+    elif recent_minutes_cv > 0.15:
+        multiplier += 0.10  # Moderate volatility
+    elif recent_minutes_cv > 0.10:
+        multiplier += 0.05  # Slight volatility
+
+    # Starter status changes
+    if starter_changes_recent >= 2:
+        multiplier += 0.15  # Role in flux
+    elif starter_changes_recent == 1:
+        multiplier += 0.08  # Recent change
+
+    # Trade uncertainty
+    if traded_recently:
+        multiplier += 0.25  # New system, unknown role
+
+    # Teammate uncertainty
+    if questionable_teammate:
+        multiplier += 0.10  # Usage could spike or not
+
+    # Cap at 2.0 (double sigma) to prevent extreme values
+    return min(multiplier, 2.0)
+
+
+def apply_uncertainty_to_projection(
+    proj_floor: float,
+    proj_ceiling: float,
+    uncertainty_multiplier: float
+) -> Tuple[float, float]:
+    """
+    Apply uncertainty multiplier to ceiling/floor spread.
+
+    Expands the range symmetrically around the midpoint.
+
+    Args:
+        proj_floor: Original floor projection
+        proj_ceiling: Original ceiling projection
+        uncertainty_multiplier: Multiplier >= 1.0
+
+    Returns:
+        (new_floor, new_ceiling) tuple
+    """
+    if uncertainty_multiplier <= 1.0:
+        return proj_floor, proj_ceiling
+
+    midpoint = (proj_ceiling + proj_floor) / 2
+    half_range = (proj_ceiling - proj_floor) / 2
+
+    # Expand range by multiplier
+    new_half_range = half_range * uncertainty_multiplier
+
+    new_floor = max(0, midpoint - new_half_range)  # Floor at 0
+    new_ceiling = midpoint + new_half_range
+
+    return new_floor, new_ceiling
+
+
 def generate_predictions_for_date(
     game_date: date,
     db_path: Path,
@@ -816,6 +919,34 @@ def _generate_prediction_for_player(
         avg_usg_last5=avg_usg_last5,
         usage_pct=usage_pct,
     )
+
+    # =========================================================================
+    # Apply Uncertainty Multiplier for Tournament Strategy
+    # =========================================================================
+    # Calculate minutes coefficient of variation (CV) from recent games
+    minutes_cv = 0.0
+    if season_avg_minutes > 0 and avg_minutes_last5 > 0:
+        # Simple proxy: deviation from season average
+        minutes_deviation = abs(avg_minutes_last5 - season_avg_minutes) / season_avg_minutes
+        minutes_cv = minutes_deviation  # Simplified CV proxy
+
+    # Get injury status if available
+    injury_status = player.get('injury_status', None)
+
+    # Calculate uncertainty multiplier
+    uncertainty_mult = calculate_uncertainty_multiplier(
+        injury_status=injury_status,
+        recent_minutes_cv=minutes_cv,
+        starter_changes_recent=0,  # Not tracked yet
+        traded_recently=False,     # Not tracked yet
+        questionable_teammate=breakdown.get("opponent_injury_detected", False)  # Proxy
+    )
+
+    # Apply uncertainty to ceiling/floor if multiplier > 1
+    if uncertainty_mult > 1.0:
+        proj_floor, proj_ceiling = apply_uncertainty_to_projection(
+            proj_floor, proj_ceiling, uncertainty_mult
+        )
 
     # Calculate DFS score
     daily_pick_score, pick_grade, pick_explanation = st_app.calculate_daily_pick_score(
