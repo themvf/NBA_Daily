@@ -8197,32 +8197,48 @@ if selected_page == "Tournament Strategy":
                         else:
                             # Create player pool
                             player_pool = []
+                            # Helper function to safely get scalar value from pandas row
+                            def safe_get(row, col, default=0):
+                                """Safely extract scalar value from pandas Series row."""
+                                try:
+                                    val = row[col] if col in row.index else default
+                                    if pd.isna(val):
+                                        return default
+                                    return float(val) if isinstance(default, (int, float)) else val
+                                except (KeyError, TypeError):
+                                    return default
+
                             for _, row in pred_df.iterrows():
-                                ceiling = row.get('proj_ceiling', 0) or 0
-                                floor = row.get('proj_floor', 0) or 0
-                                sigma = (ceiling - floor) / 4 if ceiling > floor else row.get('projected_ppg', 20) * 0.15
+                                ceiling = safe_get(row, 'proj_ceiling', 0)
+                                floor = safe_get(row, 'proj_floor', 0)
+                                proj_ppg = safe_get(row, 'projected_ppg', 20)
+                                sigma = (ceiling - floor) / 4 if ceiling > floor else proj_ppg * 0.15
 
                                 # Determine game_id from matchup or team
-                                team = row.get('team_abbreviation', 'UNK')
-                                opponent = row.get('opponent_team', 'UNK')
-                                game_id = f"{min(team, opponent)}_{max(team, opponent)}"
+                                team = safe_get(row, 'team_abbreviation', 'UNK')
+                                if team == 0:
+                                    team = 'UNK'
+                                opponent = safe_get(row, 'opponent_team', 'UNK')
+                                if opponent == 0:
+                                    opponent = 'UNK'
+                                game_id = f"{min(str(team), str(opponent))}_{max(str(team), str(opponent))}"
 
                                 player_pool.append(PlayerPool(
                                     player_id=row['player_id'],
                                     player_name=row['player_name'],
-                                    team=team,
+                                    team=str(team),
                                     game_id=game_id,
-                                    projected_ppg=row.get('projected_ppg', 0) or 0,
+                                    projected_ppg=proj_ppg,
                                     sigma=max(sigma, 1.0),
                                     ceiling=ceiling,
                                     floor=floor,
-                                    p_top1=row.get('p_top1', 0) or 0,
-                                    p_top3=row.get('p_top3', 0) or 0,
+                                    p_top1=safe_get(row, 'p_top1', 0),
+                                    p_top3=safe_get(row, 'p_top3', 0),
                                     support_score=0.5,  # Will be computed by simulation
                                     expected_rank=50,
-                                    is_star=row.get('season_avg_ppg', 0) >= 25,
-                                    is_questionable=str(row.get('injury_status', '')).lower() == 'questionable',
-                                    is_injury_beneficiary=bool(row.get('injury_adjusted', False)),
+                                    is_star=safe_get(row, 'season_avg_ppg', 0) >= 25,
+                                    is_questionable=str(safe_get(row, 'injury_status', '')).lower() == 'questionable',
+                                    is_injury_beneficiary=bool(safe_get(row, 'injury_adjusted', False)),
                                 ))
 
                             # Run correlated simulation if we have enough players
