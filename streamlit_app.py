@@ -8201,11 +8201,20 @@ if selected_page == "Tournament Strategy":
                             def safe_get(row, col, default=0):
                                 """Safely extract scalar value from pandas Series row."""
                                 try:
-                                    val = row[col] if col in row.index else default
-                                    if pd.isna(val):
+                                    if col not in row.index:
                                         return default
-                                    return float(val) if isinstance(default, (int, float)) else val
-                                except (KeyError, TypeError):
+                                    val = row[col]
+                                    # Handle case where val is still a Series (duplicate columns)
+                                    if isinstance(val, pd.Series):
+                                        val = val.iloc[0] if len(val) > 0 else default
+                                    # Check for NaN/None using scalar comparison
+                                    if val is None or (isinstance(val, float) and np.isnan(val)):
+                                        return default
+                                    # Convert to appropriate type
+                                    if isinstance(default, (int, float)):
+                                        return float(val)
+                                    return val
+                                except (KeyError, TypeError, ValueError):
                                     return default
 
                             for _, row in pred_df.iterrows():
