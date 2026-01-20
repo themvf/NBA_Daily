@@ -8152,17 +8152,6 @@ if selected_page == "Tournament Strategy":
 
             # Vegas Odds Section
             st.markdown("### 🎰 Game Environment Data")
-            vegas_col1, vegas_col2 = st.columns([2, 1])
-
-            with vegas_col1:
-                api_key = st.text_input("TheOddsAPI Key (optional)",
-                                       type="password",
-                                       help="Enter your API key to fetch Vegas odds. Leave blank to skip.")
-
-            with vegas_col2:
-                fetch_odds_btn = st.button("🎲 Fetch Vegas Odds",
-                                          disabled=not api_key,
-                                          help="Fetch spreads and totals for game environment")
 
             game_envs = {}
             game_id_lookup = {}  # Maps normalized "{date}_{min_team}_{max_team}" to actual game_id
@@ -8180,6 +8169,60 @@ if selected_page == "Tournament Strategy":
             def make_lookup_key(date_str, team1, team2):
                 t1, t2 = normalize_team(team1), normalize_team(team2)
                 return f"{date_str}_{min(t1, t2)}_{max(t1, t2)}"
+
+            # FIRST: Try to load cached odds (may have been fetched by FanDuel Compare)
+            try:
+                ensure_game_odds_table(tourn_conn)
+                cached_envs = load_game_odds(tourn_conn, selected_date)
+                if cached_envs:
+                    game_envs = {gid: {
+                        'stack_score': e.stack_score,
+                        'ot_probability': e.ot_probability,
+                        'blowout_risk': e.blowout_risk,
+                        'pace_score': e.pace_score,
+                        'spread': e.spread,
+                        'total': e.total
+                    } for gid, e in cached_envs.items()}
+                    # Build lookup for cached envs
+                    for gid, e in cached_envs.items():
+                        normalized = make_lookup_key(selected_date, e.away_team, e.home_team)
+                        if normalized in game_id_lookup and game_id_lookup[normalized] != gid:
+                            st.warning(f"⚠️ game_id collision for {normalized}")
+                        game_id_lookup[normalized] = gid
+                    st.success(f"✅ Game odds loaded for {len(cached_envs)} games (from FanDuel Compare or cached)")
+
+                    # Show game environment summary
+                    with st.expander("📊 Game Environments", expanded=False):
+                        env_data = []
+                        for gid, e in cached_envs.items():
+                            env_data.append({
+                                'Game': f"{e.away_team} @ {e.home_team}",
+                                'Spread': f"{e.spread:+.1f}",
+                                'Total': f"{e.total:.1f}",
+                                'Stack Score': f"{e.stack_score:.2f}",
+                                'Blowout Risk': f"{e.blowout_risk:.0%}"
+                            })
+                        if env_data:
+                            st.dataframe(pd.DataFrame(env_data), hide_index=True, use_container_width=True)
+            except Exception:
+                pass  # No cached odds available
+
+            # SECOND: Show manual fetch option only if no cached odds
+            if not game_envs:
+                st.info("💡 **Tip:** Fetch FanDuel lines in the **FanDuel Compare** tab first — game odds will be cached automatically for use here!")
+
+                vegas_col1, vegas_col2 = st.columns([2, 1])
+                with vegas_col1:
+                    api_key = st.text_input("TheOddsAPI Key (optional)",
+                                           type="password",
+                                           help="Enter your API key to fetch Vegas odds. Leave blank to skip.")
+                with vegas_col2:
+                    fetch_odds_btn = st.button("🎲 Fetch Vegas Odds",
+                                              disabled=not api_key,
+                                              help="Fetch spreads and totals for game environment")
+            else:
+                api_key = None
+                fetch_odds_btn = False
 
             if fetch_odds_btn and api_key:
                 try:
@@ -8214,27 +8257,6 @@ if selected_page == "Tournament Strategy":
                     st.dataframe(env_df, hide_index=True, use_container_width=True)
                 except Exception as ve:
                     st.error(f"❌ Failed to fetch odds: {ve}")
-            else:
-                # Try to load cached odds
-                try:
-                    ensure_game_odds_table(tourn_conn)
-                    cached_envs = load_game_odds(tourn_conn, selected_date)
-                    if cached_envs:
-                        game_envs = {gid: {
-                            'stack_score': e.stack_score,
-                            'ot_probability': e.ot_probability,
-                            'blowout_risk': e.blowout_risk,
-                            'pace_score': e.pace_score
-                        } for gid, e in cached_envs.items()}
-                        # Build lookup for cached envs (with collision detection)
-                        for gid, e in cached_envs.items():
-                            normalized = make_lookup_key(selected_date, e.away_team, e.home_team)
-                            if normalized in game_id_lookup and game_id_lookup[normalized] != gid:
-                                st.warning(f"⚠️ game_id collision for {normalized}")
-                            game_id_lookup[normalized] = gid
-                        st.info(f"📊 Using cached odds for {len(cached_envs)} games")
-                except Exception:
-                    st.caption("ℹ️ No Vegas odds available. Using default game environment.")
 
             st.divider()
 

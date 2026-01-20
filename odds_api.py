@@ -212,6 +212,185 @@ def get_nba_events(api_key: str) -> Tuple[List[Dict], int]:
     return response.json(), 1
 
 
+def get_game_odds_bulk(api_key: str) -> Tuple[List[Dict], int]:
+    """
+    Fetch game-level odds (spreads, totals) for all NBA games.
+
+    This is a BULK endpoint - 1 request returns all games with odds.
+    Much more efficient than per-event fetching.
+
+    Returns:
+        (games_with_odds_list, requests_used)
+        Each game contains: home_team, away_team, commence_time, bookmakers with spreads/totals
+    """
+    url = f"{BASE_URL}/sports/{SPORT}/odds"
+    params = {
+        "apiKey": api_key,
+        "regions": "us",
+        "markets": "spreads,totals",
+        "oddsFormat": "american",
+    }
+
+    response = requests.get(url, params=params, timeout=30)
+    response.raise_for_status()
+
+    return response.json(), 1
+
+
+def extract_game_odds_from_response(games_data: List[Dict], target_date: str) -> List[Dict]:
+    """
+    Extract spread/total from bulk game odds response.
+
+    Args:
+        games_data: Response from get_game_odds_bulk
+        target_date: Date string (YYYY-MM-DD) to filter games
+
+    Returns:
+        List of dicts with: game_id, home_team, away_team, spread, total, etc.
+    """
+    from zoneinfo import ZoneInfo
+
+    # Team name mapping (same as vegas_odds.py)
+    TEAM_NAME_TO_ABBR = {
+        "Atlanta Hawks": "ATL", "Boston Celtics": "BOS", "Brooklyn Nets": "BKN",
+        "Charlotte Hornets": "CHA", "Chicago Bulls": "CHI", "Cleveland Cavaliers": "CLE",
+        "Dallas Mavericks": "DAL", "Denver Nuggets": "DEN", "Detroit Pistons": "DET",
+        "Golden State Warriors": "GSW", "Houston Rockets": "HOU", "Indiana Pacers": "IND",
+        "Los Angeles Clippers": "LAC", "Los Angeles Lakers": "LAL", "Memphis Grizzlies": "MEM",
+        "Miami Heat": "MIA", "Milwaukee Bucks": "MIL", "Minnesota Timberwolves": "MIN",
+        "New Orleans Pelicans": "NOP", "New York Knicks": "NYK", "Oklahoma City Thunder": "OKC",
+        "Orlando Magic": "ORL", "Philadelphia 76ers": "PHI", "Phoenix Suns": "PHX",
+        "Portland Trail Blazers": "POR", "Sacramento Kings": "SAC", "San Antonio Spurs": "SAS",
+        "Toronto Raptors": "TOR", "Utah Jazz": "UTA", "Washington Wizards": "WAS"
+    }
+
+    eastern = ZoneInfo("America/New_York")
+    extracted = []
+
+    for game in games_data:
+        # Check date (convert UTC to Eastern)
+        commence_str = game.get("commence_time", "")
+        if commence_str:
+            try:
+                utc_dt = datetime.fromisoformat(commence_str.replace("Z", "+00:00"))
+                eastern_dt = utc_dt.astimezone(eastern)
+                game_date = eastern_dt.strftime("%Y-%m-%d")
+                if game_date != target_date:
+                    continue
+            except ValueError:
+                continue
+
+        home_team = game.get("home_team", "")
+        away_team = game.get("away_team", "")
+        home_abbr = TEAM_NAME_TO_ABBR.get(home_team, home_team[:3].upper())
+        away_abbr = TEAM_NAME_TO_ABBR.get(away_team, away_team[:3].upper())
+
+        # Extract odds from bookmakers (prefer FanDuel)
+        bookmakers = game.get("bookmakers", [])
+        preferred_order = ["fanduel", "draftkings", "betmgm", "caesars"]
+
+        selected_book = None
+        for preferred in preferred_order:
+            for book in bookmakers:
+                if book.get("key", "").lower() == preferred:
+                    selected_book = book
+                    break
+            if selected_book:
+                break
+
+        if not selected_book and bookmakers:
+            selected_book = bookmakers[0]
+
+        if not selected_book:
+            continue
+
+        spread = None
+        total = None
+
+        for market in selected_book.get("markets", []):
+            market_key = market.get("key")
+            outcomes = market.get("outcomes", [])
+
+            if market_key == "spreads":
+                for outcome in outcomes:
+                    if outcome.get("name") == home_team:
+                        spread = outcome.get("point")
+                        break
+
+            elif market_key == "totals":
+                for outcome in outcomes:
+                    if outcome.get("name") == "Over":
+                        total = outcome.get("point")
+                        break
+
+        if spread is None or total is None:
+            continue
+
+        game_id = f"{target_date}_{away_abbr}_{home_abbr}"
+
+        extracted.append({
+            "game_id": game_id,
+            "game_date": target_date,
+            "home_team": home_abbr,
+            "away_team": away_abbr,
+            "spread": spread,
+            "total": total,
+            "commence_time": commence_str,
+        })
+
+    return extracted
+
+
+def store_game_odds_from_api(conn: sqlite3.Connection, games: List[Dict]) -> int:
+    """
+    Store game odds in game_odds table (for Tournament Strategy reuse).
+
+    Args:
+        conn: Database connection
+        games: List of game dicts from extract_game_odds_from_response
+
+    Returns:
+        Number of games stored
+    """
+    # Import vegas_odds functions for environment calculation
+    try:
+        from vegas_odds import (
+            ensure_game_odds_table,
+            GameOdds,
+            compute_game_environment,
+            store_game_odds
+        )
+    except ImportError:
+        print("Warning: vegas_odds module not available, skipping game odds storage")
+        return 0
+
+    ensure_game_odds_table(conn)
+    stored = 0
+
+    for game in games:
+        # Create GameOdds object
+        odds = GameOdds(
+            game_id=game["game_id"],
+            game_date=game["game_date"],
+            home_team=game["home_team"],
+            away_team=game["away_team"],
+            spread=game["spread"],
+            total=game["total"],
+            home_ml=0,  # Not fetched in bulk
+            away_ml=0,
+            commence_time=game["commence_time"],
+        )
+
+        # Compute environment metrics
+        env = compute_game_environment(odds)
+
+        # Store in database
+        store_game_odds(conn, odds, env)
+        stored += 1
+
+    return stored
+
+
 def get_player_props_for_event(
     api_key: str,
     event_id: str
@@ -502,6 +681,23 @@ def fetch_fanduel_lines_for_date(
             result["error"] = f"No NBA events found for {game_date_str}"
             log_fetch_attempt(conn, game_date, 0, 0, total_requests, error_message=result["error"])
             return result
+
+        # Step 1.5: ALSO fetch game-level odds (spreads/totals) for Tournament Strategy
+        # This is a BULK endpoint - 1 request returns ALL games, very efficient!
+        try:
+            games_data, req_count = get_game_odds_bulk(api_key)
+            total_requests += req_count
+
+            # Extract and store game odds for the target date
+            game_odds_list = extract_game_odds_from_response(games_data, game_date_str)
+            games_stored = store_game_odds_from_api(conn, game_odds_list)
+            result["game_odds_stored"] = games_stored
+            print(f"[odds_api] Stored {games_stored} game odds for Tournament Strategy reuse")
+
+        except Exception as e:
+            # Non-fatal: player props are still useful even if game odds fail
+            print(f"[odds_api] Warning: Failed to fetch game odds: {e}")
+            result["game_odds_stored"] = 0
 
         # Step 2: Fetch player props for each event
         all_player_lines = {}
