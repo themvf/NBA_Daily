@@ -8082,6 +8082,11 @@ if selected_page == "Tournament Strategy":
                 ensure_game_odds_table,
                 fetch_and_store_odds
             )
+            from slate_quality_gate import (
+                validate_slate_inputs,
+                SlateValidationResult,
+                format_validation_metrics
+            )
 
             # Configuration
             st.markdown("### ⚙️ Portfolio Configuration")
@@ -8341,6 +8346,33 @@ if selected_page == "Tournament Strategy":
                                 max_exposure_leverage=max_exp_leverage,
                             )
 
+                            # ═══════════════════════════════════════════════════════════════
+                            # SLATE QUALITY GATE - Validate before optimization
+                            # ═══════════════════════════════════════════════════════════════
+                            validation_result = validate_slate_inputs(
+                                predictions_df=display_df,
+                                game_envs=game_envs,
+                                player_pool=player_pool,
+                                config=config
+                            )
+
+                            # Show validation metrics
+                            with st.expander(f"🔍 Slate Quality: {validation_result.status}", expanded=(validation_result.status != "PASS")):
+                                st.code(format_validation_metrics(validation_result))
+                                if validation_result.warnings:
+                                    for w in validation_result.warnings:
+                                        st.caption(f"⚠️ {w}")
+
+                            # Handle validation outcomes
+                            if validation_result.status == "FAIL":
+                                st.error(validation_result.summary)
+                                st.stop()  # Block generation entirely
+
+                            if validation_result.status == "DEGRADE":
+                                st.warning(validation_result.summary)
+                                st.info(f"📊 **Mode: {validation_result.mode_label}** — Buckets auto-adjusted")
+                                config = validation_result.adjusted_config  # Use degraded config
+
                             optimizer = TournamentLineupOptimizer(
                                 player_pool=player_pool,
                                 game_environments=game_envs,
@@ -8350,13 +8382,14 @@ if selected_page == "Tournament Strategy":
 
                             result = optimizer.optimize()
 
-                            # Check for degraded strategy and warn user
+                            # Check for degraded strategy and warn user (skip if validation already handled it)
                             stack_built = result.bucket_summary.get('stack', 0)
-                            if stack_built == 0:
+                            expected_stack = config.stack_lineups  # Use adjusted config's expectation
+                            if stack_built == 0 and expected_stack > 0:
                                 st.warning("⚠️ **No stack lineups built!** This significantly reduces tournament edge. "
                                           "Check: Vegas odds missing, game_id mismatch, or insufficient players per game.")
-                            elif stack_built < stack_n:
-                                st.warning(f"⚠️ Only {stack_built}/{stack_n} stack lineups built. "
+                            elif stack_built < expected_stack and expected_stack > 0:
+                                st.warning(f"⚠️ Only {stack_built}/{expected_stack} stack lineups built. "
                                           "Some game environments may be missing.")
 
                             # Store in session state
