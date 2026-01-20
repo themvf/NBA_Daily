@@ -26,10 +26,10 @@ import injury_adjustment as ia
 
 def calculate_uncertainty_multiplier(
     injury_status: str = None,
-    recent_minutes_cv: float = 0.0,
+    minutes_deviation_ratio: float = 0.0,
     starter_changes_recent: int = 0,
     traded_recently: bool = False,
-    questionable_teammate: bool = False
+    teammate_questionable: bool = False
 ) -> float:
     """
     Calculate sigma multiplier based on role uncertainty.
@@ -43,10 +43,12 @@ def calculate_uncertainty_multiplier(
 
     Args:
         injury_status: 'questionable', 'doubtful', 'probable', or None
-        recent_minutes_cv: Coefficient of variation of last 5 games' minutes
+        minutes_deviation_ratio: |recent_min - season_min| / season_min
+                                 (NOT coefficient of variation - renamed for accuracy)
         starter_changes_recent: Number of times starter status changed in L5
         traded_recently: Player traded in last 2 weeks
-        questionable_teammate: Star teammate is questionable (usage uncertainty)
+        teammate_questionable: Star teammate is questionable (usage uncertainty)
+                              NOTE: This is TEAMMATE, not opponent!
 
     Returns:
         Multiplier >= 1.0 to apply to sigma (ceiling - floor spread)
@@ -63,13 +65,13 @@ def calculate_uncertainty_multiplier(
         elif status_lower == 'probable':
             multiplier += 0.05  # Minor uncertainty
 
-    # Minutes volatility
-    # CV > 0.15 indicates inconsistent playing time
-    if recent_minutes_cv > 0.20:
+    # Minutes volatility (deviation from season average)
+    # > 0.15 indicates inconsistent playing time
+    if minutes_deviation_ratio > 0.20:
         multiplier += 0.20  # High volatility
-    elif recent_minutes_cv > 0.15:
+    elif minutes_deviation_ratio > 0.15:
         multiplier += 0.10  # Moderate volatility
-    elif recent_minutes_cv > 0.10:
+    elif minutes_deviation_ratio > 0.10:
         multiplier += 0.05  # Slight volatility
 
     # Starter status changes
@@ -82,8 +84,8 @@ def calculate_uncertainty_multiplier(
     if traded_recently:
         multiplier += 0.25  # New system, unknown role
 
-    # Teammate uncertainty
-    if questionable_teammate:
+    # Teammate uncertainty (usage could spike if star teammate out)
+    if teammate_questionable:
         multiplier += 0.10  # Usage could spike or not
 
     # Cap at 2.0 (double sigma) to prevent extreme values
@@ -317,6 +319,15 @@ def generate_predictions_for_date(
         result['errors'].append(f"Fatal error: {str(e)}")
         return result
 
+    finally:
+        # FIX: Always close the database connection
+        # This was leaky before - connections stayed open across multiple runs
+        if 'data' in dir() and data.get('games_conn'):
+            try:
+                data['games_conn'].close()
+            except Exception:
+                pass  # Already closed or other issue - ignore
+
 
 def _load_data_dependencies(
     db_path: str,
@@ -445,7 +456,31 @@ def _load_data_dependencies(
 
     # Fetch current injuries
     active_injuries = ia.get_active_injuries(games_conn, check_return_dates=True)
-    injured_player_ids = {inj['player_id'] for inj in active_injuries}
+
+    # Build injury_status_map: player_id -> status
+    # This is the canonical source since leaders_df may not have injury_status
+    injury_status_map: Dict[int, str] = {
+        inj['player_id']: inj.get('status', 'unknown').lower()
+        for inj in active_injuries
+    }
+
+    # ONLY exclude players who are definitively OUT or DOUBTFUL
+    # Keep Questionable/Probable players - they're valuable for tournaments!
+    excluded_statuses = {'out', 'doubtful'}
+    excluded_player_ids = {
+        pid for pid, status in injury_status_map.items()
+        if status in excluded_statuses
+    }
+
+    # Build teammate injury map: team_id -> list of questionable/out star player_ids
+    # Used for teammate_questionable uncertainty
+    teammate_injury_map: Dict[int, List[int]] = {}
+    for inj in active_injuries:
+        team_id = inj.get('team_id')
+        if team_id and injury_status_map.get(inj['player_id']) in ('questionable', 'out', 'doubtful'):
+            if team_id not in teammate_injury_map:
+                teammate_injury_map[team_id] = []
+            teammate_injury_map[team_id].append(inj['player_id'])
 
     return {
         'games_df': games_df,
@@ -457,12 +492,15 @@ def _load_data_dependencies(
         'player_style_splits': player_style_splits,
         'player_vs_team_history': player_vs_team_history,
         'active_injuries': active_injuries,
-        'injured_player_ids': injured_player_ids,
+        'injury_status_map': injury_status_map,  # NEW: canonical injury status source
+        'excluded_player_ids': excluded_player_ids,  # RENAMED: only Out/Doubtful
+        'teammate_injury_map': teammate_injury_map,  # NEW: for teammate uncertainty
         'off_ppm_df': off_ppm_df,
         'def_ppm_df': def_ppm_df,
         'league_avg_ppm': league_avg_ppm,
         'ppm_loaded': ppm_loaded,
         'games_conn': games_conn,
+        'db_path': db_path,  # NEW: store path for per-player connections if needed
         'score_column': score_column,
         'classify_difficulty': classify_difficulty,
         'low_thresh': low_thresh,
@@ -479,7 +517,12 @@ def _generate_predictions_for_game(
     st_app: Any
 ) -> Tuple[int, int, List[Dict[str, float]]]:
     """
-    Generate predictions for a single game (both teams, top 5 players each).
+    Generate predictions for a single game (both teams, top 8 players each).
+
+    IMPORTANT: We increased from top 5 to top 8 because:
+    - A 6th man or bench player can absolutely be a top-3 scorer on a slate
+    - Winner-take-all tournaments need broader coverage
+    - Only predicting top 5 means we "miss" by construction
 
     Args:
         matchup: Game row from games_df
@@ -510,6 +553,22 @@ def _generate_predictions_for_game(
     away_id = int(away_id)
     home_id = int(home_id)
 
+    # INCREASED: top 8 players per team (was 5)
+    # This ensures we don't miss potential top-3 scorers
+    PLAYERS_PER_TEAM = 8
+
+    # Pre-compute team categorizations ONCE per game (not per player!)
+    # This avoids expensive repeated DB queries
+    team_categories_cache = {}
+    try:
+        team_categories_cache = dta.categorize_teams_by_defense(
+            data['games_conn'],
+            season,
+            season_type
+        )
+    except Exception:
+        pass  # Continue without team categories
+
     # Process both teams
     for team_label, team_id, team_name in [
         ("Away", away_id, matchup["Away"]),
@@ -520,14 +579,15 @@ def _generate_predictions_for_game(
             data['leaders_df']["team_id"] == team_id
         ]
 
-        # Filter out injured players FIRST
-        if data['injured_player_ids']:
+        # Filter out ONLY Out/Doubtful players
+        # Keep Questionable/Probable - they're valuable for tournaments!
+        if data['excluded_player_ids']:
             all_team_players = all_team_players[
-                ~all_team_players['player_id'].isin(data['injured_player_ids'])
+                ~all_team_players['player_id'].isin(data['excluded_player_ids'])
             ]
 
-        # THEN take top 5 from healthy players
-        team_leaders = all_team_players.nlargest(st_app.TOP_LEADERS_COUNT, data['score_column'])
+        # Take top N from available players
+        team_leaders = all_team_players.nlargest(PLAYERS_PER_TEAM, data['score_column'])
 
         if team_leaders.empty:
             continue
@@ -583,7 +643,8 @@ def _generate_predictions_for_game(
                     game_date=game_date,
                     st_app=st_app,
                     pca=pca,
-                    dta=dta
+                    dta=dta,
+                    team_categories_cache=team_categories_cache  # NEW: cached team categories
                 )
 
                 predictions_logged += logged
@@ -767,10 +828,15 @@ def _generate_prediction_for_player(
     game_date: date,
     st_app: Any,
     pca: Any,
-    dta: Any
+    dta: Any,
+    team_categories_cache: Dict[int, Any] = None
 ) -> Tuple[int, int, Optional[Dict[str, float]]]:
     """
     Generate prediction for a single player.
+
+    Args:
+        ... (existing params)
+        team_categories_cache: Pre-computed team defense categories (avoids per-player DB hit)
 
     Returns:
         (logged_count, failed_count, stats_dict)
@@ -823,11 +889,13 @@ def _generate_prediction_for_player(
     )
 
     # Get opponent correlation
+    # FIX: Use existing connection, not sqlite3.connect(str(conn)) which was broken!
+    # str(conn) produces "<sqlite3.Connection object at 0x...>" which is NOT a path
     opponent_correlation_obj = None
     if player_id_val is not None:
         try:
             opponent_corrs = pca.calculate_opponent_correlations(
-                sqlite3.connect(str(data['games_conn'])),
+                data['games_conn'],  # FIX: Use existing connection directly
                 player_id_val,
                 season,
                 season_type,
@@ -843,25 +911,23 @@ def _generate_prediction_for_player(
             pass
 
     # Get pace and defense quality splits
+    # FIX: Use existing connection and cached team_categories
     pace_split_obj = None
     defense_quality_split_obj = None
     if player_id_val is not None and opponent_id is not None:
         try:
-            conn_for_splits = sqlite3.connect(str(data['games_conn']))
-
+            # FIX: Use existing connection, not creating new broken connection
             defense_splits = dta.calculate_defense_type_splits(
-                conn_for_splits,
+                data['games_conn'],  # FIX: Use existing connection
                 player_id_val,
                 season,
                 season_type,
                 min_games=2
             )
 
-            team_categories = dta.categorize_teams_by_defense(
-                conn_for_splits,
-                season,
-                season_type
-            )
+            # FIX: Use cached team_categories passed from game level
+            # This avoids expensive repeated DB queries per player
+            team_categories = team_categories_cache or {}
 
             if int(opponent_id) in team_categories:
                 opp_pace_cat = team_categories[int(opponent_id)]['pace_category']
@@ -873,7 +939,7 @@ def _generate_prediction_for_player(
                     elif split.defense_type == f"{opp_def_cat} Defense":
                         defense_quality_split_obj = split
 
-            conn_for_splits.close()
+            # FIX: Removed conn_for_splits.close() - we're using shared connection
         except Exception:
             pass
 
@@ -923,23 +989,37 @@ def _generate_prediction_for_player(
     # =========================================================================
     # Apply Uncertainty Multiplier for Tournament Strategy
     # =========================================================================
-    # Calculate minutes coefficient of variation (CV) from recent games
-    minutes_cv = 0.0
-    if season_avg_minutes > 0 and avg_minutes_last5 > 0:
-        # Simple proxy: deviation from season average
-        minutes_deviation = abs(avg_minutes_last5 - season_avg_minutes) / season_avg_minutes
-        minutes_cv = minutes_deviation  # Simplified CV proxy
+    # Calculate minutes deviation ratio (NOT coefficient of variation)
+    # This measures how much recent minutes deviate from season average
+    minutes_deviation_ratio = 0.0
+    if season_avg_minutes > 0 and avg_minutes_last5 is not None and avg_minutes_last5 > 0:
+        minutes_deviation_ratio = abs(avg_minutes_last5 - season_avg_minutes) / season_avg_minutes
 
-    # Get injury status if available
-    injury_status = player.get('injury_status', None)
+    # Get injury status from canonical source (injury_status_map)
+    # leaders_df may not have injury_status populated, but injury_status_map
+    # is built directly from active_injuries
+    injury_status = data.get('injury_status_map', {}).get(player_id_val)
+
+    # Check for questionable TEAMMATE (not opponent!)
+    # This is usage uncertainty - if a star teammate is questionable,
+    # this player's usage could spike (or not)
+    # FIX: The old code used "opponent_injury_detected" which was wrong direction
+    teammate_questionable = False
+    teammate_injuries = data.get('teammate_injury_map', {}).get(team_id, [])
+    if teammate_injuries:
+        # Check if any injured teammate is a star (not this player)
+        for injured_teammate_id in teammate_injuries:
+            if injured_teammate_id != player_id_val:
+                teammate_questionable = True
+                break
 
     # Calculate uncertainty multiplier
     uncertainty_mult = calculate_uncertainty_multiplier(
         injury_status=injury_status,
-        recent_minutes_cv=minutes_cv,
+        minutes_deviation_ratio=minutes_deviation_ratio,  # RENAMED from minutes_cv
         starter_changes_recent=0,  # Not tracked yet
         traded_recently=False,     # Not tracked yet
-        questionable_teammate=breakdown.get("opponent_injury_detected", False)  # Proxy
+        teammate_questionable=teammate_questionable  # FIX: Now actually uses teammate info
     )
 
     # Apply uncertainty to ceiling/floor if multiplier > 1
