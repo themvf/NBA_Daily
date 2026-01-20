@@ -8087,6 +8087,35 @@ if selected_page == "Tournament Strategy":
                 SlateValidationResult,
                 format_validation_metrics
             )
+            from scenario_presets import (
+                PRESETS,
+                apply_scenario_preset,
+                get_preset_recommendation,
+                filter_game_environments
+            )
+
+            # Scenario Preset Selection
+            st.markdown("### 🎭 Strategy Preset")
+            preset_cols = st.columns([2, 3])
+
+            with preset_cols[0]:
+                preset_options = list(PRESETS.keys())
+                preset_labels = [f"{PRESETS[p].icon} {PRESETS[p].name}" for p in preset_options]
+                selected_preset_label = st.selectbox(
+                    "Select Preset",
+                    preset_labels,
+                    index=0,
+                    help="Presets adjust bucket allocation and exposure settings for different scenarios"
+                )
+                selected_preset_key = preset_options[preset_labels.index(selected_preset_label)]
+                selected_preset = PRESETS[selected_preset_key]
+
+            with preset_cols[1]:
+                st.info(f"**{selected_preset.name}**: {selected_preset.description}")
+                if selected_preset_key != "BALANCED":
+                    st.caption(f"Adjustments: {selected_preset.summary}")
+
+            st.divider()
 
             # Configuration
             st.markdown("### ⚙️ Portfolio Configuration")
@@ -8336,7 +8365,7 @@ if selected_page == "Tournament Strategy":
                                         p.expected_rank = r.expected_rank
 
                             # Configure and run optimizer
-                            config = OptimizerConfig(
+                            base_config = OptimizerConfig(
                                 chalk_lineups=chalk_n,
                                 stack_lineups=stack_n,
                                 leverage_lineups=leverage_n,
@@ -8345,6 +8374,23 @@ if selected_page == "Tournament Strategy":
                                 max_exposure_strong=max_exp_strong,
                                 max_exposure_leverage=max_exp_leverage,
                             )
+
+                            # ═══════════════════════════════════════════════════════════════
+                            # SCENARIO PRESET - Apply preset adjustments
+                            # ═══════════════════════════════════════════════════════════════
+                            if selected_preset_key != "BALANCED":
+                                config = apply_scenario_preset(base_config, selected_preset, game_envs)
+                                st.info(f"{selected_preset.icon} **Preset Applied: {selected_preset.name}** — "
+                                       f"C:{config.chalk_lineups} S:{config.stack_lineups} "
+                                       f"L:{config.leverage_lineups} N:{config.news_lineups}")
+
+                                # Filter game environments for preset-specific requirements
+                                if selected_preset.max_game_spread or selected_preset.min_game_total:
+                                    filtered_envs = filter_game_environments(game_envs, selected_preset)
+                                    if len(filtered_envs) < len(game_envs):
+                                        st.caption(f"🎯 Filtered to {len(filtered_envs)}/{len(game_envs)} games matching preset criteria")
+                            else:
+                                config = base_config
 
                             # ═══════════════════════════════════════════════════════════════
                             # SLATE QUALITY GATE - Validate before optimization
