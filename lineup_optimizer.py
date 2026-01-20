@@ -28,6 +28,7 @@ from correlation_model import (
     lineup_win_probability,
     CorrelationConfig
 )
+from typing import FrozenSet
 
 
 # ============================================================================
@@ -249,6 +250,9 @@ class TournamentLineupOptimizer:
         for p in player_pool:
             self.players_by_team[p.team].append(p)
 
+        # Track unique lineups to prevent duplicates
+        self.seen_lineups: Set[FrozenSet[int]] = set()
+
     def _calculate_lineup_win_prob(self, player_ids: List[int]) -> float:
         """Calculate win probability for a lineup."""
         if self.sim_results:
@@ -261,6 +265,92 @@ class TournamentLineupOptimizer:
             if p:
                 p_none_top1 *= (1 - p.p_top1)
         return 1 - p_none_top1
+
+    def _is_unique_lineup(self, player_ids: List[int]) -> bool:
+        """Check if lineup is unique (not seen before)."""
+        lineup_key = frozenset(player_ids)
+        return lineup_key not in self.seen_lineups
+
+    def _register_lineup(self, player_ids: List[int]) -> bool:
+        """
+        Register a lineup as seen. Returns True if newly registered, False if duplicate.
+        """
+        lineup_key = frozenset(player_ids)
+        if lineup_key in self.seen_lineups:
+            return False
+        self.seen_lineups.add(lineup_key)
+        return True
+
+    def _calculate_portfolio_win_prob_montecarlo(
+        self,
+        lineups: List[Lineup],
+        n_sims: int = 10000
+    ) -> float:
+        """
+        Calculate portfolio win probability via Monte Carlo simulation.
+
+        This correctly handles the correlation: all lineups are evaluated
+        on the SAME simulated slate outcome each trial.
+
+        P(portfolio wins) = (# trials where any lineup contains slate winner) / n_sims
+        """
+        if not lineups:
+            return 0.0
+
+        # Get all players used in any lineup
+        all_player_ids = set()
+        for lineup in lineups:
+            all_player_ids.update(lineup.player_ids())
+
+        all_player_ids = sorted(all_player_ids)
+        n_players = len(all_player_ids)
+
+        if n_players == 0:
+            return 0.0
+
+        # Build id -> index mapping
+        id_to_idx = {pid: i for i, pid in enumerate(all_player_ids)}
+
+        # Get means and sigmas for all players
+        means = np.zeros(n_players)
+        sigmas = np.zeros(n_players)
+
+        for pid in all_player_ids:
+            idx = id_to_idx[pid]
+            player = self.pool.get(pid)
+            if player:
+                means[idx] = player.projected_ppg
+                sigmas[idx] = player.sigma
+            else:
+                means[idx] = 20.0  # fallback
+                sigmas[idx] = 5.0
+
+        # Build lineup player index sets for fast lookup
+        lineup_idx_sets = []
+        for lineup in lineups:
+            idx_set = frozenset(id_to_idx[pid] for pid in lineup.player_ids())
+            lineup_idx_sets.append(idx_set)
+
+        # Run Monte Carlo
+        # Simple version: uncorrelated sampling (correlation matrix requires more setup)
+        # For full accuracy, use correlation_model.sample_correlated_scores
+        portfolio_wins = 0
+
+        np.random.seed(42)  # reproducibility
+        for _ in range(n_sims):
+            # Sample player scores (using normal distribution)
+            simulated_scores = means + sigmas * np.random.standard_normal(n_players)
+
+            # Find the slate winner (highest scorer)
+            winner_idx = np.argmax(simulated_scores)
+
+            # Check if any lineup contains the winner
+            for idx_set in lineup_idx_sets:
+                if winner_idx in idx_set:
+                    portfolio_wins += 1
+                    break  # Only count once per trial
+
+        return portfolio_wins / n_sims
 
     def _get_available_players(
         self,
@@ -361,11 +451,12 @@ class TournamentLineupOptimizer:
         - Each lineup has 1 mega-star anchor
         - 2 support players with high support_score
         - Diversify supports across games
+        - Exposure caps (not global exclusion) prevent over-concentration
         """
         n = n or self.config.chalk_lineups
         lineups = []
 
-        # Get stars sorted by p_top1
+        # Get stars sorted by p_top1 (explicit sorting, not order-dependent)
         stars = sorted(
             [p for p in self.pool_list if p.p_top1 >= self.config.star_p_top1_threshold],
             key=lambda p: p.p_top1,
@@ -376,30 +467,33 @@ class TournamentLineupOptimizer:
             warnings.warn("No stars found for chalk lineups")
             return lineups
 
-        # Build lineups anchored on top stars
-        used_in_chalk: Set[int] = set()
+        max_attempts = n * 3  # Prevent infinite loops
+        attempts = 0
 
-        for i in range(n):
+        while len(lineups) < n and attempts < max_attempts:
+            attempts += 1
+
             # Rotate through stars (don't always use #1)
-            star_idx = i % len(stars)
+            star_idx = (len(lineups)) % len(stars)
             anchor = stars[star_idx]
 
             if not self.exposure_mgr.can_add_player(anchor.player_id):
-                # Star at exposure cap, try next
+                # Star at exposure cap, try next available
+                anchor = None
                 for alt_star in stars:
                     if self.exposure_mgr.can_add_player(alt_star.player_id):
                         anchor = alt_star
                         break
-                else:
-                    continue  # No stars available
+                if anchor is None:
+                    break  # No stars available at all
 
-            # Select supports
+            # Select supports (no global used_in_chalk exclusion - let exposure caps handle it)
             supports = self._select_supports(
-                anchor, 2, exclude_ids=used_in_chalk, prefer_different_games=True
+                anchor, 2, exclude_ids=set(), prefer_different_games=True
             )
 
             if len(supports) < 2:
-                # Relax constraints
+                # Relax game diversification constraint
                 supports = self._select_supports(
                     anchor, 2, exclude_ids=set(), prefer_different_games=False
                 )
@@ -410,10 +504,14 @@ class TournamentLineupOptimizer:
             players = [anchor] + supports
             player_ids = [p.player_id for p in players]
 
-            # Record exposure
+            # Check for duplicate lineup
+            if not self._is_unique_lineup(player_ids):
+                continue  # Skip duplicate
+
+            # Register lineup and record exposure
+            self._register_lineup(player_ids)
             for p in players:
                 self.exposure_mgr.add_player(p.player_id)
-                used_in_chalk.add(p.player_id)
 
             lineup = Lineup(
                 players=players,
@@ -430,17 +528,21 @@ class TournamentLineupOptimizer:
 
         Strategy:
         - Find games with high stack_score (tight spread + high total)
-        - Pick 2 players from that game (different teams preferred)
+        - Pick 2 players from that game (ENFORCE different teams for positive correlation)
         - Add 1 elite #1 candidate from another game
         """
         n = n or self.config.stack_lineups
         lineups = []
 
-        # Find stackable games
-        stackable_games = [
-            game_id for game_id, env in self.game_envs.items()
-            if env.get('stack_score', 0) >= self.config.stack_score_threshold
-        ]
+        # Find stackable games (sorted by stack_score for explicit ordering)
+        stackable_games = sorted(
+            [
+                game_id for game_id, env in self.game_envs.items()
+                if env.get('stack_score', 0) >= self.config.stack_score_threshold
+            ],
+            key=lambda g: self.game_envs[g].get('stack_score', 0),
+            reverse=True
+        )
 
         if not stackable_games:
             warnings.warn("No stackable games found (stack_score >= threshold)")
@@ -451,66 +553,107 @@ class TournamentLineupOptimizer:
                 reverse=True
             )[:3]
 
-        used_in_stacks: Set[int] = set()
+        max_attempts = n * 3
+        attempts = 0
 
-        for i in range(n):
+        while len(lineups) < n and attempts < max_attempts:
+            attempts += 1
+
             # Rotate through stackable games
-            game_id = stackable_games[i % len(stackable_games)]
+            game_id = stackable_games[len(lineups) % len(stackable_games)]
 
             # Get players from this game
             game_players = self.players_by_game.get(game_id, [])
             if len(game_players) < 2:
                 continue
 
-            # Select 2 players from the stack game
-            # Prefer different teams for positive correlation
+            # Get available players, grouped by team for opposite-team stacking
             available_game = [
                 p for p in game_players
                 if self.exposure_mgr.can_add_player(p.player_id)
-                and p.player_id not in used_in_stacks
             ]
-
-            if len(available_game) < 2:
-                available_game = [
-                    p for p in game_players
-                    if self.exposure_mgr.can_add_player(p.player_id)
-                ]
 
             if len(available_game) < 2:
                 continue
 
-            # Sort by p_top3 and take top 2
-            available_game.sort(key=lambda p: p.p_top3, reverse=True)
-            stack_players = available_game[:2]
+            # Find the best opposite-team pair
+            # Group by team
+            by_team: Dict[str, List[PlayerPool]] = defaultdict(list)
+            for p in available_game:
+                by_team[p.team].append(p)
 
-            # Get elite from different game
-            elite_candidates = [
-                p for p in self.pool_list
-                if p.game_id != game_id
-                and p.p_top1 >= self.config.star_p_top1_threshold
-                and self.exposure_mgr.can_add_player(p.player_id)
-            ]
+            # Sort players within each team by p_top3 (explicit ordering)
+            for team in by_team:
+                by_team[team].sort(key=lambda p: p.p_top3, reverse=True)
 
-            if not elite_candidates:
-                elite_candidates = [
+            teams = list(by_team.keys())
+            stack_players = None
+
+            if len(teams) >= 2:
+                # ENFORCE different teams: pick best from each of 2 teams
+                best_pairs = []
+                for i, team1 in enumerate(teams):
+                    for team2 in teams[i+1:]:
+                        if by_team[team1] and by_team[team2]:
+                            p1, p2 = by_team[team1][0], by_team[team2][0]
+                            pair_score = p1.p_top3 + p2.p_top3
+                            best_pairs.append((p1, p2, pair_score))
+
+                if best_pairs:
+                    # Sort by combined p_top3 and take best pair
+                    best_pairs.sort(key=lambda x: x[2], reverse=True)
+                    stack_players = [best_pairs[0][0], best_pairs[0][1]]
+
+            if not stack_players:
+                # Fallback: same team if only one team available (rare)
+                # Sort all available by p_top3
+                available_game.sort(key=lambda p: p.p_top3, reverse=True)
+                if len(available_game) >= 2:
+                    stack_players = available_game[:2]
+                else:
+                    continue
+
+            # Get elite from different game (sorted by p_top1 for explicit selection)
+            elite_candidates = sorted(
+                [
                     p for p in self.pool_list
                     if p.game_id != game_id
+                    and p.p_top1 >= self.config.star_p_top1_threshold
                     and self.exposure_mgr.can_add_player(p.player_id)
-                ]
+                ],
+                key=lambda p: p.p_top1,
+                reverse=True
+            )
+
+            if not elite_candidates:
+                elite_candidates = sorted(
+                    [
+                        p for p in self.pool_list
+                        if p.game_id != game_id
+                        and self.exposure_mgr.can_add_player(p.player_id)
+                    ],
+                    key=lambda p: p.p_top1,
+                    reverse=True
+                )
 
             if not elite_candidates:
                 continue
 
-            elite_candidates.sort(key=lambda p: p.p_top1, reverse=True)
-            elite = elite_candidates[0]
+            # Rotate through elites to get variety
+            elite_idx = len(lineups) % min(3, len(elite_candidates))
+            elite = elite_candidates[elite_idx]
 
             players = stack_players + [elite]
             player_ids = [p.player_id for p in players]
 
-            # Record exposure
+            # Check for duplicate lineup
+            if not self._is_unique_lineup(player_ids):
+                continue
+
+            # Register lineup and record exposure
+            self._register_lineup(player_ids)
             for p in players:
                 self.exposure_mgr.add_player(p.player_id)
-                used_in_stacks.add(p.player_id)
 
             lineup = Lineup(
                 players=players,
@@ -528,19 +671,23 @@ class TournamentLineupOptimizer:
 
         Strategy:
         - Find players with high sigma relative to projection
-        - Avoid obvious duplicates from other buckets
+        - Explicitly sort by sigma (not order-dependent)
         - Mix of some ceiling + some upside
         """
         n = n or self.config.leverage_lineups
         lineups = []
 
-        # Find high-leverage players
+        # Find high-leverage players (explicitly sorted by sigma)
         avg_sigma = np.mean([p.sigma for p in self.pool_list])
-        leverage_players = [
-            p for p in self.pool_list
-            if p.sigma >= avg_sigma * self.config.leverage_sigma_multiplier
-            and p.ceiling >= 35  # Must have real ceiling
-        ]
+        leverage_players = sorted(
+            [
+                p for p in self.pool_list
+                if p.sigma >= avg_sigma * self.config.leverage_sigma_multiplier
+                and p.ceiling >= 35  # Must have real ceiling
+            ],
+            key=lambda p: p.sigma,
+            reverse=True
+        )
 
         if len(leverage_players) < 3:
             warnings.warn("Few leverage players found, using top sigma players")
@@ -550,35 +697,43 @@ class TournamentLineupOptimizer:
                 reverse=True
             )[:10]
 
-        used_in_leverage: Set[int] = set()
+        max_attempts = n * 3
+        attempts = 0
 
-        for i in range(n):
-            # Select 1-2 leverage players + support
-            available_leverage = [
-                p for p in leverage_players
-                if self.exposure_mgr.can_add_player(p.player_id)
-                and p.player_id not in used_in_leverage
-            ]
+        while len(lineups) < n and attempts < max_attempts:
+            attempts += 1
 
-            if len(available_leverage) < 2:
-                available_leverage = [
+            # Select leverage players with rotation for variety
+            available_leverage = sorted(
+                [
                     p for p in leverage_players
                     if self.exposure_mgr.can_add_player(p.player_id)
-                ]
+                ],
+                key=lambda p: p.sigma,
+                reverse=True
+            )
 
             if not available_leverage:
-                continue
+                break
 
-            # Take 1-2 leverage players
+            # Take 1-2 leverage players with rotation
             num_leverage = min(2, len(available_leverage))
-            selected_leverage = available_leverage[:num_leverage]
+            # Rotate starting point to get variety
+            start_idx = (len(lineups) * num_leverage) % max(1, len(available_leverage))
+            selected_leverage = []
+            for i in range(num_leverage):
+                idx = (start_idx + i) % len(available_leverage)
+                selected_leverage.append(available_leverage[idx])
 
-            # Fill remaining with solid supports
+            # Fill remaining with solid supports (explicitly sorted by p_top3)
             remaining = self.config.lineup_size - num_leverage
-            exclude = set(p.player_id for p in selected_leverage) | used_in_leverage
+            exclude = set(p.player_id for p in selected_leverage)
 
-            supports = self._get_available_players(exclude_ids=exclude)
-            supports.sort(key=lambda p: p.p_top3, reverse=True)
+            supports = sorted(
+                self._get_available_players(exclude_ids=exclude),
+                key=lambda p: p.p_top3,
+                reverse=True
+            )
             selected_supports = supports[:remaining]
 
             if len(selected_supports) < remaining:
@@ -587,10 +742,14 @@ class TournamentLineupOptimizer:
             players = selected_leverage + selected_supports
             player_ids = [p.player_id for p in players]
 
-            # Record exposure
+            # Check for duplicate lineup
+            if not self._is_unique_lineup(player_ids):
+                continue
+
+            # Register lineup and record exposure
+            self._register_lineup(player_ids)
             for p in players:
                 self.exposure_mgr.add_player(p.player_id)
-                used_in_leverage.add(p.player_id)
 
             lineup = Lineup(
                 players=players,
@@ -608,14 +767,20 @@ class TournamentLineupOptimizer:
         Strategy:
         - Target players marked as questionable (high uncertainty = high upside)
         - Include injury beneficiaries (teammate out = usage spike)
+        - Explicitly sort by ceiling (deterministic selection)
         """
         n = n or self.config.news_lineups
         lineups = []
 
-        # Find news-relevant players
+        # Find news-relevant players (sorted by ceiling for explicit ordering)
         questionable = [p for p in self.pool_list if p.is_questionable]
         injury_bens = [p for p in self.pool_list if p.is_injury_beneficiary]
-        news_players = list(set(questionable + injury_bens))
+        news_players_set = set(p.player_id for p in questionable + injury_bens)
+        news_players = sorted(
+            [p for p in self.pool_list if p.player_id in news_players_set],
+            key=lambda p: p.ceiling,
+            reverse=True
+        )
 
         if not news_players:
             warnings.warn("No questionable/injury-beneficiary players marked")
@@ -626,31 +791,36 @@ class TournamentLineupOptimizer:
                 reverse=True
             )[:5]
 
-        used_in_news: Set[int] = set()
+        max_attempts = n * 3
+        attempts = 0
 
-        for i in range(n):
-            available_news = [
-                p for p in news_players
-                if self.exposure_mgr.can_add_player(p.player_id)
-                and p.player_id not in used_in_news
-            ]
+        while len(lineups) < n and attempts < max_attempts:
+            attempts += 1
 
-            if not available_news:
-                available_news = [
+            # Get available news players (sorted by ceiling)
+            available_news = sorted(
+                [
                     p for p in news_players
                     if self.exposure_mgr.can_add_player(p.player_id)
-                ]
+                ],
+                key=lambda p: p.ceiling,
+                reverse=True
+            )
 
             if not available_news:
-                continue
+                break
 
-            # Take 1 news player
-            news_pick = available_news[0]
+            # Pick news player with rotation for variety
+            news_idx = len(lineups) % len(available_news)
+            news_pick = available_news[news_idx]
 
-            # Fill with supports
-            exclude = {news_pick.player_id} | used_in_news
-            supports = self._get_available_players(exclude_ids=exclude)
-            supports.sort(key=lambda p: p.p_top3, reverse=True)
+            # Fill with supports (sorted by p_top3)
+            exclude = {news_pick.player_id}
+            supports = sorted(
+                self._get_available_players(exclude_ids=exclude),
+                key=lambda p: p.p_top3,
+                reverse=True
+            )
             selected_supports = supports[:2]
 
             if len(selected_supports) < 2:
@@ -659,10 +829,14 @@ class TournamentLineupOptimizer:
             players = [news_pick] + selected_supports
             player_ids = [p.player_id for p in players]
 
-            # Record exposure
+            # Check for duplicate lineup
+            if not self._is_unique_lineup(player_ids):
+                continue
+
+            # Register lineup and record exposure
+            self._register_lineup(player_ids)
             for p in players:
                 self.exposure_mgr.add_player(p.player_id)
-                used_in_news.add(p.player_id)
 
             lineup = Lineup(
                 players=players,
@@ -712,15 +886,21 @@ class TournamentLineupOptimizer:
                 f"Only built {len(news)}/{self.config.news_lineups} news lineups"
             )
 
-        # Calculate portfolio win probability
-        # P(any wins) = 1 - P(none win)
-        # Approximation: assume lineups are somewhat independent
-        p_none_win = 1.0
-        for lineup in all_lineups:
-            p_none_win *= (1 - lineup.win_probability)
-        total_win_prob = 1 - p_none_win
+        # Calculate portfolio win probability using Monte Carlo
+        # This correctly accounts for correlation: all lineups evaluated on same slate
+        total_win_prob = self._calculate_portfolio_win_prob_montecarlo(all_lineups)
 
         # Get exposure report
+        # Update exposure manager's total_lineups to actual count for accurate percentages
+        actual_total = len(all_lineups)
+        if actual_total > 0 and actual_total != self.exposure_mgr.total_lineups:
+            # Recalculate exposure percentages based on actual lineup count
+            old_total = self.exposure_mgr.total_lineups
+            self.exposure_mgr.total_lineups = actual_total
+            warnings_list.append(
+                f"Exposure calculated for {actual_total} lineups (target was {old_total})"
+            )
+
         exposure_report = self.exposure_mgr.get_exposure_report(self.pool)
 
         # Count unique players
@@ -755,7 +935,8 @@ class TournamentLineupOptimizer:
 
 def create_player_pool_from_predictions(
     predictions_df: pd.DataFrame,
-    sim_results: Dict[int, CorrelatedSimResult] = None
+    sim_results: Dict[int, CorrelatedSimResult] = None,
+    games_df: pd.DataFrame = None
 ) -> List[PlayerPool]:
     """
     Convert predictions DataFrame to PlayerPool objects.
@@ -765,8 +946,29 @@ def create_player_pool_from_predictions(
     - projected_ppg, proj_ceiling, proj_floor
     - season_avg_ppg (for is_star)
     - injury_status (optional), injury_adjusted (optional)
+
+    Optional games_df columns:
+    - game_id, home_team, away_team (for proper matchup-based game_id)
     """
     pool = []
+
+    # Build team -> game_id mapping from games_df if available
+    team_to_game = {}
+    if games_df is not None and len(games_df) > 0:
+        for _, game in games_df.iterrows():
+            gid = game.get('game_id')
+            home = game.get('home_team', game.get('home_team_abbreviation', ''))
+            away = game.get('away_team', game.get('away_team_abbreviation', ''))
+            if gid:
+                if home:
+                    team_to_game[home] = gid
+                if away:
+                    team_to_game[away] = gid
+
+    # Build matchup-based fallback game_ids by grouping teams
+    # Strategy: pair teams alphabetically if no explicit game_id
+    teams_in_slate = predictions_df['team_abbreviation'].dropna().unique().tolist()
+    teams_in_slate.sort()  # Alphabetical for consistent pairing
 
     for _, row in predictions_df.iterrows():
         player_id = row['player_id']
@@ -774,20 +976,36 @@ def create_player_pool_from_predictions(
         # Get simulation results if available
         sim = sim_results.get(player_id) if sim_results else None
 
-        # Calculate sigma
+        # Calculate sigma (use ceiling-floor/4 consistently)
         ceiling = row.get('proj_ceiling', 0) or 0
         floor = row.get('proj_floor', 0) or 0
         sigma = (ceiling - floor) / 4 if ceiling > floor else row.get('projected_ppg', 20) * 0.15
 
-        # Determine game_id
+        # Determine game_id - use proper matchup-based keys
         game_id = row.get('game_id')
+        team = row.get('team_abbreviation', 'UNK')
+
         if not game_id or pd.isna(game_id):
-            game_id = f"game_{row.get('team_abbreviation', 'UNK')}"
+            # Try to get from team_to_game mapping
+            game_id = team_to_game.get(team)
+
+        if not game_id:
+            # Fallback: construct matchup-based key from team
+            # Find this team's opponent by looking at other players
+            # or use a placeholder that at least keeps same-team players together
+            opponent = row.get('opponent', row.get('opponent_team', ''))
+            if opponent:
+                # Create consistent game_id: alphabetical ordering of teams
+                teams = sorted([team, opponent])
+                game_id = f"game_{teams[0]}@{teams[1]}"
+            else:
+                # Last resort: use team but warn
+                game_id = f"game_{team}_unknown_opponent"
 
         pool.append(PlayerPool(
             player_id=player_id,
             player_name=row['player_name'],
-            team=row.get('team_abbreviation', 'UNK'),
+            team=team,
             game_id=game_id,
             projected_ppg=row.get('projected_ppg', 0) or 0,
             sigma=max(sigma, 1.0),
@@ -807,38 +1025,41 @@ def create_player_pool_from_predictions(
 
 def format_portfolio_report(result: PortfolioResult) -> str:
     """Format portfolio result as readable string."""
+    total_lineups = len(result.lineups)
     lines = []
     lines.append("=" * 70)
-    lines.append("TOURNAMENT PORTFOLIO - 20 LINEUPS")
+    lines.append(f"TOURNAMENT PORTFOLIO - {total_lineups} LINEUPS")
     lines.append("=" * 70)
-    lines.append(f"\nTotal Win Probability: {result.total_win_probability:.1%}")
+    lines.append(f"\nPortfolio Win Probability (Monte Carlo): {result.total_win_probability:.1%}")
     lines.append(f"Unique Players: {result.unique_players}")
     lines.append(f"\nBucket Summary: {result.bucket_summary}")
 
     if result.warnings:
         lines.append("\nWarnings:")
         for w in result.warnings:
-            lines.append(f"  ⚠️ {w}")
+            lines.append(f"  [!] {w}")
 
     # Lineups by bucket
     for bucket in ['chalk', 'stack', 'leverage', 'news']:
         bucket_lineups = [l for l in result.lineups if l.bucket == bucket]
         if bucket_lineups:
-            lines.append(f"\n{'─' * 50}")
+            lines.append(f"\n{'-' * 50}")
             lines.append(f"BUCKET: {bucket.upper()} ({len(bucket_lineups)} lineups)")
-            lines.append(f"{'─' * 50}")
+            lines.append(f"{'-' * 50}")
 
             for i, lineup in enumerate(bucket_lineups, 1):
                 names = ', '.join([p.player_name for p in lineup.players])
+                teams = ', '.join([p.team for p in lineup.players])
                 lines.append(f"  {i}. {names}")
-                lines.append(f"     Win Prob: {lineup.win_probability:.2%} | "
+                lines.append(f"     Teams: {teams} | "
+                           f"Lineup Win Prob: {lineup.win_probability:.2%} | "
                            f"Ceiling: {lineup.total_ceiling():.0f}")
                 if lineup.stack_game:
-                    lines.append(f"     Stack: {lineup.stack_game}")
+                    lines.append(f"     Stack Game: {lineup.stack_game}")
 
     # Exposure report
     lines.append(f"\n{'=' * 70}")
-    lines.append("EXPOSURE REPORT")
+    lines.append(f"EXPOSURE REPORT (out of {total_lineups} lineups)")
     lines.append(f"{'=' * 70}")
 
     sorted_exposure = sorted(
@@ -848,9 +1069,9 @@ def format_portfolio_report(result: PortfolioResult) -> str:
     )
 
     for pid, data in sorted_exposure[:15]:
-        cap_indicator = "🔴 AT CAP" if data['at_cap'] else ""
+        cap_indicator = "[AT CAP]" if data['at_cap'] else ""
         lines.append(
-            f"  {data['player_name']:<25} {data['count']:>2}/{20} ({data['pct']:.0%}) "
+            f"  {data['player_name']:<25} {data['count']:>2}/{total_lineups} ({data['pct']:.0%}) "
             f"[{data['tier']}] {cap_indicator}"
         )
 
@@ -866,27 +1087,33 @@ if __name__ == "__main__":
     print("Tournament Lineup Optimizer Demo")
     print("=" * 60)
 
-    # Create sample player pool
+    # Create sample player pool with proper matchup-based game IDs
+    # Game 1: LAL vs GSW (high stack potential)
+    # Game 2: BOS vs MIA (moderate stack)
+    # Game 3: DAL vs OKC (good stack)
     sample_pool = [
-        PlayerPool(1, "LeBron James", "LAL", "game_1", 28.0, 6.0, 45.0, 18.0, 0.12, 0.35, 0.75, 8.5, True),
-        PlayerPool(2, "Anthony Davis", "LAL", "game_1", 26.0, 5.5, 42.0, 16.0, 0.09, 0.30, 0.70, 10.2, True),
-        PlayerPool(3, "Stephen Curry", "GSW", "game_1", 27.0, 7.0, 48.0, 14.0, 0.15, 0.38, 0.72, 7.8, True),
-        PlayerPool(4, "Klay Thompson", "GSW", "game_1", 20.0, 5.0, 35.0, 10.0, 0.04, 0.18, 0.55, 18.5, False),
-        PlayerPool(5, "Jayson Tatum", "BOS", "game_2", 29.0, 6.5, 46.0, 17.0, 0.14, 0.40, 0.78, 7.2, True),
-        PlayerPool(6, "Jaylen Brown", "BOS", "game_2", 24.0, 5.0, 38.0, 14.0, 0.06, 0.22, 0.62, 14.8, False),
-        PlayerPool(7, "Jimmy Butler", "MIA", "game_2", 22.0, 6.0, 40.0, 10.0, 0.05, 0.20, 0.58, 16.5, False, is_questionable=True),
-        PlayerPool(8, "Bam Adebayo", "MIA", "game_2", 18.0, 4.0, 28.0, 12.0, 0.02, 0.12, 0.48, 22.0, False),
-        PlayerPool(9, "Luka Doncic", "DAL", "game_3", 32.0, 7.5, 52.0, 18.0, 0.20, 0.48, 0.82, 5.2, True),
-        PlayerPool(10, "Kyrie Irving", "DAL", "game_3", 25.0, 6.0, 40.0, 14.0, 0.08, 0.28, 0.65, 12.0, True),
-        PlayerPool(11, "Shai Gilgeous", "OKC", "game_3", 31.0, 5.5, 45.0, 22.0, 0.18, 0.45, 0.80, 6.0, True),
-        PlayerPool(12, "Chet Holmgren", "OKC", "game_3", 17.0, 5.0, 32.0, 8.0, 0.03, 0.15, 0.52, 20.0, False, is_injury_beneficiary=True),
+        # Game 1: LAL @ GSW
+        PlayerPool(1, "LeBron James", "LAL", "game_GSW@LAL", 28.0, 6.0, 45.0, 18.0, 0.12, 0.35, 0.75, 8.5, True),
+        PlayerPool(2, "Anthony Davis", "LAL", "game_GSW@LAL", 26.0, 5.5, 42.0, 16.0, 0.09, 0.30, 0.70, 10.2, True),
+        PlayerPool(3, "Stephen Curry", "GSW", "game_GSW@LAL", 27.0, 7.0, 48.0, 14.0, 0.15, 0.38, 0.72, 7.8, True),
+        PlayerPool(4, "Klay Thompson", "GSW", "game_GSW@LAL", 20.0, 5.0, 35.0, 10.0, 0.04, 0.18, 0.55, 18.5, False),
+        # Game 2: BOS vs MIA
+        PlayerPool(5, "Jayson Tatum", "BOS", "game_BOS@MIA", 29.0, 6.5, 46.0, 17.0, 0.14, 0.40, 0.78, 7.2, True),
+        PlayerPool(6, "Jaylen Brown", "BOS", "game_BOS@MIA", 24.0, 5.0, 38.0, 14.0, 0.06, 0.22, 0.62, 14.8, False),
+        PlayerPool(7, "Jimmy Butler", "MIA", "game_BOS@MIA", 22.0, 6.0, 40.0, 10.0, 0.05, 0.20, 0.58, 16.5, False, is_questionable=True),
+        PlayerPool(8, "Bam Adebayo", "MIA", "game_BOS@MIA", 18.0, 4.0, 28.0, 12.0, 0.02, 0.12, 0.48, 22.0, False),
+        # Game 3: DAL vs OKC
+        PlayerPool(9, "Luka Doncic", "DAL", "game_DAL@OKC", 32.0, 7.5, 52.0, 18.0, 0.20, 0.48, 0.82, 5.2, True),
+        PlayerPool(10, "Kyrie Irving", "DAL", "game_DAL@OKC", 25.0, 6.0, 40.0, 14.0, 0.08, 0.28, 0.65, 12.0, True),
+        PlayerPool(11, "Shai Gilgeous", "OKC", "game_DAL@OKC", 31.0, 5.5, 45.0, 22.0, 0.18, 0.45, 0.80, 6.0, True),
+        PlayerPool(12, "Chet Holmgren", "OKC", "game_DAL@OKC", 17.0, 5.0, 32.0, 8.0, 0.03, 0.15, 0.52, 20.0, False, is_injury_beneficiary=True),
     ]
 
-    # Game environments
+    # Game environments (keyed by matchup-based game_id)
     game_envs = {
-        "game_1": {"stack_score": 0.85, "ot_probability": 0.10},
-        "game_2": {"stack_score": 0.50, "ot_probability": 0.06},
-        "game_3": {"stack_score": 0.75, "ot_probability": 0.08},
+        "game_GSW@LAL": {"stack_score": 0.85, "ot_probability": 0.10, "pace_score": 1.05},
+        "game_BOS@MIA": {"stack_score": 0.50, "ot_probability": 0.06, "pace_score": 0.98},
+        "game_DAL@OKC": {"stack_score": 0.75, "ot_probability": 0.08, "pace_score": 1.02},
     }
 
     # Build simulation results dict
@@ -914,3 +1141,8 @@ if __name__ == "__main__":
 
     # Print report
     print(format_portfolio_report(result))
+
+    # Verify uniqueness
+    all_lineup_keys = [frozenset(l.player_ids()) for l in result.lineups]
+    unique_keys = set(all_lineup_keys)
+    print(f"\n[OK] Lineup uniqueness check: {len(all_lineup_keys)} total, {len(unique_keys)} unique")
