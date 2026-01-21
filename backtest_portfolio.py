@@ -312,21 +312,33 @@ def get_predictions_for_date(conn: sqlite3.Connection, game_date: str) -> pd.Dat
             player_id,
             player_name,
             team_name as team_abbreviation,
-            game_id,
+            team_name,
+            opponent_name,
             projected_ppg,
             proj_ceiling,
             proj_floor,
             p_top1,
             p_top3,
             season_avg_ppg,
-            injury_status,
-            injury_adjusted
+            injury_adjusted,
+            sim_sigma as sigma,
+            tier
         FROM predictions
         WHERE game_date = ?
           AND projected_ppg IS NOT NULL
         ORDER BY projected_ppg DESC
     """
-    return pd.read_sql_query(query, conn, params=[game_date])
+    df = pd.read_sql_query(query, conn, params=[game_date])
+
+    # Create synthetic game_id from team_name and opponent_name
+    if not df.empty and 'team_name' in df.columns and 'opponent_name' in df.columns:
+        # Sort team names alphabetically to ensure consistent game_id
+        def make_game_id(row):
+            teams = sorted([row['team_name'], row['opponent_name']])
+            return f"{game_date}_{teams[0]}_{teams[1]}"
+        df['game_id'] = df.apply(make_game_id, axis=1)
+
+    return df
 
 
 def get_stored_portfolio(conn: sqlite3.Connection, game_date: str) -> Optional[List[List[int]]]:
