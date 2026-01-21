@@ -36,6 +36,8 @@ import position_ppm_stats
 import top3_ranking
 import top3_tracking
 import backtest_top3
+import backtest_portfolio
+import preset_ab_test
 
 DEFAULT_DB_PATH = Path(__file__).with_name("nba_stats.db")
 DEFAULT_PREDICTIONS_PATH = Path(__file__).with_name("predictions.csv")
@@ -8622,779 +8624,995 @@ if selected_page == "Tournament Strategy":
 
 # Backtest Analysis tab --------------------------------------------------------
 if selected_page == "Backtest Analysis":
-    st.header("📊 Backtest Analysis - Top 3 Scorer Performance")
-    st.caption("Evaluate how well your ranking strategies identify top 3 daily scorers")
+    st.header("📊 Backtest Analysis")
 
     # Get database connection
     backtest_conn = get_connection(str(db_path))
 
-    # Ensure backtest table exists
-    pt.create_backtest_table(backtest_conn)
+    # Mode selector at the top
+    backtest_mode = st.radio(
+        "Analysis Type",
+        ["🎯 Top 3 Scorer Analysis", "🏆 20-Lineup Portfolio Backtest"],
+        horizontal=True,
+        key="backtest_mode_selector"
+    )
 
-    # Check for missing simulation data and show warning
-    try:
-        sim_check = backtest_conn.execute("""
-            SELECT
-                COUNT(*) as total,
-                SUM(CASE WHEN p_top3 IS NOT NULL THEN 1 ELSE 0 END) as with_sim
-            FROM predictions
-            WHERE game_date >= date('now', '-60 days')
-        """).fetchone()
-        total_preds, preds_with_sim = sim_check
-        if total_preds > 0:
-            sim_coverage = preds_with_sim / total_preds * 100
-            if sim_coverage < 50:
-                st.warning(
-                    f"⚠️ **Low Simulation Coverage**: Only {sim_coverage:.0f}% of predictions "
-                    f"({preds_with_sim:,}/{total_preds:,}) have simulation data.\n\n"
-                    "Strategies using `sim_p_top3` or `sim_p_first` will fall back to `projected_ppg` for missing data.\n\n"
-                    "**To fix:** Run `python backfill_sim_probs.py` to populate historical simulation values."
+    st.divider()
+
+    # ==========================================================================
+    # MODE 2: 20-Lineup Portfolio Backtest
+    # ==========================================================================
+    if backtest_mode == "🏆 20-Lineup Portfolio Backtest":
+        st.subheader("20-Lineup Portfolio Performance")
+        st.caption("Evaluate how well your tournament portfolios would have performed")
+
+        # Ensure portfolio tables exist
+        try:
+            backtest_portfolio.create_portfolio_tables(backtest_conn)
+            preset_ab_test.create_preset_ab_tables(backtest_conn)
+        except Exception as e:
+            st.warning(f"Could not initialize portfolio tables: {e}")
+
+        # Portfolio controls
+        port_col1, port_col2 = st.columns([1, 1])
+
+        with port_col1:
+            port_days_options = {
+                "Last 7 days": 7,
+                "Last 14 days": 14,
+                "Last 30 days": 30,
+                "Last 60 days": 60,
+            }
+            port_selected_period = st.selectbox(
+                "Date Range",
+                options=list(port_days_options.keys()),
+                index=2,
+                key="portfolio_backtest_period"
+            )
+            port_days_back = port_days_options[port_selected_period]
+
+        with port_col2:
+            run_preset_comparison = st.checkbox(
+                "Compare All Presets",
+                value=True,
+                help="Compare performance across all scenario presets (BALANCED, SHOOTOUT, etc.)"
+            )
+
+        # Date range calculation
+        port_end_date = datetime.now().strftime('%Y-%m-%d')
+        port_start_date = (datetime.now() - timedelta(days=port_days_back)).strftime('%Y-%m-%d')
+
+        # Run Portfolio Backtest button
+        if st.button("Run Portfolio Backtest", type="primary", key="run_portfolio_backtest_btn"):
+            with st.spinner("Running portfolio backtest... This may take a few minutes."):
+                try:
+                    if run_preset_comparison:
+                        # Run preset A/B test
+                        summary = preset_ab_test.run_preset_ab_test(
+                            backtest_conn,
+                            port_start_date,
+                            port_end_date,
+                            verbose=False
+                        )
+                        st.session_state['portfolio_ab_summary'] = summary
+                        st.success(f"Portfolio backtest complete! Tested {summary.n_dates} slates.")
+                    else:
+                        # Run basic portfolio backtest (BALANCED only)
+                        results_df = backtest_portfolio.run_portfolio_backtest(
+                            backtest_conn,
+                            port_start_date,
+                            port_end_date,
+                            verbose=False
+                        )
+                        st.session_state['portfolio_results'] = results_df
+                        st.success(f"Portfolio backtest complete! Tested {len(results_df)} slates.")
+                except Exception as e:
+                    st.error(f"Portfolio backtest failed: {e}")
+                    import traceback
+                    st.code(traceback.format_exc())
+
+        # Display results
+        if 'portfolio_ab_summary' in st.session_state:
+            summary = st.session_state['portfolio_ab_summary']
+
+            st.markdown("### Preset Comparison Results")
+            st.markdown(f"**{summary.n_dates} slates tested** from {summary.test_dates[0] if summary.test_dates else 'N/A'} to {summary.test_dates[-1] if summary.test_dates else 'N/A'}")
+
+            # Build comparison dataframe
+            if summary.results:
+                comparison_data = []
+                for preset_name, result in summary.results.items():
+                    comparison_data.append({
+                        'Preset': preset_name,
+                        'Slates': result.n_slates,
+                        'Wins': result.wins,
+                        'Win Rate': f"{result.win_rate*100:.1f}%",
+                        'Avg Shortfall': f"{result.avg_shortfall:.1f}",
+                        'Hit 2/3 Rate': f"{result.hit_2_of_top3_rate*100:.1f}%",
+                        'Unique Players': f"{result.avg_unique_players:.1f}",
+                    })
+
+                comparison_df = pd.DataFrame(comparison_data)
+                comparison_df = comparison_df.sort_values('Win Rate', ascending=False)
+
+                st.dataframe(
+                    comparison_df,
+                    use_container_width=True,
+                    hide_index=True
                 )
-            elif sim_coverage < 90:
-                st.info(
-                    f"ℹ️ **Partial Simulation Coverage**: {sim_coverage:.0f}% of predictions have simulation data. "
-                    "Some dates may use fallback ranking for missing simulation values."
+
+                # Best preset recommendations
+                st.markdown("### Best Presets by Category")
+                rec_col1, rec_col2 = st.columns(2)
+
+                with rec_col1:
+                    st.metric("Best Overall", summary.best_overall or "N/A")
+                    if summary.best_small_slate:
+                        st.metric("Best for Small Slates", summary.best_small_slate)
+
+                with rec_col2:
+                    if summary.best_large_slate:
+                        st.metric("Best for Large Slates", summary.best_large_slate)
+                    if summary.best_high_total:
+                        st.metric("Best for High-Total Slates", summary.best_high_total)
+
+                # Win rate chart
+                st.markdown("### Win Rate by Preset")
+                chart_data = pd.DataFrame({
+                    'Preset': [r.preset_name for r in summary.results.values()],
+                    'Win Rate (%)': [r.win_rate * 100 for r in summary.results.values()]
+                })
+                st.bar_chart(chart_data.set_index('Preset'))
+
+        elif 'portfolio_results' in st.session_state:
+            results_df = st.session_state['portfolio_results']
+
+            if not results_df.empty:
+                st.markdown("### Portfolio Backtest Results (BALANCED preset)")
+
+                # Summary metrics
+                wins = results_df['won_slate'].sum()
+                total = len(results_df)
+                win_rate = wins / total * 100 if total > 0 else 0
+
+                metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+                with metric_col1:
+                    st.metric("Win Rate", f"{win_rate:.1f}%", f"{wins}/{total} slates")
+                with metric_col2:
+                    st.metric("Avg Shortfall", f"{results_df['sum_shortfall'].mean():.1f} pts")
+                with metric_col3:
+                    st.metric("Hit 2/3 Rate", f"{results_df['hit_2_of_top3_any'].mean()*100:.1f}%")
+                with metric_col4:
+                    st.metric("Avg Unique Players", f"{results_df['unique_players_used'].mean():.1f}")
+
+                # Results table
+                st.dataframe(
+                    results_df[['slate_date', 'won_slate', 'sum_shortfall', 'best_lineup_sum',
+                               'optimal_lineup_sum', 'hit_2_of_top3_any', 'unique_players_used']].round(1),
+                    use_container_width=True,
+                    hide_index=True
                 )
-    except Exception:
-        pass  # Schema might not have p_top3 column yet
+            else:
+                st.warning("No results found for the selected date range.")
 
-    # Controls row
-    ctrl_col1, ctrl_col2, ctrl_col3 = st.columns([1, 1, 1])
+        else:
+            # No results yet - show stored summary if available
+            try:
+                stored_summary = preset_ab_test.get_stored_ab_summary(backtest_conn)
+                if not stored_summary.empty:
+                    st.markdown("### Stored Preset Comparison (from previous runs)")
+                    st.dataframe(stored_summary, use_container_width=True, hide_index=True)
+                else:
+                    st.info("Click 'Run Portfolio Backtest' to analyze your 20-lineup tournament strategy performance.")
+            except Exception:
+                st.info("Click 'Run Portfolio Backtest' to analyze your 20-lineup tournament strategy performance.")
 
-    with ctrl_col1:
-        days_options = {
-            "Last 7 days": 7,
-            "Last 14 days": 14,
-            "Last 30 days": 30,
-            "Last 60 days": 60,
-            "All available": 365
-        }
-        selected_period = st.selectbox(
-            "Date Range",
-            options=list(days_options.keys()),
-            index=2,
-            key="backtest_period"
-        )
-        days_back = days_options[selected_period]
+        # Explanation
+        with st.expander("How Portfolio Backtest Works", expanded=False):
+            st.markdown("""
+            ### Portfolio vs Individual Player Backtest
 
-    with ctrl_col2:
-        strategy_options = {
-            "Simulation P(Top-3)": "sim_p_top3",
-            "Simulation P(#1)": "sim_p_first",
-            "TopScorerScore": "top_scorer_score",
-            "Projection Only (baseline)": "projection_only",
-            "Ceiling Only": "ceiling_only"
-        }
-        selected_strategy_name = st.selectbox(
-            "Primary Strategy",
-            options=list(strategy_options.keys()),
-            index=0,
-            key="backtest_strategy"
-        )
-        selected_strategy = strategy_options[selected_strategy_name]
+            | Metric | Top 3 Scorer Analysis | Portfolio Backtest |
+            |--------|----------------------|-------------------|
+            | **Question** | Did we rank players correctly? | Did any of our 20 lineups win? |
+            | **Success** | Picked 2-3 of actual top scorers | Best lineup = optimal 3-player sum |
+            | **Use Case** | Calibrating ranking model | Evaluating tournament strategy |
 
-    with ctrl_col3:
-        compare_all = st.checkbox(
-            "Compare All Strategies",
-            value=False,
-            help="Run backtest for all strategies and show comparison"
-        )
+            ### Key Metrics
 
-    # Date range
-    end_date = datetime.now().strftime('%Y-%m-%d')
-    start_date = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
+            | Metric | Description |
+            |--------|-------------|
+            | **Win Rate** | % of slates where our best lineup matched the optimal 3-player sum |
+            | **Shortfall** | Points difference between our best lineup and the optimal |
+            | **Hit 2/3 Rate** | % of slates where any lineup contained 2+ of the top 3 scorers |
+            | **Unique Players** | Average number of distinct players used across 20 lineups |
 
-    # Run backtest button
-    if st.button("🚀 Run Backtest", type="primary", key="run_backtest_btn"):
-        with st.spinner("Running backtest..."):
-            if compare_all:
-                # Run all strategies
-                all_results = {}
-                all_stats = {}
-                for strat_name, strat_key in strategy_options.items():
+            ### Scenario Presets
+
+            | Preset | Strategy |
+            |--------|----------|
+            | **BALANCED** | Default bucket allocation |
+            | **SHOOTOUT** | More stacking, targets high-total games |
+            | **CLOSE_GAMES** | Targets tight spreads |
+            | **CHAOS** | Maximum variance, leverage-heavy |
+            | **STARS_ONLY** | Concentrates on elite talent |
+            | **BLOWOUT** | Avoids blowout games |
+            """)
+
+    # ==========================================================================
+    # MODE 1: Top 3 Scorer Analysis (existing functionality)
+    # ==========================================================================
+    if backtest_mode == "🎯 Top 3 Scorer Analysis":
+        st.subheader("Top 3 Scorer Performance")
+        st.caption("Evaluate how well your ranking strategies identify top 3 daily scorers")
+
+        # Ensure backtest table exists
+        pt.create_backtest_table(backtest_conn)
+
+        # Check for missing simulation data and show warning
+        try:
+            sim_check = backtest_conn.execute("""
+                SELECT
+                    COUNT(*) as total,
+                    SUM(CASE WHEN p_top3 IS NOT NULL THEN 1 ELSE 0 END) as with_sim
+                FROM predictions
+                WHERE game_date >= date('now', '-60 days')
+            """).fetchone()
+            total_preds, preds_with_sim = sim_check
+            if total_preds > 0:
+                sim_coverage = preds_with_sim / total_preds * 100
+                if sim_coverage < 50:
+                    st.warning(
+                        f"⚠️ **Low Simulation Coverage**: Only {sim_coverage:.0f}% of predictions "
+                        f"({preds_with_sim:,}/{total_preds:,}) have simulation data.\n\n"
+                        "Strategies using `sim_p_top3` or `sim_p_first` will fall back to `projected_ppg` for missing data.\n\n"
+                        "**To fix:** Run `python backfill_sim_probs.py` to populate historical simulation values."
+                    )
+                elif sim_coverage < 90:
+                    st.info(
+                        f"ℹ️ **Partial Simulation Coverage**: {sim_coverage:.0f}% of predictions have simulation data. "
+                        "Some dates may use fallback ranking for missing simulation values."
+                    )
+        except Exception:
+            pass  # Schema might not have p_top3 column yet
+
+        # Controls row
+        ctrl_col1, ctrl_col2, ctrl_col3 = st.columns([1, 1, 1])
+
+        with ctrl_col1:
+            days_options = {
+                "Last 7 days": 7,
+                "Last 14 days": 14,
+                "Last 30 days": 30,
+                "Last 60 days": 60,
+                "All available": 365
+            }
+            selected_period = st.selectbox(
+                "Date Range",
+                options=list(days_options.keys()),
+                index=2,
+                key="backtest_period"
+            )
+            days_back = days_options[selected_period]
+
+        with ctrl_col2:
+            strategy_options = {
+                "Simulation P(Top-3)": "sim_p_top3",
+                "Simulation P(#1)": "sim_p_first",
+                "TopScorerScore": "top_scorer_score",
+                "Projection Only (baseline)": "projection_only",
+                "Ceiling Only": "ceiling_only"
+            }
+            selected_strategy_name = st.selectbox(
+                "Primary Strategy",
+                options=list(strategy_options.keys()),
+                index=0,
+                key="backtest_strategy"
+            )
+            selected_strategy = strategy_options[selected_strategy_name]
+
+        with ctrl_col3:
+            compare_all = st.checkbox(
+                "Compare All Strategies",
+                value=False,
+                help="Run backtest for all strategies and show comparison"
+            )
+
+        # Date range
+        end_date = datetime.now().strftime('%Y-%m-%d')
+        start_date = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
+
+        # Run backtest button
+        if st.button("🚀 Run Backtest", type="primary", key="run_backtest_btn"):
+            with st.spinner("Running backtest..."):
+                if compare_all:
+                    # Run all strategies
+                    all_results = {}
+                    all_stats = {}
+                    for strat_name, strat_key in strategy_options.items():
+                        results_df = backtest_top3.run_backtest(
+                            backtest_conn, start_date, end_date, strat_key,
+                            store_results=True, verbose=False
+                        )
+                        all_results[strat_key] = results_df
+                        all_stats[strat_key] = backtest_top3.compute_summary_stats(results_df)
+
+                    # Store in session state
+                    st.session_state['backtest_all_results'] = all_results
+                    st.session_state['backtest_all_stats'] = all_stats
+                    st.session_state['backtest_compare_mode'] = True
+                else:
+                    # Single strategy
                     results_df = backtest_top3.run_backtest(
-                        backtest_conn, start_date, end_date, strat_key,
+                        backtest_conn, start_date, end_date, selected_strategy,
                         store_results=True, verbose=False
                     )
-                    all_results[strat_key] = results_df
-                    all_stats[strat_key] = backtest_top3.compute_summary_stats(results_df)
+                    stats = backtest_top3.compute_summary_stats(results_df)
 
-                # Store in session state
-                st.session_state['backtest_all_results'] = all_results
-                st.session_state['backtest_all_stats'] = all_stats
-                st.session_state['backtest_compare_mode'] = True
-            else:
-                # Single strategy
-                results_df = backtest_top3.run_backtest(
-                    backtest_conn, start_date, end_date, selected_strategy,
-                    store_results=True, verbose=False
-                )
-                stats = backtest_top3.compute_summary_stats(results_df)
+                    st.session_state['backtest_results'] = results_df
+                    st.session_state['backtest_stats'] = stats
+                    st.session_state['backtest_selected_strategy'] = selected_strategy
+                    st.session_state['backtest_compare_mode'] = False
 
-                st.session_state['backtest_results'] = results_df
-                st.session_state['backtest_stats'] = stats
-                st.session_state['backtest_selected_strategy'] = selected_strategy
-                st.session_state['backtest_compare_mode'] = False
+            st.success("Backtest complete!")
+            st.rerun()
 
-        st.success("Backtest complete!")
-        st.rerun()
+        # Display results if available
+        if st.session_state.get('backtest_compare_mode', False) and 'backtest_all_stats' in st.session_state:
+            # Comparison mode
+            all_stats = st.session_state['backtest_all_stats']
+            all_results = st.session_state['backtest_all_results']
 
-    # Display results if available
-    if st.session_state.get('backtest_compare_mode', False) and 'backtest_all_stats' in st.session_state:
-        # Comparison mode
-        all_stats = st.session_state['backtest_all_stats']
-        all_results = st.session_state['backtest_all_results']
-
-        st.divider()
-        st.subheader("📊 Strategy Comparison")
-
-        # Helper: format count/total (pct%)
-        def fmt_count_pct_compare(count: int, total: int) -> str:
-            pct = (count / total * 100) if total else 0.0
-            return f"{count}/{total} ({pct:.1f}%)"
-
-        # Build comparison dataframe with counts
-        comparison_data = []
-        for strat_key, stats in all_stats.items():
-            strat_display = [k for k, v in strategy_options.items() if v == strat_key][0]
-            n = stats.get('n_slates', 0)
-            rank_avg = stats.get('rank_a1_avg')  # New key from updated compute_summary_stats
-            if rank_avg is None:
-                rank_avg = stats.get('avg_rank_a1')  # Fallback to old key
-
-            comparison_data.append({
-                'Strategy': strat_display,
-                'n': n,
-                'Hit #1': fmt_count_pct_compare(stats.get('hit_1_count', 0), n),
-                'Hit Any': fmt_count_pct_compare(stats.get('hit_any_count', 0), n),
-                'Hit 2+': fmt_count_pct_compare(stats.get('hit_2plus_count', 0), n),
-                'Overlap': f"{stats.get('avg_overlap', 0):.2f}/3",
-                'Avg Rank #1': f"{rank_avg:.1f}" if rank_avg else "N/A"
-            })
-
-        # Sort by overlap descending
-        comparison_df = pd.DataFrame(comparison_data)
-        comparison_df['_overlap_val'] = [all_stats[strategy_options[row['Strategy']]]['avg_overlap'] for _, row in comparison_df.iterrows()]
-        comparison_df = comparison_df.sort_values('_overlap_val', ascending=False).drop(columns=['_overlap_val'])
-
-        st.dataframe(comparison_df, use_container_width=True, hide_index=True)
-
-        # Bar chart comparison
-        import plotly.express as px
-
-        chart_data = pd.DataFrame([
-            {'Strategy': [k for k, v in strategy_options.items() if v == strat_key][0],
-             'Avg Overlap': stats['avg_overlap'],
-             'Hit #1 Rate': stats['hit_1_rate'] * 100}
-            for strat_key, stats in all_stats.items()
-        ]).sort_values('Avg Overlap', ascending=False)
-
-        fig = px.bar(chart_data, x='Strategy', y='Avg Overlap',
-                     title='Average Overlap by Strategy (higher is better)',
-                     color='Avg Overlap', color_continuous_scale='Greens')
-        fig.update_layout(showlegend=False)
-        st.plotly_chart(fig, use_container_width=True)
-
-    elif 'backtest_stats' in st.session_state:
-        # Single strategy mode
-        stats = st.session_state['backtest_stats']
-        results_df = st.session_state['backtest_results']
-        strategy = st.session_state.get('backtest_selected_strategy', 'unknown')
-
-        st.divider()
-
-        # Helper: format count/total (pct%)
-        def fmt_count_pct(count: int, total: int) -> str:
-            pct = (count / total * 100) if total else 0.0
-            return f"{count}/{total} ({pct:.1f}%)"
-
-        # Summary metrics - Row 1
-        st.subheader("📈 Summary Metrics")
-        met_cols = st.columns(5)
-
-        n_slates = stats.get('n_slates', 0)
-
-        with met_cols[0]:
-            st.metric("Picked Actual #1",
-                     fmt_count_pct(stats.get('hit_1_count', 0), n_slates),
-                     help="How many slates we picked the actual top scorer")
-        with met_cols[1]:
-            st.metric("Hit Any (1+)",
-                     fmt_count_pct(stats.get('hit_any_count', 0), n_slates),
-                     help="Slates with at least 1 correct pick")
-        with met_cols[2]:
-            st.metric("Avg Overlap", f"{stats.get('avg_overlap', 0):.2f}/3",
-                     help="Average correct picks per slate")
-        with met_cols[3]:
-            rank_avg = stats.get('rank_a1_avg')
-            st.metric("Avg Rank of #1", f"{rank_avg:.1f}" if rank_avg else "N/A",
-                     help="How high we ranked the actual top scorer (lower is better)")
-            # Add rank distribution below
-            if stats.get('rank_a1_min') is not None:
-                st.caption(f"min: {stats['rank_a1_min']} | med: {stats['rank_a1_median']} | max: {stats['rank_a1_max']}")
-        with met_cols[4]:
-            st.metric("Total Slates", f"{n_slates}")
-
-        # Summary metrics - Row 2 (closeness metrics)
-        met_cols2 = st.columns(5)
-        with met_cols2[0]:
-            st.metric("Hit 2+",
-                     fmt_count_pct(stats.get('hit_2plus_count', 0), n_slates),
-                     help="Slates with 2 or more correct")
-        with met_cols2[1]:
-            st.metric("Perfect (3/3)",
-                     fmt_count_pct(stats.get('hit_exact_count', 0), n_slates),
-                     help="Slates with all 3 correct")
-        with met_cols2[2]:
-            # Shortfall to top-3 (clearer than "closest miss")
-            shortfall_avg = stats.get('avg_shortfall_to_top3')
-            if shortfall_avg is not None:
-                st.metric("Avg Shortfall to Top-3", f"{shortfall_avg:.1f} pts",
-                         help="How many points our best pick was short of the #3 cutoff (0 = we reached top-3)")
-            else:
-                st.metric("Avg Shortfall to Top-3", "N/A",
-                         help="How many points our best pick was short of the #3 cutoff")
-        with met_cols2[3]:
-            # DNP in picks
-            dnp_total = stats.get('dnp_in_picks', 0)
-            st.metric("DNP in Picks", f"{dnp_total}",
-                     help="Total picks that Did Not Play (minutes=0)")
-        with met_cols2[4]:
-            # Tie-friendly avg
-            if 'tie_friendly_overlap' in results_df.columns:
-                tie_avg = results_df['tie_friendly_overlap'].mean()
-                st.metric("Tie-Friendly Overlap", f"{tie_avg:.2f}/3",
-                         help="Overlap counting all picks that beat the #3 threshold")
-            else:
-                st.metric("Tie-Friendly Overlap", "N/A")
-
-        # Worst slates quick view (for debugging)
-        if not results_df.empty and len(results_df) >= 3:
-            with st.expander("🔴 Worst 3 Slates (debugging)"):
-                # Sort by overlap ASC, then pred_rank_a1 DESC (high rank = bad)
-                sort_cols = ['overlap']
-                ascending = [True]
-                if 'pred_rank_a1' in results_df.columns:
-                    sort_cols.append('pred_rank_a1')
-                    ascending.append(False)  # High rank (bad) first
-
-                worst = results_df.sort_values(sort_cols, ascending=ascending).head(3)
-
-                for _, r in worst.iterrows():
-                    date_str = r.get('slate_date', '?')
-                    overlap_val = r.get('overlap', 0)
-                    rank_a1 = r.get('pred_rank_a1', '?')
-                    dnp = r.get('dnp_in_picks', 0)
-
-                    # Build picks summary
-                    picks_info = []
-                    for i in range(1, 4):
-                        name = r.get(f'picked{i}_name', '')
-                        finish = r.get(f'picked{i}_finish', 99)
-                        if name:
-                            last = name.split()[-1]
-                            finish_str = f"#{finish}" if finish and finish < 99 else "DNP"
-                            picks_info.append(f"{last}→{finish_str}")
-
-                    st.markdown(
-                        f"**{date_str}** — overlap {overlap_val}/3, rank(#1)={rank_a1}"
-                        + (f", DNP={dnp}" if dnp else "")
-                    )
-                    if picks_info:
-                        st.caption(f"Picks: {' | '.join(picks_info)}")
-
-        # Daily trend chart
-        if not results_df.empty:
             st.divider()
-            st.subheader("📈 Daily Overlap Trend")
+            st.subheader("📊 Strategy Comparison")
 
+            # Helper: format count/total (pct%)
+            def fmt_count_pct_compare(count: int, total: int) -> str:
+                pct = (count / total * 100) if total else 0.0
+                return f"{count}/{total} ({pct:.1f}%)"
+
+            # Build comparison dataframe with counts
+            comparison_data = []
+            for strat_key, stats in all_stats.items():
+                strat_display = [k for k, v in strategy_options.items() if v == strat_key][0]
+                n = stats.get('n_slates', 0)
+                rank_avg = stats.get('rank_a1_avg')  # New key from updated compute_summary_stats
+                if rank_avg is None:
+                    rank_avg = stats.get('avg_rank_a1')  # Fallback to old key
+
+                comparison_data.append({
+                    'Strategy': strat_display,
+                    'n': n,
+                    'Hit #1': fmt_count_pct_compare(stats.get('hit_1_count', 0), n),
+                    'Hit Any': fmt_count_pct_compare(stats.get('hit_any_count', 0), n),
+                    'Hit 2+': fmt_count_pct_compare(stats.get('hit_2plus_count', 0), n),
+                    'Overlap': f"{stats.get('avg_overlap', 0):.2f}/3",
+                    'Avg Rank #1': f"{rank_avg:.1f}" if rank_avg else "N/A"
+                })
+
+            # Sort by overlap descending
+            comparison_df = pd.DataFrame(comparison_data)
+            comparison_df['_overlap_val'] = [all_stats[strategy_options[row['Strategy']]]['avg_overlap'] for _, row in comparison_df.iterrows()]
+            comparison_df = comparison_df.sort_values('_overlap_val', ascending=False).drop(columns=['_overlap_val'])
+
+            st.dataframe(comparison_df, use_container_width=True, hide_index=True)
+
+            # Bar chart comparison
             import plotly.express as px
 
-            trend_df = results_df[['slate_date', 'overlap']].copy()
-            trend_df['slate_date'] = pd.to_datetime(trend_df['slate_date'])
-            trend_df = trend_df.sort_values('slate_date')
+            chart_data = pd.DataFrame([
+                {'Strategy': [k for k, v in strategy_options.items() if v == strat_key][0],
+                 'Avg Overlap': stats['avg_overlap'],
+                 'Hit #1 Rate': stats['hit_1_rate'] * 100}
+                for strat_key, stats in all_stats.items()
+            ]).sort_values('Avg Overlap', ascending=False)
 
-            # Color mapping for overlap
-            color_map = {0: '#FF4444', 1: '#FFAA00', 2: '#88CC88', 3: '#22AA22'}
-            trend_df['color'] = trend_df['overlap'].map(color_map)
-
-            fig = px.bar(trend_df, x='slate_date', y='overlap',
-                        title='Daily Overlap (0-3)',
-                        labels={'slate_date': 'Date', 'overlap': 'Overlap'})
-            fig.update_traces(marker_color=trend_df['color'].tolist())
-            fig.update_layout(yaxis_range=[0, 3.5])
+            fig = px.bar(chart_data, x='Strategy', y='Avg Overlap',
+                         title='Average Overlap by Strategy (higher is better)',
+                         color='Avg Overlap', color_continuous_scale='Greens')
+            fig.update_layout(showlegend=False)
             st.plotly_chart(fig, use_container_width=True)
 
-            # Daily results table - ENHANCED DIAGNOSTICS
+        elif 'backtest_stats' in st.session_state:
+            # Single strategy mode
+            stats = st.session_state['backtest_stats']
+            results_df = st.session_state['backtest_results']
+            strategy = st.session_state.get('backtest_selected_strategy', 'unknown')
+
             st.divider()
-            st.subheader("📋 Daily Results - Diagnostic View")
 
-            # Icon legend
-            st.caption("**Legend:** ✅ rank ≤10 (good) | ⚠️ rank 11-25 (warning) | 🔴 rank >25 (bad)")
+            # Helper: format count/total (pct%)
+            def fmt_count_pct(count: int, total: int) -> str:
+                pct = (count / total * 100) if total else 0.0
+                return f"{count}/{total} ({pct:.1f}%)"
 
-            # Sort by date descending for display
-            sorted_results = results_df.sort_values('slate_date', ascending=False)
+            # Summary metrics - Row 1
+            st.subheader("📈 Summary Metrics")
+            met_cols = st.columns(5)
 
-            for _, row in sorted_results.iterrows():
-                date_str = row['slate_date']
-                overlap = int(row['overlap'])
-                tie_friendly = int(row.get('tie_friendly_overlap', overlap))
-                hit_1 = int(row['hit_1'])
-                closest_miss = row.get('closest_miss', 0) or 0
-                actual_3rd_pts = row.get('actual_3rd_points', 0) or 0
-                actual_1st_pts = row.get('actual1_points', 0) or 0
-                actual_2nd_pts = row.get('actual2_points', 0) or 0
-                ties_at_3rd = row.get('ties_at_3rd', 0)
+            n_slates = stats.get('n_slates', 0)
 
-                # Get best pick points for closeness display
-                pick_pts_list = [row.get(f'picked{i}_pts', 0) or 0 for i in range(1, 4)]
-                best_pick_pts = max(pick_pts_list) if pick_pts_list else 0
+            with met_cols[0]:
+                st.metric("Picked Actual #1",
+                         fmt_count_pct(stats.get('hit_1_count', 0), n_slates),
+                         help="How many slates we picked the actual top scorer")
+            with met_cols[1]:
+                st.metric("Hit Any (1+)",
+                         fmt_count_pct(stats.get('hit_any_count', 0), n_slates),
+                         help="Slates with at least 1 correct pick")
+            with met_cols[2]:
+                st.metric("Avg Overlap", f"{stats.get('avg_overlap', 0):.2f}/3",
+                         help="Average correct picks per slate")
+            with met_cols[3]:
+                rank_avg = stats.get('rank_a1_avg')
+                st.metric("Avg Rank of #1", f"{rank_avg:.1f}" if rank_avg else "N/A",
+                         help="How high we ranked the actual top scorer (lower is better)")
+                # Add rank distribution below
+                if stats.get('rank_a1_min') is not None:
+                    st.caption(f"min: {stats['rank_a1_min']} | med: {stats['rank_a1_median']} | max: {stats['rank_a1_max']}")
+            with met_cols[4]:
+                st.metric("Total Slates", f"{n_slates}")
 
-                # Color for overlap
-                overlap_colors = {0: '🔴', 1: '🟡', 2: '🟢', 3: '💚'}
-                overlap_icon = overlap_colors.get(overlap, '⚪')
-
-                # Hit #1 indicator
-                hit1_icon = '✅' if hit_1 else '❌'
-
-                # Get ranking metrics for diagnosis
-                pred_rank_a1 = row.get('pred_rank_a1', 99) or 99
-                pred_rank_a2 = row.get('pred_rank_a2', 99) or 99
-                pred_rank_a3 = row.get('pred_rank_a3', 99) or 99
-                best_actual_rank = min(pred_rank_a1, pred_rank_a2, pred_rank_a3)
-                n_players = row.get('n_pred_players', 0) or 0
-
-                # Count how many actual top-3 we ranked badly (>25)
-                ranks_over_25 = sum(1 for r in [pred_rank_a1, pred_rank_a2, pred_rank_a3] if r > 25)
-                ranks_over_40 = sum(1 for r in [pred_rank_a1, pred_rank_a2, pred_rank_a3] if r > 40)
-
-                # Correct diagnosis logic:
-                # - If 2+ of actual top 3 ranked >25 → Ranking failure
-                # - If actual #1 ranked ≤10 but not picked → Selection failure
-                # - If best actual rank 11-20 and cutoff is low/tied → Variance
-                # - If all actual top3 ranked 21-40 → Blind spot
-                if overlap == 3:
-                    diagnosis = "✅ Perfect: All 3 correct!"
-                    diagnosis_color = "green"
-                elif overlap >= 1:
-                    # Partial hit
-                    if ranks_over_25 >= 2:
-                        diagnosis = f"Partial ({overlap}/3) + ranking failure ({ranks_over_25}/3 ranked >25)"
-                        diagnosis_color = "orange"
-                    else:
-                        diagnosis = f"Partial ({overlap}/3)"
-                        diagnosis_color = "blue"
-                elif ranks_over_25 >= 2:
-                    # Ranking failure: 2+ actual top-3 ranked terribly
-                    diagnosis = f"Ranking failure — {ranks_over_25}/3 actual top-3 ranked >25"
-                    diagnosis_color = "red"
-                elif pred_rank_a1 <= 10:
-                    # Selection failure: we saw #1 but picked others
-                    diagnosis = f"Selection failure — actual #1 was our #{pred_rank_a1}, but we picked others"
-                    diagnosis_color = "orange"
-                elif best_actual_rank <= 20:
-                    # Variance/coinflip: model was genuinely close
-                    diagnosis = f"Variance miss — best actual ranked #{best_actual_rank}"
-                    diagnosis_color = "orange"
-                elif all(21 <= r <= 40 for r in [pred_rank_a1, pred_rank_a2, pred_rank_a3]):
-                    # Blind spot: model consistently missed but wasn't catastrophic
-                    diagnosis = f"Blind spot — all actual top-3 ranked 21-40"
-                    diagnosis_color = "red"
+            # Summary metrics - Row 2 (closeness metrics)
+            met_cols2 = st.columns(5)
+            with met_cols2[0]:
+                st.metric("Hit 2+",
+                         fmt_count_pct(stats.get('hit_2plus_count', 0), n_slates),
+                         help="Slates with 2 or more correct")
+            with met_cols2[1]:
+                st.metric("Perfect (3/3)",
+                         fmt_count_pct(stats.get('hit_exact_count', 0), n_slates),
+                         help="Slates with all 3 correct")
+            with met_cols2[2]:
+                # Shortfall to top-3 (clearer than "closest miss")
+                shortfall_avg = stats.get('avg_shortfall_to_top3')
+                if shortfall_avg is not None:
+                    st.metric("Avg Shortfall to Top-3", f"{shortfall_avg:.1f} pts",
+                             help="How many points our best pick was short of the #3 cutoff (0 = we reached top-3)")
                 else:
-                    # Pure ranking failure
-                    diagnosis = f"Ranking failure — best actual ranked #{best_actual_rank}"
-                    diagnosis_color = "red"
+                    st.metric("Avg Shortfall to Top-3", "N/A",
+                             help="How many points our best pick was short of the #3 cutoff")
+            with met_cols2[3]:
+                # DNP in picks
+                dnp_total = stats.get('dnp_in_picks', 0)
+                st.metric("DNP in Picks", f"{dnp_total}",
+                         help="Total picks that Did Not Play (minutes=0)")
+            with met_cols2[4]:
+                # Tie-friendly avg
+                if 'tie_friendly_overlap' in results_df.columns:
+                    tie_avg = results_df['tie_friendly_overlap'].mean()
+                    st.metric("Tie-Friendly Overlap", f"{tie_avg:.2f}/3",
+                             help="Overlap counting all picks that beat the #3 threshold")
+                else:
+                    st.metric("Tie-Friendly Overlap", "N/A")
 
-                # Build compact picks display with prediction metric ("why we picked")
-                picks_display = []
-                for i in range(1, 4):
-                    name = row.get(f'picked{i}_name', '')
-                    pts = row.get(f'picked{i}_pts', 0) or 0
-                    finish = row.get(f'picked{i}_finish', 99) or 99
-                    pred_rank = row.get(f'picked{i}_pred_rank', i) or i
-                    proj = row.get(f'picked{i}_proj', 0) or 0
-                    p_top1 = row.get(f'picked{i}_p_top1', 0) or 0
-                    if name:
-                        # "Why we picked" metric: show P(#1) if available, else proj pts
-                        if p_top1 > 0:
-                            why = f"P#1={p_top1*100:.1f}%"
-                        elif proj > 0:
-                            why = f"proj={proj:.0f}"
+            # Worst slates quick view (for debugging)
+            if not results_df.empty and len(results_df) >= 3:
+                with st.expander("🔴 Worst 3 Slates (debugging)"):
+                    # Sort by overlap ASC, then pred_rank_a1 DESC (high rank = bad)
+                    sort_cols = ['overlap']
+                    ascending = [True]
+                    if 'pred_rank_a1' in results_df.columns:
+                        sort_cols.append('pred_rank_a1')
+                        ascending.append(False)  # High rank (bad) first
+
+                    worst = results_df.sort_values(sort_cols, ascending=ascending).head(3)
+
+                    for _, r in worst.iterrows():
+                        date_str = r.get('slate_date', '?')
+                        overlap_val = r.get('overlap', 0)
+                        rank_a1 = r.get('pred_rank_a1', '?')
+                        dnp = r.get('dnp_in_picks', 0)
+
+                        # Build picks summary
+                        picks_info = []
+                        for i in range(1, 4):
+                            name = r.get(f'picked{i}_name', '')
+                            finish = r.get(f'picked{i}_finish', 99)
+                            if name:
+                                last = name.split()[-1]
+                                finish_str = f"#{finish}" if finish and finish < 99 else "DNP"
+                                picks_info.append(f"{last}→{finish_str}")
+
+                        st.markdown(
+                            f"**{date_str}** — overlap {overlap_val}/3, rank(#1)={rank_a1}"
+                            + (f", DNP={dnp}" if dnp else "")
+                        )
+                        if picks_info:
+                            st.caption(f"Picks: {' | '.join(picks_info)}")
+
+            # Daily trend chart
+            if not results_df.empty:
+                st.divider()
+                st.subheader("📈 Daily Overlap Trend")
+
+                import plotly.express as px
+
+                trend_df = results_df[['slate_date', 'overlap']].copy()
+                trend_df['slate_date'] = pd.to_datetime(trend_df['slate_date'])
+                trend_df = trend_df.sort_values('slate_date')
+
+                # Color mapping for overlap
+                color_map = {0: '#FF4444', 1: '#FFAA00', 2: '#88CC88', 3: '#22AA22'}
+                trend_df['color'] = trend_df['overlap'].map(color_map)
+
+                fig = px.bar(trend_df, x='slate_date', y='overlap',
+                            title='Daily Overlap (0-3)',
+                            labels={'slate_date': 'Date', 'overlap': 'Overlap'})
+                fig.update_traces(marker_color=trend_df['color'].tolist())
+                fig.update_layout(yaxis_range=[0, 3.5])
+                st.plotly_chart(fig, use_container_width=True)
+
+                # Daily results table - ENHANCED DIAGNOSTICS
+                st.divider()
+                st.subheader("📋 Daily Results - Diagnostic View")
+
+                # Icon legend
+                st.caption("**Legend:** ✅ rank ≤10 (good) | ⚠️ rank 11-25 (warning) | 🔴 rank >25 (bad)")
+
+                # Sort by date descending for display
+                sorted_results = results_df.sort_values('slate_date', ascending=False)
+
+                for _, row in sorted_results.iterrows():
+                    date_str = row['slate_date']
+                    overlap = int(row['overlap'])
+                    tie_friendly = int(row.get('tie_friendly_overlap', overlap))
+                    hit_1 = int(row['hit_1'])
+                    closest_miss = row.get('closest_miss', 0) or 0
+                    actual_3rd_pts = row.get('actual_3rd_points', 0) or 0
+                    actual_1st_pts = row.get('actual1_points', 0) or 0
+                    actual_2nd_pts = row.get('actual2_points', 0) or 0
+                    ties_at_3rd = row.get('ties_at_3rd', 0)
+
+                    # Get best pick points for closeness display
+                    pick_pts_list = [row.get(f'picked{i}_pts', 0) or 0 for i in range(1, 4)]
+                    best_pick_pts = max(pick_pts_list) if pick_pts_list else 0
+
+                    # Color for overlap
+                    overlap_colors = {0: '🔴', 1: '🟡', 2: '🟢', 3: '💚'}
+                    overlap_icon = overlap_colors.get(overlap, '⚪')
+
+                    # Hit #1 indicator
+                    hit1_icon = '✅' if hit_1 else '❌'
+
+                    # Get ranking metrics for diagnosis
+                    pred_rank_a1 = row.get('pred_rank_a1', 99) or 99
+                    pred_rank_a2 = row.get('pred_rank_a2', 99) or 99
+                    pred_rank_a3 = row.get('pred_rank_a3', 99) or 99
+                    best_actual_rank = min(pred_rank_a1, pred_rank_a2, pred_rank_a3)
+                    n_players = row.get('n_pred_players', 0) or 0
+
+                    # Count how many actual top-3 we ranked badly (>25)
+                    ranks_over_25 = sum(1 for r in [pred_rank_a1, pred_rank_a2, pred_rank_a3] if r > 25)
+                    ranks_over_40 = sum(1 for r in [pred_rank_a1, pred_rank_a2, pred_rank_a3] if r > 40)
+
+                    # Correct diagnosis logic:
+                    # - If 2+ of actual top 3 ranked >25 → Ranking failure
+                    # - If actual #1 ranked ≤10 but not picked → Selection failure
+                    # - If best actual rank 11-20 and cutoff is low/tied → Variance
+                    # - If all actual top3 ranked 21-40 → Blind spot
+                    if overlap == 3:
+                        diagnosis = "✅ Perfect: All 3 correct!"
+                        diagnosis_color = "green"
+                    elif overlap >= 1:
+                        # Partial hit
+                        if ranks_over_25 >= 2:
+                            diagnosis = f"Partial ({overlap}/3) + ranking failure ({ranks_over_25}/3 ranked >25)"
+                            diagnosis_color = "orange"
                         else:
-                            why = ""
+                            diagnosis = f"Partial ({overlap}/3)"
+                            diagnosis_color = "blue"
+                    elif ranks_over_25 >= 2:
+                        # Ranking failure: 2+ actual top-3 ranked terribly
+                        diagnosis = f"Ranking failure — {ranks_over_25}/3 actual top-3 ranked >25"
+                        diagnosis_color = "red"
+                    elif pred_rank_a1 <= 10:
+                        # Selection failure: we saw #1 but picked others
+                        diagnosis = f"Selection failure — actual #1 was our #{pred_rank_a1}, but we picked others"
+                        diagnosis_color = "orange"
+                    elif best_actual_rank <= 20:
+                        # Variance/coinflip: model was genuinely close
+                        diagnosis = f"Variance miss — best actual ranked #{best_actual_rank}"
+                        diagnosis_color = "orange"
+                    elif all(21 <= r <= 40 for r in [pred_rank_a1, pred_rank_a2, pred_rank_a3]):
+                        # Blind spot: model consistently missed but wasn't catastrophic
+                        diagnosis = f"Blind spot — all actual top-3 ranked 21-40"
+                        diagnosis_color = "red"
+                    else:
+                        # Pure ranking failure
+                        diagnosis = f"Ranking failure — best actual ranked #{best_actual_rank}"
+                        diagnosis_color = "red"
 
-                        # Check if player didn't play (no actual data)
-                        if finish >= 99 or (pts == 0 and finish > 50):
-                            picks_display.append(f"~~{name}~~ (DNP) — {why}" if why else f"~~{name}~~ (DNP)")
-                        elif finish <= 3:
-                            picks_display.append(f"**{name}** ({pts:.0f}pts, #{finish}) — {why}" if why else f"**{name}** ({pts:.0f}pts, #{finish})")
-                        else:
-                            picks_display.append(f"{name} ({pts:.0f}pts, #{finish}) — {why}" if why else f"{name} ({pts:.0f}pts, #{finish})")
-
-                # Build compact actuals display with proper warning icons
-                actuals_display = []
-                for i, rank_key in enumerate(['pred_rank_a1', 'pred_rank_a2', 'pred_rank_a3'], 1):
-                    name = row.get(f'actual{i}_name', '')
-                    pts = row.get(f'actual{i}_points', 0) or 0
-                    our_rank = row.get(rank_key, 99) or 99
-                    if name:
-                        # Proper warning thresholds: ≤10 ✅, 11-25 ⚠️, >25 🔴
-                        if our_rank <= 3:
-                            icon = "✅"
-                            actuals_display.append(f"**{name}** ({pts:.0f}pts) — we ranked #{our_rank} {icon}")
-                        elif our_rank <= 10:
-                            icon = "✅"
-                            actuals_display.append(f"{name} ({pts:.0f}pts) — we ranked #{our_rank} {icon}")
-                        elif our_rank <= 25:
-                            icon = "⚠️"
-                            actuals_display.append(f"{name} ({pts:.0f}pts) — we ranked #{our_rank} {icon}")
-                        else:
-                            icon = "🔴"
-                            actuals_display.append(f"{name} ({pts:.0f}pts) — we ranked #{our_rank} {icon}")
-
-                # Build model's top 5 for context
-                model_top5 = []
-                for i in range(1, 4):
-                    name = row.get(f'picked{i}_name', '')
-                    if name:
-                        model_top5.append(name.split()[-1])  # Last name only for brevity
-
-                # Cutoff label with tie info
-                cutoff_label = f"{actual_3rd_pts:.0f}"
-                if ties_at_3rd:
-                    cutoff_label += " (tie)"
-
-                # Create expandable row with enhanced header (includes slate size)
-                slate_size_str = f" | N={n_players}" if n_players > 0 else ""
-                header = f"{overlap_icon} **{date_str}** | Overlap: {overlap}/3 | #1: {hit1_icon} | Cutoff: {cutoff_label}pts{slate_size_str}"
-
-                with st.expander(header, expanded=False):
-                    # Diagnosis badge at top
-                    st.markdown(f"**Diagnosis:** :{diagnosis_color}[{diagnosis}]")
-
-                    # One-line truth: diagnosis breakdown
-                    st.markdown(f"`Actual top-3 ranks: {pred_rank_a1} / {pred_rank_a2} / {pred_rank_a3} | Best: #{best_actual_rank} | Cutoff: {actual_3rd_pts:.0f}pts | Best pick: {best_pick_pts:.0f}pts ({closest_miss:+.0f})`")
-
-                    col1, col2 = st.columns(2)
-
-                    with col1:
-                        st.markdown("**Our Picks** (actual pts, finish):")
-                        for pick in picks_display:
-                            st.markdown(f"  • {pick}")
-
-                        # Tie-friendly overlap
-                        if tie_friendly != overlap:
-                            st.markdown(f"  Tie-friendly overlap: {tie_friendly}/3")
-
-                    with col2:
-                        st.markdown("**Actual Top 3** (our rank):")
-                        for actual in actuals_display:
-                            st.markdown(f"  • {actual}")
-
-                        # Compact scoring context
-                        st.markdown("---")
-                        spread = actual_1st_pts - actual_3rd_pts
-                        if spread == 0:
-                            st.markdown(f"**Top-3 pts:** {actual_1st_pts:.0f} / {actual_2nd_pts:.0f} / {actual_3rd_pts:.0f} (tie)")
-                        else:
-                            st.markdown(f"**Top-3 pts:** {actual_1st_pts:.0f} / {actual_2nd_pts:.0f} / {actual_3rd_pts:.0f} (spread {spread:.0f})")
-
-                    # Model picks with actual finishes (clarified display)
-                    st.markdown("---")
-                    picks_summary = []
-                    finishes = []
+                    # Build compact picks display with prediction metric ("why we picked")
+                    picks_display = []
                     for i in range(1, 4):
                         name = row.get(f'picked{i}_name', '')
+                        pts = row.get(f'picked{i}_pts', 0) or 0
                         finish = row.get(f'picked{i}_finish', 99) or 99
+                        pred_rank = row.get(f'picked{i}_pred_rank', i) or i
+                        proj = row.get(f'picked{i}_proj', 0) or 0
+                        p_top1 = row.get(f'picked{i}_p_top1', 0) or 0
                         if name:
-                            last_name = name.split()[-1]
-                            picks_summary.append(last_name)
-                            finishes.append(f"#{finish}" if finish < 99 else "DNP")
-                    if picks_summary:
-                        st.markdown(f"**Model picks:** {', '.join(picks_summary)} — actual finishes: {'/'.join(finishes)}")
-
-                    # Baseline comparison with Hit #1 indicator
-                    try:
-                        baselines = backtest_top3.compute_baseline_overlap(backtest_conn, date_str)
-                        proj_data = baselines.get('projection_only', {})
-                        ceil_data = baselines.get('ceiling_only', {})
-                        proj_overlap = proj_data.get('overlap', 0)
-                        ceil_overlap = ceil_data.get('overlap', 0)
-                        proj_hit1 = proj_data.get('pred_rank_a1', 99) <= 3
-                        ceil_hit1 = ceil_data.get('pred_rank_a1', 99) <= 3
-
-                        if proj_overlap is not None and ceil_overlap is not None:
-                            # Build comparison with Hit #1 indicators
-                            proj_hit1_icon = "✅" if proj_hit1 else "❌"
-                            ceil_hit1_icon = "✅" if ceil_hit1 else "❌"
-                            comparison_text = f"Proj: {proj_overlap}/3 (hit#1:{proj_hit1_icon}) | Ceil: {ceil_overlap}/3 (hit#1:{ceil_hit1_icon})"
-
-                            # Determine if this was a brutal slate
-                            best_baseline = max(proj_overlap or 0, ceil_overlap or 0)
-                            if best_baseline == 0 and overlap == 0:
-                                st.markdown(f"**Baselines:** {comparison_text} — brutal slate (no baseline hit)")
-                            elif overlap > best_baseline:
-                                st.markdown(f"**Baselines:** :green[{comparison_text}] — beat baselines")
-                            elif overlap == best_baseline:
-                                st.markdown(f"**Baselines:** {comparison_text} — matched")
+                            # "Why we picked" metric: show P(#1) if available, else proj pts
+                            if p_top1 > 0:
+                                why = f"P#1={p_top1*100:.1f}%"
+                            elif proj > 0:
+                                why = f"proj={proj:.0f}"
                             else:
-                                st.markdown(f"**Baselines:** :red[{comparison_text}] — baselines beat us")
-                    except Exception:
-                        pass  # Baseline comparison is optional
+                                why = ""
 
-                    # Drilldown button
-                    if st.button(f"🔍 Full Drilldown", key=f"drill_{date_str}"):
-                        st.session_state[f'drilldown_date'] = date_str
+                            # Check if player didn't play (no actual data)
+                            if finish >= 99 or (pts == 0 and finish > 50):
+                                picks_display.append(f"~~{name}~~ (DNP) — {why}" if why else f"~~{name}~~ (DNP)")
+                            elif finish <= 3:
+                                picks_display.append(f"**{name}** ({pts:.0f}pts, #{finish}) — {why}" if why else f"**{name}** ({pts:.0f}pts, #{finish})")
+                            else:
+                                picks_display.append(f"{name} ({pts:.0f}pts, #{finish}) — {why}" if why else f"{name} ({pts:.0f}pts, #{finish})")
 
-                    # Show drilldown if requested
-                    if st.session_state.get('drilldown_date') == date_str:
-                        st.divider()
-                        st.markdown("#### 🔬 Detailed Analysis")
+                    # Build compact actuals display with proper warning icons
+                    actuals_display = []
+                    for i, rank_key in enumerate(['pred_rank_a1', 'pred_rank_a2', 'pred_rank_a3'], 1):
+                        name = row.get(f'actual{i}_name', '')
+                        pts = row.get(f'actual{i}_points', 0) or 0
+                        our_rank = row.get(rank_key, 99) or 99
+                        if name:
+                            # Proper warning thresholds: ≤10 ✅, 11-25 ⚠️, >25 🔴
+                            if our_rank <= 3:
+                                icon = "✅"
+                                actuals_display.append(f"**{name}** ({pts:.0f}pts) — we ranked #{our_rank} {icon}")
+                            elif our_rank <= 10:
+                                icon = "✅"
+                                actuals_display.append(f"{name} ({pts:.0f}pts) — we ranked #{our_rank} {icon}")
+                            elif our_rank <= 25:
+                                icon = "⚠️"
+                                actuals_display.append(f"{name} ({pts:.0f}pts) — we ranked #{our_rank} {icon}")
+                            else:
+                                icon = "🔴"
+                                actuals_display.append(f"{name} ({pts:.0f}pts) — we ranked #{our_rank} {icon}")
 
+                    # Build model's top 5 for context
+                    model_top5 = []
+                    for i in range(1, 4):
+                        name = row.get(f'picked{i}_name', '')
+                        if name:
+                            model_top5.append(name.split()[-1])  # Last name only for brevity
+
+                    # Cutoff label with tie info
+                    cutoff_label = f"{actual_3rd_pts:.0f}"
+                    if ties_at_3rd:
+                        cutoff_label += " (tie)"
+
+                    # Create expandable row with enhanced header (includes slate size)
+                    slate_size_str = f" | N={n_players}" if n_players > 0 else ""
+                    header = f"{overlap_icon} **{date_str}** | Overlap: {overlap}/3 | #1: {hit1_icon} | Cutoff: {cutoff_label}pts{slate_size_str}"
+
+                    with st.expander(header, expanded=False):
+                        # Diagnosis badge at top
+                        st.markdown(f"**Diagnosis:** :{diagnosis_color}[{diagnosis}]")
+
+                        # One-line truth: diagnosis breakdown
+                        st.markdown(f"`Actual top-3 ranks: {pred_rank_a1} / {pred_rank_a2} / {pred_rank_a3} | Best: #{best_actual_rank} | Cutoff: {actual_3rd_pts:.0f}pts | Best pick: {best_pick_pts:.0f}pts ({closest_miss:+.0f})`")
+
+                        col1, col2 = st.columns(2)
+
+                        with col1:
+                            st.markdown("**Our Picks** (actual pts, finish):")
+                            for pick in picks_display:
+                                st.markdown(f"  • {pick}")
+
+                            # Tie-friendly overlap
+                            if tie_friendly != overlap:
+                                st.markdown(f"  Tie-friendly overlap: {tie_friendly}/3")
+
+                        with col2:
+                            st.markdown("**Actual Top 3** (our rank):")
+                            for actual in actuals_display:
+                                st.markdown(f"  • {actual}")
+
+                            # Compact scoring context
+                            st.markdown("---")
+                            spread = actual_1st_pts - actual_3rd_pts
+                            if spread == 0:
+                                st.markdown(f"**Top-3 pts:** {actual_1st_pts:.0f} / {actual_2nd_pts:.0f} / {actual_3rd_pts:.0f} (tie)")
+                            else:
+                                st.markdown(f"**Top-3 pts:** {actual_1st_pts:.0f} / {actual_2nd_pts:.0f} / {actual_3rd_pts:.0f} (spread {spread:.0f})")
+
+                        # Model picks with actual finishes (clarified display)
+                        st.markdown("---")
+                        picks_summary = []
+                        finishes = []
+                        for i in range(1, 4):
+                            name = row.get(f'picked{i}_name', '')
+                            finish = row.get(f'picked{i}_finish', 99) or 99
+                            if name:
+                                last_name = name.split()[-1]
+                                picks_summary.append(last_name)
+                                finishes.append(f"#{finish}" if finish < 99 else "DNP")
+                        if picks_summary:
+                            st.markdown(f"**Model picks:** {', '.join(picks_summary)} — actual finishes: {'/'.join(finishes)}")
+
+                        # Baseline comparison with Hit #1 indicator
                         try:
-                            context = backtest_top3.get_drilldown_context(
-                                backtest_conn, date_str, strategy, top_n=15
-                            )
+                            baselines = backtest_top3.compute_baseline_overlap(backtest_conn, date_str)
+                            proj_data = baselines.get('projection_only', {})
+                            ceil_data = baselines.get('ceiling_only', {})
+                            proj_overlap = proj_data.get('overlap', 0)
+                            ceil_overlap = ceil_data.get('overlap', 0)
+                            proj_hit1 = proj_data.get('pred_rank_a1', 99) <= 3
+                            ceil_hit1 = ceil_data.get('pred_rank_a1', 99) <= 3
 
-                            # Model's Top 5 ranked context (table for clarity)
-                            our_top = context.get('our_top_ranked', [])[:5]
-                            if our_top:
-                                st.markdown("**Model's Top 5 (by prediction rank):**")
-                                top5_data = []
-                                for i, p in enumerate(our_top, 1):
-                                    name = p.get('name', '?')
-                                    finish = p.get('finish_rank', 999)
-                                    finish_str = f"#{finish}" if finish < 100 else "DNP"
-                                    pts = p.get('actual_pts', 0) or 0
-                                    proj = p.get('proj_ppg', 0) or 0
-                                    top5_data.append({
-                                        "Pred": i,
-                                        "Player": name,
-                                        "Actual": finish_str,
-                                        "Pts": f"{pts:.0f}",
-                                        "Proj": f"{proj:.1f}"
-                                    })
-                                st.dataframe(
-                                    pd.DataFrame(top5_data),
-                                    hide_index=True,
-                                    use_container_width=False
+                            if proj_overlap is not None and ceil_overlap is not None:
+                                # Build comparison with Hit #1 indicators
+                                proj_hit1_icon = "✅" if proj_hit1 else "❌"
+                                ceil_hit1_icon = "✅" if ceil_hit1 else "❌"
+                                comparison_text = f"Proj: {proj_overlap}/3 (hit#1:{proj_hit1_icon}) | Ceil: {ceil_overlap}/3 (hit#1:{ceil_hit1_icon})"
+
+                                # Determine if this was a brutal slate
+                                best_baseline = max(proj_overlap or 0, ceil_overlap or 0)
+                                if best_baseline == 0 and overlap == 0:
+                                    st.markdown(f"**Baselines:** {comparison_text} — brutal slate (no baseline hit)")
+                                elif overlap > best_baseline:
+                                    st.markdown(f"**Baselines:** :green[{comparison_text}] — beat baselines")
+                                elif overlap == best_baseline:
+                                    st.markdown(f"**Baselines:** {comparison_text} — matched")
+                                else:
+                                    st.markdown(f"**Baselines:** :red[{comparison_text}] — baselines beat us")
+                        except Exception:
+                            pass  # Baseline comparison is optional
+
+                        # Drilldown button
+                        if st.button(f"🔍 Full Drilldown", key=f"drill_{date_str}"):
+                            st.session_state[f'drilldown_date'] = date_str
+
+                        # Show drilldown if requested
+                        if st.session_state.get('drilldown_date') == date_str:
+                            st.divider()
+                            st.markdown("#### 🔬 Detailed Analysis")
+
+                            try:
+                                context = backtest_top3.get_drilldown_context(
+                                    backtest_conn, date_str, strategy, top_n=15
                                 )
 
-                            # Ranking field diagnostics expander
-                            ranking_diag = context.get('ranking_diagnostics', {})
-                            slate_stats = context.get('slate_stats', {})
-                            actual_top_list = context.get('actual_top_scorers', [])
-
-                            # Check for issues that need warnings
-                            nan_pct = ranking_diag.get('nan_pct', 0)
-                            zero_pct = ranking_diag.get('zero_pct', 0)
-                            sim_missing_count = sum(1 for p in actual_top_list[:3] if p.get('sim_missing', False))
-                            not_predicted_count = sum(1 for p in actual_top_list[:3] if p.get('not_predicted', False))
-
-                            # Show critical warnings first
-                            if not_predicted_count > 0:
-                                st.error(f"🚨 {not_predicted_count}/3 actual top scorers were NOT IN PREDICTIONS!")
-                            if sim_missing_count > 0 and not_predicted_count < sim_missing_count:
-                                st.warning(f"⚠️ {sim_missing_count - not_predicted_count}/3 actual top scorers have MISSING SIM VALUES (used fallback ranking)")
-                            if nan_pct > 10:
-                                st.warning(f"⚠️ {nan_pct:.1f}% of {ranking_diag.get('field', 'ranking field')} values are NaN")
-
-                            with st.expander("🔍 Ranking Field Diagnostics", expanded=False):
-                                diag_col1, diag_col2 = st.columns(2)
-                                with diag_col1:
-                                    st.markdown(f"""
-                                    **Ranking Field:** `{ranking_diag.get('field', 'unknown')}`
-                                    - Total players: {ranking_diag.get('total_players', 0)}
-                                    - NaN count: {ranking_diag.get('nan_count', 0)} ({nan_pct:.1f}%)
-                                    - Zero count: {ranking_diag.get('zero_count', 0)} ({zero_pct:.1f}%)
-                                    """)
-                                with diag_col2:
-                                    st.markdown(f"""
-                                    **Value Range:**
-                                    - Min: {ranking_diag.get('min', 'N/A')}
-                                    - Max: {ranking_diag.get('max', 'N/A')}
-                                    - Mean: {ranking_diag.get('mean', 'N/A')}
-                                    - Median: {ranking_diag.get('median', 'N/A')}
-                                    """)
-
-                                if nan_pct > 0 or zero_pct > 20:
-                                    st.markdown("""
-                                    ---
-                                    **⚠️ Interpretation:**
-                                    - High NaN% → Simulation didn't run or failed for these players
-                                    - High Zero% → Simulation ran but assigned 0 probability (unusual for stars)
-                                    - Players with NaN use `projected_ppg` as fallback for ranking
-                                    """)
-
-                            drill_col1, drill_col2 = st.columns(2)
-
-                            with drill_col1:
-                                st.markdown("**Our Top 15 Ranked:**")
-                                our_top_df = pd.DataFrame(context['our_top_ranked'])
-                                if not our_top_df.empty:
-                                    # Ensure numeric types for proper sorting
-                                    our_top_df['rank'] = pd.to_numeric(our_top_df['rank'], errors='coerce').astype('Int64')
-                                    our_top_df['proj_ppg'] = pd.to_numeric(our_top_df['proj_ppg'], errors='coerce')
-                                    our_top_df['ceiling'] = pd.to_numeric(our_top_df.get('ceiling', 0), errors='coerce')
-                                    our_top_df['sigma'] = pd.to_numeric(our_top_df.get('sigma', 0), errors='coerce')
-                                    our_top_df['season_avg'] = pd.to_numeric(our_top_df.get('season_avg', 0), errors='coerce')
-                                    our_top_df['actual_pts'] = pd.to_numeric(our_top_df['actual_pts'], errors='coerce')
-                                    our_top_df['finish_rank'] = pd.to_numeric(our_top_df['finish_rank'], errors='coerce').astype('Int64')
-                                    our_top_df['p_top1'] = pd.to_numeric(our_top_df.get('p_top1', 0), errors='coerce')
-
-                                    our_top_df = our_top_df.rename(columns={
-                                        'rank': 'Rank', 'name': 'Player', 'proj_ppg': 'Proj',
-                                        'ceiling': 'Ceil', 'sigma': 'σ', 'season_avg': 'SznAvg',
-                                        'actual_pts': 'Actual', 'finish_rank': 'Finish',
-                                        'p_top1': 'P#1', 'dfs_grade': 'Grade'
-                                    })
-                                    # Show diagnostic columns: Proj, Ceil, σ (sigma), SznAvg, Actual, Finish
-                                    display_cols = ['Rank', 'Player', 'Proj', 'Ceil', 'σ', 'SznAvg', 'Actual', 'Finish']
-                                    if 'P#1' in our_top_df.columns and our_top_df['P#1'].sum() > 0:
-                                        display_cols.append('P#1')
+                                # Model's Top 5 ranked context (table for clarity)
+                                our_top = context.get('our_top_ranked', [])[:5]
+                                if our_top:
+                                    st.markdown("**Model's Top 5 (by prediction rank):**")
+                                    top5_data = []
+                                    for i, p in enumerate(our_top, 1):
+                                        name = p.get('name', '?')
+                                        finish = p.get('finish_rank', 999)
+                                        finish_str = f"#{finish}" if finish < 100 else "DNP"
+                                        pts = p.get('actual_pts', 0) or 0
+                                        proj = p.get('proj_ppg', 0) or 0
+                                        top5_data.append({
+                                            "Pred": i,
+                                            "Player": name,
+                                            "Actual": finish_str,
+                                            "Pts": f"{pts:.0f}",
+                                            "Proj": f"{proj:.1f}"
+                                        })
                                     st.dataframe(
-                                        our_top_df[display_cols].head(15),
-                                        use_container_width=True, hide_index=True,
-                                        column_config={
-                                            "Proj": st.column_config.NumberColumn(format="%.1f"),
-                                            "Ceil": st.column_config.NumberColumn(format="%.0f"),
-                                            "σ": st.column_config.NumberColumn(format="%.1f"),
-                                            "SznAvg": st.column_config.NumberColumn(format="%.1f"),
-                                            "Actual": st.column_config.NumberColumn(format="%.0f"),
-                                            "Finish": st.column_config.NumberColumn(format="%d"),
-                                            "P#1": st.column_config.NumberColumn(format="%.1f%%"),
-                                        }
+                                        pd.DataFrame(top5_data),
+                                        hide_index=True,
+                                        use_container_width=False
                                     )
 
-                            with drill_col2:
-                                st.markdown("**Actual Top 15 Scorers (with our projections):**")
-                                actual_top_df = pd.DataFrame(context['actual_top_scorers'])
-                                if not actual_top_df.empty:
-                                    # Ensure numeric types for proper sorting
-                                    actual_top_df['finish_rank'] = pd.to_numeric(actual_top_df['finish_rank'], errors='coerce').astype('Int64')
-                                    actual_top_df['actual_pts'] = pd.to_numeric(actual_top_df['actual_pts'], errors='coerce')
-                                    actual_top_df['our_pred_rank'] = pd.to_numeric(actual_top_df['our_pred_rank'], errors='coerce').astype('Int64')
-                                    actual_top_df['proj_ppg'] = pd.to_numeric(actual_top_df.get('proj_ppg', 0), errors='coerce')
-                                    actual_top_df['ceiling'] = pd.to_numeric(actual_top_df.get('ceiling', 0), errors='coerce')
-                                    actual_top_df['sigma'] = pd.to_numeric(actual_top_df.get('sigma', 0), errors='coerce')
-                                    actual_top_df['season_avg'] = pd.to_numeric(actual_top_df.get('season_avg', 0), errors='coerce')
-                                    actual_top_df['proj_confidence'] = pd.to_numeric(actual_top_df.get('proj_confidence', 0), errors='coerce')
+                                # Ranking field diagnostics expander
+                                ranking_diag = context.get('ranking_diagnostics', {})
+                                slate_stats = context.get('slate_stats', {})
+                                actual_top_list = context.get('actual_top_scorers', [])
 
-                                    # Add Status column combining not_predicted and sim_missing flags
-                                    def get_status(row):
-                                        if row.get('not_predicted', False):
-                                            return '❌ NO PRED'
-                                        elif row.get('sim_missing', False):
-                                            return '⚠️ NO SIM'
-                                        elif row.get('used_fallback', False):
-                                            return '📊 FALLBACK'
-                                        return '✅'
-                                    actual_top_df['Status'] = actual_top_df.apply(get_status, axis=1)
+                                # Check for issues that need warnings
+                                nan_pct = ranking_diag.get('nan_pct', 0)
+                                zero_pct = ranking_diag.get('zero_pct', 0)
+                                sim_missing_count = sum(1 for p in actual_top_list[:3] if p.get('sim_missing', False))
+                                not_predicted_count = sum(1 for p in actual_top_list[:3] if p.get('not_predicted', False))
 
-                                    actual_top_df = actual_top_df.rename(columns={
-                                        'finish_rank': 'Finish', 'name': 'Player',
-                                        'actual_pts': 'Actual', 'our_pred_rank': 'Rank',
-                                        'proj_ppg': 'Proj', 'ceiling': 'Ceil', 'sigma': 'σ',
-                                        'season_avg': 'SznAvg', 'proj_confidence': 'Conf',
-                                        'dfs_grade': 'Grade'
-                                    })
-                                    # Show diagnostic columns with Status indicator
-                                    # Status: ❌ = not predicted, ⚠️ = sim missing, 📊 = used fallback, ✅ = ok
-                                    st.dataframe(
-                                        actual_top_df[['Finish', 'Player', 'Actual', 'Rank', 'Status', 'Proj', 'Ceil', 'σ', 'SznAvg']].head(15),
-                                        use_container_width=True, hide_index=True,
-                                        column_config={
-                                            "Actual": st.column_config.NumberColumn(format="%.0f"),
-                                            "Finish": st.column_config.NumberColumn(format="%d"),
-                                            "Rank": st.column_config.NumberColumn(format="%d"),
-                                            "Proj": st.column_config.NumberColumn(format="%.1f"),
-                                            "Ceil": st.column_config.NumberColumn(format="%.0f"),
-                                            "σ": st.column_config.NumberColumn(format="%.1f"),
-                                            "SznAvg": st.column_config.NumberColumn(format="%.1f"),
-                                        }
-                                    )
+                                # Show critical warnings first
+                                if not_predicted_count > 0:
+                                    st.error(f"🚨 {not_predicted_count}/3 actual top scorers were NOT IN PREDICTIONS!")
+                                if sim_missing_count > 0 and not_predicted_count < sim_missing_count:
+                                    st.warning(f"⚠️ {sim_missing_count - not_predicted_count}/3 actual top scorers have MISSING SIM VALUES (used fallback ranking)")
+                                if nan_pct > 10:
+                                    st.warning(f"⚠️ {nan_pct:.1f}% of {ranking_diag.get('field', 'ranking field')} values are NaN")
 
-                                    # Legend for status icons
-                                    st.caption("**Status:** ✅ OK | ⚠️ NO SIM (used fallback) | ❌ NOT PREDICTED")
+                                with st.expander("🔍 Ranking Field Diagnostics", expanded=False):
+                                    diag_col1, diag_col2 = st.columns(2)
+                                    with diag_col1:
+                                        st.markdown(f"""
+                                        **Ranking Field:** `{ranking_diag.get('field', 'unknown')}`
+                                        - Total players: {ranking_diag.get('total_players', 0)}
+                                        - NaN count: {ranking_diag.get('nan_count', 0)} ({nan_pct:.1f}%)
+                                        - Zero count: {ranking_diag.get('zero_count', 0)} ({zero_pct:.1f}%)
+                                        """)
+                                    with diag_col2:
+                                        st.markdown(f"""
+                                        **Value Range:**
+                                        - Min: {ranking_diag.get('min', 'N/A')}
+                                        - Max: {ranking_diag.get('max', 'N/A')}
+                                        - Mean: {ranking_diag.get('mean', 'N/A')}
+                                        - Median: {ranking_diag.get('median', 'N/A')}
+                                        """)
 
-                                    # Flag projection anomalies: Proj << SznAvg suggests bad data
-                                    anomalies = actual_top_df[
-                                        (actual_top_df['Rank'] < 900) &
-                                        (actual_top_df['Proj'] < actual_top_df['SznAvg'] * 0.7) &
-                                        (actual_top_df['SznAvg'] > 0)
-                                    ]
-                                    if not anomalies.empty and len(anomalies) > 0:
-                                        low_proj_names = anomalies['Player'].tolist()[:3]
-                                        st.info(f"📊 Low projections: {', '.join(low_proj_names)} - Proj << SznAvg")
+                                    if nan_pct > 0 or zero_pct > 20:
+                                        st.markdown("""
+                                        ---
+                                        **⚠️ Interpretation:**
+                                        - High NaN% → Simulation didn't run or failed for these players
+                                        - High Zero% → Simulation ran but assigned 0 probability (unusual for stars)
+                                        - Players with NaN use `projected_ppg` as fallback for ranking
+                                        """)
 
-                            # Slate stats
-                            slate = context['slate_stats']
-                            st.markdown(f"""
-                            **Slate Stats:** {slate.get('total_players', 0)} players |
-                            Avg: {slate.get('avg_points', 0):.1f} pts |
-                            Max: {slate.get('max_points', 0):.0f} pts |
-                            Top-3 cutoff: {slate.get('top3_threshold', 0):.0f} pts
-                            """)
+                                drill_col1, drill_col2 = st.columns(2)
 
-                        except Exception as e:
-                            st.error(f"Drilldown error: {e}")
+                                with drill_col1:
+                                    st.markdown("**Our Top 15 Ranked:**")
+                                    our_top_df = pd.DataFrame(context['our_top_ranked'])
+                                    if not our_top_df.empty:
+                                        # Ensure numeric types for proper sorting
+                                        our_top_df['rank'] = pd.to_numeric(our_top_df['rank'], errors='coerce').astype('Int64')
+                                        our_top_df['proj_ppg'] = pd.to_numeric(our_top_df['proj_ppg'], errors='coerce')
+                                        our_top_df['ceiling'] = pd.to_numeric(our_top_df.get('ceiling', 0), errors='coerce')
+                                        our_top_df['sigma'] = pd.to_numeric(our_top_df.get('sigma', 0), errors='coerce')
+                                        our_top_df['season_avg'] = pd.to_numeric(our_top_df.get('season_avg', 0), errors='coerce')
+                                        our_top_df['actual_pts'] = pd.to_numeric(our_top_df['actual_pts'], errors='coerce')
+                                        our_top_df['finish_rank'] = pd.to_numeric(our_top_df['finish_rank'], errors='coerce').astype('Int64')
+                                        our_top_df['p_top1'] = pd.to_numeric(our_top_df.get('p_top1', 0), errors='coerce')
 
-    else:
-        # No results yet
-        st.info("👆 Select your settings and click 'Run Backtest' to analyze strategy performance.")
+                                        our_top_df = our_top_df.rename(columns={
+                                            'rank': 'Rank', 'name': 'Player', 'proj_ppg': 'Proj',
+                                            'ceiling': 'Ceil', 'sigma': 'σ', 'season_avg': 'SznAvg',
+                                            'actual_pts': 'Actual', 'finish_rank': 'Finish',
+                                            'p_top1': 'P#1', 'dfs_grade': 'Grade'
+                                        })
+                                        # Show diagnostic columns: Proj, Ceil, σ (sigma), SznAvg, Actual, Finish
+                                        display_cols = ['Rank', 'Player', 'Proj', 'Ceil', 'σ', 'SznAvg', 'Actual', 'Finish']
+                                        if 'P#1' in our_top_df.columns and our_top_df['P#1'].sum() > 0:
+                                            display_cols.append('P#1')
+                                        st.dataframe(
+                                            our_top_df[display_cols].head(15),
+                                            use_container_width=True, hide_index=True,
+                                            column_config={
+                                                "Proj": st.column_config.NumberColumn(format="%.1f"),
+                                                "Ceil": st.column_config.NumberColumn(format="%.0f"),
+                                                "σ": st.column_config.NumberColumn(format="%.1f"),
+                                                "SznAvg": st.column_config.NumberColumn(format="%.1f"),
+                                                "Actual": st.column_config.NumberColumn(format="%.0f"),
+                                                "Finish": st.column_config.NumberColumn(format="%d"),
+                                                "P#1": st.column_config.NumberColumn(format="%.1f%%"),
+                                            }
+                                        )
 
-        # Show available data info
-        try:
-            available_dates = backtest_top3.get_available_dates(backtest_conn)
-            if available_dates:
-                st.markdown(f"""
-                **Data Available:**
-                - Dates with actual results: **{len(available_dates)}**
-                - Date range: **{min(available_dates)}** to **{max(available_dates)}**
-                """)
-            else:
-                st.warning("No predictions with actual results found. Run predictions and wait for games to complete.")
-        except Exception as e:
-            st.error(f"Error checking data: {e}")
+                                with drill_col2:
+                                    st.markdown("**Actual Top 15 Scorers (with our projections):**")
+                                    actual_top_df = pd.DataFrame(context['actual_top_scorers'])
+                                    if not actual_top_df.empty:
+                                        # Ensure numeric types for proper sorting
+                                        actual_top_df['finish_rank'] = pd.to_numeric(actual_top_df['finish_rank'], errors='coerce').astype('Int64')
+                                        actual_top_df['actual_pts'] = pd.to_numeric(actual_top_df['actual_pts'], errors='coerce')
+                                        actual_top_df['our_pred_rank'] = pd.to_numeric(actual_top_df['our_pred_rank'], errors='coerce').astype('Int64')
+                                        actual_top_df['proj_ppg'] = pd.to_numeric(actual_top_df.get('proj_ppg', 0), errors='coerce')
+                                        actual_top_df['ceiling'] = pd.to_numeric(actual_top_df.get('ceiling', 0), errors='coerce')
+                                        actual_top_df['sigma'] = pd.to_numeric(actual_top_df.get('sigma', 0), errors='coerce')
+                                        actual_top_df['season_avg'] = pd.to_numeric(actual_top_df.get('season_avg', 0), errors='coerce')
+                                        actual_top_df['proj_confidence'] = pd.to_numeric(actual_top_df.get('proj_confidence', 0), errors='coerce')
 
-    # Explanation expander
-    with st.expander("ℹ️ How Backtest Metrics Work", expanded=False):
-        st.markdown("""
-        ### Overlap Metrics (Tournament-Style)
+                                        # Add Status column combining not_predicted and sim_missing flags
+                                        def get_status(row):
+                                            if row.get('not_predicted', False):
+                                                return '❌ NO PRED'
+                                            elif row.get('sim_missing', False):
+                                                return '⚠️ NO SIM'
+                                            elif row.get('used_fallback', False):
+                                                return '📊 FALLBACK'
+                                            return '✅'
+                                        actual_top_df['Status'] = actual_top_df.apply(get_status, axis=1)
 
-        | Metric | Description |
-        |--------|-------------|
-        | **Overlap** | How many of our 3 picks were in the actual top 3 (0-3) |
-        | **Hit #1** | Did we pick the actual top scorer? |
-        | **Hit Any** | Did we get at least 1 correct? |
-        | **Hit 2+** | Did we get 2 or more correct? |
+                                        actual_top_df = actual_top_df.rename(columns={
+                                            'finish_rank': 'Finish', 'name': 'Player',
+                                            'actual_pts': 'Actual', 'our_pred_rank': 'Rank',
+                                            'proj_ppg': 'Proj', 'ceiling': 'Ceil', 'sigma': 'σ',
+                                            'season_avg': 'SznAvg', 'proj_confidence': 'Conf',
+                                            'dfs_grade': 'Grade'
+                                        })
+                                        # Show diagnostic columns with Status indicator
+                                        # Status: ❌ = not predicted, ⚠️ = sim missing, 📊 = used fallback, ✅ = ok
+                                        st.dataframe(
+                                            actual_top_df[['Finish', 'Player', 'Actual', 'Rank', 'Status', 'Proj', 'Ceil', 'σ', 'SznAvg']].head(15),
+                                            use_container_width=True, hide_index=True,
+                                            column_config={
+                                                "Actual": st.column_config.NumberColumn(format="%.0f"),
+                                                "Finish": st.column_config.NumberColumn(format="%d"),
+                                                "Rank": st.column_config.NumberColumn(format="%d"),
+                                                "Proj": st.column_config.NumberColumn(format="%.1f"),
+                                                "Ceil": st.column_config.NumberColumn(format="%.0f"),
+                                                "σ": st.column_config.NumberColumn(format="%.1f"),
+                                                "SznAvg": st.column_config.NumberColumn(format="%.1f"),
+                                            }
+                                        )
 
-        ### Ranking Quality Metrics
+                                        # Legend for status icons
+                                        st.caption("**Status:** ✅ OK | ⚠️ NO SIM (used fallback) | ❌ NOT PREDICTED")
 
-        | Metric | Description |
-        |--------|-------------|
-        | **Rank of #1** | What rank did we give the actual top scorer? Lower is better. |
-        | **Avg Rank Top 3** | Average rank we gave to the actual top 3 scorers |
+                                        # Flag projection anomalies: Proj << SznAvg suggests bad data
+                                        anomalies = actual_top_df[
+                                            (actual_top_df['Rank'] < 900) &
+                                            (actual_top_df['Proj'] < actual_top_df['SznAvg'] * 0.7) &
+                                            (actual_top_df['SznAvg'] > 0)
+                                        ]
+                                        if not anomalies.empty and len(anomalies) > 0:
+                                            low_proj_names = anomalies['Player'].tolist()[:3]
+                                            st.info(f"📊 Low projections: {', '.join(low_proj_names)} - Proj << SznAvg")
 
-        ### Strategy Definitions
+                                # Slate stats
+                                slate = context['slate_stats']
+                                st.markdown(f"""
+                                **Slate Stats:** {slate.get('total_players', 0)} players |
+                                Avg: {slate.get('avg_points', 0):.1f} pts |
+                                Max: {slate.get('max_points', 0):.0f} pts |
+                                Top-3 cutoff: {slate.get('top3_threshold', 0):.0f} pts
+                                """)
 
-        | Strategy | Ranking By |
-        |----------|------------|
-        | **Simulation P(Top-3)** | Monte Carlo probability of finishing top 3 |
-        | **Simulation P(#1)** | Monte Carlo probability of being #1 scorer |
-        | **TopScorerScore** | Heuristic combining projection, ceiling, matchup |
-        | **Projection Only** | Raw projected points (baseline) |
-        | **Ceiling Only** | Scoring ceiling (max upside) |
+                            except Exception as e:
+                                st.error(f"Drilldown error: {e}")
 
-        ### Tie Handling
+        else:
+            # No results yet
+            st.info("👆 Select your settings and click 'Run Backtest' to analyze strategy performance.")
 
-        When multiple players tie at the #3 spot, we use deterministic tie-breaking:
-        1. Higher points wins
-        2. Lower player_id breaks remaining ties
+            # Show available data info
+            try:
+                available_dates = backtest_top3.get_available_dates(backtest_conn)
+                if available_dates:
+                    st.markdown(f"""
+                    **Data Available:**
+                    - Dates with actual results: **{len(available_dates)}**
+                    - Date range: **{min(available_dates)}** to **{max(available_dates)}**
+                    """)
+                else:
+                    st.warning("No predictions with actual results found. Run predictions and wait for games to complete.")
+            except Exception as e:
+                st.error(f"Error checking data: {e}")
 
-        **Tie-Friendly Overlap** counts picks that scored ≥ the #3 threshold,
-        avoiding false negatives when ties exist.
-        """)
+        # Explanation expander
+        with st.expander("ℹ️ How Backtest Metrics Work", expanded=False):
+            st.markdown("""
+            ### Overlap Metrics (Tournament-Style)
+
+            | Metric | Description |
+            |--------|-------------|
+            | **Overlap** | How many of our 3 picks were in the actual top 3 (0-3) |
+            | **Hit #1** | Did we pick the actual top scorer? |
+            | **Hit Any** | Did we get at least 1 correct? |
+            | **Hit 2+** | Did we get 2 or more correct? |
+
+            ### Ranking Quality Metrics
+
+            | Metric | Description |
+            |--------|-------------|
+            | **Rank of #1** | What rank did we give the actual top scorer? Lower is better. |
+            | **Avg Rank Top 3** | Average rank we gave to the actual top 3 scorers |
+
+            ### Strategy Definitions
+
+            | Strategy | Ranking By |
+            |----------|------------|
+            | **Simulation P(Top-3)** | Monte Carlo probability of finishing top 3 |
+            | **Simulation P(#1)** | Monte Carlo probability of being #1 scorer |
+            | **TopScorerScore** | Heuristic combining projection, ceiling, matchup |
+            | **Projection Only** | Raw projected points (baseline) |
+            | **Ceiling Only** | Scoring ceiling (max upside) |
+
+            ### Tie Handling
+
+            When multiple players tie at the #3 spot, we use deterministic tie-breaking:
+            1. Higher points wins
+            2. Lower player_id breaks remaining ties
+
+            **Tie-Friendly Overlap** counts picks that scored ≥ the #3 threshold,
+            avoiding false negatives when ties exist.
+            """)
 
 # FanDuel Compare tab --------------------------------------------------------
 if selected_page == "FanDuel Compare":
