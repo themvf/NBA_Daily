@@ -8807,6 +8807,101 @@ if selected_page == "Backtest Analysis":
             except Exception:
                 st.info("Click 'Run Portfolio Backtest' to analyze your 20-lineup tournament strategy performance.")
 
+        # =======================================================================
+        # Stack & High-Total Game Analysis Section
+        # =======================================================================
+        st.divider()
+        st.markdown("### Stack & High-Total Game Analysis")
+        st.caption("Analyze lineup composition and Vegas total correlation with top scorers")
+
+        analysis_col1, analysis_col2 = st.columns(2)
+
+        with analysis_col1:
+            if st.button("Run Stack & Total Analysis", key="run_stack_analysis_btn"):
+                with st.spinner("Analyzing stacks and high-total games..."):
+                    try:
+                        analysis_result = backtest_portfolio.run_stack_and_total_analysis(
+                            backtest_conn,
+                            port_start_date,
+                            port_end_date,
+                            verbose=False
+                        )
+                        st.session_state['stack_total_analysis'] = analysis_result
+                        st.success(f"Analysis complete! Analyzed {analysis_result['dates_analyzed']} slates.")
+                    except Exception as e:
+                        st.error(f"Analysis failed: {e}")
+                        import traceback
+                        st.code(traceback.format_exc())
+
+        # Display stack/total analysis results
+        if 'stack_total_analysis' in st.session_state:
+            analysis = st.session_state['stack_total_analysis']
+
+            st.markdown("#### Lineup Stack Composition")
+            stack_col1, stack_col2, stack_col3 = st.columns(3)
+
+            with stack_col1:
+                st.metric(
+                    "Lineups with Any Stack",
+                    f"{analysis['avg_stack_pct']:.1f}%",
+                    help="% of lineups with 2+ players from same game"
+                )
+            with stack_col2:
+                st.metric(
+                    "Same-Team Stacks",
+                    f"{analysis['avg_same_team_stack_pct']:.1f}%",
+                    help="% of lineups with 2+ players from same team"
+                )
+            with stack_col3:
+                st.metric(
+                    "Cross-Team Stacks",
+                    f"{analysis['avg_cross_team_stack_pct']:.1f}%",
+                    help="% of lineups with players from opposing teams in same game"
+                )
+
+            st.markdown("#### High-Total Games vs Top 3 Scorers")
+            st.caption("Do top scorers come from games with the highest Vegas totals?")
+
+            total_col1, total_col2, total_col3 = st.columns(3)
+
+            with total_col1:
+                st.metric(
+                    "Avg Top-3 from High-Total Games",
+                    f"{analysis['avg_top3_from_high_total_pct']:.1f}%",
+                    help="Average % of top 3 scorers from the 2 highest-total games"
+                )
+            with total_col2:
+                st.metric(
+                    "Slates with 2+ from High-Total",
+                    f"{analysis['slates_2_of_3_pct']:.1f}%",
+                    help="% of slates where at least 2 of 3 top scorers came from high-total games"
+                )
+            with total_col3:
+                st.metric(
+                    "Dates with Vegas Data",
+                    f"{analysis['dates_with_vegas']}/{analysis['dates_analyzed']}",
+                    help="Number of dates with Vegas totals available"
+                )
+
+            # Insight box
+            if analysis['avg_top3_from_high_total_pct'] > 50:
+                st.success(
+                    f"**Insight:** On average, {analysis['avg_top3_from_high_total_pct']:.0f}% of top 3 scorers "
+                    "came from high-total games. This supports targeting high-total games in your strategy."
+                )
+            elif analysis['avg_top3_from_high_total_pct'] > 33:
+                st.info(
+                    f"**Insight:** {analysis['avg_top3_from_high_total_pct']:.0f}% of top 3 scorers came from "
+                    "high-total games - roughly proportional. High totals provide slight edge."
+                )
+            else:
+                st.warning(
+                    f"**Insight:** Only {analysis['avg_top3_from_high_total_pct']:.0f}% of top 3 scorers came from "
+                    "high-total games. Consider diversifying beyond just high-total games."
+                )
+        else:
+            st.info("Click 'Run Stack & Total Analysis' to analyze lineup stacks and high-total game correlation.")
+
         # Explanation
         with st.expander("How Portfolio Backtest Works", expanded=False):
             st.markdown("""

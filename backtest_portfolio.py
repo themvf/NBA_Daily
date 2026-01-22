@@ -262,6 +262,177 @@ def evaluate_portfolio_against_actuals(
 
 
 # =============================================================================
+# STACK ANALYSIS FUNCTIONS
+# =============================================================================
+
+def analyze_lineup_stacks(
+    lineups: List[List[int]],
+    player_info: pd.DataFrame
+) -> Dict:
+    """
+    Analyze stack composition of lineups.
+
+    Args:
+        lineups: List of lineups (each lineup is list of player_ids)
+        player_info: DataFrame with player_id, team_name/team_abbreviation, game_id
+
+    Returns:
+        Dict with stack analysis metrics
+    """
+    # Build lookups
+    team_lookup = {}
+    game_lookup = {}
+
+    for _, row in player_info.iterrows():
+        pid = row['player_id']
+        team_lookup[pid] = row.get('team_abbreviation') or row.get('team_name', 'UNK')
+        game_lookup[pid] = row.get('game_id', 'UNK')
+
+    total_lineups = len(lineups)
+    lineups_with_any_stack = 0
+    lineups_with_same_team_stack = 0
+    lineups_with_cross_team_stack = 0
+
+    for lineup in lineups:
+        # Get teams and games for this lineup
+        teams = [team_lookup.get(pid, 'UNK') for pid in lineup]
+        games = [game_lookup.get(pid, 'UNK') for pid in lineup]
+
+        # Check for stacks (2+ players from same game)
+        game_counts = {}
+        for i, game in enumerate(games):
+            if game != 'UNK':
+                if game not in game_counts:
+                    game_counts[game] = []
+                game_counts[game].append(i)
+
+        has_any_stack = False
+        has_same_team = False
+        has_cross_team = False
+
+        for game, indices in game_counts.items():
+            if len(indices) >= 2:
+                has_any_stack = True
+                # Check if same team or cross-team
+                stack_teams = [teams[i] for i in indices]
+                if len(set(stack_teams)) == 1:
+                    has_same_team = True
+                else:
+                    has_cross_team = True
+
+        if has_any_stack:
+            lineups_with_any_stack += 1
+        if has_same_team:
+            lineups_with_same_team_stack += 1
+        if has_cross_team:
+            lineups_with_cross_team_stack += 1
+
+    return {
+        'total_lineups': total_lineups,
+        'lineups_with_stack': lineups_with_any_stack,
+        'stack_pct': lineups_with_any_stack / total_lineups * 100 if total_lineups > 0 else 0,
+        'same_team_stack_count': lineups_with_same_team_stack,
+        'same_team_stack_pct': lineups_with_same_team_stack / total_lineups * 100 if total_lineups > 0 else 0,
+        'cross_team_stack_count': lineups_with_cross_team_stack,
+        'cross_team_stack_pct': lineups_with_cross_team_stack / total_lineups * 100 if total_lineups > 0 else 0,
+    }
+
+
+def analyze_high_total_games_vs_top_scorers(
+    conn: sqlite3.Connection,
+    game_date: str,
+    actuals: pd.DataFrame,
+    predictions: pd.DataFrame = None
+) -> Dict:
+    """
+    Analyze if top 3 scorers came from highest projected total games.
+
+    Args:
+        conn: Database connection
+        game_date: Date to analyze
+        actuals: DataFrame with actual scores
+        predictions: Optional predictions DataFrame with game context
+
+    Returns:
+        Dict with high-total game analysis
+    """
+    # Get actual top 3 scorers
+    top3 = actuals.nlargest(3, 'actual_ppg')
+    top3_teams = set(top3['team'].tolist()) if 'team' in top3.columns else set()
+
+    # Try to get Vegas totals from game_odds table
+    game_totals = {}
+    try:
+        odds_query = """
+            SELECT game_id, over_under, home_team, away_team
+            FROM game_odds
+            WHERE game_date = ?
+            ORDER BY over_under DESC
+        """
+        odds_df = pd.read_sql_query(odds_query, conn, params=[game_date])
+
+        if not odds_df.empty:
+            for _, row in odds_df.iterrows():
+                game_totals[row['game_id']] = {
+                    'total': row['over_under'],
+                    'teams': [row.get('home_team', ''), row.get('away_team', '')]
+                }
+    except Exception:
+        pass
+
+    # Fallback: use predictions to estimate game context
+    if not game_totals and predictions is not None and not predictions.empty:
+        # Group by game_id and sum projections as proxy for game total
+        if 'game_id' in predictions.columns:
+            game_proj = predictions.groupby('game_id')['projected_ppg'].sum().sort_values(ascending=False)
+            for game_id, total in game_proj.items():
+                game_totals[game_id] = {'total': total, 'teams': []}
+
+    if not game_totals:
+        return {
+            'has_vegas_data': False,
+            'top_games_count': 0,
+            'top3_from_high_total_games': 0,
+            'top3_from_high_total_pct': 0,
+        }
+
+    # Get top 2 highest total games
+    sorted_games = sorted(game_totals.items(), key=lambda x: x[1]['total'], reverse=True)
+    top_games = sorted_games[:2] if len(sorted_games) >= 2 else sorted_games
+
+    # Get teams from top games
+    high_total_teams = set()
+    for game_id, info in top_games:
+        high_total_teams.update(info['teams'])
+
+    # Also map by checking predictions
+    if predictions is not None and 'game_id' in predictions.columns:
+        top_game_ids = [g[0] for g in top_games]
+        high_total_players = predictions[predictions['game_id'].isin(top_game_ids)]['player_id'].tolist()
+    else:
+        high_total_players = []
+
+    # Count how many top 3 scorers were from high-total games
+    top3_ids = set(top3['player_id'].tolist())
+    top3_from_high_total = len(top3_ids & set(high_total_players))
+
+    # Also check by team if we have team data
+    if top3_teams and high_total_teams:
+        top3_teams_in_high_total = len(top3_teams & high_total_teams)
+    else:
+        top3_teams_in_high_total = top3_from_high_total
+
+    return {
+        'has_vegas_data': len(game_totals) > 0,
+        'top_games_count': len(top_games),
+        'top_game_totals': [g[1]['total'] for g in top_games],
+        'top3_from_high_total_games': top3_from_high_total,
+        'top3_from_high_total_pct': top3_from_high_total / 3 * 100,
+        'high_total_teams': list(high_total_teams)[:4],  # Limit for display
+    }
+
+
+# =============================================================================
 # BACKTEST FUNCTIONS
 # =============================================================================
 
@@ -343,22 +514,26 @@ def get_predictions_for_date(conn: sqlite3.Connection, game_date: str) -> pd.Dat
 
 def get_stored_portfolio(conn: sqlite3.Connection, game_date: str) -> Optional[List[List[int]]]:
     """Retrieve stored portfolio lineups for a date, if available."""
-    query = """
-        SELECT player1_id, player2_id, player3_id
-        FROM portfolio_lineups
-        WHERE slate_date = ?
-        ORDER BY lineup_index
-    """
-    df = pd.read_sql_query(query, conn, params=[game_date])
+    try:
+        query = """
+            SELECT player1_id, player2_id, player3_id
+            FROM portfolio_lineups
+            WHERE slate_date = ?
+            ORDER BY lineup_index
+        """
+        df = pd.read_sql_query(query, conn, params=[game_date])
 
-    if df.empty:
+        if df.empty:
+            return None
+
+        lineups = []
+        for _, row in df.iterrows():
+            lineups.append([row['player1_id'], row['player2_id'], row['player3_id']])
+
+        return lineups
+    except Exception:
+        # Table might not exist yet
         return None
-
-    lineups = []
-    for _, row in df.iterrows():
-        lineups.append([row['player1_id'], row['player2_id'], row['player3_id']])
-
-    return lineups
 
 
 def store_portfolio(
@@ -597,6 +772,117 @@ def get_backtest_summary(conn: sqlite3.Connection) -> pd.DataFrame:
         FROM backtest_portfolio_results
     """
     return pd.read_sql_query(query, conn)
+
+
+def run_stack_and_total_analysis(
+    conn: sqlite3.Connection,
+    date_from: str,
+    date_to: str,
+    verbose: bool = True
+) -> Dict:
+    """
+    Run stack analysis and high-total game analysis over a date range.
+
+    Returns aggregated analysis metrics.
+    """
+    # Get available dates
+    query = """
+        SELECT DISTINCT game_date
+        FROM predictions
+        WHERE game_date BETWEEN ? AND ?
+          AND actual_ppg IS NOT NULL
+        ORDER BY game_date
+    """
+    dates_df = pd.read_sql_query(query, conn, params=[date_from, date_to])
+    dates = dates_df['game_date'].tolist()
+
+    if verbose:
+        print(f"Running stack/total analysis for {len(dates)} dates...")
+
+    # Aggregate metrics
+    all_stack_results = []
+    all_high_total_results = []
+
+    for game_date in dates:
+        try:
+            # Get predictions and actuals
+            predictions = get_predictions_for_date(conn, game_date)
+            actuals = get_actuals_for_date(conn, game_date)
+
+            if predictions.empty or actuals.empty:
+                continue
+
+            # Get stored or regenerated lineups
+            lineups = get_stored_portfolio(conn, game_date)
+            if lineups is None:
+                # Regenerate
+                player_pool = create_player_pool_from_predictions(predictions)
+                if len(player_pool) < 10:
+                    continue
+
+                game_ids = predictions['game_id'].dropna().unique()
+                game_envs = {gid: {'stack_score': 0.6, 'ot_probability': 0.06} for gid in game_ids}
+
+                optimizer = TournamentLineupOptimizer(
+                    player_pool=player_pool,
+                    game_environments=game_envs
+                )
+                result = optimizer.optimize()
+                lineups = [l.player_ids() for l in result.lineups]
+
+            if lineups:
+                # Stack analysis
+                stack_result = analyze_lineup_stacks(lineups, predictions)
+                stack_result['game_date'] = game_date
+                all_stack_results.append(stack_result)
+
+                # High-total analysis
+                high_total_result = analyze_high_total_games_vs_top_scorers(
+                    conn, game_date, actuals, predictions
+                )
+                high_total_result['game_date'] = game_date
+                all_high_total_results.append(high_total_result)
+
+        except Exception as e:
+            if verbose:
+                print(f"  Error on {game_date}: {e}")
+            continue
+
+    # Aggregate stack results
+    if all_stack_results:
+        avg_stack_pct = np.mean([r['stack_pct'] for r in all_stack_results])
+        avg_same_team_pct = np.mean([r['same_team_stack_pct'] for r in all_stack_results])
+        avg_cross_team_pct = np.mean([r['cross_team_stack_pct'] for r in all_stack_results])
+    else:
+        avg_stack_pct = avg_same_team_pct = avg_cross_team_pct = 0
+
+    # Aggregate high-total results
+    if all_high_total_results:
+        dates_with_vegas = sum(1 for r in all_high_total_results if r['has_vegas_data'])
+        avg_top3_from_high_total = np.mean([r['top3_from_high_total_pct'] for r in all_high_total_results])
+        # Count how many slates had at least 2 of 3 top scorers from high-total games
+        slates_2_of_3 = sum(1 for r in all_high_total_results if r['top3_from_high_total_games'] >= 2)
+    else:
+        dates_with_vegas = 0
+        avg_top3_from_high_total = 0
+        slates_2_of_3 = 0
+
+    return {
+        'n_dates': len(dates),
+        'dates_analyzed': len(all_stack_results),
+        # Stack metrics
+        'avg_stack_pct': avg_stack_pct,
+        'avg_same_team_stack_pct': avg_same_team_pct,
+        'avg_cross_team_stack_pct': avg_cross_team_pct,
+        # High-total metrics
+        'dates_with_vegas': dates_with_vegas,
+        'avg_top3_from_high_total_pct': avg_top3_from_high_total,
+        'slates_with_2_of_3_from_high_total': slates_2_of_3,
+        'slates_2_of_3_pct': slates_2_of_3 / len(all_high_total_results) * 100 if all_high_total_results else 0,
+        # Raw data for detailed analysis
+        'stack_results': all_stack_results,
+        'high_total_results': all_high_total_results,
+    }
 
 
 # =============================================================================
