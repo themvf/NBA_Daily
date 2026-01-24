@@ -34,9 +34,42 @@ from enum import Enum
 # DATABASE SCHEMA
 # =============================================================================
 
+def ensure_enrichment_columns(conn: sqlite3.Connection):
+    """Ensure predictions table has enrichment columns (migration for cloud DB)."""
+    cursor = conn.cursor()
+
+    # Check existing columns
+    cursor.execute("PRAGMA table_info(predictions)")
+    existing_cols = {col[1] for col in cursor.fetchall()}
+
+    # Enrichment columns to add
+    enrichment_cols = [
+        ('days_rest', 'INTEGER DEFAULT NULL'),
+        ('rest_multiplier', 'REAL DEFAULT 1.0'),
+        ('is_b2b', 'INTEGER DEFAULT 0'),
+        ('game_script_tier', 'TEXT DEFAULT "neutral"'),
+        ('blowout_risk', 'REAL DEFAULT 0.0'),
+        ('minutes_adjustment', 'REAL DEFAULT 0.0'),
+        ('role_tier', 'TEXT DEFAULT NULL'),
+        ('position_matchup_factor', 'REAL DEFAULT 1.0'),
+    ]
+
+    for col_name, col_def in enrichment_cols:
+        if col_name not in existing_cols:
+            try:
+                cursor.execute(f'ALTER TABLE predictions ADD COLUMN {col_name} {col_def}')
+            except Exception:
+                pass  # Column might already exist
+
+    conn.commit()
+
+
 def ensure_monitoring_tables(conn: sqlite3.Connection):
     """Create monitoring tables if they don't exist."""
     cursor = conn.cursor()
+
+    # First ensure predictions has enrichment columns
+    ensure_enrichment_columns(conn)
 
     # Per-prediction audit log
     cursor.execute("""
