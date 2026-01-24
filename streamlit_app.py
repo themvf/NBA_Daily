@@ -38,6 +38,7 @@ import top3_tracking
 import backtest_top3
 import backtest_portfolio
 import preset_ab_test
+from enrichment_monitor import ensure_enrichment_columns
 
 DEFAULT_DB_PATH = Path(__file__).with_name("nba_stats.db")
 DEFAULT_PREDICTIONS_PATH = Path(__file__).with_name("predictions.csv")
@@ -407,6 +408,12 @@ def get_connection(db_path: str) -> sqlite3.Connection:
     # Auto-upgrade database schema for injury adjustments (one-time migration)
     try:
         pt.upgrade_predictions_table_for_injuries(conn)
+    except Exception:
+        pass  # Schema already upgraded or predictions table doesn't exist yet
+
+    # Auto-upgrade database schema for enrichment columns (one-time migration)
+    try:
+        ensure_enrichment_columns(conn)
     except Exception:
         pass  # Schema already upgraded or predictions table doesn't exist yet
 
