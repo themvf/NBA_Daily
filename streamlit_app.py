@@ -9911,6 +9911,42 @@ if selected_page == "Enrichment Validation":
     if monitoring_available:
         ensure_monitoring_tables(enrichment_conn)
 
+        # Check if enrichment data needs backfilling
+        cursor = enrichment_conn.cursor()
+        cursor.execute("""
+            SELECT COUNT(*) as total,
+                   SUM(CASE WHEN role_tier IS NOT NULL THEN 1 ELSE 0 END) as enriched
+            FROM predictions WHERE actual_ppg IS NOT NULL
+        """)
+        enrich_check = cursor.fetchone()
+        total_preds = enrich_check[0] if enrich_check else 0
+        enriched_preds = enrich_check[1] if enrich_check else 0
+
+        if total_preds > 0 and enriched_preds < total_preds * 0.5:
+            # More than 50% of predictions missing enrichment data
+            st.warning(f"**Enrichment data missing:** Only {enriched_preds}/{total_preds} predictions have enrichment factors populated.")
+
+            col_bf1, col_bf2 = st.columns([3, 1])
+            with col_bf1:
+                st.caption("Run backfill to populate role_tier, days_rest, is_b2b, game_script_tier, and position_matchup_factor for historical predictions.")
+            with col_bf2:
+                if st.button("🔄 Backfill Enrichments", type="primary"):
+                    with st.spinner("Backfilling enrichment data... This may take a minute."):
+                        try:
+                            from backfill_enrichments import backfill_enrichments
+                            stats = backfill_enrichments(
+                                enrichment_conn,
+                                days=None,  # All predictions
+                                apply_adjustments=False,  # Don't modify projections
+                                verbose=False
+                            )
+                            st.success(f"Backfill complete! Enriched {stats['total_enriched']} predictions across {stats['dates_processed']} dates.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Backfill failed: {e}")
+
+            st.divider()
+
         # Tabs for different views
         val_tab1, val_tab2, val_tab3, val_tab4 = st.tabs([
             "📊 Weekly Summary",
