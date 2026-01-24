@@ -385,6 +385,7 @@ tab_titles = [
     "Admin Panel",
     "Tournament Strategy",
     "Backtest Analysis",
+    "Enrichment Validation",
     "FanDuel Compare",
     "Model vs FanDuel",
     "Model Review",
@@ -9875,6 +9876,278 @@ if selected_page == "Backtest Analysis":
             **Tie-Friendly Overlap** counts picks that scored ≥ the #3 threshold,
             avoiding false negatives when ties exist.
             """)
+
+# Enrichment Validation tab --------------------------------------------------
+if selected_page == "Enrichment Validation":
+    st.header("🔬 Enrichment Validation")
+    st.caption("Track and validate the 4 data enrichments (Rest, Game Script, Roles, Position Defense)")
+
+    enrichment_conn = get_connection(str(db_path))
+
+    # Import monitoring modules
+    try:
+        from enrichment_monitor import (
+            ensure_monitoring_tables,
+            calculate_weekly_summary,
+            check_alerts,
+            get_active_alerts,
+            populate_daily_audit_log,
+            backfill_audit_log
+        )
+        from enrichment_config import ENRICHMENT_CONFIG, validate_config
+        monitoring_available = True
+    except ImportError as e:
+        monitoring_available = False
+        st.error(f"Enrichment monitoring modules not found: {e}")
+
+    if monitoring_available:
+        ensure_monitoring_tables(enrichment_conn)
+
+        # Tabs for different views
+        val_tab1, val_tab2, val_tab3, val_tab4 = st.tabs([
+            "📊 Weekly Summary",
+            "🚨 Alerts",
+            "⚙️ Configuration",
+            "🧪 Ablation Study"
+        ])
+
+        with val_tab1:
+            st.subheader("Weekly Enrichment Performance")
+
+            # Date range selector
+            col1, col2, col3 = st.columns([2, 2, 1])
+            with col1:
+                summary_weeks = st.number_input("Weeks to analyze", min_value=1, max_value=12, value=4)
+            with col3:
+                if st.button("Refresh Summary", key="refresh_weekly_summary"):
+                    with st.spinner("Calculating weekly summary..."):
+                        from datetime import timedelta
+                        for i in range(summary_weeks):
+                            week_end = (datetime.now() - timedelta(days=1+i*7)).strftime('%Y-%m-%d')
+                            calculate_weekly_summary(enrichment_conn, week_end)
+                    st.success("Summary refreshed!")
+                    st.rerun()
+
+            # Load and display weekly summaries
+            try:
+                summary_df = pd.read_sql_query("""
+                    SELECT week_ending, total_predictions, overall_mae, overall_bias,
+                           b2b_predictions, b2b_effect_observed,
+                           blowout_predictions, close_game_predictions,
+                           star_mae, starter_mae, rotation_mae, bench_mae,
+                           ceiling_hit_rate
+                    FROM enrichment_weekly_summary
+                    ORDER BY week_ending DESC
+                    LIMIT ?
+                """, enrichment_conn, params=[summary_weeks])
+
+                if not summary_df.empty:
+                    # Display key metrics
+                    latest = summary_df.iloc[0]
+
+                    metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+                    with metric_col1:
+                        st.metric("Overall MAE", f"{latest['overall_mae']:.2f}" if latest['overall_mae'] else "N/A")
+                    with metric_col2:
+                        st.metric("Ceiling Hit Rate", f"{latest['ceiling_hit_rate']:.1%}" if latest['ceiling_hit_rate'] else "N/A")
+                    with metric_col3:
+                        b2b_effect = latest.get('b2b_effect_observed')
+                        st.metric("B2B Effect", f"{b2b_effect:.1%}" if b2b_effect else "N/A")
+                    with metric_col4:
+                        st.metric("Predictions", int(latest['total_predictions']) if latest['total_predictions'] else 0)
+
+                    st.divider()
+
+                    # Weekly trend chart
+                    st.subheader("MAE Trend by Week")
+                    if len(summary_df) > 1:
+                        chart_df = summary_df[['week_ending', 'overall_mae', 'star_mae', 'bench_mae']].copy()
+                        chart_df = chart_df.melt(id_vars=['week_ending'], var_name='Metric', value_name='MAE')
+                        st.line_chart(chart_df.pivot(index='week_ending', columns='Metric', values='MAE'))
+
+                    # Role tier breakdown
+                    st.subheader("MAE by Role Tier")
+                    role_cols = st.columns(4)
+                    for i, role in enumerate(['star', 'starter', 'rotation', 'bench']):
+                        with role_cols[i]:
+                            mae_val = latest.get(f'{role}_mae')
+                            st.metric(role.upper(), f"{mae_val:.2f}" if mae_val else "N/A")
+
+                    # Full summary table
+                    with st.expander("Full Weekly Data"):
+                        st.dataframe(summary_df, use_container_width=True)
+                else:
+                    st.info("No weekly summary data yet. Click 'Refresh Summary' to generate.")
+
+                    if st.button("Backfill Last 14 Days", key="backfill_audit"):
+                        with st.spinner("Backfilling audit log..."):
+                            count = backfill_audit_log(enrichment_conn, days=14)
+                            st.success(f"Backfilled {count} audit records")
+                            calculate_weekly_summary(enrichment_conn)
+                            st.rerun()
+
+            except Exception as e:
+                st.error(f"Error loading summary: {e}")
+
+        with val_tab2:
+            st.subheader("Active Alerts")
+
+            # Check for new alerts
+            if st.button("Check for Alerts", key="check_alerts_btn"):
+                with st.spinner("Checking alert conditions..."):
+                    alerts = check_alerts(enrichment_conn, verbose=False)
+                if alerts:
+                    st.warning(f"{len(alerts)} new alert(s) triggered!")
+                else:
+                    st.success("No new alerts")
+                st.rerun()
+
+            # Display active alerts
+            active_alerts = get_active_alerts(enrichment_conn)
+
+            if active_alerts:
+                for alert in active_alerts:
+                    severity = alert['severity']
+                    if severity == 'HIGH' or severity == 'CRITICAL':
+                        st.error(f"**[{severity}]** {alert['message']}")
+                    elif severity == 'MEDIUM':
+                        st.warning(f"**[{severity}]** {alert['message']}")
+                    else:
+                        st.info(f"**[{severity}]** {alert['message']}")
+            else:
+                st.success("No active alerts")
+
+            # Alert thresholds reference
+            with st.expander("Alert Thresholds Reference"):
+                st.markdown("""
+                | Alert | Condition | Severity |
+                |-------|-----------|----------|
+                | B2B Effect Flip | B2B players outperform non-B2B | HIGH |
+                | B2B Effect Weak | B2B effect < 3% | MEDIUM |
+                | Blowout Overcorrection | Star MAE in blowouts > 6 | MEDIUM |
+                | Star Underperformance | STAR MAE > 5 | MEDIUM |
+                | Position Factor Degradation | Position factor worsening MAE | MEDIUM |
+                | Overall MAE Spike | MAE > 5.5 | HIGH |
+                | Ceiling Hit Drop | Ceiling hit rate < 60% | MEDIUM |
+                """)
+
+        with val_tab3:
+            st.subheader("Enrichment Configuration")
+
+            # Show current config
+            config_issues = validate_config()
+
+            if config_issues['errors']:
+                st.error("Configuration Errors:")
+                for e in config_issues['errors']:
+                    st.write(f"  - {e}")
+
+            if config_issues['warnings']:
+                st.warning("Configuration Warnings:")
+                for w in config_issues['warnings']:
+                    st.write(f"  - {w}")
+
+            if not config_issues['errors'] and not config_issues['warnings']:
+                st.success("Configuration is valid")
+
+            # Display config sections
+            config_col1, config_col2 = st.columns(2)
+
+            with config_col1:
+                st.markdown("### Rest/B2B")
+                rest_cfg = ENRICHMENT_CONFIG['rest']
+                st.write(f"- B2B Multiplier: **{rest_cfg['b2b_multiplier']}** ({(1-rest_cfg['b2b_multiplier'])*100:.0f}% penalty)")
+                st.write(f"- Rested Multiplier: **{rest_cfg['rested_multiplier']}** (+{(rest_cfg['rested_multiplier']-1)*100:.0f}% boost)")
+                st.write(f"- Rested Threshold: **{rest_cfg['rested_threshold_days']}** days")
+                st.write(f"- Enabled: **{rest_cfg['enabled']}**")
+
+                st.markdown("### Game Script")
+                gs_cfg = ENRICHMENT_CONFIG['game_script']
+                st.write(f"- Blowout Threshold: **{gs_cfg['blowout_spread_threshold']}** pts")
+                st.write(f"- Close Game Threshold: **{gs_cfg['close_spread_threshold']}** pts")
+                st.write(f"- Star Blowout Adj: **{gs_cfg['star_blowout_minutes_adj']}** min")
+                st.write(f"- Bench Blowout Adj: **+{gs_cfg['bench_blowout_minutes_adj']}** min")
+
+            with config_col2:
+                st.markdown("### Role Tiers")
+                role_cfg = ENRICHMENT_CONFIG['roles']
+                st.write(f"- STAR: **{role_cfg['star_min_ppg']}** PPG, **{role_cfg['star_min_minutes']}** min")
+                st.write(f"- STARTER: **{role_cfg['starter_min_ppg']}** PPG, **{role_cfg['starter_min_minutes']}** min")
+                st.write(f"- ROTATION: **{role_cfg['rotation_min_minutes']}** min")
+
+                st.markdown("### Position Defense")
+                pos_cfg = ENRICHMENT_CONFIG['position_defense']
+                st.write("Grade Factors:")
+                for grade, factor in pos_cfg['grade_factors'].items():
+                    effect = (factor - 1) * 100
+                    st.write(f"  - Grade {grade}: **{factor}** ({effect:+.0f}%)")
+
+        with val_tab4:
+            st.subheader("Ablation Study")
+            st.caption("Compare model variants with different enrichment combinations")
+
+            # Date range for ablation
+            abl_col1, abl_col2, abl_col3 = st.columns([2, 2, 1])
+            with abl_col1:
+                abl_start = st.date_input("Start Date", value=datetime.now() - timedelta(days=14), key="abl_start")
+            with abl_col2:
+                abl_end = st.date_input("End Date", value=datetime.now() - timedelta(days=1), key="abl_end")
+            with abl_col3:
+                run_ablation = st.button("Run Ablation", key="run_ablation_btn")
+
+            if run_ablation:
+                with st.spinner("Running ablation study..."):
+                    try:
+                        from evaluation.ablation_backtest import run_ablation_study
+                        results = run_ablation_study(
+                            enrichment_conn,
+                            abl_start.strftime('%Y-%m-%d'),
+                            abl_end.strftime('%Y-%m-%d'),
+                            verbose=False
+                        )
+
+                        if results.variants:
+                            st.session_state['ablation_results'] = results
+                            st.success("Ablation study complete!")
+                        else:
+                            st.warning("No data found for date range")
+                    except Exception as e:
+                        st.error(f"Ablation study failed: {e}")
+
+            # Display results if available
+            if 'ablation_results' in st.session_state:
+                results = st.session_state['ablation_results']
+
+                st.markdown(f"**Best Variant:** {results.best_variant}")
+
+                # Results table
+                abl_data = []
+                for name, result in results.variants.items():
+                    vs_baseline = f"{result.mae_improvement_pct:+.1f}%" if result.mae_improvement_pct else "-"
+                    abl_data.append({
+                        'Variant': name,
+                        'MAE': result.mae,
+                        'vs Baseline': vs_baseline,
+                        'RMSE': result.rmse,
+                        'Bias': result.bias,
+                        'Ceiling Hit': f"{result.ceiling_hit_rate:.1%}",
+                        'N': result.n_predictions
+                    })
+
+                abl_df = pd.DataFrame(abl_data)
+                st.dataframe(abl_df, use_container_width=True, hide_index=True)
+
+                # Visual comparison
+                st.subheader("MAE Comparison")
+                chart_data = pd.DataFrame({
+                    'Variant': [r['Variant'] for r in abl_data],
+                    'MAE': [r['MAE'] for r in abl_data]
+                })
+                st.bar_chart(chart_data.set_index('Variant'))
+            else:
+                st.info("Click 'Run Ablation' to compare enrichment variants")
+
+    enrichment_conn.close()
 
 # FanDuel Compare tab --------------------------------------------------------
 if selected_page == "FanDuel Compare":
