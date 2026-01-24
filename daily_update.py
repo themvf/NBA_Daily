@@ -158,6 +158,31 @@ def main():
         print("\n❌ Failed to fetch game data. Aborting.")
         sys.exit(1)
 
+    # Step 1.5: Refresh enrichment tables (role tiers, position defense)
+    print(f"\n{'='*70}")
+    print("STEP 1.5: Refreshing Enrichment Tables")
+    print(f"{'='*70}")
+
+    try:
+        conn = sqlite3.connect('nba_stats.db')
+
+        # Refresh player roles (STAR/STARTER/ROTATION/BENCH)
+        from depth_chart import refresh_all_player_roles
+        role_count = refresh_all_player_roles(conn, '2025-26')
+        print(f"  - Player roles refreshed: {role_count}")
+
+        # Refresh position-specific defense data
+        from position_ppm_stats import refresh_team_position_defense
+        pos_def_count = refresh_team_position_defense(conn, '2025-26')
+        print(f"  - Position defense records: {pos_def_count}")
+
+        conn.close()
+        print("\n[OK] Enrichment tables updated")
+
+    except Exception as e:
+        print(f"\n[WARNING] Could not refresh enrichments: {e}")
+        print("Continuing without enrichment updates...")
+
     # Step 2: Score predictions
     step2_success = run_command(
         'python -c "from score_predictions import score_all_unscored; score_all_unscored()"',

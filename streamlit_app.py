@@ -164,7 +164,10 @@ def load_predictions_for_date(conn: sqlite3.Connection, game_date: str) -> pd.Da
             season_avg_ppg, recent_avg_5, recent_avg_3,
             dfs_score, dfs_grade, analytics_used,
             opponent_def_rating, vs_opponent_avg, vs_opponent_games,
-            prediction_date, player_id, team_id, opponent_id
+            prediction_date, player_id, team_id, opponent_id,
+            days_rest, rest_multiplier, is_b2b,
+            game_script_tier, blowout_risk, minutes_adjustment,
+            role_tier, position_matchup_factor
         FROM predictions
         WHERE game_date = ?
         ORDER BY dfs_score DESC
@@ -178,22 +181,82 @@ def display_team_predictions(team_preds: pd.DataFrame):
         st.caption("No predictions available")
         return
 
-    # Format for display
-    display_df = team_preds[[
-        'player_name', 'projected_ppg', 'proj_confidence',
-        'proj_floor', 'proj_ceiling', 'dfs_score', 'dfs_grade'
-    ]].copy()
+    # Format for display - include enrichment factors if available
+    cols_to_display = ['player_name', 'projected_ppg', 'proj_confidence',
+                       'proj_floor', 'proj_ceiling', 'dfs_score', 'dfs_grade']
 
-    display_df.columns = ['Player', 'Proj PPG', 'Confidence', 'Floor', 'Ceiling', 'DFS Score', 'Grade']
+    # Add enrichment columns if they exist
+    has_enrichments = 'role_tier' in team_preds.columns and team_preds['role_tier'].notna().any()
+
+    if has_enrichments:
+        # Create enrichment indicator column
+        team_preds = team_preds.copy()
+
+        def format_enrichment(row):
+            """Create enrichment indicator string."""
+            indicators = []
+
+            # Rest status
+            if row.get('is_b2b') == 1:
+                indicators.append("B2B")
+            elif row.get('days_rest') and row.get('days_rest') >= 3:
+                indicators.append("REST")
+
+            # Role tier
+            role = row.get('role_tier', '')
+            if role == 'STAR':
+                indicators.append("*")
+            elif role == 'BENCH':
+                indicators.append("(B)")
+
+            # Game script
+            script = row.get('game_script_tier', '')
+            if script == 'blowout':
+                indicators.append("BLO")
+            elif script == 'close_game':
+                indicators.append("CLS")
+
+            # Position matchup
+            pos_factor = row.get('position_matchup_factor', 1.0)
+            if pos_factor and pos_factor > 1.05:
+                indicators.append("+")
+            elif pos_factor and pos_factor < 0.95:
+                indicators.append("-")
+
+            return " ".join(indicators) if indicators else ""
+
+        team_preds['factors'] = team_preds.apply(format_enrichment, axis=1)
+        cols_to_display.append('factors')
+
+    display_df = team_preds[cols_to_display].copy()
+
+    # Set column names
+    if has_enrichments:
+        display_df.columns = ['Player', 'Proj PPG', 'Confidence', 'Floor', 'Ceiling', 'DFS Score', 'Grade', 'Factors']
+    else:
+        display_df.columns = ['Player', 'Proj PPG', 'Confidence', 'Floor', 'Ceiling', 'DFS Score', 'Grade']
 
     # Format numeric columns
-    display_df['Proj PPG'] = display_df['Proj PPG'].map(lambda x: f"{x:.1f}")
-    display_df['Confidence'] = display_df['Confidence'].map(lambda x: f"{x:.0%}")
-    display_df['Floor'] = display_df['Floor'].map(lambda x: f"{x:.1f}")
-    display_df['Ceiling'] = display_df['Ceiling'].map(lambda x: f"{x:.1f}")
-    display_df['DFS Score'] = display_df['DFS Score'].map(lambda x: f"{x:.1f}")
+    display_df['Proj PPG'] = display_df['Proj PPG'].map(lambda x: f"{x:.1f}" if pd.notna(x) else "-")
+    display_df['Confidence'] = display_df['Confidence'].map(lambda x: f"{x:.0%}" if pd.notna(x) else "-")
+    display_df['Floor'] = display_df['Floor'].map(lambda x: f"{x:.1f}" if pd.notna(x) else "-")
+    display_df['Ceiling'] = display_df['Ceiling'].map(lambda x: f"{x:.1f}" if pd.notna(x) else "-")
+    display_df['DFS Score'] = display_df['DFS Score'].map(lambda x: f"{x:.1f}" if pd.notna(x) else "-")
 
     st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+    # Add legend for factors if enrichments exist
+    if has_enrichments and team_preds['factors'].str.len().max() > 0:
+        with st.expander("Factor Legend", expanded=False):
+            st.markdown("""
+            - **B2B**: Back-to-back game (-8% fatigue)
+            - **REST**: 3+ days rest (+5% boost)
+            - __*__: Star player
+            - **(B)**: Bench player
+            - **BLO**: Blowout risk (starters may rest)
+            - **CLS**: Close game (heavy minutes expected)
+            - **+/-**: Position matchup advantage/disadvantage
+            """)
 
 
 st.set_page_config(page_title="NBA Daily Insights", layout="wide", initial_sidebar_state="expanded")

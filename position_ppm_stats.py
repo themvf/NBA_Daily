@@ -314,6 +314,197 @@ def analyze_all_position_matchups(
     return pd.DataFrame(results)
 
 
+# =============================================================================
+# DATABASE PERSISTENCE
+# =============================================================================
+
+def _ppm_to_grade(ppm: float) -> str:
+    """Convert PPM to letter grade."""
+    if ppm <= 0.42:
+        return 'A'  # Elite defense
+    elif ppm <= 0.48:
+        return 'B'  # Good defense
+    elif ppm <= 0.52:
+        return 'C'  # Average
+    elif ppm <= 0.56:
+        return 'D'  # Below average
+    else:
+        return 'F'  # Poor defense
+
+
+def refresh_team_position_defense(
+    conn: sqlite3.Connection,
+    season: str = '2025-26'
+) -> int:
+    """
+    Calculate and store position-specific defense ratings for all teams.
+
+    This populates the team_position_defense table with how each team
+    defends against Guards, Forwards, and Centers.
+
+    Args:
+        conn: Database connection
+        season: Season string
+
+    Returns:
+        Number of records updated
+    """
+    cursor = conn.cursor()
+
+    # Get all teams with data this season
+    cursor.execute("""
+        SELECT DISTINCT team_id FROM team_game_logs
+        WHERE season = ?
+    """, [season])
+    team_ids = [row[0] for row in cursor.fetchall()]
+
+    now = datetime.now().isoformat()
+    count = 0
+
+    for team_id in team_ids:
+        for position in ['Guard', 'Forward', 'Center']:
+            pos_data = get_position_defensive_ppm(conn, team_id, position, season)
+
+            if pos_data and pos_data['games_count'] >= 3:
+                avg_pts = pos_data['avg_def_ppm_vs_position'] * 25  # Approx PPG from PPM
+                grade = _ppm_to_grade(pos_data['avg_def_ppm_vs_position'])
+
+                cursor.execute("""
+                    INSERT OR REPLACE INTO team_position_defense
+                    (team_id, season, position, avg_pts_allowed, games_analyzed, league_rank, grade, calculated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    team_id,
+                    season,
+                    position,
+                    round(avg_pts, 1),
+                    pos_data['games_count'],
+                    None,  # League rank calculated separately if needed
+                    grade,
+                    now
+                ))
+                count += 1
+
+    conn.commit()
+
+    # Update league rankings per position
+    for position in ['Guard', 'Forward', 'Center']:
+        cursor.execute("""
+            SELECT team_id, avg_pts_allowed
+            FROM team_position_defense
+            WHERE season = ? AND position = ?
+            ORDER BY avg_pts_allowed ASC
+        """, [season, position])
+
+        ranked = cursor.fetchall()
+        for rank, (tid, _) in enumerate(ranked, 1):
+            cursor.execute("""
+                UPDATE team_position_defense
+                SET league_rank = ?
+                WHERE team_id = ? AND season = ? AND position = ?
+            """, [rank, tid, season, position])
+
+    conn.commit()
+    return count
+
+
+def get_position_matchup_factor(
+    conn: sqlite3.Connection,
+    opp_team_id: int,
+    player_position: str,
+    season: str = '2025-26'
+) -> float:
+    """
+    Get position-specific matchup adjustment factor.
+
+    This returns a multiplier to apply to player projections based on
+    how the opponent defends their position.
+
+    Args:
+        conn: Database connection
+        opp_team_id: Opponent team ID (defensive team)
+        player_position: Player's position ('Guard', 'Forward', 'Center', or specific like 'PG', 'SF')
+        season: Season string
+
+    Returns:
+        Adjustment factor:
+        - 1.10 = opponent weak vs this position (+10% boost)
+        - 1.00 = neutral
+        - 0.95 = opponent strong vs this position (-5% penalty)
+    """
+    # Normalize position to our categories
+    pos_upper = player_position.upper() if player_position else ''
+    if pos_upper in ['PG', 'SG', 'G', 'GUARD']:
+        position = 'Guard'
+    elif pos_upper in ['SF', 'PF', 'F', 'FORWARD']:
+        position = 'Forward'
+    elif pos_upper in ['C', 'CENTER']:
+        position = 'Center'
+    else:
+        position = 'Guard'  # Default
+
+    cursor = conn.cursor()
+
+    # Get opponent's defense vs this position
+    cursor.execute("""
+        SELECT grade, league_rank FROM team_position_defense
+        WHERE team_id = ? AND season = ? AND position = ?
+    """, [opp_team_id, season, position])
+
+    result = cursor.fetchone()
+
+    if not result:
+        return 1.0  # No data, neutral
+
+    grade, rank = result
+
+    # Convert grade to factor
+    grade_factors = {
+        'A': 0.93,  # Tough matchup: -7%
+        'B': 0.97,  # Good defense: -3%
+        'C': 1.00,  # Average: neutral
+        'D': 1.05,  # Below average: +5%
+        'F': 1.10,  # Poor defense: +10%
+    }
+
+    return grade_factors.get(grade, 1.0)
+
+
+def get_position_defense_summary(
+    conn: sqlite3.Connection,
+    team_id: int,
+    season: str = '2025-26'
+) -> Dict[str, Dict]:
+    """
+    Get summary of team's position-specific defense.
+
+    Args:
+        conn: Database connection
+        team_id: Team ID
+        season: Season string
+
+    Returns:
+        Dict mapping position -> {grade, rank, avg_pts_allowed}
+    """
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT position, grade, league_rank, avg_pts_allowed, games_analyzed
+        FROM team_position_defense
+        WHERE team_id = ? AND season = ?
+    """, [team_id, season])
+
+    return {
+        row[0]: {
+            'grade': row[1],
+            'rank': row[2],
+            'avg_pts_allowed': row[3],
+            'games_analyzed': row[4]
+        }
+        for row in cursor.fetchall()
+    }
+
+
 if __name__ == '__main__':
     # Test the module
     conn = sqlite3.connect('nba_stats.db')
