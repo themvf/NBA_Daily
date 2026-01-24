@@ -9882,7 +9882,8 @@ if selected_page == "Enrichment Validation":
     st.header("🔬 Enrichment Validation")
     st.caption("Track and validate the 4 data enrichments (Rest, Game Script, Roles, Position Defense)")
 
-    enrichment_conn = get_connection(str(db_path))
+    # Create fresh connection (don't use cached connection that may be closed)
+    enrichment_conn = sqlite3.connect(str(db_path))
 
     # Import monitoring modules
     try:
