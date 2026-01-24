@@ -9941,6 +9941,19 @@ if selected_page == "Enrichment Validation":
                                 verbose=False
                             )
                             st.success(f"Backfill complete! Enriched {stats['total_enriched']} predictions across {stats['dates_processed']} dates.")
+
+                            # Save to S3 for persistence
+                            try:
+                                storage = s3_storage.S3PredictionStorage()
+                                if storage.is_configured():
+                                    success, message = storage.upload_database(db_path)
+                                    if success:
+                                        st.info("☁️ Database backed up to S3")
+                                    else:
+                                        st.warning(f"⚠️ S3 backup failed: {message}")
+                            except Exception as s3_err:
+                                st.warning(f"⚠️ S3 backup error: {s3_err}")
+
                             st.rerun()
                         except Exception as e:
                             st.error(f"Backfill failed: {e}")
