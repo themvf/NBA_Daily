@@ -8902,6 +8902,110 @@ if selected_page == "Backtest Analysis":
         else:
             st.info("Click 'Run Stack & Total Analysis' to analyze lineup stacks and high-total game correlation.")
 
+        # =======================================================================
+        # Strategy Effectiveness - What patterns actually WIN?
+        # =======================================================================
+        st.divider()
+        st.markdown("### Strategy Effectiveness Analysis")
+        st.caption("Analyze what WINNING lineups look like to optimize your strategy")
+
+        if st.button("Analyze Winning Patterns", key="run_strategy_effectiveness_btn"):
+            with st.spinner("Analyzing winning lineup patterns..."):
+                try:
+                    effectiveness = backtest_portfolio.analyze_strategy_effectiveness(
+                        backtest_conn,
+                        port_start_date,
+                        port_end_date,
+                        verbose=False
+                    )
+                    st.session_state['strategy_effectiveness'] = effectiveness
+                    st.success(f"Analysis complete! Analyzed {effectiveness.get('total_slates', 0)} slates.")
+                except Exception as e:
+                    st.error(f"Analysis failed: {e}")
+                    import traceback
+                    st.code(traceback.format_exc())
+
+        if 'strategy_effectiveness' in st.session_state:
+            eff = st.session_state['strategy_effectiveness']
+
+            if 'error' not in eff:
+                st.markdown("#### What Do Winning Lineups Look Like?")
+                st.caption("Characteristics of the OPTIMAL (winning) lineup on each slate")
+
+                win_col1, win_col2, win_col3, win_col4 = st.columns(4)
+
+                with win_col1:
+                    st.metric(
+                        "Optimal Lineups Stacked",
+                        f"{eff['optimal_stacked_pct']:.0f}%",
+                        help="% of optimal lineups that had 2+ players from same game"
+                    )
+                with win_col2:
+                    st.metric(
+                        "Optimal Same-Team",
+                        f"{eff['optimal_same_team_pct']:.0f}%",
+                        help="% of optimal lineups with 2+ players from same team"
+                    )
+                with win_col3:
+                    st.metric(
+                        "Optimal Cross-Team",
+                        f"{eff['optimal_cross_team_pct']:.0f}%",
+                        help="% of optimal lineups with cross-team stacks"
+                    )
+                with win_col4:
+                    st.metric(
+                        "Avg from High-Total",
+                        f"{eff['avg_optimal_from_high_total']:.1f}/3",
+                        help="Avg number of top 3 scorers from high-total games"
+                    )
+
+                # Recommendations
+                st.markdown("#### Strategy Recommendations")
+
+                for rec in eff.get('recommendations', []):
+                    if rec['direction'] == 'increase':
+                        st.success(f"**{rec['strategy']}**: {rec['finding']}  \n→ {rec['action']}")
+                    elif rec['direction'] == 'decrease':
+                        st.warning(f"**{rec['strategy']}**: {rec['finding']}  \n→ {rec['action']}")
+                    else:
+                        st.info(f"**{rec['strategy']}**: {rec['finding']}  \n→ {rec['action']}")
+
+                # Summary comparison
+                st.markdown("#### Your Strategy vs Optimal")
+
+                compare_col1, compare_col2 = st.columns(2)
+
+                with compare_col1:
+                    st.markdown("**Your Lineups:**")
+                    st.write(f"- Best lineup stacked: {eff['our_stacked_best_pct']:.0f}% of slates")
+                    st.write(f"- Win rate: {eff['our_win_rate']:.1f}%")
+
+                with compare_col2:
+                    st.markdown("**Optimal Lineups:**")
+                    st.write(f"- Were stacked: {eff['optimal_stacked_pct']:.0f}% of slates")
+                    st.write(f"- From high-total games: {eff['avg_optimal_from_high_total']:.1f}/3 players")
+
+                # Key insight
+                if eff['optimal_stacked_pct'] < 40 and eff['our_stacked_best_pct'] > 60:
+                    st.error(
+                        "**Key Finding:** You're stacking heavily, but optimal lineups often aren't stacked. "
+                        "Consider reducing stack bucket allocation."
+                    )
+                elif eff['optimal_stacked_pct'] > 60 and eff['our_stacked_best_pct'] < 40:
+                    st.error(
+                        "**Key Finding:** Optimal lineups are often stacked, but your best lineups aren't. "
+                        "Consider increasing stack bucket allocation."
+                    )
+                elif eff['our_win_rate'] > 30:
+                    st.success(
+                        f"**Key Finding:** Your {eff['our_win_rate']:.0f}% win rate is strong! "
+                        "Current strategy is working well."
+                    )
+            else:
+                st.warning(eff.get('error', 'Analysis error'))
+        else:
+            st.info("Click 'Analyze Winning Patterns' to see what characteristics winning lineups have.")
+
         # Explanation
         with st.expander("How Portfolio Backtest Works", expanded=False):
             st.markdown("""

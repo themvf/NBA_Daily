@@ -23,6 +23,7 @@ import sqlite3
 import pandas as pd
 import numpy as np
 from itertools import combinations
+from collections import Counter
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 import argparse
@@ -429,6 +430,298 @@ def analyze_high_total_games_vs_top_scorers(
         'top3_from_high_total_games': top3_from_high_total,
         'top3_from_high_total_pct': top3_from_high_total / 3 * 100,
         'high_total_teams': list(high_total_teams)[:4],  # Limit for display
+    }
+
+
+# =============================================================================
+# WINNING LINEUP ANALYSIS - What strategies actually win?
+# =============================================================================
+
+def analyze_optimal_lineup_characteristics(
+    actuals: pd.DataFrame,
+    predictions: pd.DataFrame,
+    conn: sqlite3.Connection = None,
+    game_date: str = None
+) -> Dict:
+    """
+    Analyze characteristics of the OPTIMAL (winning) lineup.
+
+    This tells us what a winning lineup actually looks like:
+    - Was it stacked?
+    - Did players come from high-total games?
+
+    Args:
+        actuals: DataFrame with actual scores (player_id, actual_ppg, team)
+        predictions: DataFrame with predictions (player_id, game_id, team_name)
+        conn: Optional DB connection for Vegas data
+        game_date: Optional date for Vegas lookup
+
+    Returns:
+        Dict with optimal lineup characteristics
+    """
+    # Get top 3 scorers (the optimal lineup)
+    top3 = actuals.nlargest(3, 'actual_ppg')
+    top3_ids = top3['player_id'].tolist()
+
+    # Build lookups from predictions
+    team_lookup = {}
+    game_lookup = {}
+    for _, row in predictions.iterrows():
+        pid = row['player_id']
+        team_lookup[pid] = row.get('team_abbreviation') or row.get('team_name', 'UNK')
+        game_lookup[pid] = row.get('game_id', 'UNK')
+
+    # Check if optimal lineup is stacked
+    optimal_teams = [team_lookup.get(pid, 'UNK') for pid in top3_ids]
+    optimal_games = [game_lookup.get(pid, 'UNK') for pid in top3_ids]
+
+    # Count players per game
+    from collections import Counter
+    game_counts = Counter(g for g in optimal_games if g != 'UNK')
+
+    optimal_is_stacked = any(count >= 2 for count in game_counts.values())
+    optimal_same_team = len(set(optimal_teams)) < len(optimal_teams) and 'UNK' not in optimal_teams
+
+    # Check if from same game but different teams (cross-team stack)
+    optimal_cross_team = False
+    for game, count in game_counts.items():
+        if count >= 2:
+            # Get teams of players in this game
+            teams_in_game = [optimal_teams[i] for i, g in enumerate(optimal_games) if g == game]
+            if len(set(teams_in_game)) > 1:
+                optimal_cross_team = True
+
+    # Check if top scorers came from high-total games
+    optimal_from_high_total = 0
+    if conn and game_date:
+        try:
+            odds_query = """
+                SELECT game_id, over_under
+                FROM game_odds
+                WHERE game_date = ?
+                ORDER BY over_under DESC
+                LIMIT 2
+            """
+            odds_df = pd.read_sql_query(odds_query, conn, params=[game_date])
+            if not odds_df.empty:
+                high_total_game_ids = set(odds_df['game_id'].tolist())
+                optimal_from_high_total = sum(1 for g in optimal_games if g in high_total_game_ids)
+        except Exception:
+            pass
+
+    return {
+        'optimal_ids': top3_ids,
+        'optimal_sum': top3['actual_ppg'].sum(),
+        'optimal_is_stacked': optimal_is_stacked,
+        'optimal_same_team': optimal_same_team,
+        'optimal_cross_team': optimal_cross_team,
+        'optimal_from_high_total': optimal_from_high_total,
+        'optimal_games': list(set(optimal_games)),
+    }
+
+
+def analyze_strategy_effectiveness(
+    conn: sqlite3.Connection,
+    date_from: str,
+    date_to: str,
+    verbose: bool = True
+) -> Dict:
+    """
+    Analyze which lineup construction strategies actually lead to wins.
+
+    Compares:
+    1. Stacked vs non-stacked winning lineups
+    2. High-total game players in winning lineups
+    3. What the OPTIMAL lineup looked like (to guide strategy)
+
+    Returns actionable insights on what to change.
+    """
+    query = """
+        SELECT DISTINCT game_date
+        FROM predictions
+        WHERE game_date BETWEEN ? AND ?
+          AND actual_ppg IS NOT NULL
+        ORDER BY game_date
+    """
+    dates_df = pd.read_sql_query(query, conn, params=[date_from, date_to])
+    dates = dates_df['game_date'].tolist()
+
+    if verbose:
+        print(f"Analyzing strategy effectiveness for {len(dates)} dates...")
+
+    # Track optimal lineup characteristics
+    optimal_stacked_count = 0
+    optimal_same_team_count = 0
+    optimal_cross_team_count = 0
+    optimal_high_total_counts = []  # How many of top 3 from high-total games
+
+    # Track our winning lineup characteristics (when we won)
+    our_wins = 0
+    our_wins_stacked = 0
+    our_wins_high_total = []
+
+    # Track all our lineups
+    total_slates = 0
+    slates_with_stacked_best = 0
+
+    for game_date in dates:
+        try:
+            predictions = get_predictions_for_date(conn, game_date)
+            actuals = get_actuals_for_date(conn, game_date)
+
+            if predictions.empty or actuals.empty or len(actuals) < 10:
+                continue
+
+            total_slates += 1
+
+            # Analyze optimal lineup
+            optimal_chars = analyze_optimal_lineup_characteristics(
+                actuals, predictions, conn, game_date
+            )
+
+            if optimal_chars['optimal_is_stacked']:
+                optimal_stacked_count += 1
+            if optimal_chars['optimal_same_team']:
+                optimal_same_team_count += 1
+            if optimal_chars['optimal_cross_team']:
+                optimal_cross_team_count += 1
+            optimal_high_total_counts.append(optimal_chars['optimal_from_high_total'])
+
+            # Get our portfolio and check if we won
+            lineups = get_stored_portfolio(conn, game_date)
+            if lineups is None:
+                # Regenerate
+                player_pool = create_player_pool_from_predictions(predictions)
+                if len(player_pool) < 10:
+                    continue
+                game_ids = predictions['game_id'].dropna().unique()
+                game_envs = {gid: {'stack_score': 0.6} for gid in game_ids}
+                optimizer = TournamentLineupOptimizer(
+                    player_pool=player_pool,
+                    game_environments=game_envs
+                )
+                result = optimizer.optimize()
+                lineups = [l.player_ids() for l in result.lineups]
+
+            if not lineups:
+                continue
+
+            # Find our best lineup
+            points_lookup = dict(zip(actuals['player_id'], actuals['actual_ppg']))
+            best_sum = -np.inf
+            best_lineup = None
+
+            for lineup in lineups:
+                lineup_sum = sum(points_lookup.get(pid, 0) for pid in lineup)
+                if lineup_sum > best_sum:
+                    best_sum = lineup_sum
+                    best_lineup = lineup
+
+            # Check if we won
+            did_win = best_sum >= optimal_chars['optimal_sum'] - 0.01
+
+            # Analyze our best lineup
+            if best_lineup:
+                best_games = [predictions[predictions['player_id'] == pid]['game_id'].iloc[0]
+                             if pid in predictions['player_id'].values else 'UNK'
+                             for pid in best_lineup]
+                game_counts = Counter(g for g in best_games if g != 'UNK')
+                best_is_stacked = any(count >= 2 for count in game_counts.values())
+
+                if best_is_stacked:
+                    slates_with_stacked_best += 1
+
+                if did_win:
+                    our_wins += 1
+                    if best_is_stacked:
+                        our_wins_stacked += 1
+
+        except Exception as e:
+            if verbose:
+                print(f"  Error on {game_date}: {e}")
+            continue
+
+    # Calculate insights
+    if total_slates == 0:
+        return {'error': 'No slates analyzed'}
+
+    optimal_stacked_pct = optimal_stacked_count / total_slates * 100
+    optimal_same_team_pct = optimal_same_team_count / total_slates * 100
+    optimal_cross_team_pct = optimal_cross_team_count / total_slates * 100
+    avg_optimal_from_high_total = np.mean(optimal_high_total_counts) if optimal_high_total_counts else 0
+
+    our_stacked_best_pct = slates_with_stacked_best / total_slates * 100
+    our_win_rate = our_wins / total_slates * 100 if total_slates > 0 else 0
+
+    # Generate recommendations
+    recommendations = []
+
+    if optimal_stacked_pct < 30:
+        recommendations.append({
+            'strategy': 'STACKING',
+            'finding': f'Only {optimal_stacked_pct:.0f}% of optimal lineups were stacked',
+            'action': 'REDUCE stacking - optimal lineups often have players from different games',
+            'direction': 'decrease'
+        })
+    elif optimal_stacked_pct > 60:
+        recommendations.append({
+            'strategy': 'STACKING',
+            'finding': f'{optimal_stacked_pct:.0f}% of optimal lineups were stacked',
+            'action': 'MAINTAIN or INCREASE stacking - it aligns with winning patterns',
+            'direction': 'increase'
+        })
+    else:
+        recommendations.append({
+            'strategy': 'STACKING',
+            'finding': f'{optimal_stacked_pct:.0f}% of optimal lineups were stacked',
+            'action': 'Current stacking level is appropriate',
+            'direction': 'maintain'
+        })
+
+    if avg_optimal_from_high_total > 1.5:
+        recommendations.append({
+            'strategy': 'HIGH_TOTAL_GAMES',
+            'finding': f'Avg {avg_optimal_from_high_total:.1f} of 3 top scorers from high-total games',
+            'action': 'INCREASE weight on high-total games - they produce top scorers',
+            'direction': 'increase'
+        })
+    elif avg_optimal_from_high_total < 0.8:
+        recommendations.append({
+            'strategy': 'HIGH_TOTAL_GAMES',
+            'finding': f'Only {avg_optimal_from_high_total:.1f} of 3 top scorers from high-total games',
+            'action': 'REDUCE focus on high-total games - diversify across all games',
+            'direction': 'decrease'
+        })
+    else:
+        recommendations.append({
+            'strategy': 'HIGH_TOTAL_GAMES',
+            'finding': f'Avg {avg_optimal_from_high_total:.1f} of 3 top scorers from high-total games',
+            'action': 'High-total games are roughly average - no strong signal',
+            'direction': 'maintain'
+        })
+
+    if optimal_same_team_pct > 20:
+        recommendations.append({
+            'strategy': 'SAME_TEAM_STACKS',
+            'finding': f'{optimal_same_team_pct:.0f}% of optimal lineups had same-team stacks',
+            'action': 'Consider ADDING same-team stacks - they appear in winning lineups',
+            'direction': 'increase'
+        })
+
+    return {
+        'total_slates': total_slates,
+        'our_wins': our_wins,
+        'our_win_rate': our_win_rate,
+        # Optimal lineup patterns
+        'optimal_stacked_pct': optimal_stacked_pct,
+        'optimal_same_team_pct': optimal_same_team_pct,
+        'optimal_cross_team_pct': optimal_cross_team_pct,
+        'avg_optimal_from_high_total': avg_optimal_from_high_total,
+        # Our patterns
+        'our_stacked_best_pct': our_stacked_best_pct,
+        'our_wins_stacked': our_wins_stacked,
+        # Recommendations
+        'recommendations': recommendations,
     }
 
 
