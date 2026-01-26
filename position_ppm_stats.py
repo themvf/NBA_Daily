@@ -318,6 +318,25 @@ def analyze_all_position_matchups(
 # DATABASE PERSISTENCE
 # =============================================================================
 
+def ensure_team_position_defense_table(conn: sqlite3.Connection):
+    """Create team_position_defense table if it doesn't exist."""
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS team_position_defense (
+            team_id INTEGER NOT NULL,
+            season TEXT NOT NULL,
+            position TEXT NOT NULL,
+            avg_pts_allowed REAL NOT NULL,
+            games_analyzed INTEGER,
+            league_rank INTEGER,
+            grade TEXT,
+            calculated_at TEXT NOT NULL,
+            PRIMARY KEY (team_id, season, position)
+        )
+    """)
+    conn.commit()
+
+
 def _ppm_to_grade(ppm: float) -> str:
     """Convert PPM to letter grade."""
     if ppm <= 0.42:
@@ -349,6 +368,9 @@ def refresh_team_position_defense(
     Returns:
         Number of records updated
     """
+    # Ensure table exists before inserting
+    ensure_team_position_defense_table(conn)
+
     cursor = conn.cursor()
 
     # Get all teams with data this season

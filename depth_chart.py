@@ -32,6 +32,31 @@ import pandas as pd
 
 
 # =============================================================================
+# TABLE CREATION
+# =============================================================================
+
+def ensure_player_roles_table(conn: sqlite3.Connection):
+    """Create player_roles table if it doesn't exist."""
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS player_roles (
+            player_id INTEGER NOT NULL,
+            team_id INTEGER NOT NULL,
+            season TEXT NOT NULL,
+            role_tier TEXT NOT NULL,
+            avg_minutes REAL,
+            games_played INTEGER,
+            games_started INTEGER,
+            season_ppg REAL,
+            usage_pct REAL,
+            calculated_at TEXT NOT NULL,
+            PRIMARY KEY (player_id, team_id, season)
+        )
+    """)
+    conn.commit()
+
+
+# =============================================================================
 # ROLE TIER THRESHOLDS
 # =============================================================================
 
@@ -254,6 +279,9 @@ def refresh_all_player_roles(conn: sqlite3.Connection, season: str) -> int:
     Returns:
         Total number of player roles updated
     """
+    # Ensure table exists before inserting
+    ensure_player_roles_table(conn)
+
     cursor = conn.cursor()
 
     # Get all teams with data for this season
