@@ -9929,7 +9929,8 @@ if selected_page == "Enrichment Validation":
                 (SELECT COUNT(*) FROM enrichment_audit_log
                  WHERE days_rest IS NOT NULL AND date(game_date) >= date('now', '-7 days')) as rest_days_populated,
                 (SELECT COUNT(*) FROM enrichment_audit_log
-                 WHERE is_b2b IS NOT NULL AND date(game_date) >= date('now', '-7 days')) as b2b_populated
+                 WHERE game_script_tier IS NOT NULL AND game_script_tier != 'neutral'
+                   AND date(game_date) >= date('now', '-7 days')) as spread_populated
         """)
         health = cursor.fetchone()
         audit_7d = health[0] or 0
@@ -9937,22 +9938,29 @@ if selected_page == "Enrichment Validation":
         summaries_4w = health[2] or 0
         role_tier_pop = health[3] or 0
         rest_days_pop = health[4] or 0
-        b2b_pop = health[5] or 0
-
-        # Calculate percentages
-        role_pct = (role_tier_pop / audit_7d * 100) if audit_7d > 0 else 0
-        rest_pct = (rest_days_pop / audit_7d * 100) if audit_7d > 0 else 0
+        spread_pop = health[5] or 0
 
         # Show pipeline health status
         health_issues = []
+
+        # Handle 0-row case separately (don't compute misleading percentages)
         if audit_7d == 0:
-            health_issues.append("⚠️ No audit log entries in last 7 days")
+            health_issues.append("⚠️ No audit log entries in last 7 days - run backfill first")
+        else:
+            # Calculate percentages only when we have data
+            role_pct = (role_tier_pop / audit_7d * 100)
+            rest_pct = (rest_days_pop / audit_7d * 100)
+            spread_pct = (spread_pop / audit_7d * 100)
+
+            if role_pct < 50:
+                health_issues.append(f"⚠️ Only {role_pct:.0f}% of audit rows have role_tier")
+            if rest_pct < 50:
+                health_issues.append(f"⚠️ Only {rest_pct:.0f}% of audit rows have rest_days")
+            if spread_pct < 10:
+                health_issues.append(f"⚠️ Only {spread_pct:.0f}% have spread data (blowout/close will be 0)")
+
         if summaries_4w < 4:
             health_issues.append(f"⚠️ Only {summaries_4w}/4 weekly summaries exist")
-        if audit_7d > 0 and role_pct < 50:
-            health_issues.append(f"⚠️ Only {role_pct:.0f}% of audit rows have role_tier")
-        if audit_7d > 0 and rest_pct < 50:
-            health_issues.append(f"⚠️ Only {rest_pct:.0f}% of audit rows have rest_days")
 
         if health_issues:
             with st.expander("🔴 Pipeline Health Issues", expanded=True):
@@ -9961,8 +9969,12 @@ if selected_page == "Enrichment Validation":
                 st.caption(f"Last audit log entry: {last_audit or 'Never'}")
                 st.caption("Click 'Backfill Enrichments' below to fix these issues.")
         else:
+            role_pct = (role_tier_pop / audit_7d * 100) if audit_7d > 0 else 0
+            rest_pct = (rest_days_pop / audit_7d * 100) if audit_7d > 0 else 0
+            spread_pct = (spread_pop / audit_7d * 100) if audit_7d > 0 else 0
+
             with st.expander("🟢 Pipeline Health: OK"):
-                col_h1, col_h2, col_h3, col_h4 = st.columns(4)
+                col_h1, col_h2, col_h3, col_h4, col_h5 = st.columns(5)
                 with col_h1:
                     st.metric("Audit Rows (7d)", f"{audit_7d:,}")
                 with col_h2:
@@ -9971,6 +9983,8 @@ if selected_page == "Enrichment Validation":
                     st.metric("Role Tier %", f"{role_pct:.0f}%")
                 with col_h4:
                     st.metric("Rest Days %", f"{rest_pct:.0f}%")
+                with col_h5:
+                    st.metric("Spread %", f"{spread_pct:.0f}%")
 
         st.divider()
 
