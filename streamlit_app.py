@@ -9911,8 +9911,72 @@ if selected_page == "Enrichment Validation":
     if monitoring_available:
         ensure_monitoring_tables(enrichment_conn)
 
-        # Check if enrichment data needs backfilling
+        # =====================================================================
+        # PIPELINE HEALTH STATUS BANNER
+        # =====================================================================
         cursor = enrichment_conn.cursor()
+
+        # Get pipeline health metrics
+        cursor.execute("""
+            SELECT
+                (SELECT COUNT(*) FROM enrichment_audit_log
+                 WHERE date(game_date) >= date('now', '-7 days')) as audit_last_7d,
+                (SELECT MAX(created_at) FROM enrichment_audit_log) as last_audit_ts,
+                (SELECT COUNT(*) FROM enrichment_weekly_summary
+                 WHERE date(week_ending) >= date('now', '-28 days')) as summaries_last_4w,
+                (SELECT COUNT(*) FROM enrichment_audit_log
+                 WHERE role_tier IS NOT NULL AND date(game_date) >= date('now', '-7 days')) as role_tier_populated,
+                (SELECT COUNT(*) FROM enrichment_audit_log
+                 WHERE days_rest IS NOT NULL AND date(game_date) >= date('now', '-7 days')) as rest_days_populated,
+                (SELECT COUNT(*) FROM enrichment_audit_log
+                 WHERE is_b2b IS NOT NULL AND date(game_date) >= date('now', '-7 days')) as b2b_populated
+        """)
+        health = cursor.fetchone()
+        audit_7d = health[0] or 0
+        last_audit = health[1]
+        summaries_4w = health[2] or 0
+        role_tier_pop = health[3] or 0
+        rest_days_pop = health[4] or 0
+        b2b_pop = health[5] or 0
+
+        # Calculate percentages
+        role_pct = (role_tier_pop / audit_7d * 100) if audit_7d > 0 else 0
+        rest_pct = (rest_days_pop / audit_7d * 100) if audit_7d > 0 else 0
+
+        # Show pipeline health status
+        health_issues = []
+        if audit_7d == 0:
+            health_issues.append("⚠️ No audit log entries in last 7 days")
+        if summaries_4w < 4:
+            health_issues.append(f"⚠️ Only {summaries_4w}/4 weekly summaries exist")
+        if audit_7d > 0 and role_pct < 50:
+            health_issues.append(f"⚠️ Only {role_pct:.0f}% of audit rows have role_tier")
+        if audit_7d > 0 and rest_pct < 50:
+            health_issues.append(f"⚠️ Only {rest_pct:.0f}% of audit rows have rest_days")
+
+        if health_issues:
+            with st.expander("🔴 Pipeline Health Issues", expanded=True):
+                for issue in health_issues:
+                    st.warning(issue)
+                st.caption(f"Last audit log entry: {last_audit or 'Never'}")
+                st.caption("Click 'Backfill Enrichments' below to fix these issues.")
+        else:
+            with st.expander("🟢 Pipeline Health: OK"):
+                col_h1, col_h2, col_h3, col_h4 = st.columns(4)
+                with col_h1:
+                    st.metric("Audit Rows (7d)", f"{audit_7d:,}")
+                with col_h2:
+                    st.metric("Weekly Summaries", f"{summaries_4w}/4")
+                with col_h3:
+                    st.metric("Role Tier %", f"{role_pct:.0f}%")
+                with col_h4:
+                    st.metric("Rest Days %", f"{rest_pct:.0f}%")
+
+        st.divider()
+
+        # =====================================================================
+        # Check if enrichment data needs backfilling
+        # =====================================================================
         cursor.execute("""
             SELECT COUNT(*) as total,
                    SUM(CASE WHEN role_tier IS NOT NULL THEN 1 ELSE 0 END) as enriched
@@ -9943,17 +10007,21 @@ if selected_page == "Enrichment Validation":
                             st.success(f"Backfill complete! Enriched {stats['total_enriched']} predictions across {stats['dates_processed']} dates.")
 
                             # Step 2: Backfill audit log (copies enrichments to monitoring tables)
-                            st.info("📊 Populating audit log for monitoring...")
-                            audit_count = backfill_audit_log(enrichment_conn, days=60)
+                            # Use same window as dates_processed to cover full backfill
+                            audit_days = max(60, stats['dates_processed'] + 7)  # +7 buffer for week alignment
+                            st.info(f"📊 Populating audit log for {audit_days} days...")
+                            audit_count = backfill_audit_log(enrichment_conn, days=audit_days)
                             st.success(f"Audit log populated with {audit_count} records")
 
-                            # Step 3: Recalculate weekly summaries
-                            st.info("📈 Recalculating weekly summaries...")
+                            # Step 3: Recalculate weekly summaries for ALL weeks in backfill window
+                            # Calculate number of weeks to cover (audit_days / 7 + 1 buffer)
+                            weeks_to_calculate = (audit_days // 7) + 2
+                            st.info(f"📈 Recalculating {weeks_to_calculate} weekly summaries...")
                             from datetime import timedelta
-                            for i in range(4):  # Last 4 weeks
+                            for i in range(weeks_to_calculate):
                                 week_end = (datetime.now() - timedelta(days=1+i*7)).strftime('%Y-%m-%d')
                                 calculate_weekly_summary(enrichment_conn, week_end)
-                            st.success("Weekly summaries updated!")
+                            st.success(f"Weekly summaries updated ({weeks_to_calculate} weeks)!")
 
                             # Save to S3 for persistence
                             try:
