@@ -9942,6 +9942,19 @@ if selected_page == "Enrichment Validation":
                             )
                             st.success(f"Backfill complete! Enriched {stats['total_enriched']} predictions across {stats['dates_processed']} dates.")
 
+                            # Step 2: Backfill audit log (copies enrichments to monitoring tables)
+                            st.info("📊 Populating audit log for monitoring...")
+                            audit_count = backfill_audit_log(enrichment_conn, days=60)
+                            st.success(f"Audit log populated with {audit_count} records")
+
+                            # Step 3: Recalculate weekly summaries
+                            st.info("📈 Recalculating weekly summaries...")
+                            from datetime import timedelta
+                            for i in range(4):  # Last 4 weeks
+                                week_end = (datetime.now() - timedelta(days=1+i*7)).strftime('%Y-%m-%d')
+                                calculate_weekly_summary(enrichment_conn, week_end)
+                            st.success("Weekly summaries updated!")
+
                             # Save to S3 for persistence
                             try:
                                 storage = s3_storage.S3PredictionStorage()
