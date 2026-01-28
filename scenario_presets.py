@@ -277,9 +277,13 @@ def get_preset_recommendation(game_envs: Dict[str, dict]) -> str:
     Recommend a preset based on tonight's slate characteristics.
 
     Analyzes game environments to suggest the most appropriate preset.
+
+    UPDATED: Backtest evidence shows CLOSE_GAMES outperforms overall and on
+    large slates. High totals don't correlate well with top scorers.
+    Default is now CLOSE_GAMES unless slate has specific characteristics.
     """
     if not game_envs:
-        return "BALANCED"
+        return "CLOSE_GAMES"  # Changed from BALANCED
 
     totals = [env.get('implied_total', 220) for env in game_envs.values()]
     spreads = [abs(env.get('spread', 0)) for env in game_envs.values()]
@@ -290,19 +294,24 @@ def get_preset_recommendation(game_envs: Dict[str, dict]) -> str:
     blowout_games = sum(1 for s in spreads if s >= 10)
     high_total_games = sum(1 for t in totals if t >= 230)
 
-    # Decision logic
-    if high_total_games >= 2 and close_games >= 2:
-        return "SHOOTOUT"
-    elif close_games >= len(game_envs) * 0.5:
-        return "CLOSE_GAMES"
-    elif blowout_games >= len(game_envs) * 0.4:
+    # Decision logic - prioritize spread (close games) over totals
+    # Evidence: only 32% of top-3 scorers came from high-total games
+
+    # Small slate with mostly blowouts = BLOWOUT preset
+    if blowout_games >= len(game_envs) * 0.5:
         return "BLOWOUT"
-    elif avg_total >= 228 and avg_spread <= 5:
+
+    # Small slate (3 or fewer games) = concentrate on elites
+    if len(game_envs) <= 3:
+        return "STARS_ONLY"
+
+    # If we have several close games AND high totals = SHOOTOUT
+    # (only use this combination, not totals alone)
+    if high_total_games >= 2 and close_games >= 2 and avg_spread <= 5:
         return "SHOOTOUT"
-    elif len(game_envs) <= 3:
-        return "STARS_ONLY"  # Small slate = concentrate on elites
-    else:
-        return "BALANCED"
+
+    # Default: CLOSE_GAMES performs best across most slate types
+    return "CLOSE_GAMES"
 
 
 def format_preset_info(preset: ScenarioPreset) -> str:

@@ -10058,8 +10058,10 @@ if selected_page == "Enrichment Validation":
         st.divider()
 
         # Tabs for different views
-        val_tab1, val_tab2, val_tab3, val_tab4 = st.tabs([
+        val_tab1, val_tab2, val_tab3, val_tab4, val_tab5, val_tab6 = st.tabs([
             "📊 Weekly Summary",
+            "🔬 Minutes Lever",
+            "📉 Error Slices",
             "🚨 Alerts",
             "⚙️ Configuration",
             "🧪 Ablation Study"
@@ -10143,7 +10145,181 @@ if selected_page == "Enrichment Validation":
             except Exception as e:
                 st.error(f"Error loading summary: {e}")
 
+        # =====================================================================
+        # TAB 2: Minutes Lever (Counterfactual Analysis)
+        # =====================================================================
         with val_tab2:
+            st.subheader("Minutes Counterfactual Analysis")
+            st.caption("Quantify how much error comes from 'bad minutes' vs 'bad per-minute scoring'")
+
+            col_m1, col_m2, col_m3 = st.columns([2, 2, 1])
+            with col_m1:
+                minutes_days = st.number_input("Days to analyze", min_value=7, max_value=90, value=30, key="minutes_days")
+            with col_m2:
+                min_minutes = st.number_input("Min actual minutes", min_value=5.0, max_value=20.0, value=10.0, key="min_minutes_filter")
+            with col_m3:
+                run_minutes = st.button("Run Analysis", key="run_minutes_analysis")
+
+            if run_minutes or 'minutes_results' in st.session_state:
+                if run_minutes:
+                    with st.spinner("Running counterfactual analysis..."):
+                        try:
+                            from minutes_counterfactual import run_counterfactual_analysis
+                            st.session_state['minutes_results'] = run_counterfactual_analysis(
+                                enrichment_conn, days=minutes_days, min_minutes=min_minutes
+                            )
+                        except Exception as e:
+                            st.error(f"Analysis failed: {e}")
+                            st.session_state['minutes_results'] = None
+
+                results = st.session_state.get('minutes_results')
+                if results and results.get('has_data'):
+                    o = results['overall']
+
+                    # Primary Lever Callout
+                    if o['primary_lever'] == 'MINUTES':
+                        st.success(f"🎯 **PRIMARY LEVER: MINUTES** - {o['lever_explanation']}")
+                    elif o['primary_lever'] == 'RATE':
+                        st.info(f"🎯 **PRIMARY LEVER: RATE/MATCHUP** - {o['lever_explanation']}")
+                    else:
+                        st.warning(f"🎯 **BOTH LEVERS MATTER** - {o['lever_explanation']}")
+
+                    st.divider()
+
+                    # Main metrics
+                    st.markdown("### MAE Comparison")
+                    mcol1, mcol2, mcol3, mcol4 = st.columns(4)
+                    with mcol1:
+                        st.metric("P0 (Current)", f"{o['mae_P0']:.2f}", help="Your normal projected points")
+                    with mcol2:
+                        st.metric("P1 (Minutes-Perfect)", f"{o['mae_P1']:.2f}",
+                                  delta=f"{o['improvement_P1']:+.0f}%", delta_color="normal",
+                                  help="Projected PPM × Actual Minutes")
+                    with mcol3:
+                        st.metric("P2 (Rate-Perfect)", f"{o['mae_P2']:.2f}",
+                                  delta=f"{o['improvement_P2']:+.0f}%", delta_color="normal",
+                                  help="Actual PPM × Projected Minutes")
+                    with mcol4:
+                        st.metric("Minutes MAE", f"{o['minutes_mae']:.1f} min",
+                                  help=f"Bias: {o['minutes_bias']:+.1f} min")
+
+                    # By Role breakdown
+                    if results['by_role']:
+                        st.markdown("### By Role Tier")
+                        role_data = []
+                        for role, data in results['by_role'].items():
+                            role_data.append({
+                                'Role': role,
+                                'N': data['n'],
+                                'MAE (Current)': f"{data['mae_P0']:.2f}",
+                                'Minutes Fix': f"{data['improvement_P1']:+.0f}%",
+                                'Rate Fix': f"{data['improvement_P2']:+.0f}%",
+                                'Minutes MAE': f"{data['minutes_mae']:.1f}",
+                            })
+                        st.dataframe(pd.DataFrame(role_data), use_container_width=True, hide_index=True)
+
+                    # By Game Script breakdown
+                    if results['by_game_script']:
+                        st.markdown("### By Game Script")
+                        script_data = []
+                        for script, data in results['by_game_script'].items():
+                            script_data.append({
+                                'Game Script': script.replace('_', ' ').title(),
+                                'N': data['n'],
+                                'MAE (Current)': f"{data['mae_P0']:.2f}",
+                                'Minutes Fix': f"{data['improvement_P1']:+.0f}%",
+                                'Rate Fix': f"{data['improvement_P2']:+.0f}%",
+                            })
+                        st.dataframe(pd.DataFrame(script_data), use_container_width=True, hide_index=True)
+
+                    # Worst Minutes Misses
+                    with st.expander("Worst Minutes Misses (Top 10)"):
+                        if results['worst_minutes_misses']:
+                            st.dataframe(pd.DataFrame(results['worst_minutes_misses']), use_container_width=True, hide_index=True)
+
+                elif results:
+                    st.warning(results.get('message', 'No data available'))
+                else:
+                    st.info("Click 'Run Analysis' to see the counterfactual breakdown")
+
+        # =====================================================================
+        # TAB 3: Error Slices ("Where We Were Wrong")
+        # =====================================================================
+        with val_tab3:
+            st.subheader("Error Slices Analysis")
+            st.caption("Break down errors by role, game script, rest, and interactions to find fix targets")
+
+            col_s1, col_s2 = st.columns([3, 1])
+            with col_s1:
+                slice_days = st.number_input("Days to analyze", min_value=7, max_value=90, value=30, key="slice_days")
+            with col_s2:
+                run_slices = st.button("Run Analysis", key="run_slices_analysis")
+
+            if run_slices or 'slice_results' in st.session_state:
+                if run_slices:
+                    with st.spinner("Calculating error slices..."):
+                        try:
+                            from error_slices import calculate_error_slices
+                            st.session_state['slice_results'] = calculate_error_slices(
+                                enrichment_conn, days=slice_days
+                            )
+                        except Exception as e:
+                            st.error(f"Analysis failed: {e}")
+                            st.session_state['slice_results'] = None
+
+                results = st.session_state.get('slice_results')
+                if results and results.get('has_data'):
+                    overall = results['overall']
+                    st.metric("Overall MAE", f"{overall['mae']:.2f}", help=f"Bias: {overall['bias']:+.2f}, N={overall['n']}")
+
+                    st.divider()
+
+                    # Worst Buckets Callout (Fix Targets)
+                    if results['worst_buckets']:
+                        st.markdown("### 🎯 Fix Targets (Worst Buckets)")
+                        for s in results['worst_buckets']:
+                            st.error(f"**{s['slice']}**: {s['pct_volume']:.1f}% of volume, **+{s['delta_mae']:.2f}** MAE worse than average")
+
+                    st.divider()
+
+                    # Slice Tables
+                    def render_slice_table(slices, title):
+                        if slices:
+                            st.markdown(f"### {title}")
+                            slice_data = []
+                            for s in slices:
+                                slice_data.append({
+                                    'Slice': s['slice'],
+                                    'N': s['n'],
+                                    'Volume %': f"{s['pct_volume']:.1f}%",
+                                    'MAE': f"{s['mae']:.2f}",
+                                    'ΔMAE': f"{s['delta_mae']:+.2f}",
+                                    'Bias': f"{s['bias']:+.2f}",
+                                })
+                            st.dataframe(pd.DataFrame(slice_data), use_container_width=True, hide_index=True)
+
+                    render_slice_table(results['by_role'], "By Role Tier")
+                    render_slice_table(results['by_game_script'], "By Game Script (Spread)")
+                    render_slice_table(results['by_rest'], "By Rest Days")
+
+                    with st.expander("Interaction: Role × Game Script"):
+                        render_slice_table(results['interactions_role_script'], "")
+
+                    with st.expander("Interaction: Role × Rest"):
+                        render_slice_table(results['interactions_role_rest'], "")
+
+                    # Best Buckets (where we're doing well)
+                    if results['best_buckets']:
+                        with st.expander("Best Buckets (where we're accurate)"):
+                            for s in results['best_buckets']:
+                                st.success(f"**{s['slice']}**: {s['pct_volume']:.1f}% volume, **{s['delta_mae']:.2f}** MAE better")
+
+                elif results:
+                    st.warning(results.get('message', 'No data available'))
+                else:
+                    st.info("Click 'Run Analysis' to see error breakdowns by bucket")
+
+        with val_tab4:
             st.subheader("Active Alerts")
 
             # Check for new alerts
@@ -10185,7 +10361,7 @@ if selected_page == "Enrichment Validation":
                 | Ceiling Hit Drop | Ceiling hit rate < 60% | MEDIUM |
                 """)
 
-        with val_tab3:
+        with val_tab5:
             st.subheader("Enrichment Configuration")
 
             # Show current config
@@ -10236,7 +10412,7 @@ if selected_page == "Enrichment Validation":
                     effect = (factor - 1) * 100
                     st.write(f"  - Grade {grade}: **{factor}** ({effect:+.0f}%)")
 
-        with val_tab4:
+        with val_tab6:
             st.subheader("Ablation Study")
             st.caption("Compare model variants with different enrichment combinations")
 

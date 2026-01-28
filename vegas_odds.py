@@ -333,18 +333,22 @@ def compute_game_environment(odds: GameOdds) -> GameEnvironment:
         volatility_mult += 0.05  # More variance in shootouts
 
     # Stack score: ideal for same-game stacking
-    # High total + tight spread = both teams' players can go off
+    # UPDATED: Backtest shows spread matters more than total for top scorers
+    # Prioritize close games where stars stay in late
+    # Total is now a secondary factor, not primary
     stack_score = 0.0
-    if high_total and spread_tight:
-        stack_score = 0.9
-    elif high_total and spread_moderate:
-        stack_score = 0.7
-    elif very_high_total:
-        stack_score = 0.6
-    elif spread_tight:
-        stack_score = 0.5
+    if spread_tight:
+        # Close games are the primary stacking signal
+        stack_score = 0.85 if high_total else 0.75
+    elif spread_moderate:
+        # Moderate spreads still okay, total adds small boost
+        stack_score = 0.60 if high_total else 0.50
+    elif very_high_total and not (spread >= 10):
+        # High total but not a blowout - moderate stack value
+        stack_score = 0.45
     else:
-        stack_score = 0.3
+        # Blowouts or low-total neutral games - avoid stacking
+        stack_score = 0.25
 
     return GameEnvironment(
         game_id=odds.game_id,
