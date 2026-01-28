@@ -9989,7 +9989,7 @@ if selected_page == "Enrichment Validation":
         st.divider()
 
         # =====================================================================
-        # Check if enrichment data needs backfilling
+        # Backfill Controls (always visible)
         # =====================================================================
         cursor.execute("""
             SELECT COUNT(*) as total,
@@ -10000,60 +10000,62 @@ if selected_page == "Enrichment Validation":
         total_preds = enrich_check[0] if enrich_check else 0
         enriched_preds = enrich_check[1] if enrich_check else 0
 
-        if total_preds > 0 and enriched_preds < total_preds * 0.5:
-            # More than 50% of predictions missing enrichment data
-            st.warning(f"**Enrichment data missing:** Only {enriched_preds}/{total_preds} predictions have enrichment factors populated.")
+        # Determine if backfill is needed (predictions missing OR audit log empty)
+        needs_backfill = (total_preds > 0 and enriched_preds < total_preds * 0.5) or audit_7d == 0
 
-            col_bf1, col_bf2 = st.columns([3, 1])
-            with col_bf1:
-                st.caption("Run backfill to populate role_tier, days_rest, is_b2b, game_script_tier, and position_matchup_factor for historical predictions.")
-            with col_bf2:
-                if st.button("🔄 Backfill Enrichments", type="primary"):
-                    with st.spinner("Backfilling enrichment data... This may take a minute."):
+        if needs_backfill:
+            st.warning(f"**Backfill recommended:** {enriched_preds}/{total_preds} predictions enriched, {audit_7d} audit rows in last 7 days.")
+
+        col_bf1, col_bf2 = st.columns([3, 1])
+        with col_bf1:
+            st.caption("Run backfill to populate enrichments and rebuild monitoring data (role_tier, rest_days, spread, audit log, weekly summaries).")
+        with col_bf2:
+            if st.button("🔄 Backfill Enrichments", type="primary" if needs_backfill else "secondary"):
+                with st.spinner("Backfilling enrichment data... This may take a minute."):
+                    try:
+                        from backfill_enrichments import backfill_enrichments
+                        stats = backfill_enrichments(
+                            enrichment_conn,
+                            days=None,  # All predictions
+                            apply_adjustments=False,  # Don't modify projections
+                            verbose=False
+                        )
+                        st.success(f"Backfill complete! Enriched {stats['total_enriched']} predictions across {stats['dates_processed']} dates.")
+
+                        # Step 2: Backfill audit log (copies enrichments to monitoring tables)
+                        # Use same window as dates_processed to cover full backfill
+                        audit_days = max(60, stats['dates_processed'] + 7)  # +7 buffer for week alignment
+                        st.info(f"📊 Populating audit log for {audit_days} days...")
+                        audit_count = backfill_audit_log(enrichment_conn, days=audit_days)
+                        st.success(f"Audit log populated with {audit_count} records")
+
+                        # Step 3: Recalculate weekly summaries for ALL weeks in backfill window
+                        # Calculate number of weeks to cover (audit_days / 7 + 1 buffer)
+                        weeks_to_calculate = (audit_days // 7) + 2
+                        st.info(f"📈 Recalculating {weeks_to_calculate} weekly summaries...")
+                        from datetime import timedelta
+                        for i in range(weeks_to_calculate):
+                            week_end = (datetime.now() - timedelta(days=1+i*7)).strftime('%Y-%m-%d')
+                            calculate_weekly_summary(enrichment_conn, week_end)
+                        st.success(f"Weekly summaries updated ({weeks_to_calculate} weeks)!")
+
+                        # Save to S3 for persistence
                         try:
-                            from backfill_enrichments import backfill_enrichments
-                            stats = backfill_enrichments(
-                                enrichment_conn,
-                                days=None,  # All predictions
-                                apply_adjustments=False,  # Don't modify projections
-                                verbose=False
-                            )
-                            st.success(f"Backfill complete! Enriched {stats['total_enriched']} predictions across {stats['dates_processed']} dates.")
+                            storage = s3_storage.S3PredictionStorage()
+                            if storage.is_configured():
+                                success, message = storage.upload_database(db_path)
+                                if success:
+                                    st.info("☁️ Database backed up to S3")
+                                else:
+                                    st.warning(f"⚠️ S3 backup failed: {message}")
+                        except Exception as s3_err:
+                            st.warning(f"⚠️ S3 backup error: {s3_err}")
 
-                            # Step 2: Backfill audit log (copies enrichments to monitoring tables)
-                            # Use same window as dates_processed to cover full backfill
-                            audit_days = max(60, stats['dates_processed'] + 7)  # +7 buffer for week alignment
-                            st.info(f"📊 Populating audit log for {audit_days} days...")
-                            audit_count = backfill_audit_log(enrichment_conn, days=audit_days)
-                            st.success(f"Audit log populated with {audit_count} records")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Backfill failed: {e}")
 
-                            # Step 3: Recalculate weekly summaries for ALL weeks in backfill window
-                            # Calculate number of weeks to cover (audit_days / 7 + 1 buffer)
-                            weeks_to_calculate = (audit_days // 7) + 2
-                            st.info(f"📈 Recalculating {weeks_to_calculate} weekly summaries...")
-                            from datetime import timedelta
-                            for i in range(weeks_to_calculate):
-                                week_end = (datetime.now() - timedelta(days=1+i*7)).strftime('%Y-%m-%d')
-                                calculate_weekly_summary(enrichment_conn, week_end)
-                            st.success(f"Weekly summaries updated ({weeks_to_calculate} weeks)!")
-
-                            # Save to S3 for persistence
-                            try:
-                                storage = s3_storage.S3PredictionStorage()
-                                if storage.is_configured():
-                                    success, message = storage.upload_database(db_path)
-                                    if success:
-                                        st.info("☁️ Database backed up to S3")
-                                    else:
-                                        st.warning(f"⚠️ S3 backup failed: {message}")
-                            except Exception as s3_err:
-                                st.warning(f"⚠️ S3 backup error: {s3_err}")
-
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Backfill failed: {e}")
-
-            st.divider()
+        st.divider()
 
         # Tabs for different views
         val_tab1, val_tab2, val_tab3, val_tab4 = st.tabs([
