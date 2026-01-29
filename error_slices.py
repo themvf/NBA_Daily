@@ -214,8 +214,39 @@ def calculate_error_slices(
     """
     cutoff = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
 
-    # Query predictions directly (no audit log dependency)
-    # The predictions table has all enrichment columns + error columns
+    # ==========================================================================
+    # STEP 1: Query ALL predictions in date range (with and without actuals)
+    # This lets us compute coverage metrics
+    # ==========================================================================
+    coverage_query = """
+        SELECT
+            game_date,
+            COUNT(*) as total_rows,
+            SUM(CASE WHEN actual_ppg IS NOT NULL THEN 1 ELSE 0 END) as rows_with_actuals
+        FROM predictions
+        WHERE date(game_date) >= date(?)
+        GROUP BY game_date
+        ORDER BY game_date DESC
+    """
+    coverage_df = pd.read_sql_query(coverage_query, conn, params=[cutoff])
+
+    # Compute coverage stats
+    total_rows_in_window = coverage_df['total_rows'].sum() if not coverage_df.empty else 0
+    rows_with_actuals = coverage_df['rows_with_actuals'].sum() if not coverage_df.empty else 0
+    dates_in_window = len(coverage_df)
+    dates_with_actuals = (coverage_df['rows_with_actuals'] > 0).sum() if not coverage_df.empty else 0
+
+    # Find last date with actuals
+    if not coverage_df.empty and dates_with_actuals > 0:
+        last_date_with_actuals = coverage_df[coverage_df['rows_with_actuals'] > 0]['game_date'].iloc[0]
+    else:
+        last_date_with_actuals = None
+
+    actuals_coverage_pct = (rows_with_actuals / total_rows_in_window * 100) if total_rows_in_window > 0 else 0
+
+    # ==========================================================================
+    # STEP 2: Query predictions WITH actuals for error analysis
+    # ==========================================================================
     query = """
         SELECT
             player_id,
@@ -230,9 +261,7 @@ def calculate_error_slices(
             days_rest,
             is_b2b,
             blowout_risk,
-            position_matchup_factor,
-            error as prediction_error,
-            abs_error
+            position_matchup_factor
         FROM predictions
         WHERE actual_ppg IS NOT NULL
           AND date(game_date) >= date(?)
@@ -240,14 +269,36 @@ def calculate_error_slices(
 
     df = pd.read_sql_query(query, conn, params=[cutoff])
 
-    if df.empty:
-        return {'has_data': False, 'message': 'No predictions with actuals found in date range'}
+    # ==========================================================================
+    # STEP 3: Hard fail checks - required columns
+    # ==========================================================================
+    required_cols = ['projected_ppg', 'actual_ppg', 'game_date']
+    missing_cols = [c for c in required_cols if c not in df.columns]
+    if missing_cols:
+        return {
+            'has_data': False,
+            'message': f'Required columns missing: {missing_cols}. Check predictions table schema.'
+        }
 
-    # Ensure error columns are numeric and computed
+    if df.empty:
+        return {
+            'has_data': False,
+            'message': f'No predictions with actuals found in date range. Coverage: {rows_with_actuals}/{total_rows_in_window} rows ({actuals_coverage_pct:.0f}%).',
+            'coverage': {
+                'total_rows_in_window': total_rows_in_window,
+                'rows_with_actuals': rows_with_actuals,
+                'dates_in_window': dates_in_window,
+                'dates_with_actuals': dates_with_actuals,
+                'last_date_with_actuals': last_date_with_actuals,
+                'actuals_coverage_pct': actuals_coverage_pct,
+            }
+        }
+
+    # ==========================================================================
+    # STEP 4: Compute errors (always recompute for consistency)
+    # ==========================================================================
     df['projected_ppg'] = pd.to_numeric(df['projected_ppg'], errors='coerce')
     df['actual_ppg'] = pd.to_numeric(df['actual_ppg'], errors='coerce')
-
-    # Always recompute errors to ensure consistency
     df['prediction_error'] = df['actual_ppg'] - df['projected_ppg']
     df['abs_error'] = np.abs(df['prediction_error'])
 
@@ -259,27 +310,54 @@ def calculate_error_slices(
     if n_valid == 0:
         return {
             'has_data': False,
-            'message': f'No valid (proj, actual) pairs found. {n_total} rows had NULL values.'
+            'message': f'No valid (proj, actual) pairs found. {n_total} rows had NULL projected or actual values.',
+            'coverage': {
+                'total_rows_in_window': total_rows_in_window,
+                'rows_with_actuals': rows_with_actuals,
+                'dates_in_window': dates_in_window,
+                'dates_with_actuals': dates_with_actuals,
+                'last_date_with_actuals': last_date_with_actuals,
+                'actuals_coverage_pct': actuals_coverage_pct,
+            }
         }
 
     # Use only valid rows for analysis
     df = df[valid_mask].copy()
 
-    # Overall baseline
+    # ==========================================================================
+    # STEP 5: Compute overall baseline
+    # ==========================================================================
     overall_mae = df['abs_error'].mean()
     overall_bias = df['prediction_error'].mean()
     overall_n = len(df)
 
+    # Get sample rows for spot-checking (10 random rows)
+    sample_rows = df.sample(n=min(10, len(df)), random_state=42)[
+        ['game_date', 'player_name', 'projected_ppg', 'actual_ppg', 'abs_error', 'role_tier', 'game_script_tier', 'days_rest']
+    ].round(2).to_dict('records')
+
     results = {
         'has_data': True,
         'days_analyzed': days,
+        'cutoff_date': cutoff,
         'min_n_threshold': min_n_threshold,
         'min_pct_threshold': min_pct_threshold,
+        # Coverage info (for UI display)
+        'coverage': {
+            'total_rows_in_window': total_rows_in_window,
+            'rows_with_actuals': rows_with_actuals,
+            'dates_in_window': dates_in_window,
+            'dates_with_actuals': dates_with_actuals,
+            'last_date_with_actuals': last_date_with_actuals,
+            'actuals_coverage_pct': actuals_coverage_pct,
+        },
         'overall': {
-            'n': overall_n,
+            'n': overall_n,  # Valid N (rows used for MAE)
+            'n_total': n_total,  # Total rows with actuals (before filtering)
             'mae': overall_mae,
             'bias': overall_bias,
-        }
+        },
+        'sample_rows': sample_rows,  # For spot-checking
     }
 
     # =========================================================================

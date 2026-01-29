@@ -10535,17 +10535,38 @@ if selected_page == "Enrichment Validation":
                             st.session_state['slice_results'] = None
 
                 results = st.session_state.get('slice_results')
+
+                # Show coverage info even if no valid data (helps diagnose issues)
+                if results and results.get('coverage'):
+                    cov = results['coverage']
+                    with st.expander("📊 Data Coverage", expanded=not results.get('has_data')):
+                        cov_col1, cov_col2, cov_col3, cov_col4 = st.columns(4)
+                        with cov_col1:
+                            st.metric("Rows with Actuals", f"{cov['rows_with_actuals']:,}/{cov['total_rows_in_window']:,}")
+                        with cov_col2:
+                            st.metric("Actuals Coverage", f"{cov['actuals_coverage_pct']:.0f}%")
+                        with cov_col3:
+                            st.metric("Dates with Actuals", f"{cov['dates_with_actuals']}/{cov['dates_in_window']}")
+                        with cov_col4:
+                            last_date = cov.get('last_date_with_actuals', 'None')
+                            st.metric("Last Date with Actuals", last_date or "None")
+
+                        if cov['actuals_coverage_pct'] < 50:
+                            st.warning(f"⚠️ Low actuals coverage ({cov['actuals_coverage_pct']:.0f}%). Consider running actuals backfill or extending date range.")
+
                 if results and results.get('has_data'):
                     overall = results['overall']
 
-                    # Header metrics
-                    hcol1, hcol2, hcol3 = st.columns(3)
+                    # Header metrics with Valid N
+                    hcol1, hcol2, hcol3, hcol4 = st.columns(4)
                     with hcol1:
                         st.metric("Overall MAE", f"{overall['mae']:.2f}", help=f"Bias: {overall['bias']:+.2f}")
                     with hcol2:
-                        st.metric("Sample Size", f"{overall['n']:,}")
+                        st.metric("Valid N", f"{overall['n']:,}", help="Rows with valid (proj, actual) pairs")
                     with hcol3:
                         st.metric("Trustworthy Slices", f"{results['trustworthy_count']}/{results['total_slices']}")
+                    with hcol4:
+                        st.metric("Cutoff Date", results.get('cutoff_date', 'N/A'))
 
                     st.divider()
 
@@ -10603,8 +10624,21 @@ if selected_page == "Enrichment Validation":
                                 ci_str = f"[{s['ci_lower']:+.2f}, {s['ci_upper']:+.2f}]"
                                 st.success(f"**{s['slice']}**: {s['pct_volume']:.1f}% volume, **{s['delta_mae']:.2f}** MAE better | 95% CI: {ci_str}")
 
+                    # Sample rows for spot-checking (truth test)
+                    if results.get('sample_rows'):
+                        with st.expander("🔍 Sample Rows (Spot-Check Truth Test)"):
+                            st.caption("Verify: abs_error = |proj - actual|, role_tier looks correct, etc.")
+                            sample_df = pd.DataFrame(results['sample_rows'])
+                            # Reorder columns for clarity
+                            col_order = ['game_date', 'player_name', 'projected_ppg', 'actual_ppg', 'abs_error', 'role_tier', 'game_script_tier', 'days_rest']
+                            col_order = [c for c in col_order if c in sample_df.columns]
+                            st.dataframe(sample_df[col_order], use_container_width=True, hide_index=True)
+
                 elif results:
-                    st.warning(results.get('message', 'No data available'))
+                    # No valid data - show the message and coverage info
+                    st.error(f"❌ {results.get('message', 'No data available')}")
+                    if results.get('coverage'):
+                        st.info("Check the Data Coverage section above for details on actuals availability.")
                 else:
                     st.info("Click 'Run Analysis' to see error breakdowns by bucket")
 
