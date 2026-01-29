@@ -11,34 +11,148 @@ Method (per player-game):
 
 If MAE(P1) << MAE(P0) -> minutes modeling is the big lever
 If MAE(P2) << MAE(P0) -> rate/usage/matchup modeling is the big lever
+
+Minutes Miss Classification:
+- DNP/Late Scratch: proj_minutes > 0, actual = 0
+- Blowout Pull: spread large AND minutes << expected
+- Foul Trouble: minutes unexpectedly low (moderate)
+- OT Boost: actual minutes >> expected
+- Rotation Shift: everything else (coach decision / depth chart change)
 """
 
 import sqlite3
 import pandas as pd
 import numpy as np
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 from datetime import datetime, timedelta
 
+
+# =============================================================================
+# MISS CLASSIFICATION
+# =============================================================================
+
+def classify_minutes_miss(
+    proj_minutes: float,
+    actual_minutes: float,
+    role_tier: str,
+    game_script: str,
+    blowout_risk: float = 0.0
+) -> Tuple[str, str]:
+    """
+    Classify the type of minutes miss for actionable insights.
+
+    Args:
+        proj_minutes: Projected minutes
+        actual_minutes: Actual minutes played
+        role_tier: Player's role (STAR, STARTER, etc.)
+        game_script: Game script tier (blowout, close_game, neutral)
+        blowout_risk: Pre-game blowout probability
+
+    Returns:
+        (category, explanation)
+    """
+    minutes_diff = actual_minutes - proj_minutes
+    minutes_pct_diff = minutes_diff / proj_minutes if proj_minutes > 0 else 0
+
+    # DNP / Late Scratch
+    if actual_minutes == 0 and proj_minutes > 0:
+        return ('DNP', 'Player did not play (injury, rest, coach decision)')
+
+    # OT Boost (actual >> expected)
+    if minutes_pct_diff > 0.20 and actual_minutes >= 40:
+        return ('OT_BOOST', 'Likely overtime - minutes inflated beyond normal')
+
+    # Blowout Pull (spread large OR game_script is blowout, minutes down significantly)
+    if game_script == 'blowout' or blowout_risk > 0.5:
+        if minutes_pct_diff < -0.15:
+            if role_tier in ['STAR', 'STARTER']:
+                return ('BLOWOUT_PULL', 'Star/starter pulled early due to blowout')
+            else:
+                return ('BLOWOUT_ROTATION', 'Bench minutes affected by blowout')
+
+    # Foul Trouble (moderate minutes reduction, not extreme)
+    if -0.30 < minutes_pct_diff < -0.15 and actual_minutes > 15:
+        return ('FOUL_TROUBLE', 'Possible foul trouble - moderate minutes reduction')
+
+    # Significant underperformance in minutes (not blowout)
+    if minutes_pct_diff < -0.25:
+        return ('ROTATION_SHIFT', 'Rotation shift or coach decision - significant minutes loss')
+
+    # Significant overperformance in minutes (not OT)
+    if minutes_pct_diff > 0.20 and actual_minutes < 40:
+        return ('ROTATION_BOOST', 'Unexpected minutes boost - rotation opportunity')
+
+    # Minor variance (within 15%)
+    if abs(minutes_pct_diff) <= 0.15:
+        return ('NORMAL', 'Minutes within expected range')
+
+    return ('OTHER', 'Unclassified minutes variance')
+
+
+def analyze_miss_distribution(misses: List[Dict]) -> Dict:
+    """
+    Analyze the distribution of miss types.
+
+    Returns aggregated counts and insights.
+    """
+    if not misses:
+        return {}
+
+    categories = {}
+    for miss in misses:
+        cat = miss.get('miss_category', 'OTHER')
+        if cat not in categories:
+            categories[cat] = {
+                'count': 0,
+                'total_minutes_error': 0,
+                'examples': []
+            }
+        categories[cat]['count'] += 1
+        categories[cat]['total_minutes_error'] += abs(miss.get('minutes_error', 0))
+        if len(categories[cat]['examples']) < 3:
+            categories[cat]['examples'].append({
+                'player': miss.get('player_name', ''),
+                'date': miss.get('game_date', ''),
+                'proj': miss.get('proj_minutes', 0),
+                'actual': miss.get('actual_minutes', 0),
+            })
+
+    # Calculate percentages
+    total = sum(c['count'] for c in categories.values())
+    for cat in categories:
+        categories[cat]['pct'] = categories[cat]['count'] / total * 100 if total > 0 else 0
+        categories[cat]['avg_minutes_error'] = (
+            categories[cat]['total_minutes_error'] / categories[cat]['count']
+            if categories[cat]['count'] > 0 else 0
+        )
+
+    return categories
+
+
+# =============================================================================
+# MAIN ANALYSIS
+# =============================================================================
 
 def run_counterfactual_analysis(
     conn: sqlite3.Connection,
     days: int = 30,
-    min_minutes: float = 10.0
+    min_minutes: float = 0.0  # Changed to 0 to capture DNPs
 ) -> Dict:
     """
-    Run the minutes counterfactual backtest.
+    Run the minutes counterfactual backtest with miss classification.
 
     Args:
         conn: Database connection
         days: Number of days to analyze
-        min_minutes: Minimum actual minutes to include (filters DNPs/garbage time)
+        min_minutes: Minimum actual minutes to include in MAE calc (0 = include DNPs)
 
     Returns:
-        Dict with analysis results
+        Dict with analysis results including miss classification
     """
     cutoff = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
 
     # Query predictions with both projected and actual data
+    # Include DNPs (actual_minutes = 0) for classification
     query = """
         SELECT
             p.player_id,
@@ -50,6 +164,7 @@ def run_counterfactual_analysis(
             p.actual_minutes,
             p.role_tier,
             p.game_script_tier,
+            p.blowout_risk,
             p.season_avg_ppg,
             p.l5_minutes_avg
         FROM predictions p
@@ -57,11 +172,10 @@ def run_counterfactual_analysis(
           AND p.actual_minutes IS NOT NULL
           AND p.proj_minutes IS NOT NULL
           AND p.proj_minutes > 0
-          AND p.actual_minutes >= ?
           AND date(p.game_date) >= date(?)
     """
 
-    df = pd.read_sql_query(query, conn, params=[min_minutes, cutoff])
+    df = pd.read_sql_query(query, conn, params=[cutoff])
 
     if df.empty:
         return {
@@ -69,49 +183,82 @@ def run_counterfactual_analysis(
             'message': 'No predictions with minutes data found'
         }
 
+    # ==========================================================================
+    # Classify all minutes misses
+    # ==========================================================================
+    all_misses = []
+    for _, row in df.iterrows():
+        miss_cat, miss_explain = classify_minutes_miss(
+            row['proj_minutes'],
+            row['actual_minutes'],
+            row['role_tier'] or 'STARTER',
+            row['game_script_tier'] or 'neutral',
+            row['blowout_risk'] or 0.0
+        )
+        all_misses.append({
+            'player_id': row['player_id'],
+            'player_name': row['player_name'],
+            'game_date': row['game_date'],
+            'proj_minutes': row['proj_minutes'],
+            'actual_minutes': row['actual_minutes'],
+            'minutes_error': row['actual_minutes'] - row['proj_minutes'],
+            'role_tier': row['role_tier'],
+            'game_script_tier': row['game_script_tier'],
+            'miss_category': miss_cat,
+            'miss_explanation': miss_explain,
+        })
+
+    miss_distribution = analyze_miss_distribution(all_misses)
+
+    # ==========================================================================
+    # Filter for MAE calculations (exclude DNPs for fair comparison)
+    # ==========================================================================
+    df_for_mae = df[df['actual_minutes'] >= max(min_minutes, 10.0)].copy()
+
+    if df_for_mae.empty:
+        return {
+            'has_data': True,
+            'message': 'Not enough data with actual minutes >= threshold',
+            'miss_distribution': miss_distribution,
+            'all_misses': all_misses,
+        }
+
     # Calculate PPM (points per minute)
-    df['projected_ppm'] = df['projected_ppg'] / df['proj_minutes']
-    df['actual_ppm'] = df['actual_ppg'] / df['actual_minutes']
+    df_for_mae['projected_ppm'] = df_for_mae['projected_ppg'] / df_for_mae['proj_minutes']
+    df_for_mae['actual_ppm'] = df_for_mae['actual_ppg'] / df_for_mae['actual_minutes']
 
     # Calculate counterfactual predictions
-    # P0: Current prediction (what we predicted)
-    df['P0'] = df['projected_ppg']
-
-    # P1: Minutes-perfect (use actual minutes, keep projected rate)
-    df['P1'] = df['projected_ppm'] * df['actual_minutes']
-
-    # P2: Rate-perfect (use actual rate, keep projected minutes)
-    df['P2'] = df['actual_ppm'] * df['proj_minutes']
+    df_for_mae['P0'] = df_for_mae['projected_ppg']
+    df_for_mae['P1'] = df_for_mae['projected_ppm'] * df_for_mae['actual_minutes']
+    df_for_mae['P2'] = df_for_mae['actual_ppm'] * df_for_mae['proj_minutes']
 
     # Calculate errors
-    df['error_P0'] = df['actual_ppg'] - df['P0']
-    df['error_P1'] = df['actual_ppg'] - df['P1']
-    df['error_P2'] = df['actual_ppg'] - df['P2']
+    df_for_mae['error_P0'] = df_for_mae['actual_ppg'] - df_for_mae['P0']
+    df_for_mae['error_P1'] = df_for_mae['actual_ppg'] - df_for_mae['P1']
+    df_for_mae['error_P2'] = df_for_mae['actual_ppg'] - df_for_mae['P2']
 
-    df['abs_error_P0'] = np.abs(df['error_P0'])
-    df['abs_error_P1'] = np.abs(df['error_P1'])
-    df['abs_error_P2'] = np.abs(df['error_P2'])
+    df_for_mae['abs_error_P0'] = np.abs(df_for_mae['error_P0'])
+    df_for_mae['abs_error_P1'] = np.abs(df_for_mae['error_P1'])
+    df_for_mae['abs_error_P2'] = np.abs(df_for_mae['error_P2'])
 
-    # Also track minutes error directly
-    df['minutes_error'] = df['actual_minutes'] - df['proj_minutes']
-    df['abs_minutes_error'] = np.abs(df['minutes_error'])
+    df_for_mae['minutes_error'] = df_for_mae['actual_minutes'] - df_for_mae['proj_minutes']
+    df_for_mae['abs_minutes_error'] = np.abs(df_for_mae['minutes_error'])
 
-    # =========================================================================
+    # ==========================================================================
     # Overall Results
-    # =========================================================================
+    # ==========================================================================
     overall = {
-        'n': len(df),
-        'mae_P0': df['abs_error_P0'].mean(),
-        'mae_P1': df['abs_error_P1'].mean(),
-        'mae_P2': df['abs_error_P2'].mean(),
-        'bias_P0': df['error_P0'].mean(),
-        'bias_P1': df['error_P1'].mean(),
-        'bias_P2': df['error_P2'].mean(),
-        'minutes_mae': df['abs_minutes_error'].mean(),
-        'minutes_bias': df['minutes_error'].mean(),
+        'n': len(df_for_mae),
+        'mae_P0': df_for_mae['abs_error_P0'].mean(),
+        'mae_P1': df_for_mae['abs_error_P1'].mean(),
+        'mae_P2': df_for_mae['abs_error_P2'].mean(),
+        'bias_P0': df_for_mae['error_P0'].mean(),
+        'bias_P1': df_for_mae['error_P1'].mean(),
+        'bias_P2': df_for_mae['error_P2'].mean(),
+        'minutes_mae': df_for_mae['abs_minutes_error'].mean(),
+        'minutes_bias': df_for_mae['minutes_error'].mean(),
     }
 
-    # Calculate improvement percentages
     overall['improvement_P1'] = (overall['mae_P0'] - overall['mae_P1']) / overall['mae_P0'] * 100
     overall['improvement_P2'] = (overall['mae_P0'] - overall['mae_P2']) / overall['mae_P0'] * 100
 
@@ -126,14 +273,14 @@ def run_counterfactual_analysis(
         overall['primary_lever'] = 'BOTH'
         overall['lever_explanation'] = f"Both levers contribute similarly ({overall['improvement_P1']:.0f}% vs {overall['improvement_P2']:.0f}%)"
 
-    # =========================================================================
+    # ==========================================================================
     # Breakdown by Role Tier
-    # =========================================================================
+    # ==========================================================================
     role_tiers = ['STAR', 'STARTER', 'ROTATION', 'BENCH']
     by_role = {}
 
     for role in role_tiers:
-        role_df = df[df['role_tier'] == role]
+        role_df = df_for_mae[df_for_mae['role_tier'] == role]
         if len(role_df) >= 10:
             by_role[role] = {
                 'n': len(role_df),
@@ -145,13 +292,13 @@ def run_counterfactual_analysis(
                 'minutes_mae': role_df['abs_minutes_error'].mean(),
             }
 
-    # =========================================================================
-    # Breakdown by Game Script (Spread Proxy)
-    # =========================================================================
+    # ==========================================================================
+    # Breakdown by Game Script
+    # ==========================================================================
     by_game_script = {}
 
     for script in ['blowout', 'neutral', 'close_game']:
-        script_df = df[df['game_script_tier'] == script]
+        script_df = df_for_mae[df_for_mae['game_script_tier'] == script]
         if len(script_df) >= 10:
             by_game_script[script] = {
                 'n': len(script_df),
@@ -163,20 +310,56 @@ def run_counterfactual_analysis(
                 'minutes_mae': script_df['abs_minutes_error'].mean(),
             }
 
-    # =========================================================================
-    # Worst Misses Analysis
-    # =========================================================================
-    # Find cases where minutes error was the culprit
-    df['minutes_was_culprit'] = df['abs_error_P1'] < df['abs_error_P0'] * 0.5
-    df['rate_was_culprit'] = df['abs_error_P2'] < df['abs_error_P0'] * 0.5
+    # ==========================================================================
+    # Worst Minutes Misses (for display)
+    # ==========================================================================
+    worst_misses = sorted(all_misses, key=lambda x: abs(x['minutes_error']), reverse=True)[:15]
 
-    worst_minutes_misses = df.nlargest(10, 'abs_minutes_error')[
-        ['player_name', 'game_date', 'proj_minutes', 'actual_minutes', 'minutes_error', 'role_tier']
-    ].to_dict('records')
+    # ==========================================================================
+    # Investment Recommendations based on miss distribution
+    # ==========================================================================
+    recommendations = []
 
-    # =========================================================================
+    if miss_distribution:
+        # Check DNP rate
+        dnp_pct = miss_distribution.get('DNP', {}).get('pct', 0)
+        if dnp_pct > 5:
+            recommendations.append({
+                'area': 'Injury/Availability Data',
+                'priority': 'HIGH',
+                'reason': f'{dnp_pct:.1f}% of predictions were DNPs - improve injury tracking'
+            })
+
+        # Check blowout impact
+        blowout_pct = miss_distribution.get('BLOWOUT_PULL', {}).get('pct', 0) + miss_distribution.get('BLOWOUT_ROTATION', {}).get('pct', 0)
+        if blowout_pct > 10:
+            recommendations.append({
+                'area': 'Blowout Minutes Model',
+                'priority': 'HIGH',
+                'reason': f'{blowout_pct:.1f}% of misses are blowout-related - improve game script adjustments'
+            })
+
+        # Check rotation shifts
+        rotation_pct = miss_distribution.get('ROTATION_SHIFT', {}).get('pct', 0) + miss_distribution.get('ROTATION_BOOST', {}).get('pct', 0)
+        if rotation_pct > 15:
+            recommendations.append({
+                'area': 'Depth Chart / Rotation Updates',
+                'priority': 'MEDIUM',
+                'reason': f'{rotation_pct:.1f}% are rotation shifts - update depth charts more frequently'
+            })
+
+        # Check OT impact
+        ot_pct = miss_distribution.get('OT_BOOST', {}).get('pct', 0)
+        if ot_pct > 3:
+            recommendations.append({
+                'area': 'OT Probability Model',
+                'priority': 'LOW',
+                'reason': f'{ot_pct:.1f}% are OT boosts - limited improvement available'
+            })
+
+    # ==========================================================================
     # Package Results
-    # =========================================================================
+    # ==========================================================================
     return {
         'has_data': True,
         'days_analyzed': days,
@@ -184,9 +367,11 @@ def run_counterfactual_analysis(
         'overall': overall,
         'by_role': by_role,
         'by_game_script': by_game_script,
-        'worst_minutes_misses': worst_minutes_misses,
-        'pct_minutes_culprit': df['minutes_was_culprit'].mean() * 100,
-        'pct_rate_culprit': df['rate_was_culprit'].mean() * 100,
+        'worst_minutes_misses': worst_misses,
+        'miss_distribution': miss_distribution,
+        'recommendations': recommendations,
+        'total_predictions': len(df),
+        'dnp_count': len([m for m in all_misses if m['miss_category'] == 'DNP']),
     }
 
 
@@ -197,15 +382,15 @@ def format_counterfactual_summary(results: Dict) -> str:
 
     o = results['overall']
     lines = [
-        "=" * 60,
+        "=" * 70,
         "MINUTES COUNTERFACTUAL BACKTEST",
-        "=" * 60,
+        "=" * 70,
         f"Sample: {o['n']} predictions over {results['days_analyzed']} days",
         f"Filter: actual_minutes >= {results['min_minutes_filter']}",
         "",
         "OVERALL RESULTS:",
-        "-" * 40,
-        f"  P0 (Current):        MAE = {o['mae_P0']:.2f}  (baseline)",
+        "-" * 50,
+        f"  P0 (Current):         MAE = {o['mae_P0']:.2f}  (baseline)",
         f"  P1 (Minutes-Perfect): MAE = {o['mae_P1']:.2f}  ({o['improvement_P1']:+.0f}% improvement)",
         f"  P2 (Rate-Perfect):    MAE = {o['mae_P2']:.2f}  ({o['improvement_P2']:+.0f}% improvement)",
         "",
@@ -216,15 +401,22 @@ def format_counterfactual_summary(results: Dict) -> str:
         "",
     ]
 
-    if results['by_role']:
-        lines.append("BY ROLE TIER:")
-        lines.append("-" * 40)
-        for role, data in results['by_role'].items():
-            lines.append(f"  {role}: N={data['n']}, MAE {data['mae_P0']:.1f} -> "
-                        f"P1: {data['improvement_P1']:+.0f}%, P2: {data['improvement_P2']:+.0f}%")
+    if results.get('miss_distribution'):
+        lines.append("MISS CLASSIFICATION:")
+        lines.append("-" * 50)
+        for cat, data in sorted(results['miss_distribution'].items(), key=lambda x: -x[1]['count']):
+            lines.append(f"  {cat}: {data['count']} ({data['pct']:.1f}%) - avg error: {data['avg_minutes_error']:.1f} min")
+
+    if results.get('recommendations'):
+        lines.append("")
+        lines.append("INVESTMENT RECOMMENDATIONS:")
+        lines.append("-" * 50)
+        for rec in results['recommendations']:
+            lines.append(f"  [{rec['priority']}] {rec['area']}")
+            lines.append(f"         {rec['reason']}")
 
     lines.append("")
-    lines.append("=" * 60)
+    lines.append("=" * 70)
 
     return "\n".join(lines)
 

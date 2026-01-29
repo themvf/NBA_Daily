@@ -8845,6 +8845,7 @@ if selected_page == "Backtest Analysis":
                 wins = results_df['won_slate'].sum()
                 total = len(results_df)
                 win_rate = wins / total * 100 if total > 0 else 0
+                hit_2_rate = results_df['hit_2_of_top3_any'].mean() * 100
 
                 metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
                 with metric_col1:
@@ -8852,11 +8853,80 @@ if selected_page == "Backtest Analysis":
                 with metric_col2:
                     st.metric("Avg Shortfall", f"{results_df['sum_shortfall'].mean():.1f} pts")
                 with metric_col3:
-                    st.metric("Hit 2/3 Rate", f"{results_df['hit_2_of_top3_any'].mean()*100:.1f}%")
+                    st.metric("Hit 2/3 Rate", f"{hit_2_rate:.1f}%")
                 with metric_col4:
                     st.metric("Avg Unique Players", f"{results_df['unique_players_used'].mean():.1f}")
 
-                # Results table
+                # ===================================================================
+                # HIT 2/3 PROMINENCE - Key Tournament Success Indicator
+                # ===================================================================
+                st.divider()
+                st.markdown("#### 🎯 Hit 2/3 Analysis (Tournament Success Indicator)")
+                st.caption("Having 2+ of top 3 scorers is key to tournament success. This shows portfolio coverage quality.")
+
+                hit_2_count = results_df['hit_2_of_top3_any'].sum()
+                hit_2_miss = total - hit_2_count
+
+                h2_col1, h2_col2, h2_col3 = st.columns(3)
+                with h2_col1:
+                    # Prominent callout for hit 2/3 rate
+                    if hit_2_rate >= 75:
+                        st.success(f"🏆 **Excellent Coverage**: {hit_2_rate:.0f}% hit 2/3 rate")
+                    elif hit_2_rate >= 50:
+                        st.info(f"✅ **Good Coverage**: {hit_2_rate:.0f}% hit 2/3 rate")
+                    else:
+                        st.warning(f"⚠️ **Low Coverage**: {hit_2_rate:.0f}% hit 2/3 rate - consider increasing player diversity")
+                with h2_col2:
+                    st.metric("Slates with 2/3 Coverage", f"{hit_2_count}/{total}")
+                with h2_col3:
+                    # Conditional insight
+                    if hit_2_rate < win_rate:
+                        st.info("📊 We win some slates even without 2/3 (good luck)")
+                    elif hit_2_rate > win_rate * 1.5:
+                        st.info("📊 High coverage but low wins (bad luck or wrong players)")
+
+                # ===================================================================
+                # SHORTFALL DISTRIBUTION - Not just average
+                # ===================================================================
+                st.divider()
+                st.markdown("#### 📉 Shortfall Distribution")
+                st.caption("How far from optimal our best lineup was. Percentiles show the spread of outcomes.")
+
+                shortfalls = results_df['sum_shortfall']
+                sf_col1, sf_col2, sf_col3, sf_col4, sf_col5 = st.columns(5)
+
+                with sf_col1:
+                    st.metric("Min (Best)", f"{shortfalls.min():.1f} pts",
+                              help="Our closest result to optimal")
+                with sf_col2:
+                    st.metric("P25", f"{shortfalls.quantile(0.25):.1f} pts",
+                              help="25th percentile - better than this 75% of time")
+                with sf_col3:
+                    st.metric("Median", f"{shortfalls.median():.1f} pts",
+                              help="50th percentile - typical shortfall")
+                with sf_col4:
+                    st.metric("P75", f"{shortfalls.quantile(0.75):.1f} pts",
+                              help="75th percentile - worse than this 25% of time")
+                with sf_col5:
+                    st.metric("Max (Worst)", f"{shortfalls.max():.1f} pts",
+                              help="Our worst result vs optimal")
+
+                # Shortfall buckets breakdown
+                sf_buckets = []
+                bucket_ranges = [(0, 5, "0-5 pts (Near Miss)"), (5, 15, "5-15 pts (Moderate)"),
+                                 (15, 30, "15-30 pts (Significant)"), (30, float('inf'), "30+ pts (Major Miss)")]
+
+                for low, high, label in bucket_ranges:
+                    count = ((shortfalls >= low) & (shortfalls < high)).sum()
+                    pct = count / total * 100 if total > 0 else 0
+                    sf_buckets.append({'Shortfall Range': label, 'Count': count, 'Pct': f"{pct:.1f}%"})
+
+                st.dataframe(pd.DataFrame(sf_buckets), use_container_width=True, hide_index=True)
+
+                st.divider()
+
+                # Results table with enhanced columns
+                st.markdown("#### 📋 Detailed Results")
                 st.dataframe(
                     results_df[['slate_date', 'won_slate', 'sum_shortfall', 'best_lineup_sum',
                                'optimal_lineup_sum', 'hit_2_of_top3_any', 'unique_players_used']].round(1),
@@ -10232,10 +10302,77 @@ if selected_page == "Enrichment Validation":
                             })
                         st.dataframe(pd.DataFrame(script_data), use_container_width=True, hide_index=True)
 
+                    st.divider()
+
+                    # Miss Classification Distribution
+                    if results.get('miss_distribution'):
+                        st.markdown("### 📊 Minutes Miss Classification")
+                        st.caption("Categorizes WHY minutes predictions were wrong")
+
+                        miss_dist = results['miss_distribution']
+                        miss_data = []
+
+                        # Category descriptions for clarity
+                        cat_icons = {
+                            'DNP': '🚫', 'OT_BOOST': '⏱️', 'BLOWOUT_PULL': '💨',
+                            'BLOWOUT_ROTATION': '🔄', 'FOUL_TROUBLE': '⚠️',
+                            'ROTATION_SHIFT': '📉', 'ROTATION_BOOST': '📈',
+                            'NORMAL': '✅', 'OTHER': '❓'
+                        }
+
+                        for cat in ['DNP', 'BLOWOUT_PULL', 'BLOWOUT_ROTATION', 'FOUL_TROUBLE',
+                                    'OT_BOOST', 'ROTATION_SHIFT', 'ROTATION_BOOST', 'NORMAL', 'OTHER']:
+                            if cat in miss_dist:
+                                data = miss_dist[cat]
+                                miss_data.append({
+                                    'Category': f"{cat_icons.get(cat, '')} {cat.replace('_', ' ').title()}",
+                                    'Count': data['count'],
+                                    'Pct': f"{data['pct']:.1f}%",
+                                    'Avg Min Error': f"{data['avg_minutes_error']:.1f}",
+                                })
+
+                        st.dataframe(pd.DataFrame(miss_data), use_container_width=True, hide_index=True)
+
+                        # DNP callout
+                        dnp_count = results.get('dnp_count', 0)
+                        total_preds = results.get('total_predictions', 0)
+                        if dnp_count > 0 and total_preds > 0:
+                            dnp_rate = dnp_count / total_preds * 100
+                            if dnp_rate > 5:
+                                st.warning(f"⚠️ **High DNP Rate**: {dnp_count} DNPs ({dnp_rate:.1f}%) - injury/availability data may need improvement")
+                            else:
+                                st.info(f"📋 DNP Rate: {dnp_count} ({dnp_rate:.1f}%) - within normal range")
+
+                    st.divider()
+
+                    # Investment Recommendations
+                    if results.get('recommendations'):
+                        st.markdown("### 💡 Investment Recommendations")
+                        st.caption("Where to focus modeling improvements based on miss patterns")
+
+                        for rec in results['recommendations']:
+                            priority_color = {
+                                'HIGH': 'error',
+                                'MEDIUM': 'warning',
+                                'LOW': 'info'
+                            }.get(rec['priority'], 'info')
+
+                            if priority_color == 'error':
+                                st.error(f"**[{rec['priority']}] {rec['area']}**: {rec['reason']}")
+                            elif priority_color == 'warning':
+                                st.warning(f"**[{rec['priority']}] {rec['area']}**: {rec['reason']}")
+                            else:
+                                st.info(f"**[{rec['priority']}] {rec['area']}**: {rec['reason']}")
+
                     # Worst Minutes Misses
-                    with st.expander("Worst Minutes Misses (Top 10)"):
+                    with st.expander("📉 Worst Minutes Misses (Top 15)"):
                         if results['worst_minutes_misses']:
-                            st.dataframe(pd.DataFrame(results['worst_minutes_misses']), use_container_width=True, hide_index=True)
+                            worst_df = pd.DataFrame(results['worst_minutes_misses'])
+                            # Select relevant columns for display
+                            display_cols = ['player_name', 'game_date', 'proj_minutes', 'actual_minutes',
+                                            'minutes_error', 'miss_category', 'role_tier']
+                            display_cols = [c for c in display_cols if c in worst_df.columns]
+                            st.dataframe(worst_df[display_cols], use_container_width=True, hide_index=True)
 
                 elif results:
                     st.warning(results.get('message', 'No data available'))
@@ -10247,7 +10384,7 @@ if selected_page == "Enrichment Validation":
         # =====================================================================
         with val_tab3:
             st.subheader("Error Slices Analysis")
-            st.caption("Break down errors by role, game script, rest, and interactions to find fix targets")
+            st.caption("Break down errors by role, game script, rest, and interactions. Only statistically significant + high-volume buckets are flagged as fix targets.")
 
             col_s1, col_s2 = st.columns([3, 1])
             with col_s1:
@@ -10257,7 +10394,7 @@ if selected_page == "Enrichment Validation":
 
             if run_slices or 'slice_results' in st.session_state:
                 if run_slices:
-                    with st.spinner("Calculating error slices..."):
+                    with st.spinner("Calculating error slices with bootstrap CIs..."):
                         try:
                             from error_slices import calculate_error_slices
                             st.session_state['slice_results'] = calculate_error_slices(
@@ -10270,49 +10407,68 @@ if selected_page == "Enrichment Validation":
                 results = st.session_state.get('slice_results')
                 if results and results.get('has_data'):
                     overall = results['overall']
-                    st.metric("Overall MAE", f"{overall['mae']:.2f}", help=f"Bias: {overall['bias']:+.2f}, N={overall['n']}")
+
+                    # Header metrics
+                    hcol1, hcol2, hcol3 = st.columns(3)
+                    with hcol1:
+                        st.metric("Overall MAE", f"{overall['mae']:.2f}", help=f"Bias: {overall['bias']:+.2f}")
+                    with hcol2:
+                        st.metric("Sample Size", f"{overall['n']:,}")
+                    with hcol3:
+                        st.metric("Trustworthy Slices", f"{results['trustworthy_count']}/{results['total_slices']}")
 
                     st.divider()
 
-                    # Worst Buckets Callout (Fix Targets)
-                    if results['worst_buckets']:
-                        st.markdown("### 🎯 Fix Targets (Worst Buckets)")
-                        for s in results['worst_buckets']:
-                            st.error(f"**{s['slice']}**: {s['pct_volume']:.1f}% of volume, **+{s['delta_mae']:.2f}** MAE worse than average")
+                    # Fix Targets (statistically significant + trustworthy)
+                    if results.get('fix_targets'):
+                        st.markdown("### 🎯 Fix Targets (Statistically Significant)")
+                        st.caption("These buckets have significantly higher error AND sufficient sample size (N≥50 or ≥2% volume)")
+                        for s in results['fix_targets']:
+                            ci_str = f"[{s['ci_lower']:+.2f}, {s['ci_upper']:+.2f}]"
+                            st.error(f"**{s['slice']}**: {s['pct_volume']:.1f}% volume, **+{s['delta_mae']:.2f}** MAE worse | 95% CI: {ci_str}")
+                    else:
+                        st.success("✅ No statistically significant fix targets found - errors are within normal variance")
 
                     st.divider()
 
-                    # Slice Tables
-                    def render_slice_table(slices, title):
+                    # Slice Tables with CI
+                    def render_slice_table_with_ci(slices, title):
                         if slices:
                             st.markdown(f"### {title}")
                             slice_data = []
                             for s in slices:
+                                ci_str = f"[{s['ci_lower']:+.2f}, {s['ci_upper']:+.2f}]" if not np.isnan(s.get('ci_lower', np.nan)) else "N/A"
+                                sig_icon = "✓" if s.get('is_significant') else ""
+                                trust_icon = "" if s.get('is_trustworthy') else "⚠️"
                                 slice_data.append({
                                     'Slice': s['slice'],
                                     'N': s['n'],
-                                    'Volume %': f"{s['pct_volume']:.1f}%",
+                                    'Vol%': f"{s['pct_volume']:.1f}%",
                                     'MAE': f"{s['mae']:.2f}",
                                     'ΔMAE': f"{s['delta_mae']:+.2f}",
-                                    'Bias': f"{s['bias']:+.2f}",
+                                    '95% CI': ci_str,
+                                    'Sig': sig_icon,
+                                    '': trust_icon,
                                 })
                             st.dataframe(pd.DataFrame(slice_data), use_container_width=True, hide_index=True)
+                            st.caption("✓ = statistically significant (CI excludes 0) | ⚠️ = low sample, interpret with caution")
 
-                    render_slice_table(results['by_role'], "By Role Tier")
-                    render_slice_table(results['by_game_script'], "By Game Script (Spread)")
-                    render_slice_table(results['by_rest'], "By Rest Days")
+                    render_slice_table_with_ci(results['by_role'], "By Role Tier")
+                    render_slice_table_with_ci(results['by_game_script'], "By Game Script (Spread)")
+                    render_slice_table_with_ci(results['by_rest'], "By Rest Days")
 
                     with st.expander("Interaction: Role × Game Script"):
-                        render_slice_table(results['interactions_role_script'], "")
+                        render_slice_table_with_ci(results['interactions_role_script'], "")
 
                     with st.expander("Interaction: Role × Rest"):
-                        render_slice_table(results['interactions_role_rest'], "")
+                        render_slice_table_with_ci(results['interactions_role_rest'], "")
 
-                    # Best Buckets (where we're doing well)
-                    if results['best_buckets']:
-                        with st.expander("Best Buckets (where we're accurate)"):
+                    # Best Buckets (significantly better than baseline)
+                    if results.get('best_buckets'):
+                        with st.expander("✅ Best Buckets (significantly better than baseline)"):
                             for s in results['best_buckets']:
-                                st.success(f"**{s['slice']}**: {s['pct_volume']:.1f}% volume, **{s['delta_mae']:.2f}** MAE better")
+                                ci_str = f"[{s['ci_lower']:+.2f}, {s['ci_upper']:+.2f}]"
+                                st.success(f"**{s['slice']}**: {s['pct_volume']:.1f}% volume, **{s['delta_mae']:.2f}** MAE better | 95% CI: {ci_str}")
 
                 elif results:
                     st.warning(results.get('message', 'No data available'))

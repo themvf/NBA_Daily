@@ -5,6 +5,11 @@ Error Slices Analysis ("Where We Were Wrong")
 Breaks down prediction errors by various buckets to identify
 which assumptions are failing and where to focus improvements.
 
+Features:
+- Bootstrap confidence intervals for ΔMAE
+- N threshold filtering (only trust buckets with sufficient sample)
+- Significance flags ("real" if CI excludes 0)
+
 Slices:
 - Role tier (STAR / STARTER / ROTATION / BENCH)
 - Spread bucket (0-3, 4-7, 8-12, 13+)
@@ -15,14 +20,121 @@ Slices:
 import sqlite3
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
 
+
+# =============================================================================
+# STATISTICAL HELPERS
+# =============================================================================
+
+def bootstrap_mae_ci(
+    errors: np.ndarray,
+    baseline_mae: float,
+    n_bootstrap: int = 1000,
+    ci_level: float = 0.95
+) -> Tuple[float, float, bool]:
+    """
+    Compute bootstrap confidence interval for MAE difference vs baseline.
+
+    Args:
+        errors: Array of absolute errors for this slice
+        baseline_mae: Overall MAE to compare against
+        n_bootstrap: Number of bootstrap samples
+        ci_level: Confidence level (default 95%)
+
+    Returns:
+        (ci_lower, ci_upper, is_significant)
+        is_significant is True if CI excludes 0
+    """
+    if len(errors) < 10:
+        return (np.nan, np.nan, False)
+
+    rng = np.random.default_rng(42)  # Fixed seed for reproducibility
+    bootstrap_deltas = []
+
+    for _ in range(n_bootstrap):
+        # Resample with replacement
+        sample = rng.choice(errors, size=len(errors), replace=True)
+        sample_mae = np.mean(sample)
+        bootstrap_deltas.append(sample_mae - baseline_mae)
+
+    # Compute percentiles
+    alpha = 1 - ci_level
+    ci_lower = np.percentile(bootstrap_deltas, alpha / 2 * 100)
+    ci_upper = np.percentile(bootstrap_deltas, (1 - alpha / 2) * 100)
+
+    # Significant if CI excludes 0
+    is_significant = (ci_lower > 0) or (ci_upper < 0)
+
+    return (ci_lower, ci_upper, is_significant)
+
+
+def compute_slice_stats(
+    slice_df: pd.DataFrame,
+    overall_mae: float,
+    overall_n: int,
+    slice_name: str,
+    min_n_threshold: int = 50,
+    min_pct_threshold: float = 2.0
+) -> Optional[Dict]:
+    """
+    Compute statistics for a single slice with confidence intervals.
+
+    Args:
+        slice_df: DataFrame for this slice
+        overall_mae: Overall MAE baseline
+        overall_n: Total sample size
+        slice_name: Name of the slice
+        min_n_threshold: Minimum N to be considered "trustworthy"
+        min_pct_threshold: Minimum % of volume to be considered "trustworthy"
+
+    Returns:
+        Dict with slice statistics, or None if insufficient data
+    """
+    n = len(slice_df)
+    if n < 10:  # Absolute minimum to even show
+        return None
+
+    errors = slice_df['abs_error'].values
+    mae = np.mean(errors)
+    bias = slice_df['prediction_error'].mean()
+    delta_mae = mae - overall_mae
+    pct_volume = n / overall_n * 100
+
+    # Bootstrap CI for delta MAE
+    ci_lower, ci_upper, is_significant = bootstrap_mae_ci(errors, overall_mae)
+
+    # Trustworthy if N >= threshold OR pct >= threshold
+    is_trustworthy = (n >= min_n_threshold) or (pct_volume >= min_pct_threshold)
+
+    # Only flag as "real fix target" if significant AND trustworthy
+    is_fix_target = is_significant and is_trustworthy and delta_mae > 0.3
+
+    return {
+        'slice': slice_name,
+        'n': n,
+        'pct_volume': pct_volume,
+        'mae': mae,
+        'bias': bias,
+        'delta_mae': delta_mae,
+        'ci_lower': ci_lower,
+        'ci_upper': ci_upper,
+        'is_significant': is_significant,
+        'is_trustworthy': is_trustworthy,
+        'is_fix_target': is_fix_target,
+    }
+
+
+# =============================================================================
+# MAIN ANALYSIS
+# =============================================================================
 
 def calculate_error_slices(
     conn: sqlite3.Connection,
     days: int = 30,
-    min_sample: int = 10
+    min_n_threshold: int = 50,
+    min_pct_threshold: float = 2.0
 ) -> Dict:
     """
     Calculate MAE and other metrics broken down by various slices.
@@ -30,10 +142,11 @@ def calculate_error_slices(
     Args:
         conn: Database connection
         days: Number of days to analyze
-        min_sample: Minimum sample size to include a slice
+        min_n_threshold: Minimum N for a slice to be "trustworthy"
+        min_pct_threshold: Minimum % volume for a slice to be "trustworthy"
 
     Returns:
-        Dict with slice breakdowns
+        Dict with slice breakdowns including CIs and significance flags
     """
     cutoff = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
 
@@ -81,6 +194,8 @@ def calculate_error_slices(
     results = {
         'has_data': True,
         'days_analyzed': days,
+        'min_n_threshold': min_n_threshold,
+        'min_pct_threshold': min_pct_threshold,
         'overall': {
             'n': overall_n,
             'mae': overall_mae,
@@ -94,17 +209,10 @@ def calculate_error_slices(
     role_slices = []
     for role in ['STAR', 'STARTER', 'ROTATION', 'BENCH']:
         role_df = df[df['role_tier'] == role]
-        if len(role_df) >= min_sample:
-            mae = role_df['abs_error'].mean()
-            role_slices.append({
-                'slice': role,
-                'n': len(role_df),
-                'pct_volume': len(role_df) / overall_n * 100,
-                'mae': mae,
-                'bias': role_df['prediction_error'].mean(),
-                'delta_mae': mae - overall_mae,
-                'top10_rate': role_df['was_top10'].mean() * 100 if 'was_top10' in role_df.columns and not role_df['was_top10'].isna().all() else None,
-            })
+        stats = compute_slice_stats(role_df, overall_mae, overall_n, role,
+                                    min_n_threshold, min_pct_threshold)
+        if stats:
+            role_slices.append(stats)
 
     results['by_role'] = sorted(role_slices, key=lambda x: x['delta_mae'], reverse=True)
 
@@ -120,17 +228,11 @@ def calculate_error_slices(
 
     for script, label in script_labels.items():
         script_df = df[df['game_script_tier'] == script]
-        if len(script_df) >= min_sample:
-            mae = script_df['abs_error'].mean()
-            script_slices.append({
-                'slice': label,
-                'script_key': script,
-                'n': len(script_df),
-                'pct_volume': len(script_df) / overall_n * 100,
-                'mae': mae,
-                'bias': script_df['prediction_error'].mean(),
-                'delta_mae': mae - overall_mae,
-            })
+        stats = compute_slice_stats(script_df, overall_mae, overall_n, label,
+                                    min_n_threshold, min_pct_threshold)
+        if stats:
+            stats['script_key'] = script
+            script_slices.append(stats)
 
     results['by_game_script'] = sorted(script_slices, key=lambda x: x['delta_mae'], reverse=True)
 
@@ -141,55 +243,31 @@ def calculate_error_slices(
 
     # B2B
     b2b_df = df[df['is_b2b'] == 1]
-    if len(b2b_df) >= min_sample:
-        mae = b2b_df['abs_error'].mean()
-        rest_slices.append({
-            'slice': 'Back-to-Back',
-            'n': len(b2b_df),
-            'pct_volume': len(b2b_df) / overall_n * 100,
-            'mae': mae,
-            'bias': b2b_df['prediction_error'].mean(),
-            'delta_mae': mae - overall_mae,
-        })
+    stats = compute_slice_stats(b2b_df, overall_mae, overall_n, 'Back-to-Back',
+                                min_n_threshold, min_pct_threshold)
+    if stats:
+        rest_slices.append(stats)
 
     # 1 day rest
     rest1_df = df[(df['is_b2b'] == 0) & (df['days_rest'] == 1)]
-    if len(rest1_df) >= min_sample:
-        mae = rest1_df['abs_error'].mean()
-        rest_slices.append({
-            'slice': '1 Day Rest',
-            'n': len(rest1_df),
-            'pct_volume': len(rest1_df) / overall_n * 100,
-            'mae': mae,
-            'bias': rest1_df['prediction_error'].mean(),
-            'delta_mae': mae - overall_mae,
-        })
+    stats = compute_slice_stats(rest1_df, overall_mae, overall_n, '1 Day Rest',
+                                min_n_threshold, min_pct_threshold)
+    if stats:
+        rest_slices.append(stats)
 
     # 2 days rest
     rest2_df = df[df['days_rest'] == 2]
-    if len(rest2_df) >= min_sample:
-        mae = rest2_df['abs_error'].mean()
-        rest_slices.append({
-            'slice': '2 Days Rest',
-            'n': len(rest2_df),
-            'pct_volume': len(rest2_df) / overall_n * 100,
-            'mae': mae,
-            'bias': rest2_df['prediction_error'].mean(),
-            'delta_mae': mae - overall_mae,
-        })
+    stats = compute_slice_stats(rest2_df, overall_mae, overall_n, '2 Days Rest',
+                                min_n_threshold, min_pct_threshold)
+    if stats:
+        rest_slices.append(stats)
 
     # 3+ days rest
     rest3_df = df[df['days_rest'] >= 3]
-    if len(rest3_df) >= min_sample:
-        mae = rest3_df['abs_error'].mean()
-        rest_slices.append({
-            'slice': '3+ Days Rest',
-            'n': len(rest3_df),
-            'pct_volume': len(rest3_df) / overall_n * 100,
-            'mae': mae,
-            'bias': rest3_df['prediction_error'].mean(),
-            'delta_mae': mae - overall_mae,
-        })
+    stats = compute_slice_stats(rest3_df, overall_mae, overall_n, '3+ Days Rest',
+                                min_n_threshold, min_pct_threshold)
+    if stats:
+        rest_slices.append(stats)
 
     results['by_rest'] = sorted(rest_slices, key=lambda x: x['delta_mae'], reverse=True)
 
@@ -201,18 +279,13 @@ def calculate_error_slices(
     for role in ['STAR', 'STARTER', 'ROTATION']:
         for script in ['blowout', 'close_game']:
             int_df = df[(df['role_tier'] == role) & (df['game_script_tier'] == script)]
-            if len(int_df) >= min_sample:
-                mae = int_df['abs_error'].mean()
-                interaction_slices.append({
-                    'slice': f"{role} in {script.replace('_', ' ').title()}",
-                    'role': role,
-                    'script': script,
-                    'n': len(int_df),
-                    'pct_volume': len(int_df) / overall_n * 100,
-                    'mae': mae,
-                    'bias': int_df['prediction_error'].mean(),
-                    'delta_mae': mae - overall_mae,
-                })
+            slice_name = f"{role} in {script.replace('_', ' ').title()}"
+            stats = compute_slice_stats(int_df, overall_mae, overall_n, slice_name,
+                                        min_n_threshold, min_pct_threshold)
+            if stats:
+                stats['role'] = role
+                stats['script'] = script
+                interaction_slices.append(stats)
 
     results['interactions_role_script'] = sorted(interaction_slices, key=lambda x: x['delta_mae'], reverse=True)
 
@@ -224,38 +297,28 @@ def calculate_error_slices(
     for role in ['STAR', 'STARTER']:
         # Role on B2B
         int_df = df[(df['role_tier'] == role) & (df['is_b2b'] == 1)]
-        if len(int_df) >= min_sample:
-            mae = int_df['abs_error'].mean()
-            role_rest_slices.append({
-                'slice': f"{role} on B2B",
-                'role': role,
-                'rest': 'b2b',
-                'n': len(int_df),
-                'pct_volume': len(int_df) / overall_n * 100,
-                'mae': mae,
-                'bias': int_df['prediction_error'].mean(),
-                'delta_mae': mae - overall_mae,
-            })
+        slice_name = f"{role} on B2B"
+        stats = compute_slice_stats(int_df, overall_mae, overall_n, slice_name,
+                                    min_n_threshold, min_pct_threshold)
+        if stats:
+            stats['role'] = role
+            stats['rest'] = 'b2b'
+            role_rest_slices.append(stats)
 
         # Role well-rested (3+)
         int_df = df[(df['role_tier'] == role) & (df['days_rest'] >= 3)]
-        if len(int_df) >= min_sample:
-            mae = int_df['abs_error'].mean()
-            role_rest_slices.append({
-                'slice': f"{role} Well-Rested (3+)",
-                'role': role,
-                'rest': '3+',
-                'n': len(int_df),
-                'pct_volume': len(int_df) / overall_n * 100,
-                'mae': mae,
-                'bias': int_df['prediction_error'].mean(),
-                'delta_mae': mae - overall_mae,
-            })
+        slice_name = f"{role} Well-Rested (3+)"
+        stats = compute_slice_stats(int_df, overall_mae, overall_n, slice_name,
+                                    min_n_threshold, min_pct_threshold)
+        if stats:
+            stats['role'] = role
+            stats['rest'] = '3+'
+            role_rest_slices.append(stats)
 
     results['interactions_role_rest'] = sorted(role_rest_slices, key=lambda x: x['delta_mae'], reverse=True)
 
     # =========================================================================
-    # F. Worst Buckets Summary (actionable callouts)
+    # F. Fix Targets (statistically significant AND trustworthy)
     # =========================================================================
     all_slices = (
         results['by_role'] +
@@ -265,37 +328,49 @@ def calculate_error_slices(
         results['interactions_role_rest']
     )
 
-    # Filter to buckets with meaningful volume and significant delta
-    actionable = [
+    # Only include slices that pass the statistical bar
+    results['fix_targets'] = [
         s for s in all_slices
-        if s['pct_volume'] >= 5 and abs(s['delta_mae']) >= 0.5
+        if s.get('is_fix_target', False)
     ]
 
-    results['worst_buckets'] = sorted(actionable, key=lambda x: x['delta_mae'], reverse=True)[:5]
-    results['best_buckets'] = sorted(actionable, key=lambda x: x['delta_mae'])[:5]
+    # Best buckets (significantly better than baseline)
+    results['best_buckets'] = [
+        s for s in all_slices
+        if s.get('is_significant', False) and s['delta_mae'] < -0.3 and s.get('is_trustworthy', False)
+    ]
+
+    # Count how many slices are trustworthy vs not
+    results['trustworthy_count'] = sum(1 for s in all_slices if s.get('is_trustworthy', False))
+    results['total_slices'] = len(all_slices)
 
     return results
 
 
 def format_slice_table(slices: List[Dict], title: str) -> str:
-    """Format a slice list as a text table."""
+    """Format a slice list as a text table with CIs."""
     if not slices:
         return f"{title}: No data\n"
 
     lines = [
         title,
-        "-" * 60,
-        f"{'Slice':<25} {'N':>6} {'Vol%':>6} {'MAE':>6} {'ΔMAE':>7} {'Bias':>7}",
-        "-" * 60,
+        "-" * 80,
+        f"{'Slice':<25} {'N':>6} {'Vol%':>6} {'MAE':>6} {'ΔMAE':>7} {'95% CI':>15} {'Sig?':>5}",
+        "-" * 80,
     ]
 
     for s in slices:
+        ci_str = f"[{s['ci_lower']:+.2f}, {s['ci_upper']:+.2f}]" if not np.isnan(s['ci_lower']) else "N/A"
+        sig_str = "YES" if s.get('is_significant') else "no"
+        trust_marker = "" if s.get('is_trustworthy') else " *"
+
         lines.append(
             f"{s['slice']:<25} {s['n']:>6} {s['pct_volume']:>5.1f}% "
-            f"{s['mae']:>6.2f} {s['delta_mae']:>+6.2f} {s['bias']:>+6.2f}"
+            f"{s['mae']:>6.2f} {s['delta_mae']:>+6.2f} {ci_str:>15} {sig_str:>5}{trust_marker}"
         )
 
     lines.append("")
+    lines.append("* = low sample size, interpret with caution")
     return "\n".join(lines)
 
 
@@ -311,30 +386,36 @@ if __name__ == "__main__":
     results = calculate_error_slices(conn, days=args.days)
 
     if results['has_data']:
-        print("=" * 60)
-        print("ERROR SLICES ANALYSIS")
-        print("=" * 60)
+        print("=" * 80)
+        print("ERROR SLICES ANALYSIS (with statistical significance)")
+        print("=" * 80)
         print(f"Sample: {results['overall']['n']} predictions over {results['days_analyzed']} days")
         print(f"Overall MAE: {results['overall']['mae']:.2f}, Bias: {results['overall']['bias']:+.2f}")
+        print(f"Trustworthy slices: {results['trustworthy_count']}/{results['total_slices']}")
         print()
 
         print(format_slice_table(results['by_role'], "BY ROLE TIER"))
         print(format_slice_table(results['by_game_script'], "BY GAME SCRIPT"))
         print(format_slice_table(results['by_rest'], "BY REST"))
-        print(format_slice_table(results['interactions_role_script'], "ROLE x GAME SCRIPT"))
-        print(format_slice_table(results['interactions_role_rest'], "ROLE x REST"))
 
-        print("=" * 60)
-        print("WORST BUCKETS (Fix Targets)")
-        print("=" * 60)
-        for s in results['worst_buckets']:
-            print(f"  {s['slice']}: {s['pct_volume']:.1f}% volume, +{s['delta_mae']:.2f} MAE worse")
+        print("=" * 80)
+        print("FIX TARGETS (statistically significant + sufficient sample)")
+        print("=" * 80)
+        if results['fix_targets']:
+            for s in results['fix_targets']:
+                print(f"  🎯 {s['slice']}: {s['pct_volume']:.1f}% volume, +{s['delta_mae']:.2f} MAE worse")
+                print(f"     95% CI: [{s['ci_lower']:+.2f}, {s['ci_upper']:+.2f}]")
+        else:
+            print("  No statistically significant fix targets found")
 
         print()
-        print("BEST BUCKETS")
-        print("-" * 60)
-        for s in results['best_buckets']:
-            print(f"  {s['slice']}: {s['pct_volume']:.1f}% volume, {s['delta_mae']:.2f} MAE better")
+        print("BEST BUCKETS (significantly better than baseline)")
+        print("-" * 80)
+        if results['best_buckets']:
+            for s in results['best_buckets']:
+                print(f"  ✅ {s['slice']}: {s['pct_volume']:.1f}% volume, {s['delta_mae']:.2f} MAE better")
+        else:
+            print("  No significantly better buckets found")
     else:
         print(results.get('message', 'No data'))
 
