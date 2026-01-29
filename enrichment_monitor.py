@@ -419,17 +419,52 @@ def backfill_audit_log(
 # WEEKLY SUMMARY CALCULATION
 # =============================================================================
 
+def snap_to_week_ending_sunday(date_str: str) -> str:
+    """
+    Snap a date to the Sunday ending that calendar week.
+
+    Calendar weeks run Monday-Sunday:
+    - Monday 2026-01-20 → Sunday 2026-01-26
+    - Tuesday 2026-01-21 → Sunday 2026-01-26
+    - Sunday 2026-01-26 → Sunday 2026-01-26
+
+    Returns the Sunday date as YYYY-MM-DD string.
+    """
+    dt = datetime.strptime(date_str, '%Y-%m-%d')
+    # weekday(): Monday=0, Sunday=6
+    days_until_sunday = (6 - dt.weekday()) % 7
+    if days_until_sunday == 0 and dt.weekday() != 6:
+        # It's not Sunday, so we need to go forward to next Sunday
+        days_until_sunday = 7
+    # Actually, simpler: always go to the end of the current week
+    # If today is Sunday (weekday=6), days_until_sunday = 0
+    # If today is Monday (weekday=0), days_until_sunday = 6
+    days_until_sunday = (6 - dt.weekday()) % 7
+    week_end_dt = dt + timedelta(days=days_until_sunday)
+    return week_end_dt.strftime('%Y-%m-%d')
+
+
+def get_week_start_from_sunday(week_ending_sunday: str) -> str:
+    """Given a Sunday week-ending date, return the Monday start."""
+    dt = datetime.strptime(week_ending_sunday, '%Y-%m-%d')
+    # Go back 6 days to get Monday
+    return (dt - timedelta(days=6)).strftime('%Y-%m-%d')
+
+
 def calculate_weekly_summary(
     conn: sqlite3.Connection,
     week_ending: str = None,
     verbose: bool = False
 ) -> Dict:
     """
-    Calculate weekly enrichment summary metrics.
+    Calculate weekly enrichment summary metrics for a TRUE CALENDAR WEEK.
+
+    Calendar weeks run Monday through Sunday. The week_ending parameter
+    will be snapped to the Sunday ending that week.
 
     Args:
         conn: Database connection
-        week_ending: End date of the week (defaults to yesterday)
+        week_ending: Any date in the week (will be snapped to Sunday)
         verbose: Print progress
 
     Returns:
@@ -438,7 +473,9 @@ def calculate_weekly_summary(
     if week_ending is None:
         week_ending = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
 
-    week_start = (datetime.strptime(week_ending, '%Y-%m-%d') - timedelta(days=6)).strftime('%Y-%m-%d')
+    # Snap to true calendar week ending Sunday
+    week_ending = snap_to_week_ending_sunday(week_ending)
+    week_start = get_week_start_from_sunday(week_ending)
 
     if verbose:
         print(f"Calculating summary for week {week_start} to {week_ending}")

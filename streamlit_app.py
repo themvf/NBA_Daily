@@ -10361,6 +10361,7 @@ if selected_page == "Enrichment Validation":
 
         with val_tab1:
             st.subheader("Weekly Enrichment Performance")
+            st.caption("📅 True calendar weeks (Monday-Sunday). Each week is non-overlapping.")
 
             # Date range selector
             col1, col2, col3 = st.columns([2, 2, 1])
@@ -10368,12 +10369,19 @@ if selected_page == "Enrichment Validation":
                 summary_weeks = st.number_input("Weeks to analyze", min_value=1, max_value=12, value=4)
             with col3:
                 if st.button("Refresh Summary", key="refresh_weekly_summary"):
-                    with st.spinner("Calculating weekly summary..."):
+                    with st.spinner("Calculating weekly summaries (calendar weeks)..."):
                         from datetime import timedelta
+                        # Import the snap function
+                        from enrichment_monitor import snap_to_week_ending_sunday
+                        # Start from yesterday and work backwards by calendar week
+                        today = datetime.now()
                         for i in range(summary_weeks):
-                            week_end = (datetime.now() - timedelta(days=1+i*7)).strftime('%Y-%m-%d')
-                            calculate_weekly_summary(enrichment_conn, week_end)
-                    st.success("Summary refreshed!")
+                            # Go back i weeks from today
+                            target_date = (today - timedelta(days=7*i)).strftime('%Y-%m-%d')
+                            # Snap to that calendar week's Sunday
+                            week_sunday = snap_to_week_ending_sunday(target_date)
+                            calculate_weekly_summary(enrichment_conn, week_sunday)
+                    st.success("Summary refreshed with calendar weeks!")
                     st.rerun()
 
             # Load and display weekly summaries
@@ -10390,6 +10398,15 @@ if selected_page == "Enrichment Validation":
                 """, enrichment_conn, params=[summary_weeks])
 
                 if not summary_df.empty:
+                    # Add week range column (Mon-Sun) for clearer display
+                    def format_week_range(week_ending):
+                        try:
+                            end_dt = datetime.strptime(week_ending, '%Y-%m-%d')
+                            start_dt = end_dt - timedelta(days=6)
+                            return f"{start_dt.strftime('%m/%d')} - {end_dt.strftime('%m/%d')}"
+                        except:
+                            return week_ending
+                    summary_df.insert(0, 'Week (Mon-Sun)', summary_df['week_ending'].apply(format_week_range))
                     # Display key metrics
                     latest = summary_df.iloc[0]
 
