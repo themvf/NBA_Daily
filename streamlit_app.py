@@ -10083,6 +10083,32 @@ if selected_page == "Enrichment Validation":
             except Exception as e:
                 st.warning(f"Weekly summary query failed: {e}")
 
+        # Enrichment field coverage by week
+        st.markdown("**Enrichment Coverage by Week:**")
+        try:
+            diag_cursor.execute("""
+                SELECT
+                    strftime('%Y-%m-%d', date(game_date, 'weekday 0', '-6 days')) as week_start,
+                    COUNT(*) as total,
+                    SUM(CASE WHEN role_tier IS NOT NULL THEN 1 ELSE 0 END) as has_role,
+                    SUM(CASE WHEN is_b2b IS NOT NULL THEN 1 ELSE 0 END) as has_b2b,
+                    SUM(CASE WHEN game_script_tier IS NOT NULL THEN 1 ELSE 0 END) as has_script,
+                    SUM(CASE WHEN days_rest IS NOT NULL THEN 1 ELSE 0 END) as has_rest
+                FROM predictions
+                GROUP BY week_start
+                ORDER BY week_start DESC
+                LIMIT 8
+            """)
+            enrich_rows = diag_cursor.fetchall()
+            enrich_df = pd.DataFrame(enrich_rows,
+                columns=['Week Start', 'Total', 'Role%', 'B2B%', 'Script%', 'Rest%'])
+            # Convert to percentages
+            for col in ['Role%', 'B2B%', 'Script%', 'Rest%']:
+                enrich_df[col] = (enrich_df[col] / enrich_df['Total'] * 100).round(0).astype(int).astype(str) + '%'
+            st.dataframe(enrich_df, use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.warning(f"Enrichment coverage query failed: {e}")
+
     # Import monitoring modules
     try:
         from enrichment_monitor import (
