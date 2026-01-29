@@ -214,41 +214,56 @@ def calculate_error_slices(
     """
     cutoff = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
 
-    # Query enriched predictions
+    # Query predictions directly (no audit log dependency)
+    # The predictions table has all enrichment columns + error columns
     query = """
         SELECT
-            p.player_id,
-            p.player_name,
-            p.game_date,
-            p.projected_ppg,
-            p.actual_ppg,
-            p.proj_minutes,
-            p.actual_minutes,
-            p.role_tier,
-            p.game_script_tier,
-            p.days_rest,
-            p.is_b2b,
-            p.blowout_risk,
-            p.position_matchup_factor,
-            ea.abs_error,
-            ea.prediction_error,
-            ea.was_top10
-        FROM predictions p
-        LEFT JOIN enrichment_audit_log ea
-            ON p.player_id = ea.player_id AND date(p.game_date) = date(ea.game_date)
-        WHERE p.actual_ppg IS NOT NULL
-          AND date(p.game_date) >= date(?)
+            player_id,
+            player_name,
+            game_date,
+            projected_ppg,
+            actual_ppg,
+            proj_minutes,
+            actual_minutes,
+            role_tier,
+            game_script_tier,
+            days_rest,
+            is_b2b,
+            blowout_risk,
+            position_matchup_factor,
+            error as prediction_error,
+            abs_error
+        FROM predictions
+        WHERE actual_ppg IS NOT NULL
+          AND date(game_date) >= date(?)
     """
 
     df = pd.read_sql_query(query, conn, params=[cutoff])
 
     if df.empty:
-        return {'has_data': False, 'message': 'No predictions found'}
+        return {'has_data': False, 'message': 'No predictions with actuals found in date range'}
 
-    # Calculate error if not already present
-    if df['abs_error'].isna().all():
-        df['prediction_error'] = df['actual_ppg'] - df['projected_ppg']
-        df['abs_error'] = np.abs(df['prediction_error'])
+    # Ensure error columns are numeric and computed
+    df['projected_ppg'] = pd.to_numeric(df['projected_ppg'], errors='coerce')
+    df['actual_ppg'] = pd.to_numeric(df['actual_ppg'], errors='coerce')
+
+    # Always recompute errors to ensure consistency
+    df['prediction_error'] = df['actual_ppg'] - df['projected_ppg']
+    df['abs_error'] = np.abs(df['prediction_error'])
+
+    # Filter to rows with valid errors
+    valid_mask = df['abs_error'].notna()
+    n_valid = valid_mask.sum()
+    n_total = len(df)
+
+    if n_valid == 0:
+        return {
+            'has_data': False,
+            'message': f'No valid (proj, actual) pairs found. {n_total} rows had NULL values.'
+        }
+
+    # Use only valid rows for analysis
+    df = df[valid_mask].copy()
 
     # Overall baseline
     overall_mae = df['abs_error'].mean()
