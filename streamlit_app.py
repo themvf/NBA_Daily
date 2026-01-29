@@ -8925,6 +8925,60 @@ if selected_page == "Backtest Analysis":
 
                 st.divider()
 
+                # ===================================================================
+                # CONCENTRATION METRIC - Top-5 Exposure %
+                # ===================================================================
+                st.markdown("#### 🎪 Portfolio Concentration")
+                st.caption("Shows if your portfolio is concentrated on a few players or broadly diversified")
+
+                # Compute player exposure across all portfolios
+                try:
+                    exposure_query = """
+                        SELECT player1_id, player1_name, player2_id, player2_name, player3_id, player3_name
+                        FROM portfolio_lineups
+                        WHERE slate_date BETWEEN ? AND ?
+                    """
+                    lineups_df = pd.read_sql_query(exposure_query, backtest_conn, params=[port_start_date, port_end_date])
+
+                    if not lineups_df.empty:
+                        # Count player appearances
+                        from collections import Counter
+                        player_counts = Counter()
+                        total_slots = 0
+
+                        for _, row in lineups_df.iterrows():
+                            for pid, pname in [(row['player1_id'], row['player1_name']),
+                                               (row['player2_id'], row['player2_name']),
+                                               (row['player3_id'], row['player3_name'])]:
+                                if pid and pname:
+                                    player_counts[pname] += 1
+                                    total_slots += 1
+
+                        # Top 5 most exposed players
+                        top5 = player_counts.most_common(5)
+                        top5_exposure = sum(c for _, c in top5) / total_slots * 100 if total_slots > 0 else 0
+
+                        conc_col1, conc_col2 = st.columns([2, 3])
+                        with conc_col1:
+                            # Interpret concentration
+                            if top5_exposure > 50:
+                                st.warning(f"⚠️ **High Concentration**: Top 5 players = {top5_exposure:.0f}% of slots")
+                                st.caption("Consider increasing diversity if hit 2/3 is low")
+                            elif top5_exposure > 35:
+                                st.info(f"📊 **Moderate Concentration**: Top 5 = {top5_exposure:.0f}%")
+                            else:
+                                st.success(f"✅ **Well Diversified**: Top 5 = {top5_exposure:.0f}%")
+
+                        with conc_col2:
+                            st.markdown("**Most Exposed Players:**")
+                            exposure_data = [{'Player': name, 'Appearances': cnt, 'Exposure': f"{cnt/total_slots*100:.1f}%"}
+                                             for name, cnt in top5]
+                            st.dataframe(pd.DataFrame(exposure_data), use_container_width=True, hide_index=True)
+                except Exception as e:
+                    st.info(f"Concentration data unavailable: {e}")
+
+                st.divider()
+
                 # Results table with enhanced columns
                 st.markdown("#### 📋 Detailed Results")
                 st.dataframe(
@@ -10127,6 +10181,81 @@ if selected_page == "Enrichment Validation":
 
         st.divider()
 
+        # =====================================================================
+        # DECISION PANEL - Quick Summary of What to Change
+        # =====================================================================
+        with st.expander("🎯 **Decision Panel** - What Changed My Mind", expanded=False):
+            st.caption("Aggregates key insights from all analyses into actionable decisions")
+
+            decision_col1, decision_col2, decision_col3 = st.columns(3)
+
+            with decision_col1:
+                st.markdown("#### 🔧 Top Fix Targets")
+                # Pull from cached slice_results if available
+                if 'slice_results' in st.session_state and st.session_state['slice_results']:
+                    fix_targets = st.session_state['slice_results'].get('fix_targets', [])[:3]
+                    if fix_targets:
+                        for i, t in enumerate(fix_targets, 1):
+                            st.markdown(f"**{i}. {t['slice']}**: +{t['delta_mae']:.2f} MAE")
+                    else:
+                        st.success("No significant fix targets")
+                else:
+                    st.info("Run Error Slices analysis")
+
+            with decision_col2:
+                st.markdown("#### ⏱️ Minutes Driver")
+                # Pull from cached minutes_results if available
+                if 'minutes_results' in st.session_state and st.session_state['minutes_results']:
+                    mr = st.session_state['minutes_results']
+                    if mr.get('has_data') and mr.get('miss_distribution'):
+                        # Find top miss category (excluding NORMAL)
+                        miss_dist = mr['miss_distribution']
+                        actionable = [(k, v) for k, v in miss_dist.items()
+                                      if k not in ['NORMAL', 'OTHER', 'OT_BOOST']]
+                        if actionable:
+                            top_miss = max(actionable, key=lambda x: x[1]['pct'])
+                            st.markdown(f"**Primary**: {top_miss[0]} ({top_miss[1]['pct']:.1f}%)")
+
+                        # Show lever
+                        lever = mr.get('overall', {}).get('primary_lever', 'UNKNOWN')
+                        st.markdown(f"**Lever**: {lever}")
+                    else:
+                        st.info("Insufficient data")
+                else:
+                    st.info("Run Minutes Lever analysis")
+
+            with decision_col3:
+                st.markdown("#### 📋 Portfolio Action")
+                # Recommendations based on cached data
+                portfolio_actions = []
+
+                # Check if we have slice results for diversification hints
+                if 'slice_results' in st.session_state and st.session_state['slice_results']:
+                    slices = st.session_state['slice_results']
+                    # If blowout slice is a fix target, recommend reducing stacking
+                    for t in slices.get('fix_targets', []):
+                        if 'blowout' in t['slice'].lower():
+                            portfolio_actions.append("⬇️ Reduce blowout stacking")
+                            break
+
+                # Check if we have minutes results
+                if 'minutes_results' in st.session_state and st.session_state['minutes_results']:
+                    mr = st.session_state['minutes_results']
+                    miss_dist = mr.get('miss_distribution', {})
+                    dnp_pct = miss_dist.get('DNP', {}).get('pct', 0)
+                    if dnp_pct > 5:
+                        portfolio_actions.append("⬆️ Increase player diversity")
+
+                if portfolio_actions:
+                    for action in portfolio_actions[:3]:
+                        st.markdown(f"• {action}")
+                else:
+                    st.success("No immediate changes needed")
+
+            st.caption("💡 Run Minutes Lever and Error Slices analyses to populate this panel")
+
+        st.divider()
+
         # Tabs for different views
         val_tab1, val_tab2, val_tab3, val_tab4, val_tab5, val_tab6 = st.tabs([
             "📊 Weekly Summary",
@@ -10312,16 +10441,18 @@ if selected_page == "Enrichment Validation":
                         miss_dist = results['miss_distribution']
                         miss_data = []
 
-                        # Category descriptions for clarity
+                        # Category descriptions for clarity (priority order)
                         cat_icons = {
-                            'DNP': '🚫', 'OT_BOOST': '⏱️', 'BLOWOUT_PULL': '💨',
-                            'BLOWOUT_ROTATION': '🔄', 'FOUL_TROUBLE': '⚠️',
-                            'ROTATION_SHIFT': '📉', 'ROTATION_BOOST': '📈',
-                            'NORMAL': '✅', 'OTHER': '❓'
+                            'DNP': '🚫', 'EARLY_INJURY_EXIT': '🏥', 'OT_BOOST': '⏱️',
+                            'BLOWOUT_PULL': '💨', 'BLOWOUT_ROTATION': '🔄',
+                            'FOUL_TROUBLE': '⚠️', 'ROTATION_SHIFT': '📉',
+                            'ROTATION_BOOST': '📈', 'NORMAL': '✅', 'OTHER': '❓'
                         }
 
-                        for cat in ['DNP', 'BLOWOUT_PULL', 'BLOWOUT_ROTATION', 'FOUL_TROUBLE',
-                                    'OT_BOOST', 'ROTATION_SHIFT', 'ROTATION_BOOST', 'NORMAL', 'OTHER']:
+                        # Display in priority order
+                        for cat in ['DNP', 'EARLY_INJURY_EXIT', 'BLOWOUT_PULL', 'BLOWOUT_ROTATION',
+                                    'FOUL_TROUBLE', 'OT_BOOST', 'ROTATION_SHIFT', 'ROTATION_BOOST',
+                                    'NORMAL', 'OTHER']:
                             if cat in miss_dist:
                                 data = miss_dist[cat]
                                 miss_data.append({
@@ -10351,18 +10482,17 @@ if selected_page == "Enrichment Validation":
                         st.caption("Where to focus modeling improvements based on miss patterns")
 
                         for rec in results['recommendations']:
-                            priority_color = {
-                                'HIGH': 'error',
-                                'MEDIUM': 'warning',
-                                'LOW': 'info'
-                            }.get(rec['priority'], 'info')
+                            priority = rec['priority']
 
-                            if priority_color == 'error':
-                                st.error(f"**[{rec['priority']}] {rec['area']}**: {rec['reason']}")
-                            elif priority_color == 'warning':
-                                st.warning(f"**[{rec['priority']}] {rec['area']}**: {rec['reason']}")
+                            if priority == 'HIGH':
+                                st.error(f"**[HIGH] {rec['area']}**: {rec['reason']}")
+                            elif priority == 'MEDIUM':
+                                st.warning(f"**[MEDIUM] {rec['area']}**: {rec['reason']}")
+                            elif priority == 'IGNORE':
+                                # Show but de-emphasize - this is unmodelable variance
+                                st.caption(f"🚫 **[IGNORE] {rec['area']}**: {rec['reason']}")
                             else:
-                                st.info(f"**[{rec['priority']}] {rec['area']}**: {rec['reason']}")
+                                st.info(f"**[{priority}] {rec['area']}**: {rec['reason']}")
 
                     # Worst Minutes Misses
                     with st.expander("📉 Worst Minutes Misses (Top 15)"):
@@ -10422,16 +10552,17 @@ if selected_page == "Enrichment Validation":
                     # Fix Targets (statistically significant + trustworthy)
                     if results.get('fix_targets'):
                         st.markdown("### 🎯 Fix Targets (Statistically Significant)")
-                        st.caption("These buckets have significantly higher error AND sufficient sample size (N≥50 or ≥2% volume)")
+                        st.caption("Buckets with significantly higher error AND sufficient sample (N≥50 or ≥2% volume) AND ≥5 unique dates")
                         for s in results['fix_targets']:
                             ci_str = f"[{s['ci_lower']:+.2f}, {s['ci_upper']:+.2f}]"
-                            st.error(f"**{s['slice']}**: {s['pct_volume']:.1f}% volume, **+{s['delta_mae']:.2f}** MAE worse | 95% CI: {ci_str}")
+                            n_dates = s.get('n_dates', 0)
+                            st.error(f"**{s['slice']}**: {s['pct_volume']:.1f}% vol, {n_dates} dates, **+{s['delta_mae']:.2f}** MAE worse | 95% CI: {ci_str}")
                     else:
                         st.success("✅ No statistically significant fix targets found - errors are within normal variance")
 
                     st.divider()
 
-                    # Slice Tables with CI
+                    # Slice Tables with CI (stratified bootstrap by date)
                     def render_slice_table_with_ci(slices, title):
                         if slices:
                             st.markdown(f"### {title}")
@@ -10440,9 +10571,11 @@ if selected_page == "Enrichment Validation":
                                 ci_str = f"[{s['ci_lower']:+.2f}, {s['ci_upper']:+.2f}]" if not np.isnan(s.get('ci_lower', np.nan)) else "N/A"
                                 sig_icon = "✓" if s.get('is_significant') else ""
                                 trust_icon = "" if s.get('is_trustworthy') else "⚠️"
+                                n_dates = s.get('n_dates', 0)
                                 slice_data.append({
                                     'Slice': s['slice'],
                                     'N': s['n'],
+                                    'Dates': n_dates,
                                     'Vol%': f"{s['pct_volume']:.1f}%",
                                     'MAE': f"{s['mae']:.2f}",
                                     'ΔMAE': f"{s['delta_mae']:+.2f}",
@@ -10451,7 +10584,7 @@ if selected_page == "Enrichment Validation":
                                     '': trust_icon,
                                 })
                             st.dataframe(pd.DataFrame(slice_data), use_container_width=True, hide_index=True)
-                            st.caption("✓ = statistically significant (CI excludes 0) | ⚠️ = low sample, interpret with caution")
+                            st.caption("✓ = significant (CI excludes 0) | ⚠️ = low sample/dates | CIs use stratified bootstrap (resamples by date)")
 
                     render_slice_table_with_ci(results['by_role'], "By Role Tier")
                     render_slice_table_with_ci(results['by_game_script'], "By Game Script (Spread)")

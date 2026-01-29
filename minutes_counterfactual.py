@@ -41,6 +41,18 @@ def classify_minutes_miss(
     """
     Classify the type of minutes miss for actionable insights.
 
+    PRIORITY ORDER (mutually exclusive, first match wins):
+    1. DNP - did not play at all
+    2. EARLY_INJURY_EXIT - played but left early (3-12 min when expected 20+)
+    3. OT_BOOST - overtime inflation (unmodelable noise)
+    4. BLOWOUT_PULL - star/starter pulled in blowout
+    5. BLOWOUT_ROTATION - bench affected by blowout
+    6. FOUL_TROUBLE - moderate reduction, not extreme
+    7. ROTATION_SHIFT - significant minutes loss
+    8. ROTATION_BOOST - unexpected minutes gain
+    9. NORMAL - within expected range
+    10. OTHER - unclassified
+
     Args:
         proj_minutes: Projected minutes
         actual_minutes: Actual minutes played
@@ -54,15 +66,30 @@ def classify_minutes_miss(
     minutes_diff = actual_minutes - proj_minutes
     minutes_pct_diff = minutes_diff / proj_minutes if proj_minutes > 0 else 0
 
-    # DNP / Late Scratch
+    # ==========================================================================
+    # PRIORITY 1: DNP (did not play)
+    # ==========================================================================
     if actual_minutes == 0 and proj_minutes > 0:
         return ('DNP', 'Player did not play (injury, rest, coach decision)')
 
-    # OT Boost (actual >> expected)
-    if minutes_pct_diff > 0.20 and actual_minutes >= 40:
-        return ('OT_BOOST', 'Likely overtime - minutes inflated beyond normal')
+    # ==========================================================================
+    # PRIORITY 2: EARLY_INJURY_EXIT (played but left very early)
+    # Distinguishes from DNP: they started but couldn't finish
+    # Threshold: actual 3-12 min when projected 20+ min
+    # ==========================================================================
+    if 3 <= actual_minutes <= 12 and proj_minutes >= 20:
+        return ('EARLY_INJURY_EXIT', 'Player likely left early due to in-game injury')
 
-    # Blowout Pull (spread large OR game_script is blowout, minutes down significantly)
+    # ==========================================================================
+    # PRIORITY 3: OT_BOOST (overtime - unmodelable noise)
+    # Mark this early so we don't over-interpret it
+    # ==========================================================================
+    if minutes_pct_diff > 0.20 and actual_minutes >= 40:
+        return ('OT_BOOST', 'Likely overtime - unmodelable variance, do not chase')
+
+    # ==========================================================================
+    # PRIORITY 4-5: BLOWOUT effects
+    # ==========================================================================
     if game_script == 'blowout' or blowout_risk > 0.5:
         if minutes_pct_diff < -0.15:
             if role_tier in ['STAR', 'STARTER']:
@@ -70,22 +97,33 @@ def classify_minutes_miss(
             else:
                 return ('BLOWOUT_ROTATION', 'Bench minutes affected by blowout')
 
-    # Foul Trouble (moderate minutes reduction, not extreme)
+    # ==========================================================================
+    # PRIORITY 6: FOUL_TROUBLE (moderate reduction)
+    # ==========================================================================
     if -0.30 < minutes_pct_diff < -0.15 and actual_minutes > 15:
         return ('FOUL_TROUBLE', 'Possible foul trouble - moderate minutes reduction')
 
-    # Significant underperformance in minutes (not blowout)
+    # ==========================================================================
+    # PRIORITY 7: ROTATION_SHIFT (significant loss, not blowout)
+    # ==========================================================================
     if minutes_pct_diff < -0.25:
         return ('ROTATION_SHIFT', 'Rotation shift or coach decision - significant minutes loss')
 
-    # Significant overperformance in minutes (not OT)
+    # ==========================================================================
+    # PRIORITY 8: ROTATION_BOOST (significant gain, not OT)
+    # ==========================================================================
     if minutes_pct_diff > 0.20 and actual_minutes < 40:
         return ('ROTATION_BOOST', 'Unexpected minutes boost - rotation opportunity')
 
-    # Minor variance (within 15%)
+    # ==========================================================================
+    # PRIORITY 9: NORMAL (within 15% variance)
+    # ==========================================================================
     if abs(minutes_pct_diff) <= 0.15:
         return ('NORMAL', 'Minutes within expected range')
 
+    # ==========================================================================
+    # PRIORITY 10: OTHER (unclassified)
+    # ==========================================================================
     return ('OTHER', 'Unclassified minutes variance')
 
 
@@ -321,13 +359,22 @@ def run_counterfactual_analysis(
     recommendations = []
 
     if miss_distribution:
-        # Check DNP rate
+        # Check DNP rate (availability failures)
         dnp_pct = miss_distribution.get('DNP', {}).get('pct', 0)
         if dnp_pct > 5:
             recommendations.append({
                 'area': 'Injury/Availability Data',
                 'priority': 'HIGH',
-                'reason': f'{dnp_pct:.1f}% of predictions were DNPs - improve injury tracking'
+                'reason': f'{dnp_pct:.1f}% of predictions were DNPs - improve pre-game injury tracking'
+            })
+
+        # Check EARLY_INJURY_EXIT (in-game injuries - different fix than DNP)
+        early_exit_pct = miss_distribution.get('EARLY_INJURY_EXIT', {}).get('pct', 0)
+        if early_exit_pct > 2:
+            recommendations.append({
+                'area': 'In-Game Injury Risk',
+                'priority': 'MEDIUM',
+                'reason': f'{early_exit_pct:.1f}% left early due to in-game injury - consider injury-prone flags'
             })
 
         # Check blowout impact
@@ -348,13 +395,13 @@ def run_counterfactual_analysis(
                 'reason': f'{rotation_pct:.1f}% are rotation shifts - update depth charts more frequently'
             })
 
-        # Check OT impact
+        # Check OT impact (UNMODELABLE - note this explicitly)
         ot_pct = miss_distribution.get('OT_BOOST', {}).get('pct', 0)
-        if ot_pct > 3:
+        if ot_pct > 0:
             recommendations.append({
-                'area': 'OT Probability Model',
-                'priority': 'LOW',
-                'reason': f'{ot_pct:.1f}% are OT boosts - limited improvement available'
+                'area': 'OT Variance (Unmodelable)',
+                'priority': 'IGNORE',
+                'reason': f'{ot_pct:.1f}% are OT boosts - DO NOT CHASE, this is irreducible variance'
             })
 
     # ==========================================================================

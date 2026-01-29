@@ -28,17 +28,20 @@ from datetime import datetime, timedelta
 # STATISTICAL HELPERS
 # =============================================================================
 
-def bootstrap_mae_ci(
-    errors: np.ndarray,
+def bootstrap_mae_ci_stratified(
+    slice_df: pd.DataFrame,
     baseline_mae: float,
     n_bootstrap: int = 1000,
     ci_level: float = 0.95
 ) -> Tuple[float, float, bool]:
     """
-    Compute bootstrap confidence interval for MAE difference vs baseline.
+    Compute STRATIFIED bootstrap confidence interval for MAE difference vs baseline.
+
+    IMPORTANT: Resamples by DATE (slate), not by individual rows.
+    This accounts for within-slate correlation (players on same date are correlated).
 
     Args:
-        errors: Array of absolute errors for this slice
+        slice_df: DataFrame with 'abs_error' and 'game_date' columns
         baseline_mae: Overall MAE to compare against
         n_bootstrap: Number of bootstrap samples
         ci_level: Confidence level (default 95%)
@@ -47,17 +50,40 @@ def bootstrap_mae_ci(
         (ci_lower, ci_upper, is_significant)
         is_significant is True if CI excludes 0
     """
-    if len(errors) < 10:
+    if len(slice_df) < 10:
         return (np.nan, np.nan, False)
+
+    # Group errors by date
+    if 'game_date' not in slice_df.columns:
+        # Fallback to simple bootstrap if no date column
+        return bootstrap_mae_ci_simple(slice_df['abs_error'].values, baseline_mae, n_bootstrap, ci_level)
+
+    dates = slice_df['game_date'].unique()
+    if len(dates) < 3:
+        # Not enough dates for stratified bootstrap
+        return bootstrap_mae_ci_simple(slice_df['abs_error'].values, baseline_mae, n_bootstrap, ci_level)
+
+    # Group by date
+    date_errors = {d: slice_df[slice_df['game_date'] == d]['abs_error'].values for d in dates}
 
     rng = np.random.default_rng(42)  # Fixed seed for reproducibility
     bootstrap_deltas = []
 
     for _ in range(n_bootstrap):
-        # Resample with replacement
-        sample = rng.choice(errors, size=len(errors), replace=True)
-        sample_mae = np.mean(sample)
-        bootstrap_deltas.append(sample_mae - baseline_mae)
+        # Resample DATES with replacement (stratified bootstrap)
+        sampled_dates = rng.choice(dates, size=len(dates), replace=True)
+
+        # Collect all errors from sampled dates
+        sampled_errors = []
+        for d in sampled_dates:
+            sampled_errors.extend(date_errors[d])
+
+        if len(sampled_errors) > 0:
+            sample_mae = np.mean(sampled_errors)
+            bootstrap_deltas.append(sample_mae - baseline_mae)
+
+    if not bootstrap_deltas:
+        return (np.nan, np.nan, False)
 
     # Compute percentiles
     alpha = 1 - ci_level
@@ -70,24 +96,56 @@ def bootstrap_mae_ci(
     return (ci_lower, ci_upper, is_significant)
 
 
+def bootstrap_mae_ci_simple(
+    errors: np.ndarray,
+    baseline_mae: float,
+    n_bootstrap: int = 1000,
+    ci_level: float = 0.95
+) -> Tuple[float, float, bool]:
+    """
+    Simple (non-stratified) bootstrap for fallback cases.
+    """
+    if len(errors) < 10:
+        return (np.nan, np.nan, False)
+
+    rng = np.random.default_rng(42)
+    bootstrap_deltas = []
+
+    for _ in range(n_bootstrap):
+        sample = rng.choice(errors, size=len(errors), replace=True)
+        sample_mae = np.mean(sample)
+        bootstrap_deltas.append(sample_mae - baseline_mae)
+
+    alpha = 1 - ci_level
+    ci_lower = np.percentile(bootstrap_deltas, alpha / 2 * 100)
+    ci_upper = np.percentile(bootstrap_deltas, (1 - alpha / 2) * 100)
+    is_significant = (ci_lower > 0) or (ci_upper < 0)
+
+    return (ci_lower, ci_upper, is_significant)
+
+
 def compute_slice_stats(
     slice_df: pd.DataFrame,
     overall_mae: float,
     overall_n: int,
     slice_name: str,
     min_n_threshold: int = 50,
-    min_pct_threshold: float = 2.0
+    min_pct_threshold: float = 2.0,
+    min_dates_threshold: int = 5
 ) -> Optional[Dict]:
     """
-    Compute statistics for a single slice with confidence intervals.
+    Compute statistics for a single slice with STRATIFIED confidence intervals.
+
+    Uses date-stratified bootstrap to account for within-slate correlation.
 
     Args:
-        slice_df: DataFrame for this slice
+        slice_df: DataFrame for this slice (must have 'abs_error', 'game_date')
         overall_mae: Overall MAE baseline
         overall_n: Total sample size
         slice_name: Name of the slice
         min_n_threshold: Minimum N to be considered "trustworthy"
         min_pct_threshold: Minimum % of volume to be considered "trustworthy"
+        min_dates_threshold: Minimum unique dates for trustworthy significance
 
     Returns:
         Dict with slice statistics, or None if insufficient data
@@ -102,11 +160,16 @@ def compute_slice_stats(
     delta_mae = mae - overall_mae
     pct_volume = n / overall_n * 100
 
-    # Bootstrap CI for delta MAE
-    ci_lower, ci_upper, is_significant = bootstrap_mae_ci(errors, overall_mae)
+    # Count unique dates for this slice
+    n_dates = slice_df['game_date'].nunique() if 'game_date' in slice_df.columns else 0
 
-    # Trustworthy if N >= threshold OR pct >= threshold
-    is_trustworthy = (n >= min_n_threshold) or (pct_volume >= min_pct_threshold)
+    # STRATIFIED Bootstrap CI for delta MAE (resamples by date)
+    ci_lower, ci_upper, is_significant = bootstrap_mae_ci_stratified(slice_df, overall_mae)
+
+    # Trustworthy if (N >= threshold OR pct >= threshold) AND enough dates
+    has_volume = (n >= min_n_threshold) or (pct_volume >= min_pct_threshold)
+    has_dates = n_dates >= min_dates_threshold
+    is_trustworthy = has_volume and has_dates
 
     # Only flag as "real fix target" if significant AND trustworthy
     is_fix_target = is_significant and is_trustworthy and delta_mae > 0.3
@@ -114,6 +177,7 @@ def compute_slice_stats(
     return {
         'slice': slice_name,
         'n': n,
+        'n_dates': n_dates,
         'pct_volume': pct_volume,
         'mae': mae,
         'bias': bias,
