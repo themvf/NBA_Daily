@@ -10016,6 +10016,73 @@ if selected_page == "Enrichment Validation":
     # Create fresh connection (don't use cached connection that may be closed)
     enrichment_conn = sqlite3.connect(str(db_path))
 
+    # =========================================================================
+    # DATABASE DIAGNOSTIC EXPANDER (for debugging data issues)
+    # =========================================================================
+    with st.expander("🔧 Database Diagnostics", expanded=False):
+        st.caption(f"**DB Path:** `{db_path}`")
+
+        diag_cursor = enrichment_conn.cursor()
+
+        # Check which tables exist
+        diag_cursor.execute("""
+            SELECT name FROM sqlite_master
+            WHERE type='table'
+              AND name IN ('predictions', 'enrichment_audit_log', 'enrichment_weekly_summary')
+        """)
+        existing_tables = [row[0] for row in diag_cursor.fetchall()]
+        st.markdown(f"**Tables Found:** {', '.join(existing_tables) if existing_tables else 'None'}")
+
+        # Predictions date range
+        try:
+            diag_cursor.execute("""
+                SELECT MIN(game_date) as min_date, MAX(game_date) as max_date, COUNT(*) as n
+                FROM predictions
+            """)
+            pred_row = diag_cursor.fetchone()
+            st.markdown(f"**Predictions:** {pred_row[2]:,} rows, dates {pred_row[0]} to {pred_row[1]}")
+
+            # Actuals coverage
+            diag_cursor.execute("""
+                SELECT COUNT(*) FROM predictions WHERE actual_ppg IS NOT NULL
+            """)
+            actuals_count = diag_cursor.fetchone()[0]
+            st.markdown(f"**With Actuals:** {actuals_count:,} ({actuals_count/pred_row[2]*100:.0f}%)" if pred_row[2] > 0 else "N/A")
+
+            # Recent dates breakdown
+            diag_cursor.execute("""
+                SELECT game_date, COUNT(*) as n,
+                       SUM(CASE WHEN actual_ppg IS NOT NULL THEN 1 ELSE 0 END) as has_actuals,
+                       SUM(CASE WHEN role_tier IS NOT NULL THEN 1 ELSE 0 END) as has_role
+                FROM predictions
+                GROUP BY game_date
+                ORDER BY game_date DESC
+                LIMIT 10
+            """)
+            recent_dates = diag_cursor.fetchall()
+            st.markdown("**Recent Prediction Dates:**")
+            recent_df = pd.DataFrame(recent_dates, columns=['Date', 'N', 'Actuals', 'Role'])
+            st.dataframe(recent_df, use_container_width=True, hide_index=True)
+
+        except Exception as e:
+            st.error(f"Predictions query failed: {e}")
+
+        # Weekly summary check
+        if 'enrichment_weekly_summary' in existing_tables:
+            try:
+                diag_cursor.execute("""
+                    SELECT week_ending, total_predictions
+                    FROM enrichment_weekly_summary
+                    ORDER BY week_ending DESC
+                    LIMIT 5
+                """)
+                weekly_rows = diag_cursor.fetchall()
+                st.markdown("**Weekly Summary Table:**")
+                for row in weekly_rows:
+                    st.markdown(f"  - {row[0]}: {row[1]} predictions")
+            except Exception as e:
+                st.warning(f"Weekly summary query failed: {e}")
+
     # Import monitoring modules
     try:
         from enrichment_monitor import (
