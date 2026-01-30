@@ -60,6 +60,322 @@ def _safe_get(row: dict, key: str, default: float = 0.0) -> float:
     return float(val)
 
 
+# =============================================================================
+# MIXTURE MODEL FOR TAIL PROBABILITY
+# =============================================================================
+# Two-component mixture: typical game + spike game
+# P(points) = (1-w)*N(μ, σ_typical) + w*N(μ+Δ, σ_spike)
+#
+# This captures "nuclear" outcomes better than single Normal.
+# Key insight: role players don't just have high σ - they have a SPIKE MODE
+# where everything clicks (hot shooting, extra minutes, OT).
+# =============================================================================
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    """Clamp value to range [lo, hi]."""
+    return max(lo, min(hi, x))
+
+
+def _sigmoid(z: float) -> float:
+    """Standard sigmoid function."""
+    # Clamp to avoid overflow
+    z = _clamp(z, -20, 20)
+    return 1.0 / (1.0 + math.exp(-z))
+
+
+@dataclass
+class MixtureParams:
+    """Parameters for the two-component mixture model."""
+    mu: float                # Mean projection
+    sigma_typical: float     # Typical game stddev (your current σ)
+    spike_weight: float      # w: probability of spike game (0.05 - 0.25)
+    spike_shift: float       # Δ: how much higher the spike mean is
+    sigma_spike: float       # Stddev in spike mode (slightly wider)
+
+    # Debug info
+    r3: float = 0.0          # Normalized 3PA rate
+    u: float = 0.0           # Normalized usage
+    vmin: float = 0.0        # Normalized minutes volatility
+    role_up: float = 0.0     # Normalized role expansion
+
+    def expected_value(self) -> float:
+        """E[X] for mixture = (1-w)*μ + w*(μ+Δ)."""
+        return self.mu + self.spike_weight * self.spike_shift
+
+
+def calculate_spike_weight(
+    fg3a: float,
+    fga: float,
+    usg_pct: float,
+    l5_minutes_stddev: float,
+    avg_minutes_last5: float,
+    season_avg_minutes: float,
+    injury_adjusted: bool,
+    opponent_pace: float = 100.0,
+    minutes_confidence: float = 0.7
+) -> Tuple[float, Dict[str, float]]:
+    """
+    Calculate spike weight w using bounded logistic.
+
+    Features (all normalized to [0,1]):
+    - r3: 3PA rate (high shooters spike more)
+    - u: usage % (high usage = more opportunity to spike)
+    - vmin: minutes volatility (unstable = can get extra minutes)
+    - role_up: recent minutes increase (expanded role = spike potential)
+    - inj: injury beneficiary (teammate out = opportunity)
+    - pace: game pace (fast games = more possessions = more variance)
+
+    Returns:
+        (spike_weight, feature_dict for debugging)
+    """
+    # Feature normalization (all in [0,1])
+
+    # r3: 3PA rate. 0.22→0.40 maps to 0→1
+    three_pa_rate = fg3a / max(fga, 1.0) if fga > 0 else 0.0
+    r3 = _clamp((three_pa_rate - 0.22) / 0.18, 0, 1)
+
+    # u: usage. 18→30 maps to 0→1
+    u = _clamp((usg_pct - 18) / 12, 0, 1) if usg_pct else 0.0
+
+    # vmin: minutes volatility. 3→7 stddev maps to 0→1
+    vmin = _clamp((l5_minutes_stddev - 3.0) / 4.0, 0, 1) if l5_minutes_stddev else 0.0
+
+    # role_up: minutes increase. +0→+8 maps to 0→1
+    minutes_delta = avg_minutes_last5 - season_avg_minutes if (avg_minutes_last5 and season_avg_minutes) else 0.0
+    role_up = _clamp(minutes_delta / 8.0, 0, 1)
+
+    # inj: injury beneficiary (binary)
+    inj = 1.0 if injury_adjusted else 0.0
+
+    # pace: opponent pace. 97→103 maps to 0→1
+    pace = _clamp((opponent_pace - 97) / 6, 0, 1) if opponent_pace else 0.5
+
+    # Logistic combination
+    z = (-2.1
+         + 1.2 * r3
+         + 0.9 * u
+         + 0.7 * vmin
+         + 0.7 * role_up
+         + 0.6 * inj
+         + 0.4 * pace)
+
+    w_raw = _sigmoid(z)
+
+    # Final weight: floor at 5%, cap at 25%
+    w = _clamp(0.05 + 0.20 * w_raw, 0.05, 0.25)
+
+    # Guardrail: if low confidence + not injury + no role_up, cap at 12%
+    # Prevents "random volatile bench" from dominating
+    if minutes_confidence < 0.3 and not injury_adjusted and role_up < 0.2:
+        w = min(w, 0.12)
+
+    features = {
+        'r3': r3,
+        'u': u,
+        'vmin': vmin,
+        'role_up': role_up,
+        'inj': inj,
+        'pace': pace,
+        'z': z,
+        'w_raw': w_raw,
+    }
+
+    return w, features
+
+
+def calculate_spike_shift(
+    sigma_typical: float,
+    r3: float,
+    u: float,
+    role_up: float,
+    avg_fga_last5: float = None,
+    season_fga: float = None
+) -> float:
+    """
+    Calculate spike shift Δ (how much higher the spike mean is).
+
+    Scales with:
+    - σ_typical (higher variance = bigger spikes possible)
+    - 3PA rate (shooters can get hot)
+    - Usage (high usage = more shots to convert)
+    - Role expansion (more minutes = more points)
+    - Shot volume increase (optional)
+
+    Returns:
+        Spike shift Δ in points (capped at 5-14)
+    """
+    # Optional shot volume increase
+    shot = 0.0
+    if avg_fga_last5 and season_fga and season_fga > 0:
+        shot = _clamp((avg_fga_last5 - season_fga) / 6.0, 0, 1)
+
+    delta = (4.0
+             + 0.45 * sigma_typical
+             + 3.0 * r3
+             + 2.0 * u
+             + 2.0 * role_up
+             + 1.0 * shot)
+
+    return _clamp(delta, 5.0, 14.0)
+
+
+def calculate_sigma_spike(
+    sigma_typical: float,
+    r3: float,
+    vmin: float
+) -> float:
+    """
+    Calculate σ for spike component (slightly wider than typical).
+
+    Spike games have extra variance from:
+    - Hot shooting streaks (higher for 3PA shooters)
+    - Minutes uncertainty (higher for volatile players)
+
+    Returns:
+        σ_spike (capped at 1.10x - 1.60x of typical)
+    """
+    multiplier = 1.15 + 0.20 * r3 + 0.10 * vmin
+    sigma_spike = sigma_typical * multiplier
+
+    # Clamp to reasonable range
+    return _clamp(sigma_spike, sigma_typical * 1.10, sigma_typical * 1.60)
+
+
+def build_mixture_params(
+    player: dict,
+    sigma_typical: float,
+    mu: float
+) -> MixtureParams:
+    """
+    Build complete mixture model parameters for a player.
+
+    Args:
+        player: Player data dict with all features
+        sigma_typical: Your current σ (after all multipliers)
+        mu: Calibrated mean projection
+
+    Returns:
+        MixtureParams dataclass with all mixture components
+    """
+    # Extract features with safe defaults
+    fg3a = _safe_get(player, 'avg_fg3a_last5') or _safe_get(player, 'avg_fg3a', 0)
+    fga = _safe_get(player, 'avg_fga_last5') or _safe_get(player, 'avg_fga', 0)
+    usg_pct = _safe_get(player, 'usg_pct') or _safe_get(player, 'avg_usg_last5', 0)
+    l5_minutes_stddev = _safe_get(player, 'l5_minutes_stddev', 4.0)
+    avg_minutes_last5 = _safe_get(player, 'avg_minutes_last5', 0)
+    season_avg_minutes = _safe_get(player, 'avg_minutes', 0)
+    injury_adjusted = bool(player.get('injury_adjusted'))
+    opponent_pace = _safe_get(player, 'opponent_pace', 100.0)
+    minutes_confidence = _safe_get(player, 'minutes_confidence', 0.7)
+
+    # Calculate spike weight
+    w, features = calculate_spike_weight(
+        fg3a=fg3a,
+        fga=fga,
+        usg_pct=usg_pct,
+        l5_minutes_stddev=l5_minutes_stddev,
+        avg_minutes_last5=avg_minutes_last5,
+        season_avg_minutes=season_avg_minutes,
+        injury_adjusted=injury_adjusted,
+        opponent_pace=opponent_pace,
+        minutes_confidence=minutes_confidence
+    )
+
+    # Calculate spike shift
+    delta = calculate_spike_shift(
+        sigma_typical=sigma_typical,
+        r3=features['r3'],
+        u=features['u'],
+        role_up=features['role_up'],
+        avg_fga_last5=_safe_get(player, 'avg_fga_last5'),
+        season_fga=_safe_get(player, 'season_fga')
+    )
+
+    # Calculate spike sigma
+    sigma_spike = calculate_sigma_spike(
+        sigma_typical=sigma_typical,
+        r3=features['r3'],
+        vmin=features['vmin']
+    )
+
+    return MixtureParams(
+        mu=mu,
+        sigma_typical=sigma_typical,
+        spike_weight=w,
+        spike_shift=delta,
+        sigma_spike=sigma_spike,
+        r3=features['r3'],
+        u=features['u'],
+        vmin=features['vmin'],
+        role_up=features['role_up']
+    )
+
+
+def mixture_tail_probability(params: MixtureParams, threshold: float) -> float:
+    """
+    Calculate P(points ≥ T) using the two-component mixture.
+
+    P = (1-w) * P_typical(X ≥ T) + w * P_spike(X ≥ T)
+
+    Where:
+    - P_typical uses N(μ, σ_typical)
+    - P_spike uses N(μ + Δ, σ_spike)
+
+    Args:
+        params: MixtureParams with all model parameters
+        threshold: Target threshold T (e.g., 32 points)
+
+    Returns:
+        Probability of exceeding threshold (0 to 1)
+    """
+    from scipy import stats
+
+    w = params.spike_weight
+    mu = params.mu
+
+    # Typical component: P(X ≥ T) where X ~ N(μ, σ_typical)
+    z_typical = (threshold - mu) / params.sigma_typical
+    p_typical = 1.0 - stats.norm.cdf(z_typical)
+
+    # Spike component: P(X ≥ T) where X ~ N(μ + Δ, σ_spike)
+    z_spike = (threshold - (mu + params.spike_shift)) / params.sigma_spike
+    p_spike = 1.0 - stats.norm.cdf(z_spike)
+
+    # Mixture probability
+    p_mixture = (1 - w) * p_typical + w * p_spike
+
+    return p_mixture
+
+
+def calculate_slate_threshold(
+    projections: List[float],
+    percentile: float = 92,
+    offset: float = 2.0
+) -> float:
+    """
+    Calculate slate-specific threshold T for "top scorer" probability.
+
+    T = percentile(projections, pct) + offset
+
+    This adapts to slate strength:
+    - Big slates with stars: higher T
+    - Small/slow slates: lower T
+
+    Args:
+        projections: List of all player projections on slate
+        percentile: Which percentile to use (92 for top-15, 97 for top-3)
+        offset: Additional points above percentile
+
+    Returns:
+        Threshold T in points
+    """
+    if not projections:
+        return 30.0  # Fallback
+
+    pct_value = np.percentile(projections, percentile)
+    return pct_value + offset
+
+
 def calculate_projected_minutes(player_data: dict) -> Tuple[float, float]:
     """
     Calculate projected minutes using weighted average + role guardrails + context.
@@ -876,6 +1192,147 @@ class Top3Ranker:
         return df
 
     # =========================================================================
+    # Mixture Model Tail Probability Ranking
+    # =========================================================================
+
+    def rank_by_mixture_probability(
+        self,
+        game_date: str,
+        threshold_percentile: float = 92,
+        threshold_offset: float = 2.0,
+        include_components: bool = False
+    ) -> pd.DataFrame:
+        """
+        Rank players by P(points ≥ T) using two-component mixture model.
+
+        This is the mathematically correct way to rank for "top-N scorer" contests.
+
+        Model:
+            P(points) = (1-w)*N(μ, σ_typical) + w*N(μ+Δ, σ_spike)
+
+        Where:
+        - w = spike_weight (5-25%, depends on 3PA rate, usage, role volatility)
+        - Δ = spike_shift (5-14 points, depends on σ + shooting profile)
+        - σ_spike = σ_typical * (1.15 to 1.60)
+
+        The ranking score is P(points ≥ T) where T is slate-adaptive.
+
+        Args:
+            game_date: Date to rank for
+            threshold_percentile: Percentile for threshold (92 for top-15, 97 for top-3)
+            threshold_offset: Points to add above percentile
+            include_components: If True, includes mixture model breakdown
+
+        Returns:
+            DataFrame sorted by P(≥T) descending with rank column
+        """
+        df = self.get_predictions_for_date(game_date)
+
+        if df.empty:
+            return df
+
+        # Get calibration params
+        cal_intercept, cal_slope = self.get_calibration_params()
+        calibration_table = get_calibration_table(self.conn, days_back=60)
+
+        # First pass: calculate means and σ for all players (needed for threshold)
+        player_data_list = []
+
+        for _, row in df.iterrows():
+            row_dict = row.to_dict() if hasattr(row, 'to_dict') else dict(row)
+
+            # Calibrated mean
+            mu = cal_intercept + cal_slope * _safe_get(row_dict, 'projected_ppg', 20)
+
+            # Build player dict for σ estimation
+            player_dict = {
+                'tier': row_dict.get('tier', 'ROLE'),
+                'proj_minutes': row_dict.get('proj_minutes', 30),
+                'proj_ceiling': row_dict.get('proj_ceiling', 0),
+                'proj_floor': row_dict.get('proj_floor', 0),
+                'projected_ppg': row_dict.get('projected_ppg', 20),
+                'minutes_confidence': row_dict.get('proj_confidence', 0.7),
+                'injury_adjusted': row_dict.get('injury_adjusted'),
+                'role_change': row_dict.get('role_change'),
+                'avg_minutes_last5': row_dict.get('avg_minutes_last5'),
+                'avg_minutes': row_dict.get('avg_minutes'),
+                # Additional fields for mixture model
+                'avg_fg3a_last5': row_dict.get('avg_fg3a_last5'),
+                'avg_fg3a': row_dict.get('avg_fg3a'),
+                'avg_fga_last5': row_dict.get('avg_fga_last5'),
+                'avg_fga': row_dict.get('avg_fga'),
+                'usg_pct': row_dict.get('usg_pct'),
+                'avg_usg_last5': row_dict.get('avg_usg_last5'),
+                'l5_minutes_stddev': row_dict.get('l5_minutes_stddev', 4.0),
+                'opponent_pace': row_dict.get('opponent_pace', 100.0),
+            }
+
+            # Estimate σ_typical (your current σ)
+            sigma_typical, _ = estimate_scoring_stddev(player_dict, calibration_table)
+
+            player_data_list.append({
+                'mu': mu,
+                'sigma_typical': sigma_typical,
+                'player_dict': player_dict,
+                'row_dict': row_dict,
+            })
+
+        # Calculate slate threshold T
+        all_projections = [p['mu'] for p in player_data_list]
+        threshold_T = calculate_slate_threshold(
+            all_projections,
+            percentile=threshold_percentile,
+            offset=threshold_offset
+        )
+
+        # Second pass: build mixture models and calculate P(≥T)
+        probabilities = []
+        all_components = []
+
+        for pdata in player_data_list:
+            # Build mixture params
+            mixture = build_mixture_params(
+                player=pdata['player_dict'],
+                sigma_typical=pdata['sigma_typical'],
+                mu=pdata['mu']
+            )
+
+            # Calculate tail probability
+            p_tail = mixture_tail_probability(mixture, threshold_T)
+
+            probabilities.append(p_tail)
+
+            if include_components:
+                all_components.append({
+                    'mu': round(mixture.mu, 1),
+                    'sigma_typical': round(mixture.sigma_typical, 2),
+                    'spike_weight': round(mixture.spike_weight, 3),
+                    'spike_shift': round(mixture.spike_shift, 1),
+                    'sigma_spike': round(mixture.sigma_spike, 2),
+                    'threshold_T': round(threshold_T, 1),
+                    'p_tail': round(p_tail, 4),
+                    'r3': round(mixture.r3, 2),
+                    'u': round(mixture.u, 2),
+                    'vmin': round(mixture.vmin, 2),
+                    'role_up': round(mixture.role_up, 2),
+                })
+
+        # Add to dataframe
+        df['p_threshold'] = probabilities
+        df['p_threshold_pct'] = [p * 100 for p in probabilities]
+        df['threshold_T'] = threshold_T
+
+        if include_components:
+            components_df = pd.DataFrame(all_components)
+            df = pd.concat([df, components_df], axis=1)
+
+        # Sort by probability descending
+        df = df.sort_values('p_threshold', ascending=False).reset_index(drop=True)
+        df['mixture_rank'] = range(1, len(df) + 1)
+
+        return df
+
+    # =========================================================================
     # Monte Carlo Simulation
     # =========================================================================
 
@@ -1240,21 +1697,35 @@ class Top3Ranker:
     def rank_players(
         self,
         game_date: str,
-        method: str = 'top_scorer_score',
-        n_simulations: int = 10000
+        method: str = 'mixture',
+        n_simulations: int = 10000,
+        threshold_percentile: float = 92
     ) -> pd.DataFrame:
         """
         Rank players using specified method.
 
         Args:
             game_date: Date to rank for
-            method: 'top_scorer_score', 'simulation', or 'both'
+            method: 'mixture' (recommended), 'top_scorer_score', 'simulation', or 'both'
             n_simulations: Number of simulations (if using simulation)
+            threshold_percentile: For mixture method (92 for top-15, 97 for top-3)
 
         Returns:
             DataFrame with rankings
+
+        Methods:
+        - 'mixture': Two-component mixture model with P(≥T) ranking (RECOMMENDED)
+        - 'top_scorer_score': Proj + k*σ heuristic (fast, good approximation)
+        - 'simulation': Monte Carlo P(top-3) estimation
+        - 'both': top_scorer_score + simulation merged
         """
-        if method == 'top_scorer_score':
+        if method == 'mixture':
+            return self.rank_by_mixture_probability(
+                game_date,
+                threshold_percentile=threshold_percentile,
+                include_components=True
+            )
+        elif method == 'top_scorer_score':
             return self.rank_by_top_scorer_score(game_date, include_components=True)
         elif method == 'simulation':
             return self.simulate_top3_probability(game_date, n_simulations)
