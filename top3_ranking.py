@@ -142,11 +142,30 @@ def calculate_spike_weight(
     # Feature normalization (all in [0,1])
 
     # r3: 3PA rate. 0.22→0.40 maps to 0→1
-    three_pa_rate = fg3a / max(fga, 1.0) if fga > 0 else 0.0
+    # FALLBACK: If fga is missing, estimate from fg3a directly
+    # High fg3a relative to minutes suggests volume shooter: 5+ 3PA/30min = shooter
+    if fga and fga > 0:
+        three_pa_rate = fg3a / fga
+    elif fg3a and minutes and minutes > 0:
+        # Proxy: 3PA per 36 minutes, normalized
+        # 3→8 3PA/36 maps roughly to the same 0.22→0.40 rate range
+        three_pa_per36 = (fg3a / minutes) * 36
+        three_pa_rate = _clamp((three_pa_per36 - 2.0) / 8.0, 0, 0.45)  # Approximate rate
+    else:
+        three_pa_rate = 0.0
     r3 = _clamp((three_pa_rate - 0.22) / 0.18, 0, 1)
 
     # u: usage. 18→30 maps to 0→1
-    u = _clamp((usg_pct - 18) / 12, 0, 1) if usg_pct else 0.0
+    # If usg_pct is a normalized proxy (0-1), use directly
+    if usg_pct is not None:
+        if usg_pct <= 1.0:
+            # Already normalized proxy (0-1 scale)
+            u = _clamp(usg_pct, 0, 1)
+        else:
+            # Real usage percentage (18-30 scale)
+            u = _clamp((usg_pct - 18) / 12, 0, 1)
+    else:
+        u = 0.0
 
     # vmin: minutes volatility. 3→7 stddev maps to 0→1
     vmin = _clamp((l5_minutes_stddev - 3.0) / 4.0, 0, 1) if l5_minutes_stddev else 0.0
@@ -156,7 +175,7 @@ def calculate_spike_weight(
     role_up_raw = _clamp(minutes_delta / 8.0, 0, 1)
 
     # DOUBLE-COUNT PROTECTION:
-    # If σ_typical already got a ≥1.15x multiplier from role expansion,
+    # If sigma_typical already got a >=1.15x multiplier from role expansion,
     # halve role_up's contribution to the mixture model
     if sigma_typical_multiplier >= 1.15:
         role_up = role_up_raw * 0.5
@@ -171,7 +190,11 @@ def calculate_spike_weight(
 
     # ft: FTA per minute (drive-heavy players spike via free throws)
     # 0.10→0.28 FTA/min maps to 0→1
-    fta_per_min = fta / max(minutes, 1.0) if minutes > 0 else 0.0
+    # FALLBACK: If fta missing, use 0 (no FT signal)
+    if fta and minutes and minutes > 0:
+        fta_per_min = fta / minutes
+    else:
+        fta_per_min = 0.0
     ft = _clamp((fta_per_min - 0.10) / 0.18, 0, 1)
 
     # Logistic combination (with FT signal)
@@ -424,9 +447,10 @@ def mixture_tail_probability(
     p_mixture = (1 - w) * p_typical + w * p_spike
 
     # P_CAP: prevent hallucinating extreme probabilities
-    # Even the best player shouldn't have >35% chance of hitting top-15 threshold
+    # Top-3: 20% cap (very rare event)
+    # Top-15: 45% cap (relaxed to allow model differentiation)
     if p_cap is None:
-        p_cap = 0.20 if is_top3_threshold else 0.35
+        p_cap = 0.20 if is_top3_threshold else 0.45
 
     return min(p_mixture, p_cap)
 
@@ -602,7 +626,7 @@ class MixtureTuningConfig:
     # Mode-specific settings
     mode: str = 'top15'  # 'top15' or 'top3'
     threshold_percentile: float = 92
-    p_cap: float = 0.35
+    p_cap: float = 0.45  # Relaxed for top-15 to allow differentiation
 
     # Adaptive nudge settings
     nudge_amount: float = 0.05
@@ -1111,7 +1135,7 @@ def validate_slate(
     W_CAP = 0.25
     DELTA_CAP = 14.0
     SIGMA_SPIKE_CAP_MULT = 1.60
-    P_CAP = 0.35 if threshold_percentile < 95 else 0.20
+    P_CAP = 0.45 if threshold_percentile < 95 else 0.20  # 0.45 for top-15, 0.20 for top-3
 
     pct_at_w_cap = 0
     pct_at_delta_cap = 0
@@ -2516,6 +2540,30 @@ class Top3Ranker:
                 if 'avg_usg_last5' in stats_dict:
                     df['usg_pct'] = df['player_id'].map(stats_dict['avg_usg_last5'])
 
+                # Compute usage proxy from points per minute
+                # This provides a differentiator when real usg_pct is unavailable
+                # Usage proxy: pts/min normalized to ~0-1 range
+                # League average is ~0.5-0.6 pts/min, stars ~0.7-0.9
+                if 'avg_ppg_last5' in stats_dict and 'avg_minutes_last5' in stats_dict:
+                    ppg_map = stats_dict['avg_ppg_last5']
+                    min_map = stats_dict['avg_minutes_last5']
+
+                    def calc_usage_proxy(pid):
+                        ppg = ppg_map.get(pid)
+                        mins = min_map.get(pid)
+                        if ppg is None or mins is None or mins < 5:
+                            return None
+                        pts_per_min = ppg / mins
+                        # Normalize: 0.3 pts/min -> 0, 0.9 pts/min -> 1
+                        # Clamp to [0, 1]
+                        normalized = max(0, min(1, (pts_per_min - 0.3) / 0.6))
+                        return normalized
+
+                    df['usage_proxy'] = df['player_id'].apply(calc_usage_proxy)
+                    # Use proxy when real usg_pct is missing
+                    if df['usg_pct'].isna().all() and 'usage_proxy' in df.columns:
+                        df['usg_pct'] = df['usage_proxy']
+
                 # Calculate minutes stddev with a separate query for players we have data for
                 player_ids_with_data = stats_df['player_id'].tolist()
                 if player_ids_with_data:
@@ -2990,9 +3038,23 @@ class Top3Ranker:
             })
 
         # Calculate slate threshold T
-        all_projections = [p['mu'] for p in player_data_list]
+        # IMPORTANT: Filter pool to players with meaningful minutes/projection
+        # This prevents low-minute/DNP players from dragging down T
+        MIN_PROJ_MINUTES = 10.0
+        MIN_PROJ_PPG = 5.0
+
+        qualified_projections = [
+            p['mu'] for p in player_data_list
+            if (p['player_dict'].get('proj_minutes') or 0) >= MIN_PROJ_MINUTES
+            or p['mu'] >= MIN_PROJ_PPG  # Fallback: include if projection is decent
+        ]
+
+        # If filter is too aggressive, use all
+        if len(qualified_projections) < 20:
+            qualified_projections = [p['mu'] for p in player_data_list]
+
         threshold_T = calculate_slate_threshold(
-            all_projections,
+            qualified_projections,
             percentile=threshold_percentile,
             offset=threshold_offset
         )
