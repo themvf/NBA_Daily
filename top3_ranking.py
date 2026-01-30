@@ -106,13 +106,17 @@ class MixtureParams:
 def calculate_spike_weight(
     fg3a: float,
     fga: float,
+    fta: float,
+    minutes: float,
     usg_pct: float,
     l5_minutes_stddev: float,
     avg_minutes_last5: float,
     season_avg_minutes: float,
     injury_adjusted: bool,
     opponent_pace: float = 100.0,
-    minutes_confidence: float = 0.7
+    vegas_spread: float = 0.0,
+    minutes_confidence: float = 0.7,
+    sigma_typical_multiplier: float = 1.0
 ) -> Tuple[float, Dict[str, float]]:
     """
     Calculate spike weight w using bounded logistic.
@@ -124,6 +128,13 @@ def calculate_spike_weight(
     - role_up: recent minutes increase (expanded role = spike potential)
     - inj: injury beneficiary (teammate out = opportunity)
     - pace: game pace (fast games = more possessions = more variance)
+    - ft: FTA per minute (drive-heavy players spike via FTs)
+    - close_game: probability game stays close (amplifies spike chance)
+
+    REFINEMENTS:
+    - role_up is halved if σ_typical already got a ≥1.15x boost (double-count protection)
+    - FTA signal added (drive-heavy players can spike via free throws)
+    - Close-game amplifier (tight games = more crunch time = spike opportunity)
 
     Returns:
         (spike_weight, feature_dict for debugging)
@@ -142,7 +153,15 @@ def calculate_spike_weight(
 
     # role_up: minutes increase. +0→+8 maps to 0→1
     minutes_delta = avg_minutes_last5 - season_avg_minutes if (avg_minutes_last5 and season_avg_minutes) else 0.0
-    role_up = _clamp(minutes_delta / 8.0, 0, 1)
+    role_up_raw = _clamp(minutes_delta / 8.0, 0, 1)
+
+    # DOUBLE-COUNT PROTECTION:
+    # If σ_typical already got a ≥1.15x multiplier from role expansion,
+    # halve role_up's contribution to the mixture model
+    if sigma_typical_multiplier >= 1.15:
+        role_up = role_up_raw * 0.5
+    else:
+        role_up = role_up_raw
 
     # inj: injury beneficiary (binary)
     inj = 1.0 if injury_adjusted else 0.0
@@ -150,19 +169,34 @@ def calculate_spike_weight(
     # pace: opponent pace. 97→103 maps to 0→1
     pace = _clamp((opponent_pace - 97) / 6, 0, 1) if opponent_pace else 0.5
 
-    # Logistic combination
+    # ft: FTA per minute (drive-heavy players spike via free throws)
+    # 0.10→0.28 FTA/min maps to 0→1
+    fta_per_min = fta / max(minutes, 1.0) if minutes > 0 else 0.0
+    ft = _clamp((fta_per_min - 0.10) / 0.18, 0, 1)
+
+    # Logistic combination (with FT signal)
     z = (-2.1
          + 1.2 * r3
          + 0.9 * u
          + 0.7 * vmin
          + 0.7 * role_up
          + 0.6 * inj
-         + 0.4 * pace)
+         + 0.4 * pace
+         + 0.6 * ft)  # FTA signal - catches drive-heavy spikes
 
     w_raw = _sigmoid(z)
 
     # Final weight: floor at 5%, cap at 25%
     w = _clamp(0.05 + 0.20 * w_raw, 0.05, 0.25)
+
+    # CLOSE-GAME AMPLIFIER:
+    # Spike nights are more likely to become top-15 when player stays on floor in crunch time
+    # close_prob = sigmoid(1.2 - 0.25*|spread|)
+    # Then: w = w * (0.9 + 0.3*close_prob), capped
+    if vegas_spread is not None:
+        close_prob = _sigmoid(1.2 - 0.25 * abs(vegas_spread))
+        w = w * (0.9 + 0.3 * close_prob)
+        w = _clamp(w, 0.05, 0.25)  # Re-clamp after amplifier
 
     # Guardrail: if low confidence + not injury + no role_up, cap at 12%
     # Prevents "random volatile bench" from dominating
@@ -174,8 +208,11 @@ def calculate_spike_weight(
         'u': u,
         'vmin': vmin,
         'role_up': role_up,
+        'role_up_raw': role_up_raw,
         'inj': inj,
         'pace': pace,
+        'ft': ft,
+        'close_prob': close_prob if vegas_spread is not None else 0.5,
         'z': z,
         'w_raw': w_raw,
     }
@@ -189,7 +226,8 @@ def calculate_spike_shift(
     u: float,
     role_up: float,
     avg_fga_last5: float = None,
-    season_fga: float = None
+    season_fga: float = None,
+    sigma_typical_multiplier: float = 1.0
 ) -> float:
     """
     Calculate spike shift Δ (how much higher the spike mean is).
@@ -201,6 +239,10 @@ def calculate_spike_shift(
     - Role expansion (more minutes = more points)
     - Shot volume increase (optional)
 
+    REFINEMENTS:
+    - Volume gate: low-FGA players can't get huge Δ even with high r3
+    - role_up excluded from Δ if σ already got role expansion boost (double-count protection)
+
     Returns:
         Spike shift Δ in points (capped at 5-14)
     """
@@ -209,12 +251,28 @@ def calculate_spike_shift(
     if avg_fga_last5 and season_fga and season_fga > 0:
         shot = _clamp((avg_fga_last5 - season_fga) / 6.0, 0, 1)
 
-    delta = (4.0
-             + 0.45 * sigma_typical
-             + 3.0 * r3
-             + 2.0 * u
-             + 2.0 * role_up
-             + 1.0 * shot)
+    # DOUBLE-COUNT PROTECTION:
+    # If σ_typical already got role expansion boost, exclude role_up from Δ
+    # (keep it only in spike weight w)
+    role_up_for_delta = role_up if sigma_typical_multiplier < 1.15 else 0.0
+
+    # Base delta calculation
+    delta_raw = (4.0
+                 + 0.45 * sigma_typical
+                 + 3.0 * r3
+                 + 2.0 * u
+                 + 2.0 * role_up_for_delta
+                 + 1.0 * shot)
+
+    # VOLUME GATE:
+    # A guy with 4 FGA/g shouldn't get +12 Δ
+    # vol_gate = clamp((avg_fga_last5 - 6) / 10, 0, 1) → 6-16 FGA maps 0-1
+    # Multiply: Δ = Δ * (0.6 + 0.4*vol_gate)
+    if avg_fga_last5 is not None:
+        vol_gate = _clamp((avg_fga_last5 - 6) / 10, 0, 1)
+        delta = delta_raw * (0.6 + 0.4 * vol_gate)
+    else:
+        delta = delta_raw
 
     return _clamp(delta, 5.0, 14.0)
 
@@ -244,7 +302,8 @@ def calculate_sigma_spike(
 def build_mixture_params(
     player: dict,
     sigma_typical: float,
-    mu: float
+    mu: float,
+    sigma_typical_multiplier: float = 1.0
 ) -> MixtureParams:
     """
     Build complete mixture model parameters for a player.
@@ -253,6 +312,7 @@ def build_mixture_params(
         player: Player data dict with all features
         sigma_typical: Your current σ (after all multipliers)
         mu: Calibrated mean projection
+        sigma_typical_multiplier: How much σ was boosted (for double-count protection)
 
     Returns:
         MixtureParams dataclass with all mixture components
@@ -260,35 +320,43 @@ def build_mixture_params(
     # Extract features with safe defaults
     fg3a = _safe_get(player, 'avg_fg3a_last5') or _safe_get(player, 'avg_fg3a', 0)
     fga = _safe_get(player, 'avg_fga_last5') or _safe_get(player, 'avg_fga', 0)
+    fta = _safe_get(player, 'avg_fta_last5') or _safe_get(player, 'avg_fta', 0)
+    minutes = _safe_get(player, 'avg_minutes_last5') or _safe_get(player, 'avg_minutes', 30)
     usg_pct = _safe_get(player, 'usg_pct') or _safe_get(player, 'avg_usg_last5', 0)
     l5_minutes_stddev = _safe_get(player, 'l5_minutes_stddev', 4.0)
     avg_minutes_last5 = _safe_get(player, 'avg_minutes_last5', 0)
     season_avg_minutes = _safe_get(player, 'avg_minutes', 0)
     injury_adjusted = bool(player.get('injury_adjusted'))
     opponent_pace = _safe_get(player, 'opponent_pace', 100.0)
+    vegas_spread = _safe_get(player, 'vegas_spread', 0.0)
     minutes_confidence = _safe_get(player, 'minutes_confidence', 0.7)
 
-    # Calculate spike weight
+    # Calculate spike weight (with all refinements)
     w, features = calculate_spike_weight(
         fg3a=fg3a,
         fga=fga,
+        fta=fta,
+        minutes=minutes,
         usg_pct=usg_pct,
         l5_minutes_stddev=l5_minutes_stddev,
         avg_minutes_last5=avg_minutes_last5,
         season_avg_minutes=season_avg_minutes,
         injury_adjusted=injury_adjusted,
         opponent_pace=opponent_pace,
-        minutes_confidence=minutes_confidence
+        vegas_spread=vegas_spread,
+        minutes_confidence=minutes_confidence,
+        sigma_typical_multiplier=sigma_typical_multiplier
     )
 
-    # Calculate spike shift
+    # Calculate spike shift (with volume gate + double-count protection)
     delta = calculate_spike_shift(
         sigma_typical=sigma_typical,
         r3=features['r3'],
         u=features['u'],
         role_up=features['role_up'],
         avg_fga_last5=_safe_get(player, 'avg_fga_last5'),
-        season_fga=_safe_get(player, 'season_fga')
+        season_fga=_safe_get(player, 'season_fga'),
+        sigma_typical_multiplier=sigma_typical_multiplier
     )
 
     # Calculate spike sigma
@@ -311,7 +379,12 @@ def build_mixture_params(
     )
 
 
-def mixture_tail_probability(params: MixtureParams, threshold: float) -> float:
+def mixture_tail_probability(
+    params: MixtureParams,
+    threshold: float,
+    p_cap: float = None,
+    is_top3_threshold: bool = False
+) -> float:
     """
     Calculate P(points ≥ T) using the two-component mixture.
 
@@ -321,12 +394,18 @@ def mixture_tail_probability(params: MixtureParams, threshold: float) -> float:
     - P_typical uses N(μ, σ_typical)
     - P_spike uses N(μ + Δ, σ_spike)
 
+    REFINEMENT: P_cap prevents hallucinating "55% chance to score 32"
+    - For top-15 threshold: P_cap = 0.35
+    - For top-3 threshold: P_cap = 0.20
+
     Args:
         params: MixtureParams with all model parameters
         threshold: Target threshold T (e.g., 32 points)
+        p_cap: Manual cap on probability (overrides auto-detection)
+        is_top3_threshold: If True, uses stricter cap (0.20 vs 0.35)
 
     Returns:
-        Probability of exceeding threshold (0 to 1)
+        Probability of exceeding threshold (0 to 1), capped
     """
     from scipy import stats
 
@@ -344,7 +423,12 @@ def mixture_tail_probability(params: MixtureParams, threshold: float) -> float:
     # Mixture probability
     p_mixture = (1 - w) * p_typical + w * p_spike
 
-    return p_mixture
+    # P_CAP: prevent hallucinating extreme probabilities
+    # Even the best player shouldn't have >35% chance of hitting top-15 threshold
+    if p_cap is None:
+        p_cap = 0.20 if is_top3_threshold else 0.35
+
+    return min(p_mixture, p_cap)
 
 
 def calculate_slate_threshold(
@@ -374,6 +458,127 @@ def calculate_slate_threshold(
 
     pct_value = np.percentile(projections, percentile)
     return pct_value + offset
+
+
+# =============================================================================
+# CALIBRATION SANITY CHECKS
+# =============================================================================
+
+def calculate_calibration_metrics(
+    conn: sqlite3.Connection,
+    days_back: int = 30,
+    threshold_percentile: float = 92
+) -> Dict[str, float]:
+    """
+    Calculate calibration metrics to detect tail drift.
+
+    Key metrics:
+    1. predicted_hits vs realized_hits (should match across slates)
+    2. Brier score for P(X ≥ T)
+    3. Calibration by decile
+
+    If predicted_hits >> realized_hits → mixture is too "fat"
+    If predicted_hits << realized_hits → mixture is too conservative
+
+    Args:
+        conn: Database connection
+        days_back: How many days of history to analyze
+        threshold_percentile: Percentile for threshold T
+
+    Returns:
+        Dict with calibration metrics
+    """
+    query = f"""
+        SELECT
+            game_date,
+            player_id,
+            player_name,
+            projected_ppg,
+            actual_ppg,
+            p_threshold,
+            threshold_T
+        FROM predictions
+        WHERE actual_ppg IS NOT NULL
+          AND p_threshold IS NOT NULL
+          AND game_date >= date('now', '-{days_back} days')
+        ORDER BY game_date, p_threshold DESC
+    """
+
+    try:
+        df = pd.read_sql_query(query, conn)
+    except Exception:
+        return {'error': 'Query failed or columns missing'}
+
+    if df.empty or len(df) < 50:
+        return {'error': 'Not enough data', 'n': len(df)}
+
+    # Group by date to calculate per-slate metrics
+    results = {
+        'n_slates': 0,
+        'n_predictions': len(df),
+        'total_predicted_hits': 0.0,
+        'total_realized_hits': 0,
+        'brier_scores': [],
+        'calibration_by_decile': {},
+    }
+
+    for game_date, slate_df in df.groupby('game_date'):
+        results['n_slates'] += 1
+
+        # Get threshold for this slate
+        T = slate_df['threshold_T'].iloc[0] if 'threshold_T' in slate_df.columns else 30.0
+
+        # Predicted hits = sum of all P(≥T) for ranked pool
+        predicted_hits = slate_df['p_threshold'].sum()
+        results['total_predicted_hits'] += predicted_hits
+
+        # Realized hits = count of players who actually hit T
+        realized_hits = (slate_df['actual_ppg'] >= T).sum()
+        results['total_realized_hits'] += realized_hits
+
+        # Brier score for each prediction
+        for _, row in slate_df.iterrows():
+            actual_hit = 1.0 if row['actual_ppg'] >= T else 0.0
+            brier = (row['p_threshold'] - actual_hit) ** 2
+            results['brier_scores'].append(brier)
+
+    # Aggregate metrics
+    results['predicted_hits_per_slate'] = results['total_predicted_hits'] / max(results['n_slates'], 1)
+    results['realized_hits_per_slate'] = results['total_realized_hits'] / max(results['n_slates'], 1)
+    results['hit_ratio'] = results['total_predicted_hits'] / max(results['total_realized_hits'], 1)
+    results['mean_brier'] = np.mean(results['brier_scores']) if results['brier_scores'] else 0.0
+
+    # Calibration check: predicted/realized ratio should be ~1.0
+    if results['hit_ratio'] > 1.3:
+        results['diagnosis'] = 'TAIL_TOO_FAT: predicted hits >> realized hits. Reduce intercept or spike weight.'
+    elif results['hit_ratio'] < 0.7:
+        results['diagnosis'] = 'TAIL_TOO_THIN: predicted hits << realized hits. Increase intercept or spike weight.'
+    else:
+        results['diagnosis'] = 'CALIBRATED: predicted/realized ratio within acceptable range.'
+
+    # Calibration by decile (for top deciles)
+    df_sorted = df.sort_values('p_threshold', ascending=False)
+    n_per_decile = len(df_sorted) // 10
+
+    for decile in range(1, 4):  # Top 3 deciles
+        start_idx = (decile - 1) * n_per_decile
+        end_idx = decile * n_per_decile
+        decile_df = df_sorted.iloc[start_idx:end_idx]
+
+        if len(decile_df) > 0:
+            T = decile_df['threshold_T'].iloc[0] if 'threshold_T' in decile_df.columns else 30.0
+            predicted_rate = decile_df['p_threshold'].mean()
+            realized_rate = (decile_df['actual_ppg'] >= T).mean()
+            results['calibration_by_decile'][f'decile_{decile}'] = {
+                'predicted_rate': predicted_rate,
+                'realized_rate': realized_rate,
+                'n': len(decile_df),
+            }
+
+    # Clean up for return
+    del results['brier_scores']
+
+    return results
 
 
 def calculate_projected_minutes(player_data: dict) -> Tuple[float, float]:
