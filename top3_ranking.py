@@ -343,12 +343,21 @@ def estimate_scoring_stddev(player: dict,
 
     Higher variance = better for top-3 probability (tail event).
 
+    TOURNAMENT STRATEGY INSIGHT:
+    For tournaments, variance is GOOD. A 6th man with high σ can pop off
+    and beat stars on any given night. We need to capture this by:
+    1. Using tier-based σ multipliers (SIXTH_MAN gets bonus)
+    2. Detecting role changes (L5 minutes >> season = expanded role)
+    3. Accounting for game script uncertainty
+
     Hierarchy:
     1. Calibrated stddev from historical residuals (if available + sufficient samples)
     2. Ceiling-floor spread / 3.29 (99% CI estimate)
     3. 25% of projected ppg as last resort
 
     Additional adjustments:
+    - Tier-based multipliers (SIXTH_MAN, BENCH have higher variance)
+    - Role change detection (recent minutes spike = higher variance)
     - Minutes volatility (uncertain minutes = higher variance)
     - Injury beneficiary status (fill-in role = higher variance)
 
@@ -380,6 +389,47 @@ def estimate_scoring_stddev(player: dict,
         else:
             base_std = proj_ppg * 0.25  # 25% of projection as fallback
 
+    # =========================================================================
+    # TIER-BASED VARIANCE MULTIPLIERS
+    # =========================================================================
+    # Key insight: Different player tiers have inherently different variance
+    # SIXTH_MAN: Can ghost (12 pts) or pop off (35 pts) - highest variance
+    # BENCH: Limited ceiling but can DNP - high variance
+    # STAR: More consistent usage, but game script dependent
+    # ROLE: Most predictable minutes and usage
+    tier_multipliers = {
+        'SIXTH_MAN': 1.35,  # 6th men are tournament gold - can pop off
+        'BENCH': 1.25,      # High variance due to minutes uncertainty
+        'STAR': 1.10,       # Stars have variance from game script (blowouts)
+        'ROLE': 1.00,       # Baseline - most predictable
+    }
+    tier_mult = tier_multipliers.get(tier, 1.0)
+    base_std *= tier_mult
+
+    # =========================================================================
+    # ROLE CHANGE DETECTION
+    # =========================================================================
+    # If L5 minutes >> season average, player's role is expanding
+    # This could be permanent (trade, injury) or temporary (hot streak)
+    # Either way, it means higher variance as role stabilizes
+    l5_minutes = _safe_get(player, 'avg_minutes_last5', 0)
+    season_minutes = _safe_get(player, 'avg_minutes', 0)
+
+    if season_minutes > 0 and l5_minutes > 0:
+        minutes_ratio = l5_minutes / season_minutes
+        if minutes_ratio >= 1.25:
+            # +25% minutes = major role change
+            base_std *= 1.30
+        elif minutes_ratio >= 1.15:
+            # +15% minutes = moderate role expansion
+            base_std *= 1.15
+        elif minutes_ratio <= 0.85:
+            # -15% minutes = role contraction (also high variance)
+            base_std *= 1.20
+
+    # =========================================================================
+    # EXISTING ADJUSTMENTS
+    # =========================================================================
     # Adjust for minutes volatility (uncertain minutes = higher variance)
     minutes_conf = _safe_get(player, 'minutes_confidence', 0.7)
     if minutes_conf < 0.5:
@@ -390,6 +440,10 @@ def estimate_scoring_stddev(player: dict,
     role_change = player.get('role_change')
     if injury_adjusted and not role_change:
         base_std *= 1.2  # Fill-in role is volatile
+
+    # Cap at reasonable maximum (3x base projection as 99th percentile)
+    max_std = proj_ppg * 0.5 if proj_ppg > 10 else 6.0
+    base_std = min(base_std, max_std)
 
     return max(base_std, 2.0), is_calibrated
 
@@ -558,19 +612,34 @@ class Top3Ranker:
         self,
         row: pd.Series,
         cal_intercept: float,
-        cal_slope: float
+        cal_slope: float,
+        calibration_table: Optional[pd.DataFrame] = None
     ) -> Tuple[float, Dict]:
         """
-        Calculate TopScorerScore optimized for top-3 identification.
+        Calculate TopScorerScore optimized for TOP-3 IDENTIFICATION using top-tail probability.
 
-        Philosophy: Focus on SUSTAINABLE factors, not chasing misleading hot streaks.
+        TOURNAMENT STRATEGY CORE INSIGHT:
+        ================================
+        For tournaments where you win by having a player in the top 3 scorers,
+        you should NOT rank by mean projection alone. You should rank by
+        P(player scores >= threshold) or equivalently by top-tail probability.
 
-        Priority order (most to least important):
-        1. Calibrated projection - foundation (~60% of score)
-        2. Ceiling/upside - tournament edge
-        3. Today's matchup quality - what matters NOW
-        4. Role sustainability - GATED hot streak (ValidityFactor pattern)
-        5. Star power - established scorers are more reliable
+        Mathematical approach: TopScorerScore = Proj + k * σ
+
+        Where:
+        - Proj = calibrated mean projection
+        - σ = scoring standard deviation (higher = more upside potential)
+        - k = aggressiveness factor (1.0-1.5 depending on contest type)
+
+        This formula naturally:
+        1. Rewards high-ceiling players (higher σ)
+        2. Keeps stars at the top (higher Proj)
+        3. Finds "nuclear" role players who can pop off (high σ relative to Proj)
+
+        Additional modifiers (smaller magnitude):
+        - Matchup quality (+/- 3 pts)
+        - Injury opportunity (+0-4 pts)
+        - Risk penalties (-0-5 pts)
 
         Returns:
             Tuple of (score, component_breakdown)
@@ -584,108 +653,120 @@ class Top3Ranker:
         components = {}
 
         # =================================================================
-        # 1. CALIBRATED BASE (Foundation - ~60% of score)
+        # 1. CALIBRATED BASE PROJECTION (μ)
         # =================================================================
-        # This is our best estimate of true scoring ability TODAY
-        # Already accounts for matchup, recent form via projection model
         calibrated_ppg = cal_intercept + cal_slope * row['projected_ppg']
-        components['calibrated_base'] = calibrated_ppg
+        components['calibrated_base'] = round(calibrated_ppg, 1)
 
         # =================================================================
-        # 2. CEILING BONUS (Tournament Edge - up to +8)
+        # 2. ESTIMATE SCORING VARIANCE (σ)
         # =================================================================
-        # High ceiling = high variance = good for tournaments
-        # But we scale by projection to avoid overrating low-volume players
-        ceiling_upside = row['proj_ceiling'] - row['projected_ppg']
-        # Only give full bonus if projection is high enough (20+ PPG)
-        proj_factor = min(row['projected_ppg'] / 25.0, 1.0)  # Scales 0-1 for 0-25 PPG
-        ceiling_bonus = min(ceiling_upside * 0.5 * proj_factor, 8.0)
-        components['ceiling_bonus'] = ceiling_bonus
-
-        # =================================================================
-        # 3. SUSTAINABLE ROLE SCORE (ValidityFactor pattern)
-        # =================================================================
-        # Formula: RoleScore = RawHotBonus * ValidityFactor
-        # ValidityFactor (0-1) crushes fake streaks
+        # This is the KEY for tournament strategy:
+        # Higher σ = more likely to hit the top tail
         #
-        # Key insight: Don't add hot bonuses conditionally - multiply by validity
-        # This prevents noise from competing with ceiling/matchup
-        role_score = 0.0
+        # We need to estimate σ using:
+        # - Tier-based variance (SIXTH_MAN > STAR > ROLE > BENCH)
+        # - Role change detection (L5 minutes vs season)
+        # - Ceiling-floor spread
+        # - Minutes volatility
 
+        # Build player dict for estimate_scoring_stddev
+        player_dict = {
+            'tier': row.get('tier', 'ROLE'),
+            'proj_minutes': row.get('proj_minutes', 30),
+            'proj_ceiling': row.get('proj_ceiling', 0),
+            'proj_floor': row.get('proj_floor', 0),
+            'projected_ppg': row.get('projected_ppg', 20),
+            'minutes_confidence': row.get('proj_confidence', 0.7),
+            'injury_adjusted': row.get('injury_adjusted'),
+            'role_change': row.get('role_change'),
+            'avg_minutes_last5': row.get('avg_minutes_last5'),
+            'avg_minutes': row.get('avg_minutes'),
+        }
+
+        # Calculate σ using the enhanced estimate_scoring_stddev function
+        sim_sigma, is_calibrated = estimate_scoring_stddev(player_dict, calibration_table)
+        components['sim_sigma'] = round(sim_sigma, 2)
+        components['sigma_calibrated'] = is_calibrated
+
+        # =================================================================
+        # 3. TOP-TAIL PROBABILITY SCORE (Proj + k*σ)
+        # =================================================================
+        # The aggressiveness factor k determines how much we value variance:
+        # - k = 0.8: Conservative (cash games)
+        # - k = 1.0: Balanced
+        # - k = 1.2: Aggressive (GPPs)
+        # - k = 1.5: Very aggressive (winner-take-all)
+        #
+        # For top-3 scorer contests, we use k = 1.2 (aggressive)
+        K_AGGRESSIVENESS = 1.2
+
+        top_tail_score = calibrated_ppg + K_AGGRESSIVENESS * sim_sigma
+        components['top_tail_score'] = round(top_tail_score, 1)
+        components['k_factor'] = K_AGGRESSIVENESS
+
+        # =================================================================
+        # 4. ROLE TREND OVERRIDE (last 3-5 games)
+        # =================================================================
+        # If player's minutes have spiked 15%+ in L5, their role is expanding
+        # This gets ADDED to top_tail_score, not just baked into σ
+        role_trend_bonus = 0.0
         season_avg = row.get('season_avg_ppg') or 0
+
         if season_avg > 0:
-            # Calculate raw hot bonus (what we WOULD give if trend is valid)
             recent_avg = row.get('recent_avg_5') or season_avg
             hot_ratio = recent_avg / season_avg
 
-            # Raw bonus: +4 max for 20%+ above season (before validity gate)
-            if hot_ratio > 1.05:
-                raw_hot_bonus = min((hot_ratio - 1.0) * 20, 4.0)  # Cap at +4
-            elif hot_ratio < 0.90:
-                raw_hot_bonus = max((hot_ratio - 1.0) * 15, -3.0)  # Cold penalty
-            else:
-                raw_hot_bonus = 0.0
-
-            # =============================================================
-            # VALIDITY FACTOR (0.0 to 1.0) - gates the hot bonus
-            # =============================================================
-            validity_factor = 1.0  # Start at full validity
-
-            # Check 1: STAR RETURNS DISCOUNT (most important)
-            # If player's recent spike was during teammate absence, but teammate is back
+            # Check if this is a VALID trend (injury-backed or minutes-backed)
             is_injury_beneficiary_today = (
                 row.get('injury_adjusted') and
                 row.get('injury_adjustment_amount') and
                 row.get('injury_adjustment_amount') > 0
             )
 
-            # If elevated stats but NO injury boost today = role likely contracting
-            if hot_ratio > 1.10 and not is_injury_beneficiary_today:
-                # Spike without ongoing injury context = very suspicious
-                # Star teammate might have been out, now back
-                validity_factor *= 0.25  # Crush to 25%
+            # Minutes-based role expansion check
+            l5_minutes = row.get('avg_minutes_last5') or row.get('avg_minutes') or 0
+            season_minutes = row.get('avg_minutes') or 0
+            minutes_ratio = l5_minutes / season_minutes if season_minutes > 0 else 1.0
 
-            # Check 2: MINUTES STABILITY
-            # Only trust hot streaks if minutes support it
-            # Note: We don't have L5 minutes in current schema, so we use
-            # proj_confidence as a proxy (high confidence = stable minutes expectation)
-            proj_confidence = row.get('proj_confidence') or 0.5
-            if proj_confidence < 0.6 and hot_ratio > 1.10:
-                # Low confidence in minutes + elevated stats = suspect
-                validity_factor *= 0.5
+            # TRUST hot streaks if backed by role expansion
+            if hot_ratio > 1.10:
+                if is_injury_beneficiary_today:
+                    # Teammate out = role expansion is REAL
+                    role_trend_bonus = min((hot_ratio - 1.0) * 15, 3.0)
+                elif minutes_ratio >= 1.15:
+                    # Minutes up 15%+ = role expansion is REAL
+                    role_trend_bonus = min((hot_ratio - 1.0) * 12, 2.5)
+                else:
+                    # Elevated stats without role backing = noise, small bonus only
+                    role_trend_bonus = min((hot_ratio - 1.0) * 5, 1.0)
+            elif hot_ratio < 0.85:
+                # Cold streak - apply penalty
+                role_trend_bonus = max((hot_ratio - 1.0) * 10, -2.0)
 
-            # Check 3: IF injury boost IS active, trust the streak more
-            if is_injury_beneficiary_today and hot_ratio > 1.05:
-                # Teammate still out, recent play elevated = makes sense
-                validity_factor = max(validity_factor, 0.8)  # At least 80%
-
-            # Apply validity factor to raw bonus
-            role_score = raw_hot_bonus * validity_factor
-
-        components['role_sustainability'] = round(role_score, 2)
+        components['role_trend'] = round(role_trend_bonus, 2)
 
         # =================================================================
-        # 4. TODAY'S MATCHUP QUALITY (up to +5)
+        # 5. TODAY'S MATCHUP QUALITY (+/- 3)
         # =================================================================
-        # Opponent defense rating matters for TODAY, not what happened last week
         matchup_bonus = 0.0
         opp_def = row.get('opponent_def_rating')
         if opp_def:
             # League average is ~112. Higher = worse defense = bonus
             if opp_def >= 116:
-                matchup_bonus = 5.0  # Elite matchup (bad defense)
+                matchup_bonus = 3.0  # Elite matchup (bad defense)
             elif opp_def >= 114:
-                matchup_bonus = 3.0  # Good matchup
+                matchup_bonus = 2.0  # Good matchup
             elif opp_def >= 112:
-                matchup_bonus = 1.0  # Neutral
+                matchup_bonus = 0.5  # Neutral
             elif opp_def <= 108:
-                matchup_bonus = -3.0  # Tough matchup (elite defense)
+                matchup_bonus = -2.5  # Tough matchup (elite defense)
             elif opp_def <= 110:
-                matchup_bonus = -1.5  # Difficult matchup
+                matchup_bonus = -1.0  # Difficult matchup
         components['matchup_today'] = matchup_bonus
 
         # =================================================================
-        # 5. INJURY BENEFICIARY (Only if teammate STILL out - up to +4)
+        # 6. INJURY BENEFICIARY (teammate STILL out - up to +4)
         # =================================================================
         injury_boost = 0.0
         if row.get('injury_adjusted') and row.get('injury_adjustment_amount'):
@@ -699,49 +780,43 @@ class Top3Ranker:
         components['injury_opportunity'] = injury_boost
 
         # =================================================================
-        # 6. STAR POWER BONUS (Established scorers - up to +3)
+        # 7. RISK PENALTIES (up to -5)
         # =================================================================
-        # Stars with 25+ season avg are more likely to have big games
-        # They get more shots in close games, clutch situations
-        star_bonus = 0.0
-        if row['season_avg_ppg'] >= 28:
-            star_bonus = 3.0  # Elite star
-        elif row['season_avg_ppg'] >= 25:
-            star_bonus = 2.0  # All-star level
-        elif row['season_avg_ppg'] >= 22:
-            star_bonus = 1.0  # Borderline star
-        components['star_power'] = star_bonus
-
-        # =================================================================
-        # 7. RISK PENALTIES (up to -10)
-        # =================================================================
+        # NOTE: Reduced penalties vs old formula because:
+        # - Questionable players have UPSIDE if they play (captured in σ)
+        # - Blowout risk is already in minutes projection
         risk_penalty = 0.0
 
-        # Questionable/Doubtful = might not play or limited minutes
+        # Questionable/Doubtful = might not play (but if they do, high ceiling)
+        # Penalty reduced because σ already increased for these players
         if row.get('injury_status') and row['injury_status'] in ('questionable', 'doubtful'):
-            risk_penalty += 5.0
+            risk_penalty += 2.0  # Reduced from 5.0
 
         # Blowout risk = stars get benched in 4th quarter
         if row.get('blowout_risk'):
-            risk_penalty += 3.0
+            risk_penalty += 2.0  # Reduced from 3.0
 
         # Back-to-back = fatigue, sometimes rest
         if row.get('back_to_back'):
-            risk_penalty += 2.0
+            risk_penalty += 1.0  # Reduced from 2.0
 
         components['risk_penalty'] = -risk_penalty
 
         # =================================================================
-        # TOTAL SCORE
+        # TOTAL SCORE (Top-Tail Formula)
         # =================================================================
+        # TopScorerScore = Proj + k*σ + modifiers
+        #
+        # This naturally:
+        # 1. Keeps stars at top (high Proj)
+        # 2. Rewards high-ceiling players (high σ)
+        # 3. Finds role player "nuclear" outcomes (high σ/Proj ratio)
         total = (
-            calibrated_ppg +      # Foundation (~60%)
-            ceiling_bonus +        # Tournament edge (+0-8)
-            role_score +           # Sustainable role (+/- 5)
-            matchup_bonus +        # Today's matchup (+/- 5)
+            top_tail_score +       # Core: Proj + k*σ (~85% of score)
+            role_trend_bonus +     # Valid hot streaks (+/- 3)
+            matchup_bonus +        # Today's matchup (+/- 3)
             injury_boost +         # Opportunity (+0-6)
-            star_bonus +           # Star power (+0-3)
-            risk_penalty           # Risks (-0-10)
+            risk_penalty           # Risks (-0-5)
         )
 
         return total, components
@@ -749,10 +824,22 @@ class Top3Ranker:
     def rank_by_top_scorer_score(
         self,
         game_date: str,
-        include_components: bool = False
+        include_components: bool = False,
+        k_aggressiveness: float = 1.2
     ) -> pd.DataFrame:
         """
         Rank players by TopScorerScore for a given date.
+
+        Uses the top-tail probability formula: Score = Proj + k*σ + modifiers
+
+        Args:
+            game_date: Date to rank for
+            include_components: If True, includes score breakdown columns
+            k_aggressiveness: How much to weight variance (σ)
+                - 0.8: Conservative (cash games)
+                - 1.0: Balanced
+                - 1.2: Aggressive (GPPs) [default]
+                - 1.5: Very aggressive (winner-take-all)
 
         Returns DataFrame sorted by score descending with rank column.
         """
@@ -761,8 +848,9 @@ class Top3Ranker:
         if df.empty:
             return df
 
-        # Get calibration params
+        # Get calibration params and table
         cal_intercept, cal_slope = self.get_calibration_params()
+        calibration_table = get_calibration_table(self.conn, days_back=60)
 
         # Calculate scores
         scores = []
@@ -770,7 +858,7 @@ class Top3Ranker:
 
         for _, row in df.iterrows():
             score, components = self.calculate_top_scorer_score(
-                row, cal_intercept, cal_slope
+                row, cal_intercept, cal_slope, calibration_table
             )
             scores.append(score)
             all_components.append(components)
@@ -1226,6 +1314,144 @@ class Top3Ranker:
             })
 
         return results
+
+
+# =========================================================================
+# Training Data Analysis
+# =========================================================================
+
+def analyze_missed_top_performers(
+    conn: sqlite3.Connection,
+    days_back: int = 60,
+    top_n: int = 15,
+    rank_threshold: int = 20
+) -> pd.DataFrame:
+    """
+    Build training dataset of "Missed Top-N" cases.
+
+    These are players who:
+    - Finished in top N scorers for the slate (actual_ppg)
+    - But were ranked BELOW threshold by our model
+
+    This dataset helps identify:
+    - What features predict underranked high performers
+    - Which player types we systematically underrate
+    - Role-player/rookie "nuclear" outcomes
+
+    Args:
+        conn: Database connection
+        days_back: How many days of history to analyze
+        top_n: What counts as "top performer" (default: 15)
+        rank_threshold: Rank cutoff for "missed" (default: 20)
+                        If player ranked >= 20 but finished top 15 = miss
+
+    Returns:
+        DataFrame with columns:
+            - game_date, player_name, team_name
+            - actual_ppg, actual_rank (in slate by points)
+            - our_rank (by top_scorer_score)
+            - projected_ppg, proj_ceiling, sim_sigma
+            - tier, role_trend, injury_adjusted
+            - miss_magnitude (how much we underranked them)
+    """
+    query = f"""
+        WITH slate_rankings AS (
+            SELECT
+                game_date,
+                player_id,
+                player_name,
+                team_name,
+                actual_ppg,
+                projected_ppg,
+                proj_ceiling,
+                proj_floor,
+                top_scorer_score,
+                tier,
+                injury_adjusted,
+                season_avg_ppg,
+                recent_avg_5,
+                RANK() OVER (PARTITION BY game_date ORDER BY actual_ppg DESC) as actual_rank,
+                RANK() OVER (PARTITION BY game_date ORDER BY top_scorer_score DESC) as our_rank
+            FROM predictions
+            WHERE actual_ppg IS NOT NULL
+              AND top_scorer_score IS NOT NULL
+              AND game_date >= date('now', '-{days_back} days')
+        )
+        SELECT *
+        FROM slate_rankings
+        WHERE actual_rank <= {top_n}
+          AND our_rank > {rank_threshold}
+        ORDER BY game_date DESC, actual_rank ASC
+    """
+
+    try:
+        df = pd.read_sql_query(query, conn)
+
+        if df.empty:
+            return df
+
+        # Calculate miss magnitude (how badly we underranked them)
+        df['miss_magnitude'] = df['our_rank'] - df['actual_rank']
+
+        # Calculate hot ratio (recent vs season)
+        df['hot_ratio'] = df.apply(
+            lambda r: r['recent_avg_5'] / r['season_avg_ppg']
+            if r['season_avg_ppg'] and r['season_avg_ppg'] > 0 else 1.0,
+            axis=1
+        )
+
+        # Calculate implied σ from ceiling-floor
+        df['implied_sigma'] = (df['proj_ceiling'] - df['proj_floor']) / 3.29
+
+        # Categorize the miss type
+        def categorize_miss(row):
+            if row['injury_adjusted']:
+                return 'INJURY_BENEFICIARY'
+            elif row['hot_ratio'] >= 1.15:
+                return 'HOT_STREAK'
+            elif row['season_avg_ppg'] < 15:
+                return 'ROLE_PLAYER_NUCLEAR'
+            elif row['implied_sigma'] >= 8:
+                return 'HIGH_VARIANCE'
+            else:
+                return 'OTHER'
+
+        df['miss_category'] = df.apply(categorize_miss, axis=1)
+
+        return df
+
+    except Exception as e:
+        print(f"Error analyzing missed top performers: {e}")
+        return pd.DataFrame()
+
+
+def get_miss_category_summary(conn: sqlite3.Connection, days_back: int = 60) -> Dict:
+    """
+    Get summary statistics for missed top performers by category.
+
+    Returns dict with:
+        - total_misses: Total missed top-15 performers
+        - by_category: Count by miss category
+        - avg_miss_magnitude: How badly we underrank on average
+        - most_common_tier: Which tier we miss most often
+    """
+    df = analyze_missed_top_performers(conn, days_back)
+
+    if df.empty:
+        return {
+            'total_misses': 0,
+            'by_category': {},
+            'avg_miss_magnitude': 0,
+            'most_common_tier': None
+        }
+
+    return {
+        'total_misses': len(df),
+        'by_category': df['miss_category'].value_counts().to_dict(),
+        'avg_miss_magnitude': df['miss_magnitude'].mean(),
+        'most_common_tier': df['tier'].mode().iloc[0] if not df['tier'].mode().empty else None,
+        'top_missed_players': df.head(10)[['game_date', 'player_name', 'actual_rank', 'our_rank', 'miss_category']].to_dict('records')
+    }
 
 
 # =========================================================================
