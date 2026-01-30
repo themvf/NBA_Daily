@@ -19,7 +19,7 @@ import sqlite3
 import math
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -978,6 +978,998 @@ def get_calibration_by_threshold_bucket(
     return results
 
 
+# =============================================================================
+# INTEGRATION TESTING & VALIDATION FRAMEWORK
+# =============================================================================
+
+@dataclass
+class SlateValidationResult:
+    """Results from validating a single slate."""
+    game_date: str
+    n_players: int
+    threshold_T: float
+
+    # Feature presence
+    feature_null_pcts: Dict[str, float]
+
+    # Guardrail activation rates
+    pct_at_w_cap: float
+    pct_at_delta_cap: float
+    pct_at_sigma_spike_cap: float
+    pct_at_p_cap: float
+    pct_volatile_bench: float
+
+    # Summary stats
+    mean_spike_weight: float
+    mean_spike_shift: float
+    mean_p_threshold: float
+    predicted_hits: float
+    realized_hits: int
+    hit_ratio: float
+
+    # Top players
+    top_5_by_p: List[Dict]
+    sleeper_archetypes: List[Dict]
+
+    # Issues detected
+    issues: List[str]
+
+
+def validate_slate(
+    ranker,
+    game_date: str,
+    threshold_percentile: float = 92,
+    min_proj_minutes: float = 10.0,
+    verbose: bool = True
+) -> SlateValidationResult:
+    """
+    Comprehensive validation of mixture model for a single slate.
+
+    This is the "integration test" that verifies:
+    - Schema & feature presence
+    - Guardrail activation rates
+    - Spot-check archetypes
+
+    Args:
+        ranker: Top3Ranker instance
+        game_date: Date to validate
+        threshold_percentile: 92 for top-15, 97 for top-3
+        min_proj_minutes: Min minutes to include in T calculation
+        verbose: Print detailed output
+
+    Returns:
+        SlateValidationResult with all diagnostics
+    """
+    issues = []
+
+    # Get ranking with all components
+    df = ranker.rank_players(game_date, method='mixture')
+
+    if df.empty:
+        return SlateValidationResult(
+            game_date=game_date, n_players=0, threshold_T=0,
+            feature_null_pcts={}, pct_at_w_cap=0, pct_at_delta_cap=0,
+            pct_at_sigma_spike_cap=0, pct_at_p_cap=0, pct_volatile_bench=0,
+            mean_spike_weight=0, mean_spike_shift=0, mean_p_threshold=0,
+            predicted_hits=0, realized_hits=0, hit_ratio=0,
+            top_5_by_p=[], sleeper_archetypes=[], issues=["Empty slate"]
+        )
+
+    n_players = len(df)
+    # Ensure threshold_T is a scalar float (handle potential duplicate columns)
+    threshold_T = 0.0
+    if 'threshold_T' in df.columns and len(df) > 0:
+        t_val = df['threshold_T'].iloc[0]
+        # Handle case where column is duplicated (returns Series instead of scalar)
+        if hasattr(t_val, 'iloc'):
+            threshold_T = float(t_val.iloc[0])
+        else:
+            threshold_T = float(t_val)
+
+    # -------------------------------------------------------------------------
+    # A. Schema & Feature Presence Assertions
+    # -------------------------------------------------------------------------
+    required_columns = [
+        'projected_ppg', 'mu', 'sigma_typical',
+        'spike_weight', 'spike_shift', 'sigma_spike', 'threshold_T', 'p_threshold',
+        'r3', 'u', 'vmin', 'role_up'
+    ]
+
+    # Check columns exist (allow for column name variations)
+    column_map = {
+        'mu': ['mu', 'calibrated_ppg'],
+        'spike_weight': ['spike_weight', 'w'],
+        'spike_shift': ['spike_shift', 'delta'],
+        'p_threshold': ['p_threshold', 'p_ge_T', 'p_tail'],
+    }
+
+    missing_cols = []
+    for col in required_columns:
+        variants = column_map.get(col, [col])
+        if not any(v in df.columns for v in variants):
+            missing_cols.append(col)
+
+    if missing_cols:
+        issues.append(f"Missing columns: {missing_cols}")
+
+    # Feature null percentages
+    feature_columns = ['r3', 'u', 'vmin', 'role_up', 'spike_weight', 'spike_shift',
+                       'sigma_typical', 'sigma_spike', 'mu']
+    feature_null_pcts = {}
+
+    for col in feature_columns:
+        if col in df.columns:
+            null_pct = df[col].isna().mean() * 100
+            feature_null_pcts[col] = null_pct
+            if null_pct > 30:
+                issues.append(f"High null rate for {col}: {null_pct:.1f}%")
+
+    # -------------------------------------------------------------------------
+    # B. Guardrail Activation Rates
+    # -------------------------------------------------------------------------
+    # Constants for caps
+    W_CAP = 0.25
+    DELTA_CAP = 14.0
+    SIGMA_SPIKE_CAP_MULT = 1.60
+    P_CAP = 0.35 if threshold_percentile < 95 else 0.20
+
+    pct_at_w_cap = 0
+    pct_at_delta_cap = 0
+    pct_at_sigma_spike_cap = 0
+    pct_at_p_cap = 0
+    pct_volatile_bench = 0
+
+    if 'spike_weight' in df.columns:
+        pct_at_w_cap = (df['spike_weight'] >= W_CAP - 0.001).mean() * 100
+        if pct_at_w_cap > 15:
+            issues.append(f"High w cap rate: {pct_at_w_cap:.1f}% (expected <15%)")
+
+    if 'spike_shift' in df.columns:
+        pct_at_delta_cap = (df['spike_shift'] >= DELTA_CAP - 0.1).mean() * 100
+        if pct_at_delta_cap > 10:
+            issues.append(f"High Δ cap rate: {pct_at_delta_cap:.1f}% (expected <10%)")
+
+    if 'sigma_spike' in df.columns and 'sigma_typical' in df.columns:
+        spike_ratio = df['sigma_spike'] / df['sigma_typical'].replace(0, 1)
+        pct_at_sigma_spike_cap = (spike_ratio >= SIGMA_SPIKE_CAP_MULT - 0.01).mean() * 100
+        if pct_at_sigma_spike_cap > 15:
+            issues.append(f"High σ_spike cap rate: {pct_at_sigma_spike_cap:.1f}%")
+
+    if 'p_threshold' in df.columns:
+        pct_at_p_cap = (df['p_threshold'] >= P_CAP - 0.001).mean() * 100
+        if pct_at_p_cap > 5:
+            issues.append(f"High P_cap rate: {pct_at_p_cap:.1f}% (expected <5%)")
+
+    # Volatile bench guard detection (proxy: bench tier + high vmin)
+    if 'tier' in df.columns and 'vmin' in df.columns:
+        bench_mask = df['tier'].isin(['BENCH', 'SIXTH_MAN'])
+        high_vol_mask = df['vmin'] > 0.7
+        pct_volatile_bench = (bench_mask & high_vol_mask).mean() * 100
+
+    # -------------------------------------------------------------------------
+    # Summary Statistics
+    # -------------------------------------------------------------------------
+    mean_spike_weight = df['spike_weight'].mean() if 'spike_weight' in df.columns else 0
+    mean_spike_shift = df['spike_shift'].mean() if 'spike_shift' in df.columns else 0
+    mean_p_threshold = df['p_threshold'].mean() if 'p_threshold' in df.columns else 0
+
+    # Predicted vs realized hits
+    predicted_hits = df['p_threshold'].sum() if 'p_threshold' in df.columns else 0
+    realized_hits = 0
+    if 'actual_ppg' in df.columns and threshold_T > 0:
+        realized_hits = (df['actual_ppg'] >= threshold_T).sum()
+    hit_ratio = predicted_hits / max(realized_hits, 1)
+
+    # -------------------------------------------------------------------------
+    # C. Spot-Check: Top 5 and Sleeper Archetypes
+    # -------------------------------------------------------------------------
+    top_5_by_p = []
+    if 'p_threshold' in df.columns:
+        top5 = df.nlargest(5, 'p_threshold')
+        for _, row in top5.iterrows():
+            top_5_by_p.append({
+                'player': row.get('player_name', row.get('player_id', 'Unknown')),
+                'mu': row.get('mu', row.get('projected_ppg', 0)),
+                'sigma_typical': row.get('sigma_typical', 0),
+                'w': row.get('spike_weight', 0),
+                'delta': row.get('spike_shift', 0),
+                'p': row.get('p_threshold', 0),
+                'tier': row.get('tier', 'Unknown'),
+            })
+
+    # Sleeper archetypes: bench players with high w or high delta
+    sleeper_archetypes = []
+    if all(c in df.columns for c in ['tier', 'spike_weight', 'spike_shift', 'p_threshold']):
+        bench_mask = df['tier'].isin(['BENCH', 'SIXTH_MAN', 'ROLE'])
+        # High spike weight (bench gunners)
+        high_w_bench = df[bench_mask].nlargest(3, 'spike_weight')
+        # Injury beneficiaries (high role_up)
+        if 'role_up' in df.columns:
+            high_role_up = df[df['role_up'] > 0.5].nlargest(2, 'role_up')
+            high_w_bench = pd.concat([high_w_bench, high_role_up]).drop_duplicates()
+
+        for _, row in high_w_bench.head(5).iterrows():
+            sleeper_archetypes.append({
+                'player': row.get('player_name', row.get('player_id', 'Unknown')),
+                'mu': row.get('mu', row.get('projected_ppg', 0)),
+                'w': row.get('spike_weight', 0),
+                'delta': row.get('spike_shift', 0),
+                'role_up': row.get('role_up', 0),
+                'p': row.get('p_threshold', 0),
+                'tier': row.get('tier', 'Unknown'),
+                'archetype': 'bench_gunner' if row.get('spike_weight', 0) > 0.18 else 'role_up'
+            })
+
+    if verbose:
+        print(f"\n{'='*60}")
+        print(f"SLATE VALIDATION: {game_date}")
+        print(f"{'='*60}")
+        print(f"Players: {n_players}, Threshold T: {threshold_T:.1f}")
+        print(f"\nFeature Null %: {feature_null_pcts}")
+        print(f"\nGuardrail Activation Rates:")
+        print(f"  w at cap (25%):      {pct_at_w_cap:.1f}%")
+        print(f"  delta at cap (14):   {pct_at_delta_cap:.1f}%")
+        print(f"  sigma_spike at cap:  {pct_at_sigma_spike_cap:.1f}%")
+        print(f"  P at cap:            {pct_at_p_cap:.1f}%")
+        print(f"  Volatile bench:      {pct_volatile_bench:.1f}%")
+        print(f"\nSummary Stats:")
+        print(f"  Mean w: {mean_spike_weight:.3f}, Mean delta: {mean_spike_shift:.1f}")
+        print(f"  Predicted hits: {predicted_hits:.1f}, Realized: {realized_hits}")
+        print(f"  Hit ratio: {hit_ratio:.2f}")
+
+        if top_5_by_p:
+            print(f"\nTop 5 by P(>=T):")
+            for p in top_5_by_p:
+                # Handle player names with special characters
+                player_name = str(p['player']).encode('ascii', 'replace').decode('ascii')
+                print(f"  {player_name}: mu={p['mu']:.1f}, w={p['w']:.3f}, delta={p['delta']:.1f}, P={p['p']:.3f} ({p['tier']})")
+
+        if sleeper_archetypes:
+            print(f"\nSleeper Archetypes:")
+            for s in sleeper_archetypes:
+                player_name = str(s['player']).encode('ascii', 'replace').decode('ascii')
+                print(f"  {player_name}: mu={s['mu']:.1f}, w={s['w']:.3f}, role_up={s['role_up']:.2f}, P={s['p']:.3f} [{s['archetype']}]")
+
+        if issues:
+            print(f"\n[!] Issues Detected:")
+            for issue in issues:
+                print(f"  - {issue}")
+        else:
+            print(f"\n[OK] No issues detected")
+
+    return SlateValidationResult(
+        game_date=game_date,
+        n_players=n_players,
+        threshold_T=threshold_T,
+        feature_null_pcts=feature_null_pcts,
+        pct_at_w_cap=pct_at_w_cap,
+        pct_at_delta_cap=pct_at_delta_cap,
+        pct_at_sigma_spike_cap=pct_at_sigma_spike_cap,
+        pct_at_p_cap=pct_at_p_cap,
+        pct_volatile_bench=pct_volatile_bench,
+        mean_spike_weight=mean_spike_weight,
+        mean_spike_shift=mean_spike_shift,
+        mean_p_threshold=mean_p_threshold,
+        predicted_hits=predicted_hits,
+        realized_hits=realized_hits,
+        hit_ratio=hit_ratio,
+        top_5_by_p=top_5_by_p,
+        sleeper_archetypes=sleeper_archetypes,
+        issues=issues
+    )
+
+
+def explain_player(
+    ranker,
+    player_id: int,
+    game_date: str,
+    verbose: bool = True
+) -> Dict[str, Any]:
+    """
+    Detailed breakdown of mixture model calculation for one player.
+
+    This is the fastest way to debug:
+    - Wrong units (FTA per minute miscomputed)
+    - Pace scaling wrong
+    - Spread sign flipped in close_prob
+    - Role_up double counted
+
+    Args:
+        ranker: Top3Ranker instance
+        player_id: Player to explain
+        game_date: Date of prediction
+        verbose: Print detailed output
+
+    Returns:
+        Dict with all input features and computed values
+    """
+    from scipy import stats
+
+    # Get full ranking to find player
+    df = ranker.rank_players(game_date, method='mixture')
+
+    if df.empty:
+        return {'error': 'Empty slate'}
+
+    player_row = df[df['player_id'] == player_id]
+    if player_row.empty:
+        return {'error': f'Player {player_id} not found in slate'}
+
+    row = player_row.iloc[0]
+
+    # Extract all relevant values
+    result = {
+        'player_id': player_id,
+        'player_name': row.get('player_name', 'Unknown'),
+        'game_date': game_date,
+
+        # Raw inputs
+        'inputs': {
+            'projected_ppg': row.get('projected_ppg'),
+            'proj_minutes': row.get('proj_minutes'),
+            'tier': row.get('tier'),
+            'avg_fg3a_last5': row.get('avg_fg3a_last5'),
+            'avg_fga_last5': row.get('avg_fga_last5'),
+            'avg_fta_last5': row.get('avg_fta_last5'),
+            'usg_pct': row.get('usg_pct'),
+            'l5_minutes_stddev': row.get('l5_minutes_stddev'),
+            'avg_minutes_last5': row.get('avg_minutes_last5'),
+            'avg_minutes': row.get('avg_minutes'),
+            'injury_adjusted': row.get('injury_adjusted'),
+            'opponent_pace': row.get('opponent_pace'),
+            'vegas_spread': row.get('vegas_spread'),
+        },
+
+        # Normalized features
+        'normalized_features': {
+            'r3': row.get('r3'),
+            'u': row.get('u'),
+            'vmin': row.get('vmin'),
+            'role_up': row.get('role_up'),
+        },
+
+        # Mixture components
+        'mixture': {
+            'mu': row.get('mu'),
+            'sigma_typical': row.get('sigma_typical'),
+            'spike_weight': row.get('spike_weight'),
+            'spike_shift': row.get('spike_shift'),
+            'sigma_spike': row.get('sigma_spike'),
+        },
+
+        # Output
+        'output': {
+            'threshold_T': row.get('threshold_T'),
+            'p_threshold': row.get('p_threshold'),
+            'mixture_rank': row.get('mixture_rank'),
+            'actual_ppg': row.get('actual_ppg'),
+        }
+    }
+
+    # Calculate component probabilities
+    mu = row.get('mu', 20)
+    sigma_typical = row.get('sigma_typical', 6)
+    sigma_spike = row.get('sigma_spike', 8)
+    w = row.get('spike_weight', 0.1)
+    delta = row.get('spike_shift', 6)
+    T = row.get('threshold_T', 30)
+
+    p_typical = 1 - stats.norm.cdf(T, loc=mu, scale=sigma_typical)
+    p_spike = 1 - stats.norm.cdf(T, loc=mu + delta, scale=sigma_spike)
+    p_mixture = (1 - w) * p_typical + w * p_spike
+
+    result['decomposition'] = {
+        'p_typical_component': p_typical,
+        'p_spike_component': p_spike,
+        'p_mixture_final': p_mixture,
+        'typical_contribution': (1 - w) * p_typical,
+        'spike_contribution': w * p_spike,
+    }
+
+    if verbose:
+        player_name_safe = str(result['player_name']).encode('ascii', 'replace').decode('ascii')
+        print(f"\n{'='*60}")
+        print(f"PLAYER EXPLANATION: {player_name_safe} (ID: {player_id})")
+        print(f"Date: {game_date}")
+        print(f"{'='*60}")
+
+        print(f"\n[Raw Inputs]")
+        for k, v in result['inputs'].items():
+            print(f"  {k}: {v}")
+
+        print(f"\n[Normalized Features]")
+        for k, v in result['normalized_features'].items():
+            print(f"  {k}: {v}")
+
+        print(f"\n[Mixture Components]")
+        print(f"  mu (calibrated mean):   {mu:.1f}")
+        print(f"  sigma_typical:          {sigma_typical:.2f}")
+        print(f"  w (spike weight):       {w:.3f} (range: 0.05-0.25)")
+        print(f"  delta (spike shift):    {delta:.1f} (range: 5-14)")
+        print(f"  sigma_spike:            {sigma_spike:.2f}")
+
+        print(f"\n[Probability Decomposition]")
+        print(f"  Threshold T:            {T:.1f}")
+        print(f"  P(>=T | typical):       {p_typical:.4f}")
+        print(f"  P(>=T | spike):         {p_spike:.4f}")
+        print(f"  Typical contribution:   (1-{w:.3f}) * {p_typical:.4f} = {(1-w)*p_typical:.4f}")
+        print(f"  Spike contribution:     {w:.3f} * {p_spike:.4f} = {w*p_spike:.4f}")
+        print(f"  P(>=T | mixture):       {p_mixture:.4f}")
+
+        actual = row.get('actual_ppg')
+        if actual is not None:
+            hit = '[HIT]' if actual >= T else '[MISS]'
+            print(f"\n[Actual] {actual:.1f} points {hit}")
+
+    return result
+
+
+@dataclass
+class BacktestResult:
+    """Results from backtesting over multiple slates."""
+    n_slates: int
+    n_predictions: int
+
+    # Aggregate calibration
+    predicted_hits: float
+    realized_hits: int
+    aggregate_ratio: float
+
+    # Rolling stats
+    rolling_ratios: List[float]
+    rolling_ratio_min: float
+    rolling_ratio_max: float
+    rolling_ratio_std: float
+
+    # Reliability by decile
+    reliability_table: pd.DataFrame
+    top_decile_gap: float  # avg_predicted - actual_hit_rate for top decile
+
+    # Capture metrics
+    capture_at_15: float  # % of slates where top-15 contained ≥1 actual top-15
+    capture_at_10: float  # For top-3 mode
+    avg_realized_rank: float  # Average actual finish rank of top-15 picks
+
+    # Comparison to baseline
+    baseline_capture_at_15: float
+    capture_improvement: float
+
+    # Issues
+    issues: List[str]
+
+
+def run_backtest(
+    ranker,
+    start_date: str = None,
+    end_date: str = None,
+    n_slates: int = 30,
+    rolling_window: int = 7,
+    threshold_percentile: float = 92,
+    compare_baseline: bool = True,
+    verbose: bool = True
+) -> BacktestResult:
+    """
+    Run comprehensive backtest over multiple slates.
+
+    This is the "no free lunch" test that validates:
+    - Predicted vs realized hits (aggregate and rolling)
+    - Reliability by decile
+    - Capture metrics vs baseline
+
+    Args:
+        ranker: Top3Ranker instance
+        start_date: Start date (defaults to n_slates days ago)
+        end_date: End date (defaults to yesterday)
+        n_slates: Number of slates to test
+        rolling_window: Window for rolling ratio
+        threshold_percentile: 92 for top-15, 97 for top-3
+        compare_baseline: Also run baseline (proj-only) for comparison
+        verbose: Print detailed output
+
+    Returns:
+        BacktestResult with all metrics
+    """
+    from datetime import datetime, timedelta
+
+    issues = []
+
+    # Get dates with actual results
+    query = """
+        SELECT DISTINCT game_date
+        FROM predictions
+        WHERE actual_ppg IS NOT NULL
+        ORDER BY game_date DESC
+        LIMIT ?
+    """
+    dates_df = pd.read_sql_query(query, ranker.conn, params=[n_slates + 10])
+
+    if dates_df.empty:
+        return BacktestResult(
+            n_slates=0, n_predictions=0, predicted_hits=0, realized_hits=0,
+            aggregate_ratio=0, rolling_ratios=[], rolling_ratio_min=0,
+            rolling_ratio_max=0, rolling_ratio_std=0,
+            reliability_table=pd.DataFrame(), top_decile_gap=0,
+            capture_at_15=0, capture_at_10=0, avg_realized_rank=0,
+            baseline_capture_at_15=0, capture_improvement=0,
+            issues=['No historical data found']
+        )
+
+    test_dates = dates_df['game_date'].tolist()[:n_slates]
+
+    # Collect all predictions
+    all_predictions = []
+    slate_metrics = []
+    baseline_slate_metrics = []
+
+    for game_date in test_dates:
+        # Mixture model ranking
+        df = ranker.rank_players(game_date, method='mixture')
+        if df.empty or 'actual_ppg' not in df.columns:
+            continue
+
+        df = df[df['actual_ppg'].notna()].copy()
+        if len(df) < 10:
+            continue
+
+        T = df['threshold_T'].iloc[0] if 'threshold_T' in df.columns else 0
+
+        # Store predictions for reliability table
+        df['game_date'] = game_date
+        all_predictions.append(df[['game_date', 'player_id', 'p_threshold', 'actual_ppg', 'threshold_T']].copy())
+
+        # Slate-level metrics
+        predicted = df['p_threshold'].sum()
+        realized = (df['actual_ppg'] >= T).sum()
+
+        # Capture: did top-15 by P contain ≥1 actual top-15 scorer?
+        top15_by_p = set(df.nlargest(15, 'p_threshold')['player_id'])
+        actual_top15 = set(df.nlargest(15, 'actual_ppg')['player_id'])
+        capture_15 = 1 if len(top15_by_p & actual_top15) > 0 else 0
+
+        # Capture@10 for top-3 mode
+        top10_by_p = set(df.nlargest(10, 'p_threshold')['player_id'])
+        actual_top3 = set(df.nlargest(3, 'actual_ppg')['player_id'])
+        capture_10 = 1 if len(top10_by_p & actual_top3) > 0 else 0
+
+        # Average realized rank of our top-15
+        df['actual_rank'] = df['actual_ppg'].rank(ascending=False, method='min')
+        avg_rank = df[df['player_id'].isin(top15_by_p)]['actual_rank'].mean()
+
+        slate_metrics.append({
+            'game_date': game_date,
+            'predicted': predicted,
+            'realized': realized,
+            'ratio': predicted / max(realized, 1),
+            'capture_15': capture_15,
+            'capture_10': capture_10,
+            'avg_rank': avg_rank,
+        })
+
+        # Baseline comparison (proj-only ranking)
+        if compare_baseline and 'projected_ppg' in df.columns:
+            baseline_top15 = set(df.nlargest(15, 'projected_ppg')['player_id'])
+            baseline_capture = 1 if len(baseline_top15 & actual_top15) > 0 else 0
+            baseline_slate_metrics.append({
+                'game_date': game_date,
+                'capture_15': baseline_capture,
+            })
+
+    if not slate_metrics:
+        return BacktestResult(
+            n_slates=0, n_predictions=0, predicted_hits=0, realized_hits=0,
+            aggregate_ratio=0, rolling_ratios=[], rolling_ratio_min=0,
+            rolling_ratio_max=0, rolling_ratio_std=0,
+            reliability_table=pd.DataFrame(), top_decile_gap=0,
+            capture_at_15=0, capture_at_10=0, avg_realized_rank=0,
+            baseline_capture_at_15=0, capture_improvement=0,
+            issues=['No valid slates processed']
+        )
+
+    # Aggregate metrics
+    slate_df = pd.DataFrame(slate_metrics)
+    total_predicted = slate_df['predicted'].sum()
+    total_realized = slate_df['realized'].sum()
+    aggregate_ratio = total_predicted / max(total_realized, 1)
+
+    # Rolling ratios
+    slate_df['rolling_predicted'] = slate_df['predicted'].rolling(rolling_window, min_periods=1).sum()
+    slate_df['rolling_realized'] = slate_df['realized'].rolling(rolling_window, min_periods=1).sum()
+    slate_df['rolling_ratio'] = slate_df['rolling_predicted'] / slate_df['rolling_realized'].replace(0, 1)
+    rolling_ratios = slate_df['rolling_ratio'].tolist()
+
+    # Reliability table
+    if all_predictions:
+        combined_df = pd.concat(all_predictions, ignore_index=True)
+        reliability_table = get_reliability_table(combined_df)
+        top_decile_gap = reliability_table.iloc[0]['calibration_error'] if len(reliability_table) > 0 else 0
+    else:
+        reliability_table = pd.DataFrame()
+        top_decile_gap = 0
+
+    # Capture metrics
+    capture_at_15 = slate_df['capture_15'].mean() * 100
+    capture_at_10 = slate_df['capture_10'].mean() * 100
+    avg_realized_rank = slate_df['avg_rank'].mean()
+
+    # Baseline comparison
+    baseline_capture_at_15 = 0
+    capture_improvement = 0
+    if baseline_slate_metrics:
+        baseline_df = pd.DataFrame(baseline_slate_metrics)
+        baseline_capture_at_15 = baseline_df['capture_15'].mean() * 100
+        capture_improvement = capture_at_15 - baseline_capture_at_15
+
+    # Check for issues
+    if aggregate_ratio < 0.85 or aggregate_ratio > 1.15:
+        issues.append(f"Aggregate ratio out of range: {aggregate_ratio:.2f} (target: 0.95-1.05)")
+
+    if abs(top_decile_gap) > 0.05:
+        issues.append(f"Top decile calibration gap: {top_decile_gap:.3f} (target: <0.03)")
+
+    rolling_max = max(rolling_ratios) if rolling_ratios else 0
+    rolling_min = min(rolling_ratios) if rolling_ratios else 0
+    if rolling_max > 1.5 or rolling_min < 0.5:
+        issues.append(f"Rolling ratio drift: {rolling_min:.2f} to {rolling_max:.2f}")
+
+    if verbose:
+        print(f"\n{'='*60}")
+        print(f"BACKTEST RESULTS ({len(slate_metrics)} slates)")
+        print(f"{'='*60}")
+
+        print(f"\n[Aggregate Calibration]")
+        print(f"  Predicted hits: {total_predicted:.1f}")
+        print(f"  Realized hits:  {total_realized}")
+        ratio_status = '[OK]' if 0.95 <= aggregate_ratio <= 1.05 else '[!]'
+        print(f"  Aggregate ratio: {aggregate_ratio:.3f} {ratio_status}")
+
+        print(f"\n[Rolling Ratio] (window={rolling_window})")
+        print(f"  Min: {rolling_min:.2f}, Max: {rolling_max:.2f}")
+        print(f"  Std: {np.std(rolling_ratios):.3f}")
+
+        if not reliability_table.empty:
+            print(f"\n[Reliability by Decile] (top 3)")
+            print(reliability_table.head(3).to_string())
+            gap_status = '[OK]' if abs(top_decile_gap) < 0.03 else '[!]'
+            print(f"\n  Top decile gap: {top_decile_gap:.3f} {gap_status}")
+
+        print(f"\n[Capture Metrics]")
+        print(f"  Capture@15: {capture_at_15:.1f}% (mixture model)")
+        print(f"  Capture@10: {capture_at_10:.1f}% (for top-3 mode)")
+        print(f"  Avg realized rank of top-15 picks: {avg_realized_rank:.1f}")
+
+        if compare_baseline:
+            print(f"\n  Baseline Capture@15: {baseline_capture_at_15:.1f}% (proj-only)")
+            improvement_status = '[OK]' if capture_improvement > 0 else '[!]'
+            print(f"  Improvement: {capture_improvement:+.1f}% {improvement_status}")
+
+        print(f"\n{'='*60}")
+        if issues:
+            print("[!] ISSUES DETECTED:")
+            for issue in issues:
+                print(f"  - {issue}")
+        else:
+            print("[OK] ALL CHECKS PASSED - GREEN LIGHT!")
+        print(f"{'='*60}")
+
+    return BacktestResult(
+        n_slates=len(slate_metrics),
+        n_predictions=len(pd.concat(all_predictions)) if all_predictions else 0,
+        predicted_hits=total_predicted,
+        realized_hits=total_realized,
+        aggregate_ratio=aggregate_ratio,
+        rolling_ratios=rolling_ratios,
+        rolling_ratio_min=rolling_min,
+        rolling_ratio_max=rolling_max,
+        rolling_ratio_std=np.std(rolling_ratios) if rolling_ratios else 0,
+        reliability_table=reliability_table,
+        top_decile_gap=top_decile_gap,
+        capture_at_15=capture_at_15,
+        capture_at_10=capture_at_10,
+        avg_realized_rank=avg_realized_rank,
+        baseline_capture_at_15=baseline_capture_at_15,
+        capture_improvement=capture_improvement,
+        issues=issues
+    )
+
+
+def generate_tail_audit(
+    ranker,
+    game_date: str,
+    verbose: bool = True
+) -> Dict[str, Any]:
+    """
+    Generate per-slate tail audit record for debugging.
+
+    When you see weird results (too many 20%+ probabilities, or ratio spikes),
+    this instantly tells you whether the issue is:
+    - w inflation
+    - Δ inflation
+    - T too low
+
+    Args:
+        ranker: Top3Ranker instance
+        game_date: Date to audit
+        verbose: Print output
+
+    Returns:
+        Dict with all audit metrics
+    """
+    df = ranker.rank_players(game_date, method='mixture')
+
+    if df.empty:
+        return {'error': 'Empty slate'}
+
+    T = df['threshold_T'].iloc[0] if 'threshold_T' in df.columns else 0
+
+    # Summary stats
+    audit = {
+        'game_date': game_date,
+        'n_players': len(df),
+        'threshold_T': T,
+        'sum_P': df['p_threshold'].sum() if 'p_threshold' in df.columns else 0,
+        'realized_hits': (df['actual_ppg'] >= T).sum() if 'actual_ppg' in df.columns else None,
+
+        # w stats
+        'mean_w': df['spike_weight'].mean() if 'spike_weight' in df.columns else 0,
+        'median_w': df['spike_weight'].median() if 'spike_weight' in df.columns else 0,
+        'pct_w_capped': (df['spike_weight'] >= 0.249).mean() * 100 if 'spike_weight' in df.columns else 0,
+
+        # Δ stats
+        'mean_delta': df['spike_shift'].mean() if 'spike_shift' in df.columns else 0,
+        'median_delta': df['spike_shift'].median() if 'spike_shift' in df.columns else 0,
+        'pct_delta_capped': (df['spike_shift'] >= 13.9).mean() * 100 if 'spike_shift' in df.columns else 0,
+
+        # Guard stats
+        'pct_p_capped': (df['p_threshold'] >= 0.349).mean() * 100 if 'p_threshold' in df.columns else 0,
+    }
+
+    # Top 10 players with highest P
+    top10 = []
+    if 'p_threshold' in df.columns:
+        for _, row in df.nlargest(10, 'p_threshold').iterrows():
+            top10.append({
+                'player': row.get('player_name', row.get('player_id', 'Unknown')),
+                'mu': row.get('mu', 0),
+                'sigma_typical': row.get('sigma_typical', 0),
+                'w': row.get('spike_weight', 0),
+                'delta': row.get('spike_shift', 0),
+                'p': row.get('p_threshold', 0),
+                'actual': row.get('actual_ppg'),
+            })
+    audit['top_10_players'] = top10
+
+    if verbose:
+        print(f"\n{'='*60}")
+        print(f"TAIL AUDIT: {game_date}")
+        print(f"{'='*60}")
+        print(f"Players: {audit['n_players']}, T: {audit['threshold_T']:.1f}")
+        print(f"Sum P (predicted): {audit['sum_P']:.1f}, Realized: {audit['realized_hits']}")
+        print(f"\nSpike Weight (w):")
+        print(f"  Mean: {audit['mean_w']:.3f}, Median: {audit['median_w']:.3f}, % capped: {audit['pct_w_capped']:.1f}%")
+        print(f"\nSpike Shift (delta):")
+        print(f"  Mean: {audit['mean_delta']:.1f}, Median: {audit['median_delta']:.1f}, % capped: {audit['pct_delta_capped']:.1f}%")
+        print(f"\n% P capped: {audit['pct_p_capped']:.1f}%")
+
+        print(f"\nTop 10 by P(>=T):")
+        for p in top10:
+            player_name = str(p['player']).encode('ascii', 'replace').decode('ascii')
+            actual_str = f", actual={p['actual']:.1f}" if p['actual'] is not None else ""
+            print(f"  {player_name}: mu={p['mu']:.1f}, w={p['w']:.3f}, delta={p['delta']:.1f}, P={p['p']:.3f}{actual_str}")
+
+    return audit
+
+
+def check_silent_failures(
+    ranker,
+    game_date: str,
+    verbose: bool = True
+) -> Dict[str, Any]:
+    """
+    Check for common "silent failure" bugs.
+
+    1. FGA/FG3A windows wrong (last5 not last5, or mixing season vs last5)
+    2. Threshold T computed on wrong pool (includes DNP/G-league)
+
+    Args:
+        ranker: Top3Ranker instance
+        game_date: Date to check
+        verbose: Print output
+
+    Returns:
+        Dict with diagnostic results
+    """
+    df = ranker.rank_players(game_date, method='mixture')
+
+    if df.empty:
+        return {'error': 'Empty slate'}
+
+    results = {
+        'game_date': game_date,
+        'n_players': len(df),
+        'issues': []
+    }
+
+    # Check 1: r3/vol_gate distributions (should not be all zeros or all ones)
+    if 'r3' in df.columns:
+        r3_values = df['r3'].dropna()
+        results['r3_distribution'] = {
+            'mean': r3_values.mean(),
+            'std': r3_values.std(),
+            'pct_zero': (r3_values == 0).mean() * 100,
+            'pct_one': (r3_values >= 0.99).mean() * 100,
+        }
+        if results['r3_distribution']['pct_zero'] > 50:
+            results['issues'].append("r3: >50% at zero - possible FG3A data issue")
+        if results['r3_distribution']['pct_one'] > 30:
+            results['issues'].append("r3: >30% at 1.0 - normalization may be off")
+
+    if 'vmin' in df.columns:
+        vmin_values = df['vmin'].dropna()
+        results['vmin_distribution'] = {
+            'mean': vmin_values.mean(),
+            'std': vmin_values.std(),
+            'pct_zero': (vmin_values == 0).mean() * 100,
+        }
+        if results['vmin_distribution']['pct_zero'] > 50:
+            results['issues'].append("vmin: >50% at zero - possible minutes stddev data issue")
+
+    # Check 2: T computed on wrong pool
+    if 'proj_minutes' in df.columns:
+        # T with all players
+        all_projs = df['mu'].dropna() if 'mu' in df.columns else df['projected_ppg'].dropna()
+        T_all = np.percentile(all_projs, 92) + 2.0 if len(all_projs) > 0 else 0
+
+        # T with only players >10 minutes
+        qualified = df[df['proj_minutes'] > 10]
+        qual_projs = qualified['mu'].dropna() if 'mu' in qualified.columns else qualified['projected_ppg'].dropna()
+        T_qualified = np.percentile(qual_projs, 92) + 2.0 if len(qual_projs) > 0 else 0
+
+        results['threshold_check'] = {
+            'T_all_players': T_all,
+            'T_qualified_only': T_qualified,
+            'difference': T_qualified - T_all,
+            'n_low_minutes': len(df[df['proj_minutes'] <= 10]),
+        }
+
+        if results['threshold_check']['difference'] > 3:
+            results['issues'].append(
+                f"T difference of {results['threshold_check']['difference']:.1f} pts when filtering low-minutes players - "
+                "consider filtering pool for T calculation"
+            )
+
+    # Check 3: Unusual spike weight distribution
+    if 'spike_weight' in df.columns:
+        w_values = df['spike_weight'].dropna()
+        results['spike_weight_check'] = {
+            'mean': w_values.mean(),
+            'std': w_values.std(),
+            'min': w_values.min(),
+            'max': w_values.max(),
+        }
+        if w_values.mean() > 0.18:
+            results['issues'].append(f"Mean spike_weight={w_values.mean():.3f} is high - check intercept/features")
+        if w_values.mean() < 0.08:
+            results['issues'].append(f"Mean spike_weight={w_values.mean():.3f} is low - may be too conservative")
+
+    if verbose:
+        print(f"\n{'='*60}")
+        print(f"SILENT FAILURE CHECK: {game_date}")
+        print(f"{'='*60}")
+
+        if 'r3_distribution' in results:
+            print(f"\nr3 distribution:")
+            print(f"  Mean: {results['r3_distribution']['mean']:.3f}, Std: {results['r3_distribution']['std']:.3f}")
+            print(f"  % at zero: {results['r3_distribution']['pct_zero']:.1f}%, % at 1.0: {results['r3_distribution']['pct_one']:.1f}%")
+
+        if 'threshold_check' in results:
+            print(f"\nThreshold T check:")
+            print(f"  T (all players): {results['threshold_check']['T_all_players']:.1f}")
+            print(f"  T (>10 min only): {results['threshold_check']['T_qualified_only']:.1f}")
+            print(f"  Low-minutes players excluded: {results['threshold_check']['n_low_minutes']}")
+
+        if 'spike_weight_check' in results:
+            print(f"\nSpike weight distribution:")
+            print(f"  Mean: {results['spike_weight_check']['mean']:.3f}, Std: {results['spike_weight_check']['std']:.3f}")
+            print(f"  Range: [{results['spike_weight_check']['min']:.3f}, {results['spike_weight_check']['max']:.3f}]")
+
+        if results['issues']:
+            print(f"\n[!] ISSUES DETECTED:")
+            for issue in results['issues']:
+                print(f"  - {issue}")
+        else:
+            print(f"\n[OK] No silent failures detected")
+
+    return results
+
+
+def run_full_validation(
+    ranker,
+    test_date: str = None,
+    n_backtest_slates: int = 30,
+    verbose: bool = True
+) -> Dict[str, Any]:
+    """
+    Run full validation suite (single entry point).
+
+    Combines:
+    1. Single slate validation
+    2. Silent failure checks
+    3. Full backtest
+
+    Args:
+        ranker: Top3Ranker instance
+        test_date: Specific date to test (or most recent)
+        n_backtest_slates: Number of slates for backtest
+        verbose: Print output
+
+    Returns:
+        Dict with all validation results
+    """
+    # Get most recent date with actuals if not specified
+    if test_date is None:
+        query = "SELECT MAX(game_date) FROM predictions WHERE actual_ppg IS NOT NULL"
+        result = pd.read_sql_query(query, ranker.conn)
+        test_date = result.iloc[0, 0] if not result.empty else None
+
+    if test_date is None:
+        return {'error': 'No historical data available'}
+
+    if verbose:
+        print(f"\n{'='*70}")
+        print(f"FULL VALIDATION SUITE")
+        print(f"Test date: {test_date}, Backtest slates: {n_backtest_slates}")
+        print(f"{'='*70}")
+
+    results = {
+        'test_date': test_date,
+        'slate_validation': validate_slate(ranker, test_date, verbose=verbose),
+        'silent_failures': check_silent_failures(ranker, test_date, verbose=verbose),
+        'backtest': run_backtest(ranker, n_slates=n_backtest_slates, verbose=verbose),
+    }
+
+    # Green light checklist
+    all_clear = True
+    checklist = []
+
+    # 1. Predicted/realized ratio
+    ratio = results['backtest'].aggregate_ratio
+    ratio_ok = 0.95 <= ratio <= 1.05
+    checklist.append(f"{'[OK]' if ratio_ok else '[X]'} predicted_hits/realized_hits: {ratio:.3f} (target: 0.95-1.05)")
+    all_clear &= ratio_ok
+
+    # 2. % at P_cap
+    pct_p_cap = results['slate_validation'].pct_at_p_cap
+    cap_ok = pct_p_cap < 5
+    checklist.append(f"{'[OK]' if cap_ok else '[X]'} % at P_cap: {pct_p_cap:.1f}% (target: <5%)")
+    all_clear &= cap_ok
+
+    # 3. Top-decile reliability gap
+    gap = abs(results['backtest'].top_decile_gap)
+    gap_ok = gap < 0.03
+    checklist.append(f"{'[OK]' if gap_ok else '[X]'} Top-decile gap: {gap:.3f} (target: <0.03)")
+    all_clear &= gap_ok
+
+    # 4. Capture improvement
+    improvement = results['backtest'].capture_improvement
+    improvement_ok = improvement > 0
+    checklist.append(f"{'[OK]' if improvement_ok else '[!]'} Capture@15 vs baseline: {improvement:+.1f}%")
+
+    results['green_light_checklist'] = checklist
+    results['all_clear'] = all_clear
+
+    if verbose:
+        print(f"\n{'='*70}")
+        print("GREEN LIGHT CHECKLIST")
+        print(f"{'='*70}")
+        for item in checklist:
+            print(f"  {item}")
+        final_msg = '[GREEN] ALL CLEAR - Ready to ship!' if all_clear else '[RED] ISSUES DETECTED - Review above'
+        print(f"\n{final_msg}")
+        print(f"{'='*70}")
+
+    return results
+
+
 def calculate_projected_minutes(player_data: dict) -> Tuple[float, float]:
     """
     Calculate projected minutes using weighted average + role guardrails + context.
@@ -1428,6 +2420,7 @@ class Top3Ranker:
                 p.team_name,
                 p.opponent_name,
                 p.opponent_def_rating,
+                p.opponent_pace,
                 p.projected_ppg,
                 p.proj_floor,
                 p.proj_ceiling,
@@ -1442,13 +2435,130 @@ class Top3Ranker:
                 p.opponent_injury_detected,
                 p.opponent_injury_boost_projection,
                 p.actual_ppg,
+                -- Columns for mixture model
+                p.proj_minutes,
+                p.l5_minutes_avg as avg_minutes_last5,
+                p.l5_minutes_stddev,
+                p.season_minutes_avg as avg_minutes,
+                p.tier,
+                p.role_change,
+                p.minutes_confidence,
+                p.role_tier,
                 il.status as injury_status
             FROM predictions p
             LEFT JOIN injury_list il ON p.player_id = il.player_id
                 AND il.status IN ('questionable', 'doubtful', 'out')
             WHERE p.game_date = ?
         """
-        return pd.read_sql_query(query, self.conn, params=[game_date])
+        df = pd.read_sql_query(query, self.conn, params=[game_date])
+
+        # Enrich with player_game_logs data if mixture model columns are missing
+        if not df.empty and df['avg_minutes_last5'].isna().all():
+            df = self._enrich_with_game_logs(df, game_date)
+
+        return df
+
+    def _enrich_with_game_logs(self, df: pd.DataFrame, game_date: str) -> pd.DataFrame:
+        """
+        Enrich predictions with stats from player_game_logs when missing.
+
+        Calculates last 5 games averages for:
+        - avg_minutes_last5, l5_minutes_stddev
+        - avg_fg3a_last5
+        - usg_pct (average)
+
+        Note: player_game_logs has limited columns (no fga/fta), so we use what's available.
+        """
+        player_ids = df['player_id'].tolist()
+        if not player_ids:
+            return df
+
+        # Get last 5 games stats for each player
+        placeholders = ','.join(['?' for _ in player_ids])
+        query = f"""
+            WITH RankedGames AS (
+                SELECT
+                    player_id,
+                    CAST(minutes AS REAL) as minutes_num,
+                    fg3a,
+                    usg_pct,
+                    points,
+                    ROW_NUMBER() OVER (PARTITION BY player_id ORDER BY game_date DESC) as rn
+                FROM player_game_logs
+                WHERE player_id IN ({placeholders})
+                  AND game_date < ?
+                  AND CAST(minutes AS REAL) > 0
+            )
+            SELECT
+                player_id,
+                AVG(minutes_num) as avg_minutes_last5,
+                AVG(fg3a) as avg_fg3a_last5,
+                AVG(usg_pct) as avg_usg_last5,
+                AVG(points) as avg_ppg_last5
+            FROM RankedGames
+            WHERE rn <= 5
+            GROUP BY player_id
+            HAVING COUNT(*) >= 3
+        """
+
+        try:
+            stats_df = pd.read_sql_query(query, self.conn, params=player_ids + [game_date])
+
+            if not stats_df.empty:
+                # Create mapping dictionaries
+                stats_dict = stats_df.set_index('player_id').to_dict()
+
+                # Map stats to predictions
+                if 'avg_minutes_last5' in stats_dict:
+                    df['avg_minutes_last5'] = df['player_id'].map(stats_dict['avg_minutes_last5'])
+                if 'avg_fg3a_last5' in stats_dict:
+                    df['avg_fg3a_last5'] = df['player_id'].map(stats_dict['avg_fg3a_last5'])
+                if 'avg_usg_last5' in stats_dict:
+                    df['usg_pct'] = df['player_id'].map(stats_dict['avg_usg_last5'])
+
+                # Calculate minutes stddev with a separate query for players we have data for
+                player_ids_with_data = stats_df['player_id'].tolist()
+                if player_ids_with_data:
+                    stddev_query = f"""
+                        WITH RankedGames AS (
+                            SELECT
+                                player_id,
+                                CAST(minutes AS REAL) as minutes_num,
+                                ROW_NUMBER() OVER (PARTITION BY player_id ORDER BY game_date DESC) as rn
+                            FROM player_game_logs
+                            WHERE player_id IN ({','.join(['?' for _ in player_ids_with_data])})
+                              AND game_date < ?
+                              AND CAST(minutes AS REAL) > 0
+                        ),
+                        PlayerStats AS (
+                            SELECT player_id, AVG(minutes_num) as avg_min
+                            FROM RankedGames WHERE rn <= 5 GROUP BY player_id
+                        )
+                        SELECT
+                            r.player_id,
+                            CASE WHEN COUNT(*) > 1 THEN
+                                SQRT(SUM((r.minutes_num - ps.avg_min) * (r.minutes_num - ps.avg_min)) / (COUNT(*) - 1))
+                            ELSE 4.0 END as l5_minutes_stddev
+                        FROM RankedGames r
+                        JOIN PlayerStats ps ON r.player_id = ps.player_id
+                        WHERE r.rn <= 5
+                        GROUP BY r.player_id
+                    """
+                    try:
+                        stddev_df = pd.read_sql_query(stddev_query, self.conn,
+                                                       params=player_ids_with_data + [game_date])
+                        if not stddev_df.empty:
+                            stddev_dict = stddev_df.set_index('player_id')['l5_minutes_stddev'].to_dict()
+                            df['l5_minutes_stddev'] = df['player_id'].map(stddev_dict)
+                    except Exception:
+                        pass
+
+        except Exception as e:
+            # Log error for debugging but don't fail
+            import sys
+            print(f"Warning: Failed to enrich with game logs: {e}", file=sys.stderr)
+
+        return df
 
     def get_calibration_params(self, days_back: int = 30) -> Tuple[float, float]:
         """
@@ -1911,7 +3021,7 @@ class Top3Ranker:
                     'spike_weight': round(mixture.spike_weight, 3),
                     'spike_shift': round(mixture.spike_shift, 1),
                     'sigma_spike': round(mixture.sigma_spike, 2),
-                    'threshold_T': round(threshold_T, 1),
+                    # Note: threshold_T is added to df directly, not here (avoid duplicates)
                     'p_tail': round(p_tail, 4),
                     'r3': round(mixture.r3, 2),
                     'u': round(mixture.u, 2),
