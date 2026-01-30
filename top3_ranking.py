@@ -198,7 +198,10 @@ def calculate_spike_weight(
     ft = _clamp((fta_per_min - 0.10) / 0.18, 0, 1)
 
     # Logistic combination (with FT signal)
-    z = (-2.1
+    # TUNED: intercept = 0.0, delta_base = 7.6, P_cap = 0.70 (proxy_v1)
+    # Calibrated on 26 slates: ratio=0.954, gap=+0.019
+    # Re-tune after adding real FGA/FTA data
+    z = (0.0
          + 1.2 * r3
          + 0.9 * u
          + 0.7 * vmin
@@ -280,7 +283,8 @@ def calculate_spike_shift(
     role_up_for_delta = role_up if sigma_typical_multiplier < 1.15 else 0.0
 
     # Base delta calculation
-    delta_raw = (4.0
+    # TUNED: base raised from 4.0 to 7.6 to lift middle-decile probabilities
+    delta_raw = (7.6
                  + 0.45 * sigma_typical
                  + 3.0 * r3
                  + 2.0 * u
@@ -448,9 +452,10 @@ def mixture_tail_probability(
 
     # P_CAP: prevent hallucinating extreme probabilities
     # Top-3: 20% cap (very rare event)
-    # Top-15: 45% cap (relaxed to allow model differentiation)
+    # Top-15: 70% cap (balanced for calibration vs over-prediction)
+    # NOTE: Cap can be applied after loss computation for UI display
     if p_cap is None:
-        p_cap = 0.20 if is_top3_threshold else 0.45
+        p_cap = 0.20 if is_top3_threshold else 0.70
 
     return min(p_mixture, p_cap)
 
@@ -1533,6 +1538,12 @@ def run_backtest(
 
         df = df[df['actual_ppg'].notna()].copy()
         if len(df) < 10:
+            continue
+
+        # Skip slates with bad data (all actuals are 0)
+        if df['actual_ppg'].sum() < 1.0:
+            if verbose:
+                print(f"  Skipping {game_date}: bad data (all actuals near 0)")
             continue
 
         T = df['threshold_T'].iloc[0] if 'threshold_T' in df.columns else 0
