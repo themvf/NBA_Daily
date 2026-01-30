@@ -581,6 +581,403 @@ def calculate_calibration_metrics(
     return results
 
 
+# =============================================================================
+# MIXTURE MODEL TUNING INFRASTRUCTURE
+# =============================================================================
+
+@dataclass
+class MixtureTuningConfig:
+    """Configuration for mixture model tuning."""
+    # Grid search ranges
+    intercept_range: Tuple[float, float] = (-2.8, -1.4)
+    intercept_step: float = 0.1
+    delta_base_range: Tuple[float, float] = (2.5, 6.0)
+    delta_base_step: float = 0.25
+
+    # Loss weights
+    weight_brier_top: float = 0.7
+    weight_ratio_penalty: float = 0.25
+    weight_cap_penalty: float = 0.15
+
+    # Mode-specific settings
+    mode: str = 'top15'  # 'top15' or 'top3'
+    threshold_percentile: float = 92
+    p_cap: float = 0.35
+
+    # Adaptive nudge settings
+    nudge_amount: float = 0.05
+    ratio_high_threshold: float = 1.12
+    ratio_low_threshold: float = 0.88
+
+    def for_top3(self) -> 'MixtureTuningConfig':
+        """Return config adjusted for top-3 mode."""
+        return MixtureTuningConfig(
+            intercept_range=self.intercept_range,
+            intercept_step=self.intercept_step,
+            delta_base_range=self.delta_base_range,
+            delta_base_step=self.delta_base_step,
+            weight_brier_top=self.weight_brier_top,
+            weight_ratio_penalty=self.weight_ratio_penalty,
+            weight_cap_penalty=self.weight_cap_penalty,
+            mode='top3',
+            threshold_percentile=97,
+            p_cap=0.20,
+            nudge_amount=self.nudge_amount,
+            ratio_high_threshold=self.ratio_high_threshold,
+            ratio_low_threshold=self.ratio_low_threshold,
+        )
+
+
+def compute_composite_loss(
+    predictions_df: pd.DataFrame,
+    config: MixtureTuningConfig = None
+) -> Dict[str, float]:
+    """
+    Compute single composite loss for tuning.
+
+    Loss = brier_all + 0.7*brier_top + 0.25*ratio_penalty + 0.15*cap_penalty
+
+    Why this works:
+    - Brier alone can reward "too flat" probabilities
+    - Top-decile Brier forces correctness where you actually pick
+    - Ratio penalty prevents "printing probability"
+    - Cap penalty catches masked fat tails during tuning
+
+    Args:
+        predictions_df: DataFrame with columns:
+            - p_threshold: predicted P(>=T)
+            - actual_ppg: actual points
+            - threshold_T: threshold used
+            - at_cap: whether P was capped (optional)
+        config: Tuning configuration
+
+    Returns:
+        Dict with loss components and total
+    """
+    if config is None:
+        config = MixtureTuningConfig()
+
+    df = predictions_df.copy()
+
+    # Calculate actual hits
+    df['actual_hit'] = (df['actual_ppg'] >= df['threshold_T']).astype(float)
+
+    # Brier score (all predictions)
+    df['brier'] = (df['p_threshold'] - df['actual_hit']) ** 2
+    brier_all = df['brier'].mean()
+
+    # Brier score (top 20% by predicted P)
+    top_20_pct = df.nlargest(int(len(df) * 0.2), 'p_threshold')
+    brier_top = top_20_pct['brier'].mean() if len(top_20_pct) > 0 else brier_all
+
+    # Ratio penalty: log(predicted/realized)^2
+    predicted_hits = df['p_threshold'].sum()
+    realized_hits = df['actual_hit'].sum()
+    if realized_hits > 0:
+        ratio = predicted_hits / realized_hits
+        ratio_penalty = math.log(max(ratio, 0.1)) ** 2
+    else:
+        ratio_penalty = 1.0  # Penalize if no realized hits
+
+    # Cap penalty: % of predictions at P_cap
+    if 'at_cap' in df.columns:
+        pct_capped = df['at_cap'].mean()
+    else:
+        # Estimate from P values near cap
+        pct_capped = (df['p_threshold'] >= config.p_cap * 0.95).mean()
+    cap_penalty = pct_capped
+
+    # Composite loss
+    total_loss = (
+        brier_all
+        + config.weight_brier_top * brier_top
+        + config.weight_ratio_penalty * ratio_penalty
+        + config.weight_cap_penalty * cap_penalty
+    )
+
+    return {
+        'total_loss': total_loss,
+        'brier_all': brier_all,
+        'brier_top': brier_top,
+        'ratio_penalty': ratio_penalty,
+        'cap_penalty': cap_penalty,
+        'predicted_hits': predicted_hits,
+        'realized_hits': realized_hits,
+        'hit_ratio': predicted_hits / max(realized_hits, 1),
+        'pct_capped': pct_capped,
+    }
+
+
+def get_reliability_table(
+    predictions_df: pd.DataFrame,
+    n_bins: int = 10
+) -> pd.DataFrame:
+    """
+    Generate reliability table (calibration by decile).
+
+    For each decile of predicted P:
+    - avg predicted P
+    - actual hit rate
+    - count
+
+    You want these to track closely, especially in top 2 deciles.
+
+    Args:
+        predictions_df: DataFrame with p_threshold, actual_ppg, threshold_T
+        n_bins: Number of bins (default 10 for deciles)
+
+    Returns:
+        DataFrame with reliability metrics per bin
+    """
+    df = predictions_df.copy()
+    df['actual_hit'] = (df['actual_ppg'] >= df['threshold_T']).astype(float)
+
+    # Sort by predicted P and assign deciles
+    df = df.sort_values('p_threshold', ascending=False)
+    df['decile'] = pd.qcut(range(len(df)), n_bins, labels=False) + 1
+
+    # Aggregate by decile
+    reliability = df.groupby('decile').agg({
+        'p_threshold': ['mean', 'count'],
+        'actual_hit': 'mean'
+    })
+    # Flatten multi-level columns
+    reliability.columns = ['avg_predicted_P', 'count', 'actual_hit_rate']
+    # Reorder columns for clarity
+    reliability = reliability[['avg_predicted_P', 'actual_hit_rate', 'count']]
+
+    # Add calibration error
+    reliability['calibration_error'] = reliability['avg_predicted_P'] - reliability['actual_hit_rate']
+
+    return reliability
+
+
+def get_tail_mass_curve(
+    conn: sqlite3.Connection,
+    days_back: int = 30,
+    rolling_window: int = 7
+) -> pd.DataFrame:
+    """
+    Track tail mass metrics over time (rolling window).
+
+    Tracks:
+    - predicted_hits / realized_hits (should be ~1.0)
+    - avg spike_weight and % at w cap
+    - avg spike_shift and % at delta cap
+    - avg threshold T
+
+    This tells you WHY the ratio moved (weights vs shift vs caps).
+
+    Args:
+        conn: Database connection
+        days_back: How many days of history
+        rolling_window: Rolling window size in slates
+
+    Returns:
+        DataFrame with per-slate metrics and rolling averages
+    """
+    query = f"""
+        SELECT
+            game_date,
+            p_threshold,
+            actual_ppg,
+            threshold_T,
+            spike_weight,
+            spike_shift
+        FROM predictions
+        WHERE actual_ppg IS NOT NULL
+          AND p_threshold IS NOT NULL
+          AND game_date >= date('now', '-{days_back} days')
+        ORDER BY game_date
+    """
+
+    try:
+        df = pd.read_sql_query(query, conn)
+    except Exception:
+        return pd.DataFrame()
+
+    if df.empty:
+        return pd.DataFrame()
+
+    # Per-slate aggregation
+    slate_metrics = []
+    for game_date, slate_df in df.groupby('game_date'):
+        T = slate_df['threshold_T'].iloc[0] if 'threshold_T' in slate_df.columns else 30.0
+        predicted = slate_df['p_threshold'].sum()
+        realized = (slate_df['actual_ppg'] >= T).sum()
+
+        metrics = {
+            'game_date': game_date,
+            'predicted_hits': predicted,
+            'realized_hits': realized,
+            'hit_ratio': predicted / max(realized, 1),
+            'threshold_T': T,
+            'n_players': len(slate_df),
+        }
+
+        # Spike weight metrics (if available)
+        if 'spike_weight' in slate_df.columns and slate_df['spike_weight'].notna().any():
+            metrics['avg_spike_weight'] = slate_df['spike_weight'].mean()
+            metrics['pct_w_at_cap'] = (slate_df['spike_weight'] >= 0.24).mean()  # Near 0.25 cap
+
+        # Spike shift metrics (if available)
+        if 'spike_shift' in slate_df.columns and slate_df['spike_shift'].notna().any():
+            metrics['avg_spike_shift'] = slate_df['spike_shift'].mean()
+            metrics['pct_delta_at_cap'] = (slate_df['spike_shift'] >= 13.5).mean()  # Near 14 cap
+
+        slate_metrics.append(metrics)
+
+    result_df = pd.DataFrame(slate_metrics)
+
+    # Add rolling averages
+    if len(result_df) >= rolling_window:
+        result_df['rolling_hit_ratio'] = result_df['hit_ratio'].rolling(rolling_window).mean()
+        if 'avg_spike_weight' in result_df.columns:
+            result_df['rolling_avg_w'] = result_df['avg_spike_weight'].rolling(rolling_window).mean()
+
+    return result_df
+
+
+def adaptive_intercept_nudge(
+    conn: sqlite3.Connection,
+    current_intercept: float,
+    config: MixtureTuningConfig = None,
+    n_recent_slates: int = 10
+) -> Tuple[float, str]:
+    """
+    Self-healing intercept adjustment based on recent hit ratio.
+
+    If rolling ratio (last N slates) is:
+    - > 1.12 → decrease intercept by nudge_amount (tail too fat)
+    - < 0.88 → increase intercept by nudge_amount (tail too thin)
+    - else → no change
+
+    Hard-limits intercept to the tuning range.
+
+    Args:
+        conn: Database connection
+        current_intercept: Current intercept value (e.g., -2.1)
+        config: Tuning configuration
+        n_recent_slates: Number of recent slates to check
+
+    Returns:
+        (new_intercept, reason)
+    """
+    if config is None:
+        config = MixtureTuningConfig()
+
+    # Get recent tail mass curve
+    curve_df = get_tail_mass_curve(conn, days_back=60, rolling_window=n_recent_slates)
+
+    if curve_df.empty or len(curve_df) < n_recent_slates:
+        return current_intercept, 'NOT_ENOUGH_DATA'
+
+    # Get rolling hit ratio from most recent point
+    if 'rolling_hit_ratio' in curve_df.columns:
+        recent_ratio = curve_df['rolling_hit_ratio'].iloc[-1]
+    else:
+        # Calculate manually
+        recent_df = curve_df.tail(n_recent_slates)
+        recent_ratio = recent_df['predicted_hits'].sum() / max(recent_df['realized_hits'].sum(), 1)
+
+    # Determine adjustment
+    new_intercept = current_intercept
+    reason = 'NO_CHANGE'
+
+    if recent_ratio > config.ratio_high_threshold:
+        # Tail too fat → decrease intercept (makes z smaller → lower w)
+        new_intercept = current_intercept - config.nudge_amount
+        reason = f'TAIL_TOO_FAT (ratio={recent_ratio:.2f}): decreased intercept'
+    elif recent_ratio < config.ratio_low_threshold:
+        # Tail too thin → increase intercept (makes z larger → higher w)
+        new_intercept = current_intercept + config.nudge_amount
+        reason = f'TAIL_TOO_THIN (ratio={recent_ratio:.2f}): increased intercept'
+
+    # Hard-limit to tuning range
+    lo, hi = config.intercept_range
+    new_intercept = _clamp(new_intercept, lo, hi)
+
+    if new_intercept == current_intercept and reason != 'NO_CHANGE':
+        reason += ' (but already at limit)'
+
+    return new_intercept, reason
+
+
+def get_calibration_by_threshold_bucket(
+    conn: sqlite3.Connection,
+    days_back: int = 30,
+    buckets: List[Tuple[float, float]] = None
+) -> Dict[str, Dict]:
+    """
+    Report calibration metrics conditioned on threshold T bucket.
+
+    Because T = percentile(projections) + 2, the target event changes
+    with slate composition. This reports calibration separately for
+    different T ranges to catch threshold-dependent miscalibration.
+
+    Args:
+        conn: Database connection
+        days_back: How many days of history
+        buckets: List of (lo, hi) tuples for T ranges
+                 Default: [(28, 30), (30, 32), (32, 34), (34, 40)]
+
+    Returns:
+        Dict with calibration metrics per T bucket
+    """
+    if buckets is None:
+        buckets = [(28, 30), (30, 32), (32, 34), (34, 40)]
+
+    query = f"""
+        SELECT
+            game_date,
+            p_threshold,
+            actual_ppg,
+            threshold_T
+        FROM predictions
+        WHERE actual_ppg IS NOT NULL
+          AND p_threshold IS NOT NULL
+          AND game_date >= date('now', '-{days_back} days')
+    """
+
+    try:
+        df = pd.read_sql_query(query, conn)
+    except Exception:
+        return {'error': 'Query failed'}
+
+    if df.empty:
+        return {'error': 'No data'}
+
+    results = {}
+
+    for lo, hi in buckets:
+        bucket_key = f'T_{lo}-{hi}'
+        bucket_df = df[(df['threshold_T'] >= lo) & (df['threshold_T'] < hi)]
+
+        if len(bucket_df) < 20:
+            results[bucket_key] = {'n': len(bucket_df), 'error': 'insufficient_data'}
+            continue
+
+        # Calculate metrics for this bucket
+        bucket_df = bucket_df.copy()
+        bucket_df['actual_hit'] = (bucket_df['actual_ppg'] >= bucket_df['threshold_T']).astype(float)
+
+        predicted = bucket_df['p_threshold'].sum()
+        realized = bucket_df['actual_hit'].sum()
+        brier = ((bucket_df['p_threshold'] - bucket_df['actual_hit']) ** 2).mean()
+
+        results[bucket_key] = {
+            'n': len(bucket_df),
+            'n_slates': bucket_df['game_date'].nunique(),
+            'avg_T': bucket_df['threshold_T'].mean(),
+            'predicted_hits': predicted,
+            'realized_hits': realized,
+            'hit_ratio': predicted / max(realized, 1),
+            'brier': brier,
+        }
+
+    return results
+
+
 def calculate_projected_minutes(player_data: dict) -> Tuple[float, float]:
     """
     Calculate projected minutes using weighted average + role guardrails + context.
