@@ -8697,6 +8697,7 @@ if selected_page == "Tournament Strategy":
     # MIXTURE MODEL TOURNAMENT STRATEGY (CALIBRATED)
     # =========================================================================
     st.divider()
+    st.info("🔍 DEBUG: Mixture Model section reached!")  # DEBUG - remove after testing
     st.markdown("## 🎲 Mixture Model Rankings")
     st.caption("Calibrated two-component model: P(points ≥ threshold) using typical + spike game modes")
 
