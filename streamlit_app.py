@@ -8747,8 +8747,31 @@ if selected_page == "Tournament Strategy":
             # =====================================================
             st.markdown("### 🔍 Cap Rate Diagnostics")
 
-            # Calculate cap rates
-            pct_w_capped = mixture_df['is_w_capped'].mean() * 100 if 'is_w_capped' in mixture_df.columns else 0
+            # Calculate cap rates - use raw float comparison with epsilon
+            W_CAP = 0.25
+            EPS = 1e-6
+
+            if 'w_uncapped' in mixture_df.columns:
+                # Truth: count how many w_uncapped >= 0.25 (actually hit the cap)
+                count_w_at_cap = (mixture_df['w_uncapped'] >= (W_CAP - EPS)).sum()
+                pct_w_truth = count_w_at_cap / len(mixture_df) * 100
+
+                # Also check the flag (should match)
+                pct_w_flag = mixture_df['is_w_capped'].mean() * 100 if 'is_w_capped' in mixture_df.columns else 0
+
+                # Debug: show both for verification
+                w_min = mixture_df['w_uncapped'].min()
+                w_med = mixture_df['w_uncapped'].median()
+                w_max = mixture_df['w_uncapped'].max()
+
+                # Add w_cap_delta column
+                mixture_df['w_cap_delta'] = mixture_df['spike_weight'] - mixture_df['w_uncapped']
+
+                pct_w_capped = pct_w_truth  # Use truth, not flag
+            else:
+                pct_w_capped = 0
+                w_min = w_med = w_max = 0
+
             pct_p_capped = mixture_df['is_p_capped'].mean() * 100 if 'is_p_capped' in mixture_df.columns else 0
             median_w = mixture_df['w_uncapped'].median() if 'w_uncapped' in mixture_df.columns else mixture_df['spike_weight'].median()
             median_delta = mixture_df['spike_shift'].median() if 'spike_shift' in mixture_df.columns else 0
@@ -8757,6 +8780,18 @@ if selected_page == "Tournament Strategy":
             w_cap_status = "🟢" if pct_w_capped < 10 else ("🟡" if pct_w_capped < 15 else "🔴")
             p_cap_status = "🟢" if pct_p_capped < 10 else ("🟡" if pct_p_capped < 15 else "🔴")
             w_median_status = "🟢" if 0.08 <= median_w <= 0.14 else ("🟡" if median_w < 0.20 else "🔴")
+
+            # Debug expander showing raw stats
+            with st.expander("🔧 Debug: Raw Cap Statistics", expanded=True):
+                st.code(f"""
+w_uncapped range: {w_min:.4f} - {w_max:.4f}
+w_uncapped median: {w_med:.4f}
+W_CAP threshold: {W_CAP}
+count(w_uncapped >= {W_CAP}): {count_w_at_cap if 'w_uncapped' in mixture_df.columns else 'N/A'}
+% w capped (truth): {pct_w_capped:.1f}%
+% w capped (flag): {pct_w_flag if 'w_uncapped' in mixture_df.columns else 'N/A'}%
+Flag matches truth: {'✅ YES' if abs(pct_w_capped - pct_w_flag) < 0.1 else '❌ NO - BUG!' if 'w_uncapped' in mixture_df.columns else 'N/A'}
+""", language=None)
 
             cap_cols = st.columns(4)
             with cap_cols[0]:
@@ -8791,22 +8826,32 @@ if selected_page == "Tournament Strategy":
             # Show uncapped vs capped table
             with st.expander("📊 Capped vs Uncapped Values (Top 20)", expanded=False):
                 if 'w_uncapped' in mixture_df.columns and 'p_uncapped' in mixture_df.columns:
-                    uncapped_cols = ['player_name', 'spike_weight', 'w_uncapped', 'is_w_capped',
+                    uncapped_cols = ['player_name', 'spike_weight', 'w_uncapped', 'w_cap_delta', 'is_w_capped',
                                     'p_threshold', 'p_uncapped', 'is_p_capped', 'spike_shift']
                     uncapped_df = mixture_df[uncapped_cols].head(20).copy()
-                    uncapped_df.columns = ['Player', 'w (capped)', 'w (uncapped)', 'w@cap?',
-                                          'P (capped)', 'P (uncapped)', 'P@cap?', 'Δ']
+                    uncapped_df.columns = ['Player', 'w (capped)', 'w (uncapped)', 'w Δcap', 'w@cap?',
+                                          'P (capped)', 'P (uncapped)', 'P@cap?', 'spike Δ']
 
-                    # Format
+                    # Format - compute cap flag BEFORE formatting to avoid rounding bugs
+                    uncapped_df['w@cap?'] = uncapped_df['w (uncapped)'].apply(lambda x: "🔴 YES" if x >= (W_CAP - EPS) else "")
+                    uncapped_df['P@cap?'] = uncapped_df['P@cap?'].apply(lambda x: "🔴 YES" if x else "")
+
+                    # Now format for display
                     uncapped_df['w (capped)'] = uncapped_df['w (capped)'].apply(lambda x: f"{x:.3f}")
                     uncapped_df['w (uncapped)'] = uncapped_df['w (uncapped)'].apply(lambda x: f"{x:.3f}")
+                    uncapped_df['w Δcap'] = uncapped_df['w Δcap'].apply(lambda x: f"{x:+.3f}" if x != 0 else "0")
                     uncapped_df['P (capped)'] = uncapped_df['P (capped)'].apply(lambda x: f"{x:.1%}")
                     uncapped_df['P (uncapped)'] = uncapped_df['P (uncapped)'].apply(lambda x: f"{x:.1%}")
-                    uncapped_df['w@cap?'] = uncapped_df['w@cap?'].apply(lambda x: "🔴 YES" if x else "")
-                    uncapped_df['P@cap?'] = uncapped_df['P@cap?'].apply(lambda x: "🔴 YES" if x else "")
-                    uncapped_df['Δ'] = uncapped_df['Δ'].apply(lambda x: f"{x:.1f}")
+                    uncapped_df['spike Δ'] = uncapped_df['spike Δ'].apply(lambda x: f"{x:.1f}")
 
                     st.dataframe(uncapped_df, hide_index=True, use_container_width=True)
+
+                    # Explanation
+                    st.caption("""
+                    **Column meanings:**
+                    - **w Δcap** = w(capped) - w(uncapped). Should be 0 for most players, negative only if capped.
+                    - **w@cap?** = 🔴 YES if w_uncapped >= 0.25 (actually hit the ceiling)
+                    """)
                 else:
                     st.info("Uncapped columns not available. Re-run ranking with latest code.")
 

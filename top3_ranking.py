@@ -216,18 +216,32 @@ def calculate_spike_weight(
 
     w_raw = _sigmoid(z)
 
-    # Final weight: floor at 5%, cap at 25%
-    w_uncapped = 0.05 + 0.20 * w_raw  # Before clamping
-    w = _clamp(w_uncapped, 0.05, 0.25)
+    # Base weight calculation: floor at 5%, max at 25%
+    W_CAP_UPPER = 0.25
+    W_CAP_LOWER = 0.05
+    EPS = 1e-6
+
+    w_base = W_CAP_LOWER + 0.20 * w_raw  # Base calculation from sigmoid
 
     # CLOSE-GAME AMPLIFIER:
     # Spike nights are more likely to become top-15 when player stays on floor in crunch time
     # close_prob = sigmoid(1.2 - 0.25*|spread|)
-    # Then: w = w * (0.9 + 0.3*close_prob), capped
+    # Then: w = w * (0.9 + 0.3*close_prob)
     if vegas_spread is not None:
         close_prob = _sigmoid(1.2 - 0.25 * abs(vegas_spread))
-        w = w * (0.9 + 0.3 * close_prob)
-        w = _clamp(w, 0.05, 0.25)  # Re-clamp after amplifier
+        w_pre_cap = w_base * (0.9 + 0.3 * close_prob)
+    else:
+        close_prob = 0.5
+        w_pre_cap = w_base
+
+    # w_uncapped is the value BEFORE hitting any cap (after amplifier)
+    w_uncapped = w_pre_cap
+
+    # Apply the 0.05-0.25 clamp
+    w = _clamp(w_pre_cap, W_CAP_LOWER, W_CAP_UPPER)
+
+    # Check if we actually hit the UPPER cap (0.25)
+    is_w_capped = w_pre_cap >= (W_CAP_UPPER - EPS)
 
     # Guardrail: if low confidence + not injury + no role_up, cap at 12%
     # Prevents "random volatile bench" from dominating
@@ -243,11 +257,11 @@ def calculate_spike_weight(
         'inj': inj,
         'pace': pace,
         'ft': ft,
-        'close_prob': close_prob if vegas_spread is not None else 0.5,
+        'close_prob': close_prob,
         'z': z,
         'w_raw': w_raw,
-        'w_uncapped': w_uncapped,  # Before 0.05-0.25 clamp
-        'is_w_capped': w != w_uncapped,  # True if capped
+        'w_uncapped': w_uncapped,  # Value AFTER amplifier, BEFORE cap
+        'is_w_capped': is_w_capped,  # True only if w_pre_cap >= 0.25
     }
 
     return w, features
