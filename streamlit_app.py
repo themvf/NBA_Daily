@@ -8742,6 +8742,76 @@ if selected_page == "Tournament Strategy":
         mixture_df = mixture_ranker.rank_players(selected_date, method='mixture')
 
         if not mixture_df.empty:
+            # =====================================================
+            # CAP RATE KPIs - Critical diagnostic section
+            # =====================================================
+            st.markdown("### 🔍 Cap Rate Diagnostics")
+
+            # Calculate cap rates
+            pct_w_capped = mixture_df['is_w_capped'].mean() * 100 if 'is_w_capped' in mixture_df.columns else 0
+            pct_p_capped = mixture_df['is_p_capped'].mean() * 100 if 'is_p_capped' in mixture_df.columns else 0
+            median_w = mixture_df['w_uncapped'].median() if 'w_uncapped' in mixture_df.columns else mixture_df['spike_weight'].median()
+            median_delta = mixture_df['spike_shift'].median() if 'spike_shift' in mixture_df.columns else 0
+
+            # Pass/Fail thresholds
+            w_cap_status = "🟢" if pct_w_capped < 10 else ("🟡" if pct_w_capped < 15 else "🔴")
+            p_cap_status = "🟢" if pct_p_capped < 10 else ("🟡" if pct_p_capped < 15 else "🔴")
+            w_median_status = "🟢" if 0.08 <= median_w <= 0.14 else ("🟡" if median_w < 0.20 else "🔴")
+
+            cap_cols = st.columns(4)
+            with cap_cols[0]:
+                st.metric(
+                    f"{w_cap_status} % w Capped",
+                    f"{pct_w_capped:.1f}%",
+                    help="% players at spike_weight cap (0.25). Target: <10% green, 10-15% yellow, >15% red"
+                )
+            with cap_cols[1]:
+                st.metric(
+                    f"{p_cap_status} % P Capped",
+                    f"{pct_p_capped:.1f}%",
+                    help="% players at P cap (0.70). Target: <10% green, 10-15% yellow, >15% red"
+                )
+            with cap_cols[2]:
+                st.metric(
+                    f"{w_median_status} Median w (uncapped)",
+                    f"{median_w:.3f}",
+                    help="Median spike weight before capping. Target: 0.08-0.14 for proper differentiation"
+                )
+            with cap_cols[3]:
+                st.metric(
+                    "Median Δ",
+                    f"{median_delta:.1f}",
+                    help="Median spike shift. Should have meaningful spread (not all 5-8)"
+                )
+
+            # Warning if w cap rate is too high
+            if pct_w_capped > 15:
+                st.warning(f"⚠️ **High w cap rate ({pct_w_capped:.0f}%)** - Intercept may be too high. Model loses differentiation when everyone hits the cap.")
+
+            # Show uncapped vs capped table
+            with st.expander("📊 Capped vs Uncapped Values (Top 20)", expanded=False):
+                if 'w_uncapped' in mixture_df.columns and 'p_uncapped' in mixture_df.columns:
+                    uncapped_cols = ['player_name', 'spike_weight', 'w_uncapped', 'is_w_capped',
+                                    'p_threshold', 'p_uncapped', 'is_p_capped', 'spike_shift']
+                    uncapped_df = mixture_df[uncapped_cols].head(20).copy()
+                    uncapped_df.columns = ['Player', 'w (capped)', 'w (uncapped)', 'w@cap?',
+                                          'P (capped)', 'P (uncapped)', 'P@cap?', 'Δ']
+
+                    # Format
+                    uncapped_df['w (capped)'] = uncapped_df['w (capped)'].apply(lambda x: f"{x:.3f}")
+                    uncapped_df['w (uncapped)'] = uncapped_df['w (uncapped)'].apply(lambda x: f"{x:.3f}")
+                    uncapped_df['P (capped)'] = uncapped_df['P (capped)'].apply(lambda x: f"{x:.1%}")
+                    uncapped_df['P (uncapped)'] = uncapped_df['P (uncapped)'].apply(lambda x: f"{x:.1%}")
+                    uncapped_df['w@cap?'] = uncapped_df['w@cap?'].apply(lambda x: "🔴 YES" if x else "")
+                    uncapped_df['P@cap?'] = uncapped_df['P@cap?'].apply(lambda x: "🔴 YES" if x else "")
+                    uncapped_df['Δ'] = uncapped_df['Δ'].apply(lambda x: f"{x:.1f}")
+
+                    st.dataframe(uncapped_df, hide_index=True, use_container_width=True)
+                else:
+                    st.info("Uncapped columns not available. Re-run ranking with latest code.")
+
+            st.divider()
+
             # Show mixture vs baseline comparison
             st.markdown("### 📊 Mixture vs Projection Rankings")
 
@@ -8775,22 +8845,64 @@ if selected_page == "Tournament Strategy":
 
                 st.dataframe(top15_df, hide_index=True, use_container_width=True)
 
-                # Show significant rank changes
+                # Show significant rank changes WITH FEATURES
                 significant = comparison_df[abs(comparison_df['rank_change']) >= 3].copy()
                 if not significant.empty:
-                    with st.expander(f"🔄 Significant Rank Changes ({len(significant)} players)", expanded=False):
-                        boosted_df = significant[significant['rank_change'] > 0].sort_values('rank_change', ascending=False)
-                        dropped_df = significant[significant['rank_change'] < 0].sort_values('rank_change')
+                    with st.expander(f"🔄 Significant Rank Changes ({len(significant)} players) - WITH FEATURES", expanded=True):
+                        # Merge features from mixture_df
+                        feature_cols = ['player_id', 'u', 'r3', 'role_up', 'vmin', 'spike_weight', 'w_uncapped', 'spike_shift', 'p_uncapped']
+                        available_features = [c for c in feature_cols if c in mixture_df.columns]
 
+                        if 'player_id' in mixture_df.columns and 'player_id' in significant.columns:
+                            merged = significant.merge(
+                                mixture_df[available_features],
+                                on='player_id',
+                                how='left',
+                                suffixes=('', '_mix')
+                            )
+                        else:
+                            merged = significant
+
+                        boosted_df = merged[merged['rank_change'] > 0].sort_values('rank_change', ascending=False)
+                        dropped_df = merged[merged['rank_change'] < 0].sort_values('rank_change')
+
+                        st.markdown("**⬆️ BOOSTED by Mixture** (high spike potential)")
                         if not boosted_df.empty:
-                            st.markdown("**⬆️ Boosted by Mixture Model** (high spike potential)")
-                            for _, row in boosted_df.head(10).iterrows():
-                                st.markdown(f"- **{row['player_name']}**: Proj #{int(row['proj_rank'])} → Mix #{int(row['mixture_rank'])} (+{int(row['rank_change'])})")
+                            boost_display = boosted_df.head(10)[['player_name', 'proj_rank', 'mixture_rank', 'rank_change']].copy()
+                            # Add features if available
+                            for feat in ['u', 'r3', 'role_up', 'spike_weight', 'w_uncapped', 'spike_shift']:
+                                if feat in boosted_df.columns:
+                                    boost_display[feat] = boosted_df.head(10)[feat]
 
+                            boost_display.columns = ['Player', 'Proj#', 'Mix#', 'Chg'] + [c for c in boost_display.columns[4:]]
+                            # Format numeric columns
+                            for col in ['u', 'r3', 'role_up', 'spike_weight', 'w_uncapped']:
+                                if col in boost_display.columns:
+                                    boost_display[col] = boost_display[col].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "-")
+                            if 'spike_shift' in boost_display.columns:
+                                boost_display['spike_shift'] = boost_display['spike_shift'].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "-")
+                            boost_display['Chg'] = boost_display['Chg'].apply(lambda x: f"+{int(x)}")
+                            st.dataframe(boost_display, hide_index=True, use_container_width=True)
+                        else:
+                            st.caption("None")
+
+                        st.markdown("**⬇️ DROPPED by Mixture** (steady but less explosive)")
                         if not dropped_df.empty:
-                            st.markdown("**⬇️ Dropped by Mixture Model** (steady but less explosive)")
-                            for _, row in dropped_df.head(10).iterrows():
-                                st.markdown(f"- **{row['player_name']}**: Proj #{int(row['proj_rank'])} → Mix #{int(row['mixture_rank'])} ({int(row['rank_change'])})")
+                            drop_display = dropped_df.head(10)[['player_name', 'proj_rank', 'mixture_rank', 'rank_change']].copy()
+                            for feat in ['u', 'r3', 'role_up', 'spike_weight', 'w_uncapped', 'spike_shift']:
+                                if feat in dropped_df.columns:
+                                    drop_display[feat] = dropped_df.head(10)[feat]
+
+                            drop_display.columns = ['Player', 'Proj#', 'Mix#', 'Chg'] + [c for c in drop_display.columns[4:]]
+                            for col in ['u', 'r3', 'role_up', 'spike_weight', 'w_uncapped']:
+                                if col in drop_display.columns:
+                                    drop_display[col] = drop_display[col].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "-")
+                            if 'spike_shift' in drop_display.columns:
+                                drop_display['spike_shift'] = drop_display['spike_shift'].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "-")
+                            drop_display['Chg'] = drop_display['Chg'].apply(lambda x: str(int(x)))
+                            st.dataframe(drop_display, hide_index=True, use_container_width=True)
+                        else:
+                            st.caption("None")
 
             # Build Mixture Portfolio Button
             st.markdown("### 🚀 Generate Mixture Portfolio")

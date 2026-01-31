@@ -88,7 +88,7 @@ class MixtureParams:
     """Parameters for the two-component mixture model."""
     mu: float                # Mean projection
     sigma_typical: float     # Typical game stddev (your current σ)
-    spike_weight: float      # w: probability of spike game (0.05 - 0.25)
+    spike_weight: float      # w: probability of spike game (CAPPED 0.05-0.25)
     spike_shift: float       # Δ: how much higher the spike mean is
     sigma_spike: float       # Stddev in spike mode (slightly wider)
 
@@ -97,6 +97,10 @@ class MixtureParams:
     u: float = 0.0           # Normalized usage
     vmin: float = 0.0        # Normalized minutes volatility
     role_up: float = 0.0     # Normalized role expansion
+
+    # Uncapped values for diagnostics
+    w_uncapped: float = 0.0  # w before 0.05-0.25 clamp
+    is_w_capped: bool = False  # True if w was capped
 
     def expected_value(self) -> float:
         """E[X] for mixture = (1-w)*μ + w*(μ+Δ)."""
@@ -213,7 +217,8 @@ def calculate_spike_weight(
     w_raw = _sigmoid(z)
 
     # Final weight: floor at 5%, cap at 25%
-    w = _clamp(0.05 + 0.20 * w_raw, 0.05, 0.25)
+    w_uncapped = 0.05 + 0.20 * w_raw  # Before clamping
+    w = _clamp(w_uncapped, 0.05, 0.25)
 
     # CLOSE-GAME AMPLIFIER:
     # Spike nights are more likely to become top-15 when player stays on floor in crunch time
@@ -241,6 +246,8 @@ def calculate_spike_weight(
         'close_prob': close_prob if vegas_spread is not None else 0.5,
         'z': z,
         'w_raw': w_raw,
+        'w_uncapped': w_uncapped,  # Before 0.05-0.25 clamp
+        'is_w_capped': w != w_uncapped,  # True if capped
     }
 
     return w, features
@@ -402,7 +409,10 @@ def build_mixture_params(
         r3=features['r3'],
         u=features['u'],
         vmin=features['vmin'],
-        role_up=features['role_up']
+        role_up=features['role_up'],
+        # Uncapped values for diagnostics
+        w_uncapped=features['w_uncapped'],
+        is_w_capped=features['is_w_capped'],
     )
 
 
@@ -410,8 +420,9 @@ def mixture_tail_probability(
     params: MixtureParams,
     threshold: float,
     p_cap: float = None,
-    is_top3_threshold: bool = False
-) -> float:
+    is_top3_threshold: bool = False,
+    return_details: bool = False
+):
     """
     Calculate P(points ≥ T) using the two-component mixture.
 
@@ -430,9 +441,11 @@ def mixture_tail_probability(
         threshold: Target threshold T (e.g., 32 points)
         p_cap: Manual cap on probability (overrides auto-detection)
         is_top3_threshold: If True, uses stricter cap (0.20 vs 0.35)
+        return_details: If True, returns dict with capped/uncapped values
 
     Returns:
-        Probability of exceeding threshold (0 to 1), capped
+        If return_details=False: Probability of exceeding threshold (capped)
+        If return_details=True: Dict with p_capped, p_uncapped, is_p_capped, p_cap_value
     """
     from scipy import stats
 
@@ -447,8 +460,8 @@ def mixture_tail_probability(
     z_spike = (threshold - (mu + params.spike_shift)) / params.sigma_spike
     p_spike = 1.0 - stats.norm.cdf(z_spike)
 
-    # Mixture probability
-    p_mixture = (1 - w) * p_typical + w * p_spike
+    # Mixture probability (UNCAPPED)
+    p_uncapped = (1 - w) * p_typical + w * p_spike
 
     # P_CAP: prevent hallucinating extreme probabilities
     # Top-3: 20% cap (very rare event)
@@ -457,7 +470,20 @@ def mixture_tail_probability(
     if p_cap is None:
         p_cap = 0.20 if is_top3_threshold else 0.70
 
-    return min(p_mixture, p_cap)
+    p_capped = min(p_uncapped, p_cap)
+    is_p_capped = p_uncapped > p_cap
+
+    if return_details:
+        return {
+            'p_capped': p_capped,
+            'p_uncapped': p_uncapped,
+            'is_p_capped': is_p_capped,
+            'p_cap_value': p_cap,
+            'p_typical': p_typical,
+            'p_spike': p_spike,
+        }
+
+    return p_capped
 
 
 def calculate_slate_threshold(
@@ -3082,8 +3108,9 @@ class Top3Ranker:
                 mu=pdata['mu']
             )
 
-            # Calculate tail probability
-            p_tail = mixture_tail_probability(mixture, threshold_T)
+            # Calculate tail probability WITH DETAILS (capped + uncapped)
+            p_details = mixture_tail_probability(mixture, threshold_T, return_details=True)
+            p_tail = p_details['p_capped']
 
             probabilities.append(p_tail)
 
@@ -3091,11 +3118,18 @@ class Top3Ranker:
                 all_components.append({
                     'mu': round(mixture.mu, 1),
                     'sigma_typical': round(mixture.sigma_typical, 2),
+                    # Capped values (what we actually use)
                     'spike_weight': round(mixture.spike_weight, 3),
                     'spike_shift': round(mixture.spike_shift, 1),
                     'sigma_spike': round(mixture.sigma_spike, 2),
-                    # Note: threshold_T is added to df directly, not here (avoid duplicates)
                     'p_tail': round(p_tail, 4),
+                    # UNCAPPED values for diagnostics
+                    'w_uncapped': round(mixture.w_uncapped, 3),
+                    'p_uncapped': round(p_details['p_uncapped'], 4),
+                    # Cap flags
+                    'is_w_capped': mixture.is_w_capped,
+                    'is_p_capped': p_details['is_p_capped'],
+                    # Features
                     'r3': round(mixture.r3, 2),
                     'u': round(mixture.u, 2),
                     'vmin': round(mixture.vmin, 2),
