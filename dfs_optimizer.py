@@ -26,6 +26,79 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 import numpy as np
 import pandas as pd
 
+# Import injury module for filtering out injured players
+try:
+    import injury_adjustment as ia
+    INJURY_MODULE_AVAILABLE = True
+except ImportError:
+    INJURY_MODULE_AVAILABLE = False
+
+
+# =============================================================================
+# Injury Filtering
+# =============================================================================
+
+def get_injured_player_ids(conn: sqlite3.Connection) -> Set[int]:
+    """
+    Get set of player IDs who are currently injured (OUT or DOUBTFUL).
+
+    Uses the injury_list table to identify players who should be excluded
+    from DFS lineups.
+
+    Returns:
+        Set of player_ids who are injured/out
+    """
+    if not INJURY_MODULE_AVAILABLE:
+        return set()
+
+    try:
+        injuries = ia.get_active_injuries(conn, status_filter=['out', 'doubtful'])
+        return {inj['player_id'] for inj in injuries if inj.get('player_id')}
+    except Exception:
+        # Fallback: try direct query if injury_adjustment fails
+        try:
+            query = """
+                SELECT DISTINCT player_id
+                FROM injury_list
+                WHERE LOWER(status) IN ('out', 'doubtful', 'active')
+            """
+            df = pd.read_sql_query(query, conn)
+            return set(df['player_id'].tolist())
+        except Exception:
+            return set()
+
+
+def get_injured_player_names(conn: sqlite3.Connection) -> Dict[int, str]:
+    """
+    Get mapping of injured player IDs to their names and status.
+
+    Returns:
+        Dict mapping player_id -> "name (status)"
+    """
+    if not INJURY_MODULE_AVAILABLE:
+        return {}
+
+    try:
+        injuries = ia.get_active_injuries(conn, status_filter=['out', 'doubtful', 'questionable'])
+        return {
+            inj['player_id']: f"{inj['player_name']} ({inj.get('status', 'OUT')})"
+            for inj in injuries if inj.get('player_id')
+        }
+    except Exception:
+        try:
+            query = """
+                SELECT player_id, player_name, status
+                FROM injury_list
+                WHERE LOWER(status) IN ('out', 'doubtful', 'questionable', 'active')
+            """
+            df = pd.read_sql_query(query, conn)
+            return {
+                row['player_id']: f"{row['player_name']} ({row['status']})"
+                for _, row in df.iterrows()
+            }
+        except Exception:
+            return {}
+
 
 # =============================================================================
 # Name Normalization & Matching
@@ -421,6 +494,8 @@ class DFSPlayer:
     # Status flags
     is_locked: bool = False      # Force include in all lineups
     is_excluded: bool = False    # Never include in lineups
+    is_injured: bool = False     # Player is OUT/DOUBTFUL - auto-excluded
+    injury_status: str = ""      # Injury status (OUT, DOUBTFUL, etc.)
 
     # DraftKings ID for export
     dk_id: str = ""
@@ -726,6 +801,10 @@ def parse_dk_csv(
     # Normalize column names
     df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
 
+    # Get injured players from database
+    injured_player_ids = get_injured_player_ids(conn)
+    injured_player_info = get_injured_player_names(conn)
+
     # Build lookup from database
     players_query = """
         SELECT DISTINCT player_id, player_name, team_abbreviation
@@ -805,6 +884,15 @@ def parse_dk_csv(
 
         matched_names.append((name, name_to_id.get(normalize_name(name), {}).get('original_name', 'Unknown')))
 
+        # Check if player is injured
+        is_injured = player_id in injured_player_ids
+        injury_status = ""
+        if is_injured and player_id in injured_player_info:
+            # Extract status from "Name (STATUS)" format
+            info = injured_player_info[player_id]
+            if '(' in info and ')' in info:
+                injury_status = info.split('(')[-1].rstrip(')')
+
         player = DFSPlayer(
             player_id=player_id,
             name=name,
@@ -813,10 +901,15 @@ def parse_dk_csv(
             game_id=game_id,
             positions=positions,
             salary=int(row.get('salary', 0)),
-            dk_id=str(row.get('id', ''))
+            dk_id=str(row.get('id', '')),
+            is_injured=is_injured,
+            injury_status=injury_status.upper() if injury_status else ""
         )
 
         players.append(player)
+
+    # Count injured players
+    injured_players = [p for p in players if p.is_injured]
 
     metadata = {
         'total_players': len(df),
@@ -828,6 +921,8 @@ def parse_dk_csv(
             max(p.salary for p in players) if players else 0
         ),
         'match_rate': len(players) / len(df) * 100 if len(df) > 0 else 0,
+        'injured_players': [(p.name, p.injury_status) for p in injured_players],
+        'injured_count': len(injured_players),
     }
 
     return players, metadata
@@ -871,16 +966,19 @@ def optimize_lineup_randomized(
     max_exposure = max_exposure or {}
     current_exposures = current_exposures or {}
 
-    # Filter available players
+    # Filter available players (exclude injured, excluded, and specified IDs)
     available = [
         p for p in player_pool
         if p.player_id not in excluded_ids
         and not p.is_excluded
+        and not p.is_injured
     ]
 
     # Check exposure limits
     def can_use_player(player: DFSPlayer) -> bool:
         if player.player_id in excluded_ids:
+            return False
+        if player.is_injured:
             return False
         if player.is_excluded:
             return False
@@ -1016,11 +1114,15 @@ def generate_diversified_lineups(
     excluded_games = excluded_games or set()
     filtered_pool = [p for p in player_pool if p.game_id not in excluded_games]
 
+    # Filter out injured players (OUT/DOUBTFUL)
+    injured_count = len([p for p in filtered_pool if p.is_injured])
+    filtered_pool = [p for p in filtered_pool if not p.is_injured]
+
     if not filtered_pool:
         return []
 
-    # Get locked players
-    locked = [p for p in filtered_pool if p.is_locked]
+    # Get locked players (ensure they're not injured)
+    locked = [p for p in filtered_pool if p.is_locked and not p.is_injured]
 
     # Build max exposure dict
     max_exp = {p.player_id: max_player_exposure for p in filtered_pool}

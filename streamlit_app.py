@@ -12604,6 +12604,14 @@ if selected_page == "DFS Lineup Builder":
                             if len(metadata['unmatched_players']) > 20:
                                 st.caption(f"...and {len(metadata['unmatched_players']) - 20} more")
 
+                    # Show injured players that will be auto-excluded
+                    if metadata.get('injured_players'):
+                        with st.expander(f"🏥 {metadata['injured_count']} Injured Players (Auto-Excluded)", expanded=True):
+                            st.write("These players are OUT/DOUBTFUL and will be excluded from lineups:")
+                            for name, status in metadata['injured_players']:
+                                status_emoji = "🔴" if status.upper() == "OUT" else "🟠"
+                                st.caption(f"{status_emoji} {name} - {status}")
+
                     # Game selection - exclude postponed/cancelled games
                     st.divider()
                     st.subheader("🏟️ Select Games to Include")
@@ -12731,7 +12739,17 @@ if selected_page == "DFS Lineup Builder":
             # Build DataFrame for display
             player_data = []
             for p in filtered:
+                # Status indicator
+                status = ""
+                if p.is_injured:
+                    status = f"🔴 {p.injury_status}" if p.injury_status else "🔴 OUT"
+                elif p.is_locked:
+                    status = "🔒 LOCK"
+                elif p.is_excluded:
+                    status = "❌ EXCL"
+
                 player_data.append({
+                    'Status': status,
                     'Name': p.name,
                     'Team': p.team,
                     'Opp': p.opponent,
@@ -12746,6 +12764,11 @@ if selected_page == "DFS Lineup Builder":
 
             df = pd.DataFrame(player_data)
             st.dataframe(df, use_container_width=True, hide_index=True)
+
+            # Show count of injured players
+            injured_count = len([p for p in filtered if p.is_injured])
+            if injured_count > 0:
+                st.warning(f"🏥 {injured_count} injured player(s) shown above will be auto-excluded from lineups")
 
             # Export player pool button
             export_col1, export_col2 = st.columns([1, 3])
