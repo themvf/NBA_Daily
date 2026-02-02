@@ -39,6 +39,7 @@ import backtest_top3
 import backtest_portfolio
 import preset_ab_test
 from enrichment_monitor import ensure_enrichment_columns
+import dfs_optimizer as dfs
 
 DEFAULT_DB_PATH = Path(__file__).with_name("nba_stats.db")
 DEFAULT_PREDICTIONS_PATH = Path(__file__).with_name("predictions.csv")
@@ -390,6 +391,7 @@ tab_titles = [
     "FanDuel Compare",
     "Model vs FanDuel",
     "Model Review",
+    "DFS Lineup Builder",
 ]
 
 # Initialize selected page in session state
@@ -12506,6 +12508,450 @@ if selected_page == "Model Review":
                 st.write("")
     else:
         st.success("✅ No major issues detected! Model is performing well.")
+
+
+# DFS Lineup Builder tab ---------------------------------------------------
+if selected_page == "DFS Lineup Builder":
+    st.title("🏀 DFS Lineup Builder")
+    st.caption("Generate optimized DraftKings NBA Classic lineups for GPP tournaments")
+
+    # Initialize session state for DFS
+    if 'dfs_player_pool' not in st.session_state:
+        st.session_state.dfs_player_pool = []
+    if 'dfs_lineups' not in st.session_state:
+        st.session_state.dfs_lineups = []
+    if 'dfs_upload_metadata' not in st.session_state:
+        st.session_state.dfs_upload_metadata = {}
+
+    # Get database connection
+    dfs_conn = get_connection(str(db_path))
+
+    # Sidebar configuration
+    with st.sidebar:
+        st.subheader("⚙️ Builder Settings")
+        num_lineups = st.slider("Number of lineups", 20, 150, 100, step=10)
+        max_exposure = st.slider("Max player exposure %", 20, 60, 40, step=5) / 100
+
+        st.divider()
+        st.subheader("📋 DraftKings Rules")
+        st.markdown("""
+        - **Salary Cap**: $50,000
+        - **Roster**: 8 positions
+        - **Min Games**: 2 different games
+        - **Scoring**:
+          - PTS: +1.0
+          - 3PM: +0.5
+          - REB: +1.25
+          - AST: +1.5
+          - STL/BLK: +2.0
+          - TO: -0.5
+          - Double-Double: +1.5
+          - Triple-Double: +3.0
+        """)
+
+    # Main content with tabs
+    builder_tabs = st.tabs([
+        "📤 Upload & Configure",
+        "👥 Player Pool",
+        "📊 Generated Lineups",
+        "📈 Exposure Report"
+    ])
+
+    # ==========================================================================
+    # TAB 1: Upload & Configure
+    # ==========================================================================
+    with builder_tabs[0]:
+        st.subheader("Upload DraftKings CSV")
+        st.markdown("""
+        Download your contest CSV from DraftKings and upload it here.
+        The file should contain player names, positions, salaries, and game information.
+        """)
+
+        uploaded_file = st.file_uploader(
+            "Choose DraftKings CSV file",
+            type=['csv'],
+            help="Export from DraftKings contest lobby"
+        )
+
+        if uploaded_file is not None:
+            # Save uploaded file
+            csv_path = persist_uploaded_file(uploaded_file, ".csv")
+
+            with st.spinner("Parsing DraftKings CSV..."):
+                try:
+                    players, metadata = dfs.parse_dk_csv(csv_path, dfs_conn)
+
+                    st.success(f"✅ Loaded {metadata['matched_players']} players from {metadata['unique_games']} games")
+
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Players Matched", metadata['matched_players'])
+                    with col2:
+                        st.metric("Unique Games", metadata['unique_games'])
+                    with col3:
+                        low, high = metadata['salary_range']
+                        st.metric("Salary Range", f"${low:,} - ${high:,}")
+
+                    if metadata['unmatched_players']:
+                        with st.expander(f"⚠️ {len(metadata['unmatched_players'])} Unmatched Players"):
+                            st.write("These players couldn't be matched to the database:")
+                            for name in metadata['unmatched_players'][:20]:
+                                st.caption(f"• {name}")
+                            if len(metadata['unmatched_players']) > 20:
+                                st.caption(f"...and {len(metadata['unmatched_players']) - 20} more")
+
+                    # Generate projections
+                    st.subheader("Generate Projections")
+
+                    if st.button("🔄 Generate Player Projections", type="primary"):
+                        progress_bar = st.progress(0)
+                        status_text = st.empty()
+
+                        projected_players = []
+                        for i, player in enumerate(players):
+                            progress = (i + 1) / len(players)
+                            progress_bar.progress(progress)
+                            status_text.text(f"Projecting {player.name}...")
+
+                            player = dfs.generate_player_projections(
+                                dfs_conn, player,
+                                season=DEFAULT_SEASON,
+                                season_type=DEFAULT_SEASON_TYPE
+                            )
+                            projected_players.append(player)
+
+                        progress_bar.empty()
+                        status_text.empty()
+
+                        st.session_state.dfs_player_pool = projected_players
+                        st.session_state.dfs_upload_metadata = metadata
+
+                        st.success(f"✅ Generated projections for {len(projected_players)} players")
+                        st.info("Switch to the **Player Pool** tab to review and adjust projections.")
+
+                except Exception as e:
+                    st.error(f"❌ Error parsing CSV: {str(e)}")
+                    import traceback
+                    st.code(traceback.format_exc())
+
+    # ==========================================================================
+    # TAB 2: Player Pool
+    # ==========================================================================
+    with builder_tabs[1]:
+        st.subheader("Player Pool & Projections")
+
+        if not st.session_state.dfs_player_pool:
+            st.info("📤 Upload a DraftKings CSV in the first tab to populate the player pool.")
+        else:
+            players = st.session_state.dfs_player_pool
+
+            # Filters
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                teams = sorted(set(p.team for p in players))
+                selected_teams = st.multiselect("Filter by Team", teams, default=[])
+            with col2:
+                positions = ['PG', 'SG', 'SF', 'PF', 'C']
+                selected_positions = st.multiselect("Filter by Position", positions, default=[])
+            with col3:
+                salary_range = st.slider(
+                    "Salary Range",
+                    min_value=min(p.salary for p in players),
+                    max_value=max(p.salary for p in players),
+                    value=(min(p.salary for p in players), max(p.salary for p in players)),
+                    step=500
+                )
+
+            # Apply filters
+            filtered = players
+            if selected_teams:
+                filtered = [p for p in filtered if p.team in selected_teams]
+            if selected_positions:
+                filtered = [p for p in filtered if any(pos in p.positions for pos in selected_positions)]
+            filtered = [p for p in filtered if salary_range[0] <= p.salary <= salary_range[1]]
+
+            # Sort options
+            sort_by = st.selectbox(
+                "Sort by",
+                ["Projected FPTS", "Salary", "Value (FPTS/$)", "Ceiling"],
+                index=0
+            )
+
+            if sort_by == "Projected FPTS":
+                filtered.sort(key=lambda p: p.proj_fpts, reverse=True)
+            elif sort_by == "Salary":
+                filtered.sort(key=lambda p: p.salary, reverse=True)
+            elif sort_by == "Value (FPTS/$)":
+                filtered.sort(key=lambda p: p.fpts_per_dollar, reverse=True)
+            else:
+                filtered.sort(key=lambda p: p.proj_ceiling, reverse=True)
+
+            # Display player table
+            st.caption(f"Showing {len(filtered)} of {len(players)} players")
+
+            # Build DataFrame for display
+            player_data = []
+            for p in filtered:
+                player_data.append({
+                    'Name': p.name,
+                    'Team': p.team,
+                    'Opp': p.opponent,
+                    'Pos': '/'.join(p.positions),
+                    'Salary': f"${p.salary:,}",
+                    'Proj FPTS': f"{p.proj_fpts:.1f}",
+                    'Floor': f"{p.proj_floor:.1f}",
+                    'Ceiling': f"{p.proj_ceiling:.1f}",
+                    'Value': f"{p.fpts_per_dollar:.2f}",
+                    'Own%': f"{p.ownership_proj:.1f}%",
+                })
+
+            df = pd.DataFrame(player_data)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+            # Lock/Exclude controls
+            st.divider()
+            st.subheader("Lock & Exclude Players")
+
+            col1, col2 = st.columns(2)
+            with col1:
+                player_names = [p.name for p in players]
+                locked_names = st.multiselect(
+                    "🔒 Lock Players (must include)",
+                    player_names,
+                    default=[p.name for p in players if p.is_locked],
+                    help="These players will be included in ALL lineups"
+                )
+                for p in players:
+                    p.is_locked = p.name in locked_names
+
+            with col2:
+                excluded_names = st.multiselect(
+                    "❌ Exclude Players",
+                    player_names,
+                    default=[p.name for p in players if p.is_excluded],
+                    help="These players will NOT appear in any lineup"
+                )
+                for p in players:
+                    p.is_excluded = p.name in excluded_names
+
+            if locked_names:
+                locked_salary = sum(p.salary for p in players if p.is_locked)
+                st.caption(f"Locked players total: ${locked_salary:,} ({len(locked_names)} players)")
+
+    # ==========================================================================
+    # TAB 3: Generated Lineups
+    # ==========================================================================
+    with builder_tabs[2]:
+        st.subheader("Generated Lineups")
+
+        if not st.session_state.dfs_player_pool:
+            st.info("📤 Upload a DraftKings CSV and generate projections first.")
+        else:
+            players = st.session_state.dfs_player_pool
+
+            col1, col2 = st.columns([2, 1])
+            with col1:
+                if st.button("🚀 Generate Lineups", type="primary", use_container_width=True):
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+
+                    def update_progress(current, total, message):
+                        progress_bar.progress(current / total if total > 0 else 0)
+                        status_text.text(message)
+
+                    with st.spinner("Optimizing lineups..."):
+                        lineups = dfs.generate_diversified_lineups(
+                            player_pool=players,
+                            num_lineups=num_lineups,
+                            max_player_exposure=max_exposure,
+                            progress_callback=update_progress
+                        )
+
+                    progress_bar.empty()
+                    status_text.empty()
+
+                    st.session_state.dfs_lineups = lineups
+
+                    if lineups:
+                        st.success(f"✅ Generated {len(lineups)} valid lineups!")
+                    else:
+                        st.error("❌ Could not generate any valid lineups. Try adjusting constraints.")
+
+            with col2:
+                if st.session_state.dfs_lineups:
+                    # Export button
+                    lineups = st.session_state.dfs_lineups
+                    export_df = pd.DataFrame([l.to_dk_export_row() for l in lineups])
+
+                    csv_data = export_df.to_csv(index=False)
+                    st.download_button(
+                        label="📥 Export for DraftKings",
+                        data=csv_data,
+                        file_name="dk_lineups.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+
+            # Display generated lineups
+            if st.session_state.dfs_lineups:
+                lineups = st.session_state.dfs_lineups
+
+                st.divider()
+
+                # Summary stats
+                col1, col2, col3, col4 = st.columns(4)
+                avg_proj = sum(l.total_proj_fpts for l in lineups) / len(lineups)
+                avg_salary = sum(l.total_salary for l in lineups) / len(lineups)
+                avg_ceiling = sum(l.total_ceiling for l in lineups) / len(lineups)
+
+                with col1:
+                    st.metric("Total Lineups", len(lineups))
+                with col2:
+                    st.metric("Avg Projected FPTS", f"{avg_proj:.1f}")
+                with col3:
+                    st.metric("Avg Salary Used", f"${avg_salary:,.0f}")
+                with col4:
+                    st.metric("Avg Ceiling", f"{avg_ceiling:.1f}")
+
+                # Display each lineup
+                st.subheader("Lineup Details")
+
+                # Pagination
+                lineups_per_page = 10
+                total_pages = (len(lineups) + lineups_per_page - 1) // lineups_per_page
+                page = st.selectbox("Page", range(1, total_pages + 1), index=0) - 1
+
+                start_idx = page * lineups_per_page
+                end_idx = min(start_idx + lineups_per_page, len(lineups))
+
+                for i in range(start_idx, end_idx):
+                    lineup = lineups[i]
+                    with st.expander(
+                        f"Lineup #{i+1} | Proj: {lineup.total_proj_fpts:.1f} | "
+                        f"Salary: ${lineup.total_salary:,} | Ceiling: {lineup.total_ceiling:.1f}",
+                        expanded=(i == start_idx)
+                    ):
+                        # Show lineup table
+                        lineup_data = []
+                        for slot in dfs.ROSTER_SLOTS:
+                            player = lineup.players.get(slot)
+                            if player:
+                                lineup_data.append({
+                                    'Slot': slot,
+                                    'Player': player.name,
+                                    'Team': player.team,
+                                    'Salary': f"${player.salary:,}",
+                                    'Proj': f"{player.proj_fpts:.1f}",
+                                    'Ceiling': f"{player.proj_ceiling:.1f}"
+                                })
+
+                        st.dataframe(
+                            pd.DataFrame(lineup_data),
+                            use_container_width=True,
+                            hide_index=True
+                        )
+
+                        # Show stacks
+                        stacks = lineup.game_stacks
+                        stack_info = [f"{game}: {len(players)} players" for game, players in stacks.items() if len(players) >= 2]
+                        if stack_info:
+                            st.caption(f"Game Stacks: {', '.join(stack_info)}")
+
+    # ==========================================================================
+    # TAB 4: Exposure Report
+    # ==========================================================================
+    with builder_tabs[3]:
+        st.subheader("Exposure Report")
+
+        if not st.session_state.dfs_lineups:
+            st.info("🚀 Generate lineups first to see the exposure report.")
+        else:
+            lineups = st.session_state.dfs_lineups
+
+            # Player exposure chart
+            st.subheader("Player Exposure")
+
+            exposure_df = dfs.generate_exposure_report(lineups)
+
+            if not exposure_df.empty:
+                # Top exposed players chart
+                import plotly.express as px
+
+                top_exposure = exposure_df.head(20)
+                fig = px.bar(
+                    top_exposure,
+                    x='name',
+                    y='exposure_pct',
+                    color='exposure_pct',
+                    color_continuous_scale='Blues',
+                    labels={'name': 'Player', 'exposure_pct': 'Exposure %'},
+                    title='Top 20 Most Exposed Players'
+                )
+                fig.update_layout(xaxis_tickangle=-45, showlegend=False)
+                st.plotly_chart(fig, use_container_width=True)
+
+                # Full exposure table
+                with st.expander("View All Player Exposures"):
+                    display_exp = exposure_df.copy()
+                    display_exp['exposure_pct'] = display_exp['exposure_pct'].apply(lambda x: f"{x:.1f}%")
+                    display_exp['proj_fpts'] = display_exp['proj_fpts'].apply(lambda x: f"{x:.1f}")
+                    display_exp['salary'] = display_exp['salary'].apply(lambda x: f"${x:,}")
+                    display_exp.columns = ['Name', 'Team', 'Salary', 'Proj FPTS', 'Count', 'Exposure %']
+                    st.dataframe(display_exp, use_container_width=True, hide_index=True)
+
+            # Team exposure
+            st.divider()
+            st.subheader("Team Exposure")
+
+            team_exposure = {}
+            for lineup in lineups:
+                for player in lineup.players.values():
+                    if player.team not in team_exposure:
+                        team_exposure[player.team] = 0
+                    team_exposure[player.team] += 1
+
+            team_df = pd.DataFrame([
+                {'team': team, 'count': count, 'exposure_pct': count / (len(lineups) * 8) * 100}
+                for team, count in team_exposure.items()
+            ]).sort_values('exposure_pct', ascending=False)
+
+            if not team_df.empty:
+                fig_team = px.bar(
+                    team_df,
+                    x='team',
+                    y='exposure_pct',
+                    color='exposure_pct',
+                    color_continuous_scale='Greens',
+                    labels={'team': 'Team', 'exposure_pct': 'Exposure %'},
+                    title='Team Distribution Across Lineups'
+                )
+                fig_team.update_layout(showlegend=False)
+                st.plotly_chart(fig_team, use_container_width=True)
+
+            # Salary distribution
+            st.divider()
+            st.subheader("Salary Distribution")
+
+            salary_data = [l.total_salary for l in lineups]
+            fig_salary = px.histogram(
+                x=salary_data,
+                nbins=20,
+                labels={'x': 'Total Salary', 'y': 'Count'},
+                title='Lineup Salary Distribution'
+            )
+            fig_salary.add_vline(x=50000, line_dash="dash", line_color="red",
+                                annotation_text="Salary Cap")
+            st.plotly_chart(fig_salary, use_container_width=True)
+
+            # Stack report
+            st.divider()
+            st.subheader("Game Stacks")
+
+            stack_df = dfs.generate_stack_report(lineups)
+            if not stack_df.empty:
+                st.dataframe(stack_df, use_container_width=True, hide_index=True)
+            else:
+                st.info("No significant stacks (2+ players from same game) found.")
 
 
 st.divider()

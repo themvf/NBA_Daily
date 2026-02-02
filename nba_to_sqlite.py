@@ -256,6 +256,16 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             minutes TEXT,
             usg_pct REAL,
             points REAL,
+            rebounds REAL,
+            assists REAL,
+            steals REAL,
+            blocks REAL,
+            turnovers REAL,
+            fgm REAL,
+            fga REAL,
+            ftm REAL,
+            fta REAL,
+            plus_minus REAL,
             PRIMARY KEY (season, season_type, player_id, game_id)
         );
 
@@ -307,6 +317,17 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         ("team_game_logs", "opp_oreb", "REAL"),
         ("team_game_logs", "opp_tov", "REAL"),
         ("player_game_logs", "usg_pct", "REAL"),
+        # DFS columns for full box score tracking
+        ("player_game_logs", "rebounds", "REAL"),
+        ("player_game_logs", "assists", "REAL"),
+        ("player_game_logs", "steals", "REAL"),
+        ("player_game_logs", "blocks", "REAL"),
+        ("player_game_logs", "turnovers", "REAL"),
+        ("player_game_logs", "fgm", "REAL"),
+        ("player_game_logs", "fga", "REAL"),
+        ("player_game_logs", "ftm", "REAL"),
+        ("player_game_logs", "fta", "REAL"),
+        ("player_game_logs", "plus_minus", "REAL"),
     ]
     for table, column, col_type in alter_columns:
         try:
@@ -601,6 +622,17 @@ def load_player_game_logs(
                 "minutes": data.get("min"),
                 "usg_pct": normalize_float(data.get("usg_pct")),
                 "points": data.get("pts"),
+                # Additional DFS-relevant stats
+                "rebounds": data.get("reb"),
+                "assists": data.get("ast"),
+                "steals": data.get("stl"),
+                "blocks": data.get("blk"),
+                "turnovers": data.get("tov"),
+                "fgm": data.get("fgm"),
+                "fga": data.get("fga"),
+                "ftm": data.get("ftm"),
+                "fta": data.get("fta"),
+                "plus_minus": normalize_float(data.get("plus_minus")),
             }
         )
     return upsert_rows(
