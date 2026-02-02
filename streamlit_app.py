@@ -12522,6 +12522,10 @@ if selected_page == "DFS Lineup Builder":
         st.session_state.dfs_lineups = []
     if 'dfs_upload_metadata' not in st.session_state:
         st.session_state.dfs_upload_metadata = {}
+    if 'dfs_excluded_games' not in st.session_state:
+        st.session_state.dfs_excluded_games = set()
+    if 'dfs_all_games' not in st.session_state:
+        st.session_state.dfs_all_games = []
 
     # Get database connection
     dfs_conn = get_connection(str(db_path))
@@ -12600,7 +12604,42 @@ if selected_page == "DFS Lineup Builder":
                             if len(metadata['unmatched_players']) > 20:
                                 st.caption(f"...and {len(metadata['unmatched_players']) - 20} more")
 
+                    # Game selection - exclude postponed/cancelled games
+                    st.divider()
+                    st.subheader("🏟️ Select Games to Include")
+                    st.caption("Uncheck any postponed or cancelled games")
+
+                    # Get unique games from players
+                    all_games = sorted(set(p.game_id for p in players))
+                    st.session_state.dfs_all_games = all_games
+
+                    # Display games as checkboxes in columns
+                    game_cols = st.columns(min(3, len(all_games)))
+                    included_games = set()
+
+                    for i, game_id in enumerate(all_games):
+                        col_idx = i % len(game_cols)
+                        # Get teams in this game
+                        game_teams = set(p.team for p in players if p.game_id == game_id)
+                        game_label = ' vs '.join(sorted(game_teams)) if game_teams else game_id
+
+                        with game_cols[col_idx]:
+                            is_included = st.checkbox(
+                                game_label,
+                                value=game_id not in st.session_state.dfs_excluded_games,
+                                key=f"game_{game_id}"
+                            )
+                            if is_included:
+                                included_games.add(game_id)
+
+                    # Update excluded games
+                    st.session_state.dfs_excluded_games = set(all_games) - included_games
+
+                    if st.session_state.dfs_excluded_games:
+                        st.warning(f"⚠️ {len(st.session_state.dfs_excluded_games)} game(s) excluded from lineup generation")
+
                     # Generate projections
+                    st.divider()
                     st.subheader("Generate Projections")
 
                     if st.button("🔄 Generate Player Projections", type="primary"):
@@ -12708,6 +12747,36 @@ if selected_page == "DFS Lineup Builder":
             df = pd.DataFrame(player_data)
             st.dataframe(df, use_container_width=True, hide_index=True)
 
+            # Export player pool button
+            export_col1, export_col2 = st.columns([1, 3])
+            with export_col1:
+                # Build export data with raw values for CSV
+                export_data = []
+                for p in filtered:
+                    export_data.append({
+                        'Name': p.name,
+                        'ID': p.dk_id,
+                        'Team': p.team,
+                        'Opponent': p.opponent,
+                        'Position': '/'.join(p.positions),
+                        'Salary': p.salary,
+                        'Proj_FPTS': round(p.proj_fpts, 2),
+                        'Floor': round(p.proj_floor, 2),
+                        'Ceiling': round(p.proj_ceiling, 2),
+                        'Value': round(p.fpts_per_dollar, 3),
+                        'Own_Pct': round(p.ownership_proj, 1),
+                        'Game': p.game_id,
+                    })
+                export_pool_df = pd.DataFrame(export_data)
+                csv_pool = export_pool_df.to_csv(index=False)
+                st.download_button(
+                    label="📥 Export Player Pool",
+                    data=csv_pool,
+                    file_name="dk_player_pool.csv",
+                    mime="text/csv",
+                    help="Download player pool with projections"
+                )
+
             # Lock/Exclude controls
             st.divider()
             st.subheader("Lock & Exclude Players")
@@ -12764,7 +12833,8 @@ if selected_page == "DFS Lineup Builder":
                             player_pool=players,
                             num_lineups=num_lineups,
                             max_player_exposure=max_exposure,
-                            progress_callback=update_progress
+                            progress_callback=update_progress,
+                            excluded_games=st.session_state.dfs_excluded_games
                         )
 
                     progress_bar.empty()

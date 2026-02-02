@@ -837,26 +837,31 @@ def parse_dk_csv(
 # Lineup Optimizer
 # =============================================================================
 
-def optimize_lineup(
+def optimize_lineup_randomized(
     player_pool: List[DFSPlayer],
-    strategy: str = "projection",  # projection, ceiling, value
+    strategy: str = "projection",
     locked_players: Optional[List[DFSPlayer]] = None,
     excluded_ids: Optional[Set[int]] = None,
     max_exposure: Optional[Dict[int, float]] = None,
     current_exposures: Optional[Dict[int, int]] = None,
-    num_lineups_total: int = 1
+    num_lineups_total: int = 1,
+    randomization_factor: float = 0.3
 ) -> Optional[DFSLineup]:
     """
-    Build an optimized lineup using a greedy algorithm.
+    Build an optimized lineup with controlled randomization for diversity.
+
+    Uses weighted random selection instead of pure greedy to generate
+    diverse lineups while still respecting projections/strategy.
 
     Args:
         player_pool: Available players
-        strategy: Optimization target (projection, ceiling, value)
+        strategy: Optimization target (projection, ceiling, value, leverage)
         locked_players: Players that must be in lineup
         excluded_ids: Player IDs to exclude
         max_exposure: Maximum exposure % per player
         current_exposures: Current lineup count per player
-        num_lineups_total: Total lineups being generated (for exposure calc)
+        num_lineups_total: Total lineups being generated
+        randomization_factor: How much randomness (0=greedy, 1=random)
 
     Returns:
         Optimized DFSLineup or None if no valid lineup found
@@ -888,15 +893,19 @@ def optimize_lineup(
 
     available = [p for p in available if can_use_player(p)]
 
-    # Sort by strategy metric
-    if strategy == "ceiling":
-        available.sort(key=lambda p: p.proj_ceiling, reverse=True)
-    elif strategy == "value":
-        available.sort(key=lambda p: p.fpts_per_dollar, reverse=True)
-    elif strategy == "leverage":
-        available.sort(key=lambda p: p.leverage_score, reverse=True)
-    else:  # projection
-        available.sort(key=lambda p: p.proj_fpts, reverse=True)
+    if not available:
+        return None
+
+    # Get score function based on strategy
+    def get_score(p: DFSPlayer) -> float:
+        if strategy == "ceiling":
+            return p.proj_ceiling
+        elif strategy == "value":
+            return p.fpts_per_dollar
+        elif strategy == "leverage":
+            return p.leverage_score
+        else:  # projection
+            return p.proj_fpts
 
     lineup = DFSLineup()
     used_player_ids = set()
@@ -909,12 +918,13 @@ def optimize_lineup(
                 used_player_ids.add(player.player_id)
                 break
 
-    # Fill remaining slots greedily
+    # Fill remaining slots with weighted random selection
     for slot in ROSTER_SLOTS:
         if slot in lineup.players:
             continue
 
-        # Find best available player for this slot
+        # Find all valid candidates for this slot
+        candidates = []
         for player in available:
             if player.player_id in used_player_ids:
                 continue
@@ -924,27 +934,46 @@ def optimize_lineup(
             # Check salary constraint
             tentative_salary = lineup.total_salary + player.salary
             remaining_slots = sum(1 for s in ROSTER_SLOTS if s not in lineup.players and s != slot)
-
-            # Need to leave room for minimum salary players
-            min_salary_needed = remaining_slots * 3000  # Assume min ~$3000 per player
+            min_salary_needed = remaining_slots * 3500  # Conservative minimum
 
             if tentative_salary + min_salary_needed > SALARY_CAP:
                 continue
 
-            # Check game diversity (need at least 2 games)
-            current_games = lineup.unique_games
-            slots_remaining_after = remaining_slots
-
-            if slots_remaining_after == 0:
-                # This is the last player - ensure we have 2+ games
-                test_games = current_games | {player.game_id}
+            # Check we can still get 2 games
+            if remaining_slots == 0:
+                test_games = lineup.unique_games | {player.game_id}
                 if len(test_games) < MIN_GAMES:
                     continue
 
-            # Add player
-            lineup.players[slot] = player
-            used_player_ids.add(player.player_id)
-            break
+            candidates.append(player)
+
+        if not candidates:
+            continue
+
+        # Weighted random selection based on score
+        scores = [max(0.1, get_score(p)) for p in candidates]
+        max_score = max(scores)
+        min_score = min(scores)
+
+        # Normalize scores and apply randomization
+        if max_score > min_score:
+            weights = []
+            for score in scores:
+                normalized = (score - min_score) / (max_score - min_score)
+                # Mix between score-based and uniform
+                weight = (1 - randomization_factor) * normalized + randomization_factor * 1.0
+                weights.append(max(0.01, weight))
+        else:
+            weights = [1.0] * len(candidates)
+
+        # Normalize weights
+        total_weight = sum(weights)
+        weights = [w / total_weight for w in weights]
+
+        # Select player
+        selected = random.choices(candidates, weights=weights, k=1)[0]
+        lineup.players[slot] = selected
+        used_player_ids.add(selected.player_id)
 
     # Validate final lineup
     if lineup.is_valid:
@@ -956,97 +985,104 @@ def optimize_lineup(
 def generate_diversified_lineups(
     player_pool: List[DFSPlayer],
     num_lineups: int = 100,
-    max_player_exposure: float = 0.40,  # 40% max exposure
-    progress_callback: Optional[Callable[[int, int, str], None]] = None
+    max_player_exposure: float = 0.50,  # 50% max exposure (was 40%)
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    excluded_games: Optional[Set[str]] = None
 ) -> List[DFSLineup]:
     """
-    Generate diversified GPP tournament lineups.
+    Generate diversified GPP tournament lineups using randomized optimization.
 
-    Strategy buckets:
-    - Max Projection (20%): Highest expected value
-    - Ceiling Plays (30%): Maximize upside
-    - Value Plays (25%): Best points per dollar
-    - Contrarian (15%): Low ownership + high ceiling
-    - Random Mix (10%): Diversification
+    Strategy distribution:
+    - Projection (25%): Weighted toward highest projected
+    - Ceiling (30%): Weighted toward highest ceiling
+    - Value (20%): Weighted toward best value plays
+    - Balanced (25%): High randomization for diversity
 
     Args:
         player_pool: Available players with projections
         num_lineups: Target number of lineups
         max_player_exposure: Maximum exposure per player (0.0-1.0)
         progress_callback: Optional progress callback (current, total, message)
+        excluded_games: Set of game_ids to exclude (for postponed games)
 
     Returns:
         List of valid DFSLineup objects
     """
-    lineups = []
-    exposures: Dict[int, int] = {}  # player_id -> lineup count
+    lineups: List[DFSLineup] = []
+    exposures: Dict[int, int] = {}
+    existing_lineup_keys: Set[Tuple[int, ...]] = set()
 
-    # Calculate bucket sizes
-    buckets = {
-        'projection': int(num_lineups * 0.20),
-        'ceiling': int(num_lineups * 0.30),
-        'value': int(num_lineups * 0.25),
-        'leverage': int(num_lineups * 0.15),
-        'random': num_lineups - int(num_lineups * 0.90)  # Remainder
-    }
+    # Filter out excluded games
+    excluded_games = excluded_games or set()
+    filtered_pool = [p for p in player_pool if p.game_id not in excluded_games]
+
+    if not filtered_pool:
+        return []
 
     # Get locked players
-    locked = [p for p in player_pool if p.is_locked]
+    locked = [p for p in filtered_pool if p.is_locked]
 
     # Build max exposure dict
-    max_exp = {p.player_id: max_player_exposure for p in player_pool}
+    max_exp = {p.player_id: max_player_exposure for p in filtered_pool}
 
-    lineup_count = 0
-    attempts = 0
-    max_attempts = num_lineups * 10  # Limit total attempts
+    # Strategy configuration: (strategy, randomization_factor, target_count_pct)
+    strategies = [
+        ('projection', 0.25, 0.25),  # 25% of lineups, moderate randomization
+        ('ceiling', 0.30, 0.30),     # 30% of lineups, higher randomization
+        ('value', 0.25, 0.20),       # 20% of lineups, moderate randomization
+        ('projection', 0.60, 0.25), # 25% "balanced" - high randomization
+    ]
 
-    for strategy, count in buckets.items():
-        strategy_lineups = 0
+    total_generated = 0
+    max_total_attempts = num_lineups * 50  # Allow many more attempts
+    total_attempts = 0
+
+    for strategy, rand_factor, pct in strategies:
+        target_count = int(num_lineups * pct)
+        strategy_generated = 0
         strategy_attempts = 0
-        max_strategy_attempts = count * 5
+        max_strategy_attempts = target_count * 20  # More attempts per strategy
 
-        while strategy_lineups < count and attempts < max_attempts and strategy_attempts < max_strategy_attempts:
-            attempts += 1
+        while (strategy_generated < target_count and
+               total_attempts < max_total_attempts and
+               strategy_attempts < max_strategy_attempts and
+               total_generated < num_lineups):
+
+            total_attempts += 1
             strategy_attempts += 1
 
-            if progress_callback:
-                progress_callback(lineup_count, num_lineups, f"Generating {strategy} lineups...")
+            if progress_callback and total_attempts % 10 == 0:
+                progress_callback(
+                    total_generated, num_lineups,
+                    f"Building {strategy} lineups ({total_generated}/{num_lineups})..."
+                )
 
-            # For random strategy, shuffle the pool
-            if strategy == 'random':
-                pool = player_pool.copy()
-                random.shuffle(pool)
-            else:
-                pool = player_pool
-
-            lineup = optimize_lineup(
-                player_pool=pool,
-                strategy=strategy if strategy != 'random' else 'projection',
+            lineup = optimize_lineup_randomized(
+                player_pool=filtered_pool,
+                strategy=strategy,
                 locked_players=locked,
                 max_exposure=max_exp,
                 current_exposures=exposures,
-                num_lineups_total=num_lineups
+                num_lineups_total=num_lineups,
+                randomization_factor=rand_factor
             )
 
             if lineup and lineup.is_valid:
                 # Check lineup uniqueness
                 lineup_key = tuple(sorted(p.player_id for p in lineup.players.values()))
-                existing_keys = {
-                    tuple(sorted(p.player_id for p in l.players.values()))
-                    for l in lineups
-                }
 
-                if lineup_key not in existing_keys:
+                if lineup_key not in existing_lineup_keys:
                     lineups.append(lineup)
-                    strategy_lineups += 1
-                    lineup_count += 1
+                    existing_lineup_keys.add(lineup_key)
+                    strategy_generated += 1
+                    total_generated += 1
 
                     # Update exposures
                     for player in lineup.players.values():
                         exposures[player.player_id] = exposures.get(player.player_id, 0) + 1
 
     if progress_callback:
-        progress_callback(len(lineups), num_lineups, "Complete!")
+        progress_callback(total_generated, num_lineups, "Complete!")
 
     return lineups
 
