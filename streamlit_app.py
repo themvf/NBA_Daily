@@ -8732,6 +8732,8 @@ if selected_page == "Tournament Strategy":
         from lineup_optimizer import (
             create_mixture_player_pool,
             build_mixture_tournament_portfolio,
+            build_top3_tournament_portfolio,
+            Top3TournamentConfig,
             compare_mixture_vs_baseline,
             format_portfolio_report
         )
@@ -8949,44 +8951,91 @@ Flag matches truth: {'✅ YES' if abs(pct_w_capped - pct_w_flag) < 0.1 else '❌
                         else:
                             st.caption("None")
 
-            # Build Mixture Portfolio Button
-            st.markdown("### 🚀 Generate Mixture Portfolio")
+            # Build Top-3 Scorer Tournament Portfolio
+            st.markdown("### 🏆 Generate Top-3 Scorer Tournament Portfolio")
+            st.caption("Predict the top 3 NBA scorers for winner-take-all tournament. NOT a DFS lineup optimizer.")
 
-            if st.button("🎲 Build 20-Lineup Mixture Portfolio", key="build_mixture_portfolio"):
-                with st.spinner("Building mixture-based tournament portfolio..."):
+            # Configuration options
+            with st.expander("⚙️ Portfolio Settings", expanded=False):
+                cfg_col1, cfg_col2 = st.columns(2)
+                with cfg_col1:
+                    pool_size = st.slider("Candidate Pool Size", min_value=20, max_value=100, value=60,
+                                         help="Top N players by p_threshold to consider")
+                    max_attempts = st.slider("Max Generation Attempts", min_value=200, max_value=2000, value=1000,
+                                            help="Maximum attempts to find valid lineups")
+                with cfg_col2:
+                    max_exposure_star = st.slider("Star Exposure Cap", min_value=0.3, max_value=1.0, value=0.70,
+                                                  help="Max % of lineups top-5 players can appear in")
+                    max_core_overlap = st.slider("Max Core Overlap", min_value=2, max_value=10, value=5,
+                                                help="Max lineups sharing same 2-player pair")
+
+            if st.button("🎲 Build 20-Prediction Top-3 Portfolio", key="build_top3_portfolio"):
+                with st.spinner("Building top-3 scorer tournament portfolio..."):
                     try:
-                        result = build_mixture_tournament_portfolio(tourn_conn, selected_date)
+                        # Build with custom config
+                        config = Top3TournamentConfig(
+                            candidate_pool_size=pool_size,
+                            max_attempts=max_attempts,
+                            max_exposure_star=max_exposure_star,
+                            max_core_overlap=max_core_overlap
+                        )
+                        result = build_top3_tournament_portfolio(tourn_conn, selected_date, config)
 
                         if result.lineups:
-                            st.success(f"✅ Generated {len(result.lineups)} lineups using mixture model rankings!")
+                            st.success(f"✅ Generated {len(result.lineups)} predictions for top-3 scorers!")
 
                             # Summary metrics
                             sum_cols = st.columns(4)
                             with sum_cols[0]:
-                                st.metric("Total Lineups", len(result.lineups))
+                                st.metric("Total Predictions", len(result.lineups))
                             with sum_cols[1]:
                                 st.metric("Unique Players", result.unique_players)
                             with sum_cols[2]:
-                                st.metric("Win Probability", f"{result.total_win_probability:.1%}")
+                                st.metric("Win Probability", f"{result.total_win_probability:.1%}",
+                                         help="P(at least one prediction matches actual top 3)")
                             with sum_cols[3]:
-                                st.metric("Diversity Score", f"{result.diversity_score:.2f}")
+                                st.metric("Pool Size", result.diagnostics.get('candidate_pool_size', 0))
 
-                            # Bucket breakdown
-                            st.markdown("#### Bucket Breakdown")
-                            bucket_df = pd.DataFrame([
-                                {"Bucket": k.title(), "Count": v}
-                                for k, v in result.bucket_summary.items()
-                            ])
-                            st.dataframe(bucket_df, hide_index=True, use_container_width=True)
+                            # DIAGNOSTIC OUTPUT SECTION
+                            st.markdown("#### 📊 Generation Diagnostics")
+                            diag = result.diagnostics
 
-                            # Show lineups by bucket
-                            for bucket in ['chalk', 'stack', 'leverage', 'news']:
-                                bucket_lineups = [l for l in result.lineups if l.bucket == bucket]
-                                if bucket_lineups:
-                                    st.markdown(f"**{bucket.title()} Lineups ({len(bucket_lineups)})**")
-                                    for i, lineup in enumerate(bucket_lineups, 1):
-                                        names = ' | '.join([p.player_name for p in lineup.players])
-                                        st.markdown(f"{i}. {names} (Win: {lineup.win_probability:.2%}, Ceil: {lineup.total_ceiling():.0f})")
+                            diag_cols = st.columns(4)
+                            with diag_cols[0]:
+                                st.metric("Attempted", diag.get('attempted_lineups', 0))
+                            with diag_cols[1]:
+                                st.metric("Valid Found", diag.get('valid_lineups_found', 0))
+                            with diag_cols[2]:
+                                rej_overlap = diag.get('rejected_core_overlap', 0)
+                                st.metric("Rejected (Overlap)", rej_overlap,
+                                         delta=f"-{rej_overlap}" if rej_overlap > 0 else None,
+                                         delta_color="inverse")
+                            with diag_cols[3]:
+                                rej_cap = diag.get('rejected_exposure_cap', 0)
+                                st.metric("Rejected (Cap)", rej_cap,
+                                         delta=f"-{rej_cap}" if rej_cap > 0 else None,
+                                         delta_color="inverse")
+
+                            # Top exposures
+                            if diag.get('top_exposures'):
+                                with st.expander("📈 Top Player Exposures", expanded=True):
+                                    for exp_line in diag['top_exposures']:
+                                        st.caption(exp_line)
+
+                            # Rejection log (if any)
+                            if diag.get('rejection_log'):
+                                with st.expander(f"⚠️ Rejection Log ({len(diag['rejection_log'])} samples)", expanded=False):
+                                    for log_entry in diag['rejection_log'][:15]:
+                                        st.caption(f"• {log_entry}")
+
+                            # Show all 20 predictions (no buckets)
+                            st.markdown("#### 🎯 Top-3 Scorer Predictions")
+                            for i, lineup in enumerate(result.lineups, 1):
+                                players = lineup.players
+                                names = ' | '.join([f"**{p.player_name}** ({p.team})" for p in players])
+                                ceiling_sum = sum(p.ceiling for p in players)
+                                avg_pthresh = sum(p.p_threshold for p in players) / 3
+                                st.markdown(f"{i}. {names} (Ceiling: {ceiling_sum:.0f}, Avg P: {avg_pthresh:.2%})")
 
                             # Exposure report
                             with st.expander("📊 Player Exposure Report", expanded=False):
@@ -8997,6 +9046,7 @@ Flag matches truth: {'✅ YES' if abs(pct_w_capped - pct_w_flag) < 0.1 else '❌
                                     exp_data.append({
                                         'Player': data.get('player_name', f'ID:{pid}'),
                                         'Count': data['count'],
+                                        'Max': data.get('max_allowed', 0),
                                         'Exposure': f"{data['pct']:.0%}",
                                         'Tier': data.get('tier', 'unknown'),
                                         'Status': cap_status
@@ -9005,19 +9055,24 @@ Flag matches truth: {'✅ YES' if abs(pct_w_capped - pct_w_flag) < 0.1 else '❌
                                     st.dataframe(pd.DataFrame(exp_data), hide_index=True, use_container_width=True)
 
                             # Export
-                            if st.button("📋 Copy Mixture Lineups", key="copy_mixture_lineups"):
-                                lines = []
-                                for i, lineup in enumerate(result.lineups, 1):
-                                    names = ', '.join([p.player_name for p in lineup.players])
-                                    lines.append(f"{i}. [{lineup.bucket}] {names}")
-                                st.code('\n'.join(lines))
+                            st.markdown("#### 📋 Export Predictions")
+                            lines = []
+                            for i, lineup in enumerate(result.lineups, 1):
+                                names = ', '.join([p.player_name for p in lineup.players])
+                                lines.append(f"{i}. {names}")
+                            st.code('\n'.join(lines))
+
                         else:
-                            st.warning("⚠️ No lineups generated. Check warnings:")
+                            st.warning("⚠️ No predictions generated. Check warnings and diagnostics:")
                             for w in result.warnings:
-                                st.caption(f"- {w}")
+                                st.error(f"- {w}")
+                            # Show diagnostics even on failure
+                            diag = result.diagnostics
+                            st.info(f"Pool size: {diag.get('candidate_pool_size', 0)}, "
+                                   f"Attempts: {diag.get('attempted_lineups', 0)}")
 
                     except Exception as e:
-                        st.error(f"Error building mixture portfolio: {e}")
+                        st.error(f"Error building portfolio: {e}")
                         import traceback
                         st.code(traceback.format_exc())
 

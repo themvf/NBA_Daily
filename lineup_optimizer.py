@@ -1488,6 +1488,398 @@ def format_portfolio_report(result: PortfolioResult) -> str:
 
 
 # ============================================================================
+# TOP-3 SCORER TOURNAMENT OPTIMIZER (Simplified, No Buckets)
+# ============================================================================
+# This is for predicting the TOP 3 NBA SCORERS for a day, not DFS lineups.
+# Each "lineup" represents a prediction of who will be the 3 highest scorers.
+# Winner-take-all tournament: we need 20 diverse predictions to maximize
+# our chance that at least ONE of our predictions matches the actual top 3.
+# ============================================================================
+
+@dataclass
+class Top3TournamentConfig:
+    """Configuration for top-3 scorer tournament optimizer."""
+    # Number of lineups (predictions) to generate
+    num_lineups: int = 20
+
+    # Candidate pool size (top N players by p_threshold to consider)
+    candidate_pool_size: int = 60
+
+    # Exposure caps (fraction of lineups a player can appear in)
+    max_exposure_star: float = 0.70      # Top 5 players: up to 70%
+    max_exposure_tier2: float = 0.50     # Players 6-15: up to 50%
+    max_exposure_tier3: float = 0.35     # Players 16+: up to 35%
+
+    # Uniqueness constraints (relaxed for small pools)
+    min_unique_players: int = 6          # Minimum unique players across all lineups
+    max_core_overlap: int = 5            # Max lineups sharing same 2-player pair
+
+    # Search parameters
+    max_attempts: int = 1000             # Maximum attempts to generate lineups
+
+    # Dynamic cap adjustment for small slates
+    small_slate_threshold: int = 20      # If pool < this, relax caps
+
+
+@dataclass
+class Top3TournamentResult:
+    """Result of top-3 scorer tournament optimization with diagnostics."""
+    lineups: List[Lineup]
+    exposure_report: Dict[int, dict]
+    total_win_probability: float
+    unique_players: int
+    warnings: List[str] = field(default_factory=list)
+
+    # Diagnostic information
+    diagnostics: Dict[str, Any] = field(default_factory=dict)
+
+
+class Top3ScorerOptimizer:
+    """
+    Optimizer for predicting top 3 NBA scorers in a winner-take-all tournament.
+
+    This is NOT a DFS optimizer. It generates diverse predictions of which
+    3 players will be the highest scorers across all games on a given day.
+
+    Key differences from DFS:
+    - No bucket system (chalk/stack/leverage/news)
+    - Single goal: maximize P(at least one prediction matches actual top 3)
+    - Larger candidate pool (60 players vs 15)
+    - Relaxed constraints to generate 20 unique predictions
+    """
+
+    def __init__(
+        self,
+        player_pool: List[PlayerPool],
+        config: Top3TournamentConfig = None
+    ):
+        self.config = config or Top3TournamentConfig()
+
+        # Use top N candidates by p_threshold (mixture model probability)
+        sorted_pool = sorted(player_pool, key=lambda p: p.p_threshold, reverse=True)
+        self.pool_list = sorted_pool[:self.config.candidate_pool_size]
+        self.pool = {p.player_id: p for p in self.pool_list}
+
+        # Track for exposure
+        self.exposure_counts: Dict[int, int] = defaultdict(int)
+        self.player_tiers: Dict[int, str] = {}
+
+        # Assign tiers based on position in sorted pool
+        for i, p in enumerate(self.pool_list):
+            if i < 5:
+                self.player_tiers[p.player_id] = "star"
+            elif i < 15:
+                self.player_tiers[p.player_id] = "tier2"
+            else:
+                self.player_tiers[p.player_id] = "tier3"
+
+        # Track unique lineups
+        self.seen_lineups: Set[FrozenSet[int]] = set()
+
+        # Track 2-player cores
+        self.core_counts: Dict[FrozenSet[int], int] = defaultdict(int)
+
+        # Diagnostics
+        self.diag = {
+            'attempted_lineups': 0,
+            'valid_lineups_found': 0,
+            'rejected_duplicate': 0,
+            'rejected_core_overlap': 0,
+            'rejected_exposure_cap': 0,
+            'candidate_pool_size': len(self.pool_list),
+            'rejection_log': []
+        }
+
+    def _get_max_exposure(self, player_id: int) -> int:
+        """Get max lineup count for a player based on tier."""
+        tier = self.player_tiers.get(player_id, "tier3")
+        n = self.config.num_lineups
+
+        # Dynamic cap adjustment for small slates
+        if len(self.pool_list) < self.config.small_slate_threshold:
+            # Increase caps when pool is small
+            multiplier = 1.3
+        else:
+            multiplier = 1.0
+
+        if tier == "star":
+            return int(self.config.max_exposure_star * n * multiplier)
+        elif tier == "tier2":
+            return int(self.config.max_exposure_tier2 * n * multiplier)
+        else:
+            return int(self.config.max_exposure_tier3 * n * multiplier)
+
+    def _can_add_player(self, player_id: int) -> bool:
+        """Check if player can be added based on exposure."""
+        current = self.exposure_counts[player_id]
+        max_allowed = self._get_max_exposure(player_id)
+        return current < max_allowed
+
+    def _get_all_cores(self, player_ids: List[int]) -> List[FrozenSet[int]]:
+        """Get all 2-player cores from a 3-player lineup."""
+        from itertools import combinations
+        return [frozenset(pair) for pair in combinations(player_ids, 2)]
+
+    def _can_add_lineup_core(self, player_ids: List[int]) -> Tuple[bool, str]:
+        """Check if lineup's cores would exceed overlap limit. Returns (ok, reason)."""
+        max_overlap = self.config.max_core_overlap
+        for core in self._get_all_cores(player_ids):
+            if self.core_counts[core] >= max_overlap:
+                player_names = [self.pool[pid].player_name for pid in core if pid in self.pool]
+                return False, f"Core saturated: {' + '.join(player_names)} ({self.core_counts[core]} uses)"
+        return True, ""
+
+    def _generate_lineup(self) -> Optional[List[int]]:
+        """
+        Generate a single valid lineup (3 players).
+
+        Strategy:
+        1. Pick anchor from available high-tier players (weighted by p_threshold)
+        2. Pick 2 supporting players with some randomization for diversity
+        3. Verify exposure and core constraints
+        """
+        # Get available players by exposure
+        available = [p for p in self.pool_list if self._can_add_player(p.player_id)]
+
+        if len(available) < 3:
+            return None
+
+        # Weight by p_threshold with some randomization
+        weights = np.array([p.p_threshold + 0.01 for p in available])
+        weights = weights / weights.sum()
+
+        # Sample 3 players without replacement
+        try:
+            indices = np.random.choice(len(available), size=3, replace=False, p=weights)
+            player_ids = [available[i].player_id for i in indices]
+            return player_ids
+        except ValueError:
+            return None
+
+    def optimize(self) -> Top3TournamentResult:
+        """
+        Generate 20 diverse predictions for top 3 NBA scorers.
+
+        Returns:
+            Top3TournamentResult with lineups and diagnostics
+        """
+        lineups = []
+        warnings_list = []
+
+        np.random.seed(42)  # Reproducibility
+
+        attempts = 0
+        while len(lineups) < self.config.num_lineups and attempts < self.config.max_attempts:
+            attempts += 1
+            self.diag['attempted_lineups'] = attempts
+
+            # Generate candidate lineup
+            candidate = self._generate_lineup()
+            if candidate is None:
+                continue
+
+            lineup_key = frozenset(candidate)
+
+            # Check uniqueness
+            if lineup_key in self.seen_lineups:
+                self.diag['rejected_duplicate'] += 1
+                continue
+
+            # Check exposure (all 3 players must be addable)
+            exposure_ok = all(self._can_add_player(pid) for pid in candidate)
+            if not exposure_ok:
+                self.diag['rejected_exposure_cap'] += 1
+                # Log which player hit cap
+                for pid in candidate:
+                    if not self._can_add_player(pid):
+                        player = self.pool.get(pid)
+                        if player and len(self.diag['rejection_log']) < 20:
+                            self.diag['rejection_log'].append(
+                                f"Exposure cap: {player.player_name} at {self.exposure_counts[pid]}/{self._get_max_exposure(pid)}"
+                            )
+                continue
+
+            # Check core overlap
+            core_ok, core_reason = self._can_add_lineup_core(candidate)
+            if not core_ok:
+                self.diag['rejected_core_overlap'] += 1
+                if len(self.diag['rejection_log']) < 20:
+                    self.diag['rejection_log'].append(core_reason)
+                continue
+
+            # Valid lineup! Register it
+            self.seen_lineups.add(lineup_key)
+            for core in self._get_all_cores(candidate):
+                self.core_counts[core] += 1
+            for pid in candidate:
+                self.exposure_counts[pid] += 1
+
+            # Create lineup object (no bucket)
+            players = [self.pool[pid] for pid in candidate]
+            lineup = Lineup(
+                players=players,
+                bucket="tournament",  # Single bucket for all
+                win_probability=self._estimate_win_prob(candidate)
+            )
+            lineups.append(lineup)
+            self.diag['valid_lineups_found'] = len(lineups)
+
+        # Warnings
+        if len(lineups) < self.config.num_lineups:
+            warnings_list.append(
+                f"Only generated {len(lineups)}/{self.config.num_lineups} lineups after {attempts} attempts"
+            )
+            warnings_list.append(
+                f"Rejected: {self.diag['rejected_duplicate']} duplicates, "
+                f"{self.diag['rejected_exposure_cap']} exposure cap, "
+                f"{self.diag['rejected_core_overlap']} core overlap"
+            )
+
+        # Calculate metrics
+        unique_players = len([pid for pid, count in self.exposure_counts.items() if count > 0])
+
+        if unique_players < self.config.min_unique_players:
+            warnings_list.append(f"Only {unique_players} unique players used (target: {self.config.min_unique_players})")
+
+        # Portfolio win probability (Monte Carlo)
+        total_win_prob = self._calculate_portfolio_win_prob(lineups)
+
+        # Build exposure report
+        exposure_report = {}
+        for pid, count in self.exposure_counts.items():
+            if count > 0:
+                player = self.pool.get(pid)
+                exposure_report[pid] = {
+                    'player_name': player.player_name if player else f"ID:{pid}",
+                    'team': player.team if player else "?",
+                    'count': count,
+                    'pct': count / max(len(lineups), 1),
+                    'tier': self.player_tiers.get(pid, "unknown"),
+                    'max_allowed': self._get_max_exposure(pid),
+                    'at_cap': count >= self._get_max_exposure(pid)
+                }
+
+        # Add top exposures to diagnostics
+        sorted_exp = sorted(exposure_report.items(), key=lambda x: x[1]['count'], reverse=True)
+        self.diag['top_exposures'] = [
+            f"{data['player_name']}: {data['count']}/{data['max_allowed']} ({data['pct']:.0%})"
+            for _, data in sorted_exp[:10]
+        ]
+
+        return Top3TournamentResult(
+            lineups=lineups,
+            exposure_report=exposure_report,
+            total_win_probability=total_win_prob,
+            unique_players=unique_players,
+            warnings=warnings_list,
+            diagnostics=self.diag
+        )
+
+    def _estimate_win_prob(self, player_ids: List[int]) -> float:
+        """Estimate win probability for a single lineup."""
+        # Simple approximation: product of p_threshold values
+        p = 1.0
+        for pid in player_ids:
+            player = self.pool.get(pid)
+            if player:
+                p *= (player.p_threshold + 0.1)  # Boost to avoid tiny numbers
+        return min(p * 10, 0.5)  # Scale and cap
+
+    def _calculate_portfolio_win_prob(self, lineups: List[Lineup], n_sims: int = 5000) -> float:
+        """
+        Calculate probability that at least one lineup matches the actual top 3.
+
+        Uses Monte Carlo simulation where:
+        - We sample player scores using their projections + variance
+        - Find the actual top 3 scorers in that simulation
+        - Check if any of our lineups matches that top 3
+        """
+        if not lineups:
+            return 0.0
+
+        # Get all candidates
+        all_player_ids = [p.player_id for p in self.pool_list]
+        n_players = len(all_player_ids)
+
+        if n_players < 3:
+            return 0.0
+
+        # Build id -> index mapping
+        id_to_idx = {pid: i for i, pid in enumerate(all_player_ids)}
+
+        # Get means and sigmas
+        means = np.zeros(n_players)
+        sigmas = np.zeros(n_players)
+
+        for i, pid in enumerate(all_player_ids):
+            player = self.pool.get(pid)
+            if player:
+                means[i] = player.projected_ppg
+                sigmas[i] = max(player.sigma, 3.0)  # Floor of 3 points stddev
+
+        # Build lineup sets for fast matching
+        lineup_sets = [frozenset(l.player_ids()) for l in lineups]
+
+        # Monte Carlo
+        wins = 0
+        np.random.seed(42)
+
+        for _ in range(n_sims):
+            # Sample scores
+            scores = means + sigmas * np.random.standard_normal(n_players)
+
+            # Find top 3 scorer indices
+            top3_idx = np.argsort(scores)[-3:]
+            actual_top3 = frozenset(all_player_ids[i] for i in top3_idx)
+
+            # Check if any lineup matches
+            if actual_top3 in lineup_sets:
+                wins += 1
+
+        return wins / n_sims
+
+
+def build_top3_tournament_portfolio(
+    conn,
+    game_date: str,
+    config: Top3TournamentConfig = None
+) -> Top3TournamentResult:
+    """
+    Build a tournament portfolio for predicting top 3 NBA scorers.
+
+    This is the main entry point for the simplified top-3 scorer tournament.
+
+    Args:
+        conn: SQLite database connection
+        game_date: Date to build portfolio for (YYYY-MM-DD)
+        config: Optional configuration
+
+    Returns:
+        Top3TournamentResult with 20 diverse predictions and diagnostics
+    """
+    config = config or Top3TournamentConfig()
+
+    # Build player pool using mixture model
+    player_pool = create_mixture_player_pool(conn, game_date)
+
+    if not player_pool:
+        return Top3TournamentResult(
+            lineups=[],
+            exposure_report={},
+            total_win_probability=0,
+            unique_players=0,
+            warnings=["No players available for top-3 tournament"],
+            diagnostics={'candidate_pool_size': 0}
+        )
+
+    # Run optimizer
+    optimizer = Top3ScorerOptimizer(player_pool, config)
+    result = optimizer.optimize()
+
+    return result
+
+
+# ============================================================================
 # CLI
 # ============================================================================
 
