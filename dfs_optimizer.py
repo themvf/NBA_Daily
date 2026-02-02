@@ -87,6 +87,14 @@ NICKNAME_MAP = {
     'dj': ['d.j.'],
     'jt': ['j.t.'],
     'kt': ['k.t.'],
+    # Special cases
+    'gregory': ['gg', 'greg'],
+    'gg': ['gregory', 'greg'],
+    'greg': ['gregory', 'gg'],
+    'scotty': ['scottie', 'scott'],
+    'scottie': ['scotty', 'scott'],
+    'scott': ['scottie', 'scotty'],
+    'marjon': ['mar-jon'],  # MarJon Beauchamp
 }
 
 # Known problematic player name mappings (DK name -> NBA API name)
@@ -129,6 +137,20 @@ PLAYER_NAME_OVERRIDES = {
     'jaren jackson jr': 'jaren jackson jr.',
     'marvin bagley iii': 'marvin bagley',
     'robert williams iii': 'robert williams',
+    # GG Jackson / Gregory Jackson
+    'gregory jackson': 'gg jackson',
+    'gg jackson': 'gregory jackson',
+    'gregory jackson ii': 'gg jackson',
+    # Scotty/Scottie Pippen
+    'scotty pippen jr': 'scottie pippen jr',
+    'scottie pippen jr': 'scotty pippen jr',
+    'scotty pippen': 'scottie pippen jr',
+    # Fred VanVleet - space variations
+    'fred vanvleet': 'fred van vleet',
+    'fred van vleet': 'fred vanvleet',
+    # MarJon Beauchamp
+    'marjon beauchamp': 'mar-jon beauchamp',
+    'mar-jon beauchamp': 'marjon beauchamp',
 }
 
 
@@ -204,6 +226,22 @@ def generate_name_variants(name: str) -> Set[str]:
     if '-' in normalized:
         variants.add(normalized.replace('-', ' '))
         variants.add(normalized.replace('-', ''))
+
+    # Handle compound last names (VanVleet <-> Van Vleet)
+    # Check for CamelCase patterns in original name
+    original_parts = name.split()
+    if len(original_parts) >= 2:
+        original_last = ' '.join(original_parts[1:])
+        # Check for internal capitals suggesting compound name (e.g., "VanVleet")
+        if re.search(r'[a-z][A-Z]', original_last):
+            # Split on internal capitals: "VanVleet" -> "Van Vleet"
+            split_last = re.sub(r'([a-z])([A-Z])', r'\1 \2', original_last).lower()
+            variants.add(f"{first_name} {split_last}")
+
+    # Also try joining multi-word last names (Van Vleet -> vanvleet)
+    if len(parts) > 2:
+        joined_last = ''.join(parts[1:])
+        variants.add(f"{first_name} {joined_last}")
 
     return variants
 
@@ -518,19 +556,43 @@ def load_player_historical_stats(
     season: str = "2025-26",
     season_type: str = "Regular Season"
 ) -> pd.DataFrame:
-    """Load historical game logs for a player."""
-    query = """
-        SELECT
-            game_date, matchup,
-            points, rebounds, assists, steals, blocks, turnovers, fg3m,
-            fgm, fga, ftm, fta, minutes
+    """Load historical game logs for a player.
+
+    Handles databases with or without the extended DFS columns.
+    Falls back to basic columns if extended stats aren't available.
+    """
+    # First, check which columns exist in the database
+    cursor = conn.execute("PRAGMA table_info(player_game_logs)")
+    existing_columns = {row[1] for row in cursor.fetchall()}
+
+    # Define required columns and optional DFS columns
+    base_columns = ['game_date', 'matchup', 'points', 'fg3m', 'minutes']
+    dfs_columns = ['rebounds', 'assists', 'steals', 'blocks', 'turnovers', 'fgm', 'fga', 'ftm', 'fta']
+
+    # Build column list based on what exists
+    select_columns = [c for c in base_columns if c in existing_columns]
+    select_columns += [c for c in dfs_columns if c in existing_columns]
+
+    if not select_columns:
+        return pd.DataFrame()
+
+    query = f"""
+        SELECT {', '.join(select_columns)}
         FROM player_game_logs
         WHERE player_id = ?
           AND season = ?
           AND season_type = ?
         ORDER BY game_date DESC
     """
-    return pd.read_sql_query(query, conn, params=[player_id, season, season_type])
+
+    df = pd.read_sql_query(query, conn, params=[player_id, season, season_type])
+
+    # Add missing DFS columns with zeros for compatibility
+    for col in dfs_columns:
+        if col not in df.columns:
+            df[col] = 0.0
+
+    return df
 
 
 def generate_player_projections(
