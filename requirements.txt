@@ -1,5 +1,7 @@
 nba_api>=1.5.7,<2
+numpy>=1.24,<3
 pandas>=2.0,<3
+scipy>=1.10,<2
 scikit-learn>=1.4,<2
 streamlit>=1.36,<2
 plotly>=5.0,<6
