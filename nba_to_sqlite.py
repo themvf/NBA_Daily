@@ -516,6 +516,10 @@ def load_player_shooting_totals(
                 "points": data.get("pts"),
             }
         )
+    # Ensure all players exist before inserting (FK constraint)
+    created = ensure_shooting_players_exist(conn, rows)
+    if created:
+        print(f"  Created {created} missing player records.")
     return upsert_rows(
         conn,
         "player_season_totals",
@@ -787,6 +791,66 @@ def ensure_roster_players_exist(
     if not rows:
         return 0
     return upsert_rows(conn, "players", rows, ["player_id"])
+
+
+def ensure_shooting_players_exist(
+    conn: sqlite3.Connection, rows: List[Dict[str, object]]
+) -> int:
+    """
+    Ensure all players in shooting stats exist in players table.
+    Creates placeholder records for any missing player_ids.
+    """
+    if not rows:
+        return 0
+
+    # Extract unique player_ids from shooting data
+    player_ids = list(set(
+        row.get('player_id') for row in rows if row.get('player_id')
+    ))
+
+    if not player_ids:
+        return 0
+
+    # Find which ones are missing
+    placeholders = ','.join('?' * len(player_ids))
+    existing = set(
+        r[0] for r in conn.execute(
+            f"SELECT player_id FROM players WHERE player_id IN ({placeholders})",
+            player_ids
+        ).fetchall()
+    )
+
+    missing_ids = [pid for pid in player_ids if pid not in existing]
+
+    if not missing_ids:
+        return 0
+
+    # Create placeholder records using data from the shooting stats
+    inserts: List[Dict[str, object]] = []
+    seen_ids: set = set()
+    for row in rows:
+        pid = row.get('player_id')
+        if pid in missing_ids and pid not in seen_ids:
+            player_name = row.get('player_name', f'Unknown Player {pid}')
+            first_name, last_name = split_full_name(player_name)
+            inserts.append({
+                'player_id': pid,
+                'full_name': player_name,
+                'first_name': first_name,
+                'last_name': last_name,
+                'is_active': 1
+            })
+            seen_ids.add(pid)
+
+    if inserts:
+        conn.executemany(
+            """INSERT OR IGNORE INTO players (player_id, full_name, first_name, last_name, is_active)
+               VALUES (:player_id, :full_name, :first_name, :last_name, :is_active)""",
+            inserts
+        )
+        conn.commit()
+
+    return len(inserts)
 
 
 def load_team_rosters(
