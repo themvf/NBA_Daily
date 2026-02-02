@@ -12739,13 +12739,18 @@ if selected_page == "DFS Lineup Builder":
             # Build DataFrame for display
             player_data = []
             for p in filtered:
-                # Status indicator
+                # Status indicator (use getattr for backwards compatibility with old session state)
                 status = ""
-                if p.is_injured:
-                    status = f"🔴 {p.injury_status}" if p.injury_status else "🔴 OUT"
-                elif p.is_locked:
+                is_injured = getattr(p, 'is_injured', False)
+                injury_status = getattr(p, 'injury_status', '')
+                is_locked = getattr(p, 'is_locked', False)
+                is_excluded = getattr(p, 'is_excluded', False)
+
+                if is_injured:
+                    status = f"🔴 {injury_status}" if injury_status else "🔴 OUT"
+                elif is_locked:
                     status = "🔒 LOCK"
-                elif p.is_excluded:
+                elif is_excluded:
                     status = "❌ EXCL"
 
                 player_data.append({
@@ -12765,8 +12770,8 @@ if selected_page == "DFS Lineup Builder":
             df = pd.DataFrame(player_data)
             st.dataframe(df, use_container_width=True, hide_index=True)
 
-            # Show count of injured players
-            injured_count = len([p for p in filtered if p.is_injured])
+            # Show count of injured players (use getattr for backwards compatibility)
+            injured_count = len([p for p in filtered if getattr(p, 'is_injured', False)])
             if injured_count > 0:
                 st.warning(f"🏥 {injured_count} injured player(s) shown above will be auto-excluded from lineups")
 
@@ -12810,7 +12815,7 @@ if selected_page == "DFS Lineup Builder":
                 locked_names = st.multiselect(
                     "🔒 Lock Players (must include)",
                     player_names,
-                    default=[p.name for p in players if p.is_locked],
+                    default=[p.name for p in players if getattr(p, 'is_locked', False)],
                     help="These players will be included in ALL lineups"
                 )
                 for p in players:
@@ -12820,14 +12825,14 @@ if selected_page == "DFS Lineup Builder":
                 excluded_names = st.multiselect(
                     "❌ Exclude Players",
                     player_names,
-                    default=[p.name for p in players if p.is_excluded],
+                    default=[p.name for p in players if getattr(p, 'is_excluded', False)],
                     help="These players will NOT appear in any lineup"
                 )
                 for p in players:
                     p.is_excluded = p.name in excluded_names
 
             if locked_names:
-                locked_salary = sum(p.salary for p in players if p.is_locked)
+                locked_salary = sum(p.salary for p in players if getattr(p, 'is_locked', False))
                 st.caption(f"Locked players total: ${locked_salary:,} ({len(locked_names)} players)")
 
     # ==========================================================================
