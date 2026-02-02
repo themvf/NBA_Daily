@@ -15,7 +15,9 @@ DraftKings Classic Rules:
 from __future__ import annotations
 
 import random
+import re
 import sqlite3
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -23,6 +25,256 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
+
+
+# =============================================================================
+# Name Normalization & Matching
+# =============================================================================
+
+# Common nickname mappings (DraftKings name -> possible NBA API names)
+NICKNAME_MAP = {
+    # First name nicknames
+    'nic': ['nicolas', 'nicholas', 'nick'],
+    'nick': ['nicolas', 'nicholas', 'nic'],
+    'herb': ['herbert'],
+    'herbert': ['herb'],
+    'cam': ['cameron'],
+    'cameron': ['cam'],
+    'mike': ['michael'],
+    'michael': ['mike'],
+    'chris': ['christopher'],
+    'christopher': ['chris'],
+    'matt': ['matthew'],
+    'matthew': ['matt'],
+    'rob': ['robert'],
+    'robert': ['rob', 'bobby'],
+    'bobby': ['robert', 'bob'],
+    'will': ['william'],
+    'william': ['will', 'willie', 'bill'],
+    'alex': ['alexander', 'alexandre'],
+    'alexander': ['alex'],
+    'tony': ['anthony'],
+    'anthony': ['tony'],
+    'tim': ['timothy'],
+    'timothy': ['tim'],
+    'dan': ['daniel'],
+    'daniel': ['dan', 'danny'],
+    'danny': ['daniel', 'dan'],
+    'ben': ['benjamin'],
+    'benjamin': ['ben'],
+    'jon': ['jonathan', 'john'],
+    'jonathan': ['jon'],
+    'josh': ['joshua'],
+    'joshua': ['josh'],
+    'nate': ['nathan', 'nathaniel'],
+    'nathan': ['nate'],
+    'nathaniel': ['nate'],
+    'drew': ['andrew'],
+    'andrew': ['drew', 'andy'],
+    'andy': ['andrew'],
+    'jake': ['jacob'],
+    'jacob': ['jake'],
+    'joe': ['joseph'],
+    'joseph': ['joe', 'joey'],
+    'joey': ['joseph', 'joe'],
+    'max': ['maximilian', 'maxwell'],
+    'ty': ['tyler', 'tyrese', 'tyrus'],
+    'tj': ['t.j.'],
+    'pj': ['p.j.'],
+    'cj': ['c.j.'],
+    'rj': ['r.j.'],
+    'aj': ['a.j.'],
+    'dj': ['d.j.'],
+    'jt': ['j.t.'],
+    'kt': ['k.t.'],
+}
+
+# Known problematic player name mappings (DK name -> NBA API name)
+# Add specific overrides here as discovered
+PLAYER_NAME_OVERRIDES = {
+    'nicolas claxton': 'nic claxton',
+    'nic claxton': 'nicolas claxton',
+    'herbert jones': 'herb jones',
+    'herb jones': 'herbert jones',
+    'cameron johnson': 'cam johnson',
+    'cam johnson': 'cameron johnson',
+    'p.j. washington': 'pj washington',
+    'pj washington': 'p.j. washington',
+    'c.j. mccollum': 'cj mccollum',
+    'cj mccollum': 'c.j. mccollum',
+    'r.j. barrett': 'rj barrett',
+    'rj barrett': 'r.j. barrett',
+    'o.g. anunoby': 'og anunoby',
+    'og anunoby': 'o.g. anunoby',
+    't.j. mcconnell': 'tj mcconnell',
+    'tj mcconnell': 't.j. mcconnell',
+    'd.j. augustin': 'dj augustin',
+    'dj augustin': 'd.j. augustin',
+    'a.j. green': 'aj green',
+    'aj green': 'a.j. green',
+    'kenyon martin jr.': 'kenyon martin jr',
+    'kenyon martin jr': 'kenyon martin jr.',
+    'gary payton ii': 'gary payton',
+    'larry nance jr.': 'larry nance jr',
+    'larry nance jr': 'larry nance jr.',
+    'tim hardaway jr.': 'tim hardaway jr',
+    'tim hardaway jr': 'tim hardaway jr.',
+    'kelly oubre jr.': 'kelly oubre jr',
+    'kelly oubre jr': 'kelly oubre jr.',
+    'marcus morris sr.': 'marcus morris sr',
+    'marcus morris sr': 'marcus morris sr.',
+    'wendell carter jr.': 'wendell carter jr',
+    'wendell carter jr': 'wendell carter jr.',
+    'jaren jackson jr.': 'jaren jackson jr',
+    'jaren jackson jr': 'jaren jackson jr.',
+    'marvin bagley iii': 'marvin bagley',
+    'robert williams iii': 'robert williams',
+}
+
+
+def normalize_name(name: str) -> str:
+    """
+    Normalize a player name for matching.
+
+    - Converts to lowercase
+    - Removes accents (Jokić -> jokic)
+    - Removes periods from initials (P.J. -> pj)
+    - Removes suffixes (Jr., III, II, Sr.)
+    - Normalizes whitespace
+    - Removes hyphens for comparison
+    """
+    if not name:
+        return ""
+
+    # Lowercase
+    name = name.lower().strip()
+
+    # Remove accents (NFD decomposition, then remove combining marks)
+    name = unicodedata.normalize('NFD', name)
+    name = ''.join(c for c in name if unicodedata.category(c) != 'Mn')
+
+    # Remove periods (P.J. -> PJ)
+    name = name.replace('.', '')
+
+    # Remove common suffixes
+    suffixes = [' jr', ' sr', ' iii', ' ii', ' iv', ' v']
+    for suffix in suffixes:
+        if name.endswith(suffix):
+            name = name[:-len(suffix)]
+
+    # Normalize whitespace
+    name = ' '.join(name.split())
+
+    return name
+
+
+def generate_name_variants(name: str) -> Set[str]:
+    """
+    Generate possible name variants for fuzzy matching.
+
+    Returns a set of normalized name variants to try matching against.
+    """
+    variants = set()
+    normalized = normalize_name(name)
+    variants.add(normalized)
+
+    # Check direct overrides
+    if normalized in PLAYER_NAME_OVERRIDES:
+        variants.add(normalize_name(PLAYER_NAME_OVERRIDES[normalized]))
+
+    # Split into parts
+    parts = normalized.split()
+    if len(parts) < 2:
+        return variants
+
+    first_name = parts[0]
+    last_name = ' '.join(parts[1:])  # Handle compound last names
+
+    # Add nickname variants for first name
+    if first_name in NICKNAME_MAP:
+        for alt_first in NICKNAME_MAP[first_name]:
+            variants.add(f"{alt_first} {last_name}")
+
+    # Also try without hyphen in last name
+    if '-' in last_name:
+        variants.add(f"{first_name} {last_name.replace('-', ' ')}")
+        variants.add(f"{first_name} {last_name.replace('-', '')}")
+
+    # Try with hyphen removed from entire name
+    if '-' in normalized:
+        variants.add(normalized.replace('-', ' '))
+        variants.add(normalized.replace('-', ''))
+
+    return variants
+
+
+def find_best_player_match(
+    dk_name: str,
+    dk_team: str,
+    db_lookup: Dict[str, Dict],
+    team_lookup: Dict[str, List[str]]
+) -> Optional[int]:
+    """
+    Find the best matching player_id for a DraftKings player name.
+
+    Args:
+        dk_name: Player name from DraftKings
+        dk_team: Team abbreviation from DraftKings
+        db_lookup: Dict mapping normalized name -> {player_id, team}
+        team_lookup: Dict mapping team abbreviation -> list of normalized player names
+
+    Returns:
+        player_id if match found, None otherwise
+    """
+    # Generate all variants of the DK name
+    variants = generate_name_variants(dk_name)
+
+    # Try exact match first
+    for variant in variants:
+        if variant in db_lookup:
+            return db_lookup[variant]['player_id']
+
+    # Try team-constrained partial match
+    dk_team_upper = dk_team.upper() if dk_team else None
+    if dk_team_upper and dk_team_upper in team_lookup:
+        team_players = team_lookup[dk_team_upper]
+
+        # Get last name from DK name for partial matching
+        dk_parts = normalize_name(dk_name).split()
+        if len(dk_parts) >= 2:
+            dk_last = dk_parts[-1]
+            dk_first = dk_parts[0]
+
+            for db_name in team_players:
+                db_parts = db_name.split()
+                if len(db_parts) >= 2:
+                    db_last = db_parts[-1]
+                    db_first = db_parts[0]
+
+                    # Match if last names match and first names are similar
+                    if dk_last == db_last:
+                        # Check if first names match or are nickname variants
+                        if dk_first == db_first:
+                            return db_lookup[db_name]['player_id']
+
+                        # Check nickname variants
+                        dk_first_variants = {dk_first}
+                        if dk_first in NICKNAME_MAP:
+                            dk_first_variants.update(NICKNAME_MAP[dk_first])
+
+                        if db_first in dk_first_variants:
+                            return db_lookup[db_name]['player_id']
+
+    # Fallback: try substring matching (for compound names)
+    for variant in variants:
+        for db_name, info in db_lookup.items():
+            # Check if one contains the other (handles "Gilgeous-Alexander" variations)
+            if variant in db_name or db_name in variant:
+                # Verify team if available
+                if not dk_team_upper or info.get('team', '').upper() == dk_team_upper:
+                    return info['player_id']
+
+    return None
 
 
 # =============================================================================
@@ -397,6 +649,13 @@ def parse_dk_csv(
 
     Expected columns: Name, Position, Salary, TeamAbbrev, Game Info, AvgPointsPerGame, ID
 
+    Uses robust name matching to handle:
+    - Nicknames (Nic vs Nicolas, Herb vs Herbert)
+    - Initials with/without periods (P.J. vs PJ)
+    - Suffixes (Jr., III, etc.)
+    - Accented characters (Jokić vs Jokic)
+    - Hyphenated names
+
     Returns:
         Tuple of (player list, metadata dict)
     """
@@ -413,17 +672,39 @@ def parse_dk_csv(
     """
     db_players = pd.read_sql_query(players_query, conn)
 
-    # Create name->id lookup (lowercase for matching)
+    # Create normalized name->id lookup
     name_to_id = {}
+    team_to_players: Dict[str, List[str]] = {}  # team -> list of normalized names
+
     for _, row in db_players.iterrows():
-        name_lower = str(row['player_name']).lower().strip()
-        name_to_id[name_lower] = {
+        player_name = str(row['player_name'])
+        normalized = normalize_name(player_name)
+        team_abbrev = str(row['team_abbreviation']).upper() if row['team_abbreviation'] else ''
+
+        name_to_id[normalized] = {
             'player_id': row['player_id'],
-            'team': row['team_abbreviation']
+            'team': team_abbrev,
+            'original_name': player_name
         }
+
+        # Also add all variants of the DB name
+        for variant in generate_name_variants(player_name):
+            if variant not in name_to_id:
+                name_to_id[variant] = {
+                    'player_id': row['player_id'],
+                    'team': team_abbrev,
+                    'original_name': player_name
+                }
+
+        # Build team lookup
+        if team_abbrev:
+            if team_abbrev not in team_to_players:
+                team_to_players[team_abbrev] = []
+            team_to_players[team_abbrev].append(normalized)
 
     players = []
     unmatched = []
+    matched_names = []  # For debugging
 
     for _, row in df.iterrows():
         name = str(row.get('name', '')).strip()
@@ -448,23 +729,19 @@ def parse_dk_csv(
         # Create game_id from game_info (use teams as proxy)
         game_id = game_info.replace(' ', '_').replace('@', '_') if game_info else f"game_{team}"
 
-        # Match to database
-        name_lower = name.lower()
-        match = name_to_id.get(name_lower)
+        # Use robust name matching
+        player_id = find_best_player_match(
+            dk_name=name,
+            dk_team=team,
+            db_lookup=name_to_id,
+            team_lookup=team_to_players
+        )
 
-        if match:
-            player_id = match['player_id']
-        else:
-            # Try partial match
-            player_id = None
-            for db_name, info in name_to_id.items():
-                if name_lower in db_name or db_name in name_lower:
-                    player_id = info['player_id']
-                    break
+        if player_id is None:
+            unmatched.append(name)
+            continue
 
-            if player_id is None:
-                unmatched.append(name)
-                continue
+        matched_names.append((name, name_to_id.get(normalize_name(name), {}).get('original_name', 'Unknown')))
 
         player = DFSPlayer(
             player_id=player_id,
@@ -487,7 +764,8 @@ def parse_dk_csv(
         'salary_range': (
             min(p.salary for p in players) if players else 0,
             max(p.salary for p in players) if players else 0
-        )
+        ),
+        'match_rate': len(players) / len(df) * 100 if len(df) > 0 else 0,
     }
 
     return players, metadata
