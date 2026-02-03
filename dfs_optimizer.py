@@ -572,6 +572,11 @@ ROSTER_SLOTS = ['PG', 'SG', 'SF', 'PF', 'C', 'G', 'F', 'UTIL']
 SALARY_CAP = 50000
 MIN_GAMES = 2
 
+# League average stats per game (2025-26 season, for opponent adjustment)
+LEAGUE_AVG_TEAM_REB = 44.0
+LEAGUE_AVG_TEAM_AST = 25.5
+LEAGUE_AVG_TEAM_FG3M = 12.5
+
 
 # =============================================================================
 # Lineup Data Class
@@ -701,6 +706,12 @@ def _calculate_fpts_ppg_ratio(logs: pd.DataFrame) -> float:
     """
     Calculate historical ratio of DK Fantasy Points to raw PPG.
 
+    .. deprecated::
+        No longer used by the sophisticated projection model, which now
+        projects each stat independently via ``_project_stat_multi_factor()``
+        and computes FPTS directly with ``calculate_dk_fantasy_points()``.
+        Retained for the ``_generate_simple_projections()`` fallback path.
+
     This accounts for DFS scoring beyond just points:
     - Points (+1.0 per point)
     - 3PM bonus (+0.5)
@@ -788,9 +799,9 @@ def _get_matchup_history(
     player_id: int,
     opponent_team: str,
     season: str = "2025-26"
-) -> Tuple[Optional[float], int]:
+) -> Tuple[Dict[str, Optional[float]], int]:
     """
-    Get player's historical performance vs opponent.
+    Get player's historical performance vs opponent across all stats.
 
     Args:
         conn: Database connection
@@ -799,11 +810,15 @@ def _get_matchup_history(
         season: Season string
 
     Returns:
-        (avg_points_vs_opponent, games_played)
+        (dict of stat averages vs opponent, games_played)
+        e.g. ({"points": 28.5, "rebounds": 7.2, ...}, 4)
     """
+    ALL_STATS = ['points', 'rebounds', 'assists', 'steals', 'blocks', 'turnovers', 'fg3m']
+    empty_result = {stat: None for stat in ALL_STATS}
+
     try:
-        query = """
-            SELECT points, matchup
+        query = f"""
+            SELECT {', '.join(ALL_STATS)}, matchup
             FROM player_game_logs
             WHERE player_id = ?
               AND season = ?
@@ -817,11 +832,117 @@ def _get_matchup_history(
         )
 
         if df.empty:
-            return None, 0
+            return empty_result, 0
 
-        return df['points'].mean(), len(df)
+        result = {stat: df[stat].mean() if stat in df.columns else None for stat in ALL_STATS}
+        return result, len(df)
     except Exception:
-        return None, 0
+        return empty_result, 0
+
+
+# Mapping of stats that receive opponent-allowed adjustments.
+# Steals, blocks, and turnovers are excluded because team-level
+# opponent-allowed stats for those are too noisy to be useful.
+STAT_OPP_ADJUSTMENT_MAP = {
+    'rebounds': {'defense_key': 'avg_allowed_reb', 'league_avg': LEAGUE_AVG_TEAM_REB},
+    'assists':  {'defense_key': 'avg_allowed_ast', 'league_avg': LEAGUE_AVG_TEAM_AST},
+    'fg3m':     {'defense_key': 'avg_allowed_fg3m', 'league_avg': LEAGUE_AVG_TEAM_FG3M},
+}
+
+
+def _project_stat_multi_factor(
+    stat_name: str,
+    logs: pd.DataFrame,
+    vs_opp_stats: Dict[str, Optional[float]],
+    vs_opp_games: int,
+    opp_defense: Optional[Dict] = None
+) -> float:
+    """
+    Project a single stat using multi-factor weighting (mirrors PPG model).
+
+    Weighting:
+    - 25% season average
+    - 40% recent form (0.6 × L5 + 0.4 × L3)
+    - Up to 35% matchup history (scaled by confidence = min(1, games/5))
+
+    Then applies opponent-allowed adjustment for rebounds, assists, and fg3m:
+    - Compares opponent's avg allowed stat to league average
+    - Dampened 50% to avoid overfitting team-level data to individual players
+    - Clamped to [0.85, 1.15] to prevent extreme swings
+
+    Args:
+        stat_name: Column name in logs (e.g. 'rebounds', 'assists')
+        logs: Player game log DataFrame, ordered by date DESC
+        vs_opp_stats: Dict of stat averages vs this opponent
+        vs_opp_games: Number of games vs this opponent
+        opp_defense: Opponent defense dict from defense_map (optional)
+
+    Returns:
+        Projected stat value (before rest/pace adjustments)
+    """
+    if logs.empty or stat_name not in logs.columns:
+        return 0.0
+
+    # --- Base components (same structure as PPG model) ---
+    season_avg = logs[stat_name].mean()
+    if pd.isna(season_avg):
+        return 0.0
+
+    recent_5 = logs.head(5)
+    recent_3 = logs.head(3)
+    recent_avg_5 = recent_5[stat_name].mean() if len(recent_5) > 0 else season_avg
+    recent_avg_3 = recent_3[stat_name].mean() if len(recent_3) > 0 else recent_avg_5
+
+    # Build weighted components
+    components = {}
+    weights = {}
+
+    # Season baseline (25%)
+    components["season"] = season_avg
+    weights["season"] = 0.25
+
+    # Recent form (40%) — blend of L5 and L3
+    if pd.notna(recent_avg_5):
+        components["recent"] = (recent_avg_5 * 0.6) + (recent_avg_3 * 0.4)
+        weights["recent"] = 0.40
+    else:
+        components["recent"] = season_avg
+        weights["recent"] = 0.20
+
+    # Matchup history (up to 35%)
+    vs_opp_val = vs_opp_stats.get(stat_name)
+    if vs_opp_val is not None and pd.notna(vs_opp_val) and vs_opp_games >= 2:
+        confidence_factor = min(1.0, vs_opp_games / 5.0)
+        components["vs_team"] = vs_opp_val
+        weights["vs_team"] = 0.35 * confidence_factor
+
+    # Normalize weights to sum to 1.0
+    total_weight = sum(weights.values())
+    if total_weight > 0:
+        weights = {k: v / total_weight for k, v in weights.items()}
+
+    # Compute weighted projection
+    projection = sum(
+        components.get(k, 0) * weights.get(k, 0)
+        for k in components
+        if components.get(k) is not None and pd.notna(components.get(k))
+    )
+
+    # --- Opponent-allowed adjustment (reb, ast, fg3m only) ---
+    if opp_defense and stat_name in STAT_OPP_ADJUSTMENT_MAP:
+        adj_info = STAT_OPP_ADJUSTMENT_MAP[stat_name]
+        opp_allowed = opp_defense.get(adj_info['defense_key'])
+        league_avg = adj_info['league_avg']
+
+        if opp_allowed is not None and pd.notna(opp_allowed) and opp_allowed > 0 and league_avg > 0:
+            raw_ratio = opp_allowed / league_avg
+            # Dampen by 50%: move only halfway from 1.0 toward the raw ratio
+            dampened_ratio = 1.0 + (raw_ratio - 1.0) * 0.5
+            # Clamp to prevent extreme adjustments
+            dampened_ratio = max(0.85, min(1.15, dampened_ratio))
+            projection *= dampened_ratio
+
+    return max(0.0, projection)
 
 
 def _generate_simple_projections(
@@ -985,15 +1106,17 @@ def generate_player_projections(
     recent_avg_5 = recent_5['points'].mean() if len(recent_5) > 0 else season_avg_pts
     recent_avg_3 = recent_3['points'].mean() if len(recent_3) > 0 else recent_avg_5
 
-    # --- Step 2: Get matchup history ---
-    vs_opp_avg, vs_opp_games = _get_matchup_history(
+    # --- Step 2: Get matchup history (all stats) ---
+    vs_opp_stats, vs_opp_games = _get_matchup_history(
         conn, player.player_id, player.opponent, season
     )
+    vs_opp_avg = vs_opp_stats.get('points')  # Points avg for PPG model
 
     # --- Step 3: Get opponent defense stats ---
     opponent_id = None
     opp_def_rating = None
     opp_pace = None
+    opp_defense = None  # Full defense dict for stat-level opponent adjustments
 
     # Try to find opponent team_id from defense_map
     if defense_map:
@@ -1003,6 +1126,7 @@ def generate_player_projections(
                 opponent_id = team_id
                 opp_def_rating = stats.get('def_rating')
                 opp_pace = stats.get('avg_opp_possessions')
+                opp_defense = stats  # Store full dict for per-stat adjustments
                 break
 
     # --- Step 4: Calculate sophisticated PPG projection ---
@@ -1050,6 +1174,7 @@ def generate_player_projections(
             analytics_used.append("🛡️")  # Defense adjustment indicator
 
     # --- Step 6: Apply pace adjustment ---
+    pace_adjustment = 1.0  # Default; reused in Step 10 for all stats
     if opp_pace is not None:
         league_avg_pace = 99.0
         pace_adjustment = 1.0 + ((opp_pace - league_avg_pace) / league_avg_pace) * 0.05
@@ -1076,19 +1201,8 @@ def generate_player_projections(
 
     ppg_projection *= rest_multiplier
 
-    # --- Step 8: Calculate floor/ceiling ---
-    if len(logs) >= 3:
-        ppg_floor = logs['points'].quantile(0.10)
-        ppg_ceiling = logs['points'].quantile(0.90)
-    else:
-        ppg_floor = ppg_projection * 0.6
-        ppg_ceiling = ppg_projection * 1.5
-
-    # Apply rest multiplier to floor/ceiling
-    ppg_floor *= rest_multiplier
-    ppg_ceiling *= rest_multiplier
-
-    # --- Step 9: Apply uncertainty multiplier for GPP strategy ---
+    # --- Step 8: Calculate uncertainty multiplier for GPP strategy ---
+    # (Floor/ceiling now computed from FPTS distribution in Step 9)
     uncertainty_mult = 1.0
 
     try:
@@ -1117,32 +1231,49 @@ def generate_player_projections(
             teammate_questionable=teammate_questionable
         )
 
-        # Apply uncertainty to floor/ceiling spread
-        ppg_floor, ppg_ceiling = pg.apply_uncertainty_to_projection(
-            ppg_floor, ppg_ceiling, uncertainty_mult
-        )
-
         player.uncertainty_multiplier = uncertainty_mult
     except Exception:
         pass
 
-    # --- Step 10: Convert PPG to DK Fantasy Points ---
-    fpts_ratio = _calculate_fpts_ppg_ratio(logs)
-    player.proj_fpts = ppg_projection * fpts_ratio
-    player.proj_floor = ppg_floor * fpts_ratio
-    player.proj_ceiling = ppg_ceiling * fpts_ratio
+    # --- Step 9: Project all stats with multi-factor model ---
+    player.proj_points = ppg_projection  # Already sophisticated (steps 4-7)
 
-    # Also set individual stat projections from historical ratios
+    # pace_adjustment reused from Step 6 (applies uniformly to all stats)
     for stat in ['rebounds', 'assists', 'steals', 'blocks', 'turnovers', 'fg3m']:
-        stat_avg = logs[stat].mean() if stat in logs.columns else 0.0
-        setattr(player, f'proj_{stat}', stat_avg * rest_multiplier if pd.notna(stat_avg) else 0)
+        raw = _project_stat_multi_factor(
+            stat, logs, vs_opp_stats, vs_opp_games, opp_defense
+        )
+        adjusted = raw * rest_multiplier * pace_adjustment
+        setattr(player, f'proj_{stat}', max(0.0, adjusted))
 
-    player.proj_points = ppg_projection
+    # Direct FPTS from individual stat projections (replaces ratio approach)
+    player.proj_fpts = calculate_dk_fantasy_points(
+        player.proj_points, player.proj_rebounds, player.proj_assists,
+        player.proj_steals, player.proj_blocks, player.proj_turnovers,
+        player.proj_fg3m
+    )
 
-    # --- Step 11: Set analytics indicators ---
+    # Floor/ceiling from actual DK FPTS distribution (preserves stat correlations)
+    if len(logs) >= 3:
+        base_floor = logs['dk_fpts'].quantile(0.10) * rest_multiplier
+        base_ceiling = logs['dk_fpts'].quantile(0.90) * rest_multiplier
+    else:
+        base_floor = player.proj_fpts * 0.6
+        base_ceiling = player.proj_fpts * 1.5
+
+    # Apply uncertainty multiplier (calculated in Step 8)
+    try:
+        player.proj_floor, player.proj_ceiling = pg.apply_uncertainty_to_projection(
+            base_floor, base_ceiling, uncertainty_mult
+        )
+    except Exception:
+        player.proj_floor = base_floor
+        player.proj_ceiling = base_ceiling
+
+    # --- Step 10: Set analytics indicators ---
     player.analytics_used = ''.join(analytics_used)
 
-    # --- Step 12: Calculate derived values ---
+    # --- Step 11: Calculate derived values ---
     if player.salary > 0:
         player.fpts_per_dollar = (player.proj_fpts / player.salary) * 1000
 
