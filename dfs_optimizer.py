@@ -10,6 +10,9 @@ DraftKings Classic Rules:
 - Constraint: Players from at least 2 different NBA games
 - Scoring: PTS (+1), 3PM (+0.5), REB (+1.25), AST (+1.5),
            STL (+2), BLK (+2), TO (-0.5), DD (+1.5), TD (+3)
+
+Version 2.0: Integrated sophisticated prediction system with rest days,
+             uncertainty multipliers, and position-specific PPM adjustments.
 """
 
 from __future__ import annotations
