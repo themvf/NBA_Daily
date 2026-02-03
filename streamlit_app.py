@@ -12650,11 +12650,85 @@ if selected_page == "DFS Lineup Builder":
                     st.divider()
                     st.subheader("Generate Projections")
 
+                    # Game date selector for rest day calculations
+                    game_date_col1, game_date_col2 = st.columns([2, 1])
+                    with game_date_col1:
+                        projection_date = st.date_input(
+                            "Projection Date (for rest day calculations)",
+                            value=date.today(),
+                            help="Select the date of the games to calculate rest days correctly"
+                        )
+                    with game_date_col2:
+                        use_sophisticated = st.checkbox(
+                            "Use Sophisticated Model",
+                            value=True,
+                            help="Enable advanced projections with rest days, PPM stats, and uncertainty"
+                        )
+
                     if st.button("🔄 Generate Player Projections", type="primary"):
                         progress_bar = st.progress(0)
                         status_text = st.empty()
 
+                        # Load sophisticated prediction data if enabled
+                        defense_map = None
+                        def_style_map = None
+                        def_ppm_df = None
+                        league_avg_ppm = 0.462
+                        injury_status_map = {}
+                        teammate_injury_map = {}
+
+                        if use_sophisticated:
+                            status_text.text("Loading sophisticated prediction data...")
+                            try:
+                                # Load defense stats
+                                defense_stats = load_team_defense_stats(
+                                    str(db_path), DEFAULT_SEASON, DEFAULT_SEASON_TYPE
+                                )
+                                defense_map = {
+                                    int(row["team_id"]): row.to_dict()
+                                    for _, row in defense_stats.iterrows()
+                                }
+                                def_style_map = {
+                                    int(row["team_id"]): str(row.get("defense_style") or "Neutral")
+                                    for _, row in defense_stats.iterrows()
+                                }
+
+                                # Load PPM stats
+                                try:
+                                    _, def_ppm_df, league_avg_ppm = load_ppm_stats(
+                                        str(db_path), DEFAULT_SEASON
+                                    )
+                                except Exception:
+                                    pass
+
+                                # Load injury data
+                                try:
+                                    active_injuries = ia.get_active_injuries(
+                                        dfs_conn, check_return_dates=True
+                                    )
+                                    injury_status_map = {
+                                        inj['player_id']: inj.get('status', 'unknown').lower()
+                                        for inj in active_injuries
+                                    }
+                                    # Build teammate injury map
+                                    for inj in active_injuries:
+                                        team_id = inj.get('team_id')
+                                        status = injury_status_map.get(inj['player_id'])
+                                        if team_id and status in ('questionable', 'out', 'doubtful'):
+                                            if team_id not in teammate_injury_map:
+                                                teammate_injury_map[team_id] = []
+                                            teammate_injury_map[team_id].append(inj['player_id'])
+                                except Exception:
+                                    pass
+
+                                status_text.text("Sophisticated prediction data loaded ✓")
+                            except Exception as e:
+                                st.warning(f"Could not load sophisticated data: {e}. Using simple model.")
+                                use_sophisticated = False
+
                         projected_players = []
+                        game_date_str = str(projection_date) if projection_date else None
+
                         for i, player in enumerate(players):
                             progress = (i + 1) / len(players)
                             progress_bar.progress(progress)
@@ -12663,7 +12737,14 @@ if selected_page == "DFS Lineup Builder":
                             player = dfs.generate_player_projections(
                                 dfs_conn, player,
                                 season=DEFAULT_SEASON,
-                                season_type=DEFAULT_SEASON_TYPE
+                                season_type=DEFAULT_SEASON_TYPE,
+                                game_date=game_date_str,
+                                defense_map=defense_map if use_sophisticated else None,
+                                def_style_map=def_style_map,
+                                def_ppm_df=def_ppm_df,
+                                league_avg_ppm=league_avg_ppm,
+                                injury_status_map=injury_status_map,
+                                teammate_injury_map=teammate_injury_map,
                             )
                             projected_players.append(player)
 
@@ -12673,7 +12754,13 @@ if selected_page == "DFS Lineup Builder":
                         st.session_state.dfs_player_pool = projected_players
                         st.session_state.dfs_upload_metadata = metadata
 
+                        # Show projection summary
+                        b2b_count = sum(1 for p in projected_players if getattr(p, 'days_rest', None) == 1)
+                        rested_count = sum(1 for p in projected_players if (getattr(p, 'days_rest', None) or 0) >= 3)
+
                         st.success(f"✅ Generated projections for {len(projected_players)} players")
+                        if use_sophisticated and (b2b_count > 0 or rested_count > 0):
+                            st.info(f"📊 Rest analysis: **{b2b_count}** players on B2B (-8%), **{rested_count}** well-rested (+5%)")
                         st.info("Switch to the **Player Pool** tab to review and adjust projections.")
 
                 except Exception as e:
@@ -12753,6 +12840,20 @@ if selected_page == "DFS Lineup Builder":
                 elif is_excluded:
                     status = "❌ EXCL"
 
+                # Get rest and analytics info (use getattr for backwards compatibility)
+                days_rest = getattr(p, 'days_rest', None)
+                rest_mult = getattr(p, 'rest_multiplier', 1.0)
+                analytics = getattr(p, 'analytics_used', '')
+
+                # Build rest indicator
+                rest_indicator = ""
+                if days_rest == 1:
+                    rest_indicator = "😴 B2B"  # Back-to-back
+                elif days_rest and days_rest >= 3:
+                    rest_indicator = f"💪 {days_rest}d"  # Well-rested
+                elif days_rest:
+                    rest_indicator = f"{days_rest}d"
+
                 player_data.append({
                     'Status': status,
                     'Name': p.name,
@@ -12764,7 +12865,9 @@ if selected_page == "DFS Lineup Builder":
                     'Floor': f"{p.proj_floor:.1f}",
                     'Ceiling': f"{p.proj_ceiling:.1f}",
                     'Value': f"{p.fpts_per_dollar:.2f}",
+                    'Rest': rest_indicator,
                     'Own%': f"{p.ownership_proj:.1f}%",
+                    '📊': analytics,  # Analytics indicators
                 })
 
             df = pd.DataFrame(player_data)
@@ -12793,6 +12896,10 @@ if selected_page == "DFS Lineup Builder":
                         'Ceiling': round(p.proj_ceiling, 2),
                         'Value': round(p.fpts_per_dollar, 3),
                         'Own_Pct': round(p.ownership_proj, 1),
+                        'Days_Rest': getattr(p, 'days_rest', None),
+                        'Rest_Mult': round(getattr(p, 'rest_multiplier', 1.0), 3),
+                        'Uncertainty': round(getattr(p, 'uncertainty_multiplier', 1.0), 3),
+                        'Analytics': getattr(p, 'analytics_used', ''),
                         'Game': p.game_id,
                     })
                 export_pool_df = pd.DataFrame(export_data)
