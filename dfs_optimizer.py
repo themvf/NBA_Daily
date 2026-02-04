@@ -1604,7 +1604,8 @@ def generate_diversified_lineups(
     num_lineups: int = 100,
     max_player_exposure: float = 0.50,  # 50% max exposure (was 40%)
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
-    excluded_games: Optional[Set[str]] = None
+    excluded_games: Optional[Set[str]] = None,
+    exposure_targets: Optional[Dict[int, float]] = None
 ) -> List[DFSLineup]:
     """
     Generate diversified GPP tournament lineups using randomized optimization.
@@ -1621,6 +1622,8 @@ def generate_diversified_lineups(
         max_player_exposure: Maximum exposure per player (0.0-1.0)
         progress_callback: Optional progress callback (current, total, message)
         excluded_games: Set of game_ids to exclude (for postponed games)
+        exposure_targets: Dict mapping player_id -> target exposure fraction
+                          (e.g. {12345: 0.30} means 30% of lineups)
 
     Returns:
         List of valid DFSLineup objects
@@ -1642,9 +1645,29 @@ def generate_diversified_lineups(
 
     # Get locked players (ensure they're not injured)
     locked = [p for p in filtered_pool if p.is_locked and not p.is_injured]
+    locked_ids = {p.player_id for p in locked}
+
+    # Resolve exposure target players
+    exposure_targets = exposure_targets or {}
+    target_player_map: Dict[int, Dict] = {}
+    for pid, target_pct in exposure_targets.items():
+        if pid in locked_ids:
+            continue  # Already locked at 100%
+        player_obj = next(
+            (p for p in filtered_pool if p.player_id == pid), None
+        )
+        if player_obj and not player_obj.is_excluded and not player_obj.is_injured:
+            target_player_map[pid] = {
+                'player': player_obj,
+                'target': target_pct
+            }
 
     # Build max exposure dict
     max_exp = {p.player_id: max_player_exposure for p in filtered_pool}
+
+    # Targeted players: raise their max to at least their target
+    for pid, info in target_player_map.items():
+        max_exp[pid] = max(max_player_exposure, info['target'])
 
     # Strategy configuration: (strategy, randomization_factor, target_count_pct)
     strategies = [
@@ -1678,10 +1701,25 @@ def generate_diversified_lineups(
                     f"Building {strategy} lineups ({total_generated}/{num_lineups})..."
                 )
 
+            # Build per-attempt locked list: always-locked + exposure targets
+            attempt_locked = list(locked)
+
+            for pid, info in target_player_map.items():
+                current_count = exposures.get(pid, 0)
+                target_count_for_player = round(num_lineups * info['target'])
+                remaining_lineups = num_lineups - total_generated
+                needed = target_count_for_player - current_count
+
+                if remaining_lineups > 0 and needed > 0:
+                    # Catch-up probability: adjusts to converge on target
+                    lock_prob = min(1.0, needed / remaining_lineups)
+                    if random.random() < lock_prob:
+                        attempt_locked.append(info['player'])
+
             lineup = optimize_lineup_randomized(
                 player_pool=filtered_pool,
                 strategy=strategy,
-                locked_players=locked,
+                locked_players=attempt_locked,
                 max_exposure=max_exp,
                 current_exposures=exposures,
                 num_lineups_total=num_lineups,

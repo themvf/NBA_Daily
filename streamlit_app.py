@@ -12526,6 +12526,8 @@ if selected_page == "DFS Lineup Builder":
         st.session_state.dfs_excluded_games = set()
     if 'dfs_all_games' not in st.session_state:
         st.session_state.dfs_all_games = []
+    if 'dfs_exposure_targets' not in st.session_state:
+        st.session_state.dfs_exposure_targets = {}
 
     # Get database connection
     dfs_conn = get_connection(str(db_path))
@@ -12533,7 +12535,7 @@ if selected_page == "DFS Lineup Builder":
     # Sidebar configuration
     with st.sidebar:
         st.subheader("⚙️ Builder Settings")
-        num_lineups = st.slider("Number of lineups", 20, 150, 100, step=10)
+        num_lineups = st.slider("Number of lineups", 1, 100, 20, step=1)
         max_exposure = st.slider("Max player exposure %", 20, 60, 40, step=5) / 100
 
         st.divider()
@@ -12942,6 +12944,43 @@ if selected_page == "DFS Lineup Builder":
                 locked_salary = sum(p.salary for p in players if getattr(p, 'is_locked', False))
                 st.caption(f"Locked players total: ${locked_salary:,} ({len(locked_names)} players)")
 
+            # --- Exposure Targets ---
+            st.divider()
+            st.subheader("📊 Exposure Targets")
+            st.caption("Set target exposure % for specific players (overrides global max)")
+
+            # Filter out locked/excluded players from target selection
+            available_for_targets = [
+                p.name for p in players
+                if not getattr(p, 'is_locked', False)
+                and not getattr(p, 'is_excluded', False)
+                and not getattr(p, 'is_injured', False)
+            ]
+
+            target_names = st.multiselect(
+                "Select players for custom exposure",
+                available_for_targets,
+                help="Pick players and set how often they should appear in lineups"
+            )
+
+            exposure_targets = {}
+            if target_names:
+                cols = st.columns(3)
+                for i, name in enumerate(target_names):
+                    player_obj = next((p for p in players if p.name == name), None)
+                    if player_obj:
+                        with cols[i % 3]:
+                            pct = st.number_input(
+                                f"{name}", min_value=5, max_value=95,
+                                value=25, step=5,
+                                key=f"exp_target_{player_obj.player_id}"
+                            )
+                            exposure_targets[player_obj.player_id] = pct / 100
+
+                st.caption(f"🎯 Targeting {len(target_names)} players with custom exposure")
+
+            st.session_state.dfs_exposure_targets = exposure_targets
+
     # ==========================================================================
     # TAB 3: Generated Lineups
     # ==========================================================================
@@ -12969,7 +13008,8 @@ if selected_page == "DFS Lineup Builder":
                             num_lineups=num_lineups,
                             max_player_exposure=max_exposure,
                             progress_callback=update_progress,
-                            excluded_games=st.session_state.dfs_excluded_games
+                            excluded_games=st.session_state.dfs_excluded_games,
+                            exposure_targets=st.session_state.dfs_exposure_targets
                         )
 
                     progress_bar.empty()
@@ -12984,9 +13024,12 @@ if selected_page == "DFS Lineup Builder":
 
             with col2:
                 if st.session_state.dfs_lineups:
-                    # Export button
-                    lineups = st.session_state.dfs_lineups
-                    export_df = pd.DataFrame([l.to_dk_export_row() for l in lineups])
+                    # Export button — sorted by projected FPTS (highest first)
+                    sorted_lineups = sorted(
+                        st.session_state.dfs_lineups,
+                        key=lambda l: l.total_proj_fpts, reverse=True
+                    )
+                    export_df = pd.DataFrame([l.to_dk_export_row() for l in sorted_lineups])
 
                     csv_data = export_df.to_csv(index=False)
                     st.download_button(
@@ -12997,9 +13040,12 @@ if selected_page == "DFS Lineup Builder":
                         use_container_width=True
                     )
 
-            # Display generated lineups
+            # Display generated lineups (sorted by projected FPTS, highest first)
             if st.session_state.dfs_lineups:
-                lineups = st.session_state.dfs_lineups
+                lineups = sorted(
+                    st.session_state.dfs_lineups,
+                    key=lambda l: l.total_proj_fpts, reverse=True
+                )
 
                 st.divider()
 
