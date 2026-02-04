@@ -4,7 +4,7 @@
 import boto3
 from pathlib import Path
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 import streamlit as st
 from botocore.exceptions import ClientError, NoCredentialsError
 
@@ -163,6 +163,97 @@ class S3PredictionStorage:
             return {'exists': False}
         except Exception as e:
             return {'exists': False, 'error': str(e)}
+
+    def upload_file(self, local_path: Path, s3_key: str,
+                    metadata: Optional[dict] = None) -> tuple[bool, str]:
+        """
+        Upload any local file to a custom S3 key.
+
+        Args:
+            local_path: Path to the local file
+            s3_key: Destination key in S3 (e.g. 'dfs_slates/2026-02-03/dk_salaries.csv')
+            metadata: Optional metadata dict to attach
+
+        Returns:
+            Tuple of (success: bool, message: str)
+        """
+        if not self.connected:
+            return False, f"S3 not configured: {self.error}"
+
+        if not local_path.exists():
+            return False, f"File not found: {local_path}"
+
+        try:
+            default_metadata = {
+                'upload_time': datetime.now().isoformat(),
+                'source': 'streamlit_app'
+            }
+            final_metadata = {**default_metadata, **(metadata or {})}
+            extra = {'Metadata': final_metadata}
+            self.s3.upload_file(str(local_path), self.bucket, s3_key, ExtraArgs=extra)
+            file_size = local_path.stat().st_size / 1024
+            return True, f"Uploaded {file_size:.1f} KB to {s3_key}"
+
+        except ClientError as e:
+            error_code = e.response['Error']['Code']
+            return False, f"S3 upload failed ({error_code}): {e}"
+        except Exception as e:
+            return False, f"Unexpected error during upload: {e}"
+
+    def download_file(self, s3_key: str, local_path: Path) -> tuple[bool, str]:
+        """
+        Download any file from S3 to a local path.
+
+        Args:
+            s3_key: Source key in S3
+            local_path: Where to save the file locally
+
+        Returns:
+            Tuple of (success: bool, message: str)
+        """
+        if not self.connected:
+            return False, f"S3 not configured: {self.error}"
+
+        try:
+            self.s3.head_object(Bucket=self.bucket, Key=s3_key)
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            self.s3.download_file(self.bucket, s3_key, str(local_path))
+
+            if local_path.exists():
+                file_size = local_path.stat().st_size / 1024
+                return True, f"Downloaded {file_size:.1f} KB"
+            return False, "Download completed but file not found"
+
+        except ClientError as e:
+            error_code = e.response['Error']['Code']
+            if error_code == '404':
+                return False, "File not found in S3"
+            return False, f"S3 download failed ({error_code}): {e}"
+        except Exception as e:
+            return False, f"Unexpected error during download: {e}"
+
+    def list_files(self, prefix: str) -> List[str]:
+        """
+        List all S3 keys under a prefix.
+
+        Args:
+            prefix: S3 key prefix (e.g. 'dfs_slates/')
+
+        Returns:
+            List of S3 keys matching the prefix
+        """
+        if not self.connected:
+            return []
+
+        try:
+            keys = []
+            paginator = self.s3.get_paginator('list_objects_v2')
+            for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
+                for obj in page.get('Contents', []):
+                    keys.append(obj['Key'])
+            return keys
+        except Exception:
+            return []
 
 
 def sync_database_to_s3(db_path: Path) -> tuple[bool, str]:

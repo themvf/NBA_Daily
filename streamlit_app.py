@@ -467,6 +467,40 @@ def persist_uploaded_file(file, suffix: str) -> Path:
     return temp_path
 
 
+def _s3_backup_db(db_path: Path, toast: bool = True) -> None:
+    """Best-effort S3 database backup after key DFS operations."""
+    try:
+        from s3_storage import S3PredictionStorage
+        s3 = S3PredictionStorage()
+        if s3.is_connected():
+            success, msg = s3.upload_database(db_path)
+            if success and toast:
+                st.toast("☁️ Database backed up to S3")
+    except Exception:
+        pass
+
+
+def _s3_upload_slate_file(local_path: Path, slate_date: str,
+                          filename: str, toast_msg: str = None) -> None:
+    """Best-effort upload of a DFS slate artifact to S3."""
+    try:
+        # Validate inputs to prevent malformed S3 keys
+        if not slate_date or '/' in slate_date or '..' in slate_date:
+            return
+        if not filename or '/' in filename or '..' in filename:
+            return
+
+        from s3_storage import S3PredictionStorage
+        s3 = S3PredictionStorage()
+        if s3.is_connected():
+            s3_key = f"dfs_slates/{slate_date}/{filename}"
+            success, msg = s3.upload_file(local_path, s3_key)
+            if success and toast_msg:
+                st.toast(toast_msg)
+    except Exception:
+        pass
+
+
 def normalize_weight_map(weight_map: Dict[str, float]) -> Dict[str, float]:
     sanitized = {k: max(0.0, float(v)) for k, v in weight_map.items()}
     total = sum(sanitized.values())
@@ -12590,6 +12624,13 @@ if selected_page == "DFS Lineup Builder":
                 try:
                     players, metadata = dfs.parse_dk_csv(csv_path, dfs_conn)
 
+                    # Save raw DK CSV to S3 (preserves salary/player data)
+                    _s3_upload_slate_file(
+                        csv_path, str(date.today()),
+                        "dk_salaries.csv",
+                        f"☁️ DK CSV saved to S3 for {date.today()}"
+                    )
+
                     st.success(f"✅ Loaded {metadata['matched_players']} players from {metadata['unique_games']} games")
 
                     col1, col2, col3 = st.columns(3)
@@ -12777,6 +12818,45 @@ if selected_page == "DFS Lineup Builder":
                         if use_sophisticated and (b2b_count > 0 or rested_count > 0):
                             st.info(f"📊 Rest analysis: **{b2b_count}** players on B2B (-8%), **{rested_count}** well-rested (+5%)")
                         st.info("Switch to the **Player Pool** tab to review and adjust projections.")
+
+                        # Save projections to S3 (latest overrides earlier for same day)
+                        try:
+                            slate_date = str(projection_date) if projection_date else str(date.today())
+                            proj_rows = []
+                            for p in projected_players:
+                                if p.is_injured or p.is_excluded:
+                                    continue
+                                proj_rows.append({
+                                    'player_id': p.player_id, 'name': p.name,
+                                    'team': p.team, 'opponent': p.opponent,
+                                    'salary': p.salary, 'positions': ','.join(p.positions),
+                                    'proj_fpts': p.proj_fpts, 'proj_points': p.proj_points,
+                                    'proj_rebounds': p.proj_rebounds, 'proj_assists': p.proj_assists,
+                                    'proj_steals': p.proj_steals, 'proj_blocks': p.proj_blocks,
+                                    'proj_turnovers': p.proj_turnovers, 'proj_fg3m': p.proj_fg3m,
+                                    'proj_floor': p.proj_floor, 'proj_ceiling': p.proj_ceiling,
+                                    'fpts_per_dollar': p.fpts_per_dollar,
+                                })
+                            if proj_rows:
+                                proj_df = pd.DataFrame(proj_rows)
+                                with tempfile.NamedTemporaryFile(
+                                    mode='w', suffix='.csv', delete=False
+                                ) as tmp:
+                                    proj_df.to_csv(tmp, index=False)
+                                    tmp_path = Path(tmp.name)
+                                _s3_upload_slate_file(
+                                    tmp_path, slate_date,
+                                    "projections.csv",
+                                    f"☁️ Projections saved to S3 for {slate_date}"
+                                )
+                                try:
+                                    tmp_path.unlink()
+                                except OSError:
+                                    pass
+                            # Also backup DB (projections are now in tracking tables too)
+                            _s3_backup_db(db_path, toast=False)
+                        except Exception:
+                            pass  # Best-effort S3 save
 
                 except Exception as e:
                     st.error(f"❌ Error parsing CSV: {str(e)}")
@@ -13045,6 +13125,8 @@ if selected_page == "DFS Lineup Builder":
                             save_slate_projections(dfs_conn, slate_date, players)
                             save_slate_lineups(dfs_conn, slate_date, lineups)
                             st.toast(f"📊 Slate saved for {slate_date} tracking")
+                            # Backup DB to S3 (persists projections + lineups)
+                            _s3_backup_db(db_path)
                         except Exception as e:
                             st.warning(f"⚠️ Could not save slate for tracking: {e}")
                     else:
@@ -13490,6 +13572,30 @@ if selected_page == "DFS Lineup Builder":
                             st.info("No actual data available for this slate yet.")
                 else:
                     st.info("No slate results computed yet. Click 'Update Actuals' to compute accuracy metrics.")
+
+            # --- S3 Slate Archive ---
+            st.divider()
+            with st.expander("☁️ S3 Slate Archive"):
+                try:
+                    from s3_storage import S3PredictionStorage
+                    s3_arch = S3PredictionStorage()
+                    if s3_arch.is_connected():
+                        slate_files = s3_arch.list_files("dfs_slates/")
+                        if slate_files:
+                            s3_dates = sorted(set(
+                                key.split('/')[1] for key in slate_files
+                                if len(key.split('/')) >= 3
+                            ), reverse=True)
+                            st.write(f"**{len(s3_dates)} slate(s) archived in S3:**")
+                            for d in s3_dates:
+                                files = [k.split('/')[-1] for k in slate_files if f"/{d}/" in k]
+                                st.write(f"• **{d}**: {', '.join(files)}")
+                        else:
+                            st.info("No slates archived in S3 yet. Upload a DK CSV and generate projections to start archiving.")
+                    else:
+                        st.info("S3 not configured. Slate data is stored locally only.")
+                except Exception:
+                    st.info("Could not connect to S3.")
 
         except Exception as e:
             st.error(f"❌ Error loading model accuracy: {e}")
