@@ -1943,3 +1943,163 @@ def parse_contest_standings(csv_path) -> Tuple[Dict[str, float], Dict[str, float
             actual_fpts_map[player_name] = fpts
 
     return ownership_map, actual_fpts_map
+
+
+def parse_entry_name(entry_name: str) -> Tuple[str, int, int]:
+    """Parse DK EntryName into (username, entry_number, max_entries).
+
+    Examples:
+        "DaddyBambi (9/20)"  -> ("DaddyBambi", 9, 20)
+        "kwwagner1142"       -> ("kwwagner1142", 1, 1)
+
+    Returns:
+        (username, entry_number, max_entries)
+    """
+    if not entry_name or not isinstance(entry_name, str):
+        return str(entry_name).strip(), 1, 1
+
+    match = re.match(r'^(.+?)\s*\((\d+)/(\d+)\)$', entry_name.strip())
+    if match:
+        return match.group(1).strip(), int(match.group(2)), int(match.group(3))
+    return entry_name.strip(), 1, 1
+
+
+def parse_lineup_string(lineup_str: str) -> Dict[str, str]:
+    """Parse DK lineup string into {position: player_name} dict.
+
+    The lineup string looks like:
+        "C Isaiah Jackson F Jalen Johnson G Ayo Dosunmu PF Kyle Filipowski
+         PG Isaiah Collier SF Kyle Kuzma SG Quenton Jackson UTIL Ryan Rollins"
+
+    Each position code is followed by a player name until the next position code.
+
+    Returns:
+        Dict like {'C': 'Isaiah Jackson', 'PG': 'Isaiah Collier', ...}
+        Returns empty dict if lineup_str is empty/invalid.
+    """
+    if not lineup_str or not isinstance(lineup_str, str) or lineup_str.strip() == '':
+        return {}
+
+    text = lineup_str.strip()
+
+    # Find position tokens and their locations
+    # Regex: position token preceded by start-of-string or whitespace,
+    # followed by a space and an uppercase letter (start of player name)
+    pattern = r'(?:^|\s)(UTIL|PG|SG|SF|PF|C|G|F)\s+(?=[A-Z])'
+    matches = list(re.finditer(pattern, text))
+
+    if not matches:
+        return {}
+
+    result = {}
+    for i, match in enumerate(matches):
+        position = match.group(1)
+        # Player name starts right after the position token + space
+        name_start = match.end()
+        # Player name ends at the start of the next position match (or end of string)
+        if i + 1 < len(matches):
+            name_end = matches[i + 1].start()
+        else:
+            name_end = len(text)
+
+        player_name = text[name_start:name_end].strip()
+        if player_name:
+            result[position] = player_name
+
+    return result
+
+
+def parse_contest_entries(csv_path, contest_id: str) -> List[Dict]:
+    """Parse the LEFT side of a DK contest standings CSV to extract entries.
+
+    Reads Rank, EntryName, Points, Lineup columns, parses usernames and
+    lineup strings, and deduplicates identical lineups per user.
+
+    Args:
+        csv_path: Path to the contest standings CSV.
+        contest_id: Contest identifier (usually from filename).
+
+    Returns:
+        List of dicts with keys: username, max_entries, entry_count, rank,
+        points, lineup_raw, pg, sg, sf, pf, c, g, f, util
+    """
+    df = pd.read_csv(csv_path, encoding='utf-8-sig')
+    cols = df.columns.tolist()
+
+    # Find left-side columns by name (case-insensitive)
+    rank_col = entry_col = points_col = lineup_col = None
+    for col in cols:
+        cl = str(col).strip().lower()
+        if cl == 'rank':
+            rank_col = col
+        elif cl == 'entryname':
+            entry_col = col
+        elif cl == 'points':
+            points_col = col
+        elif cl == 'lineup':
+            lineup_col = col
+
+    if entry_col is None or lineup_col is None:
+        raise ValueError(
+            f"Could not find 'EntryName' and 'Lineup' columns. "
+            f"Available columns: {cols}"
+        )
+
+    # Group by (username, lineup_raw) for deduplication
+    # key -> {username, max_entries, entry_count, best_rank, best_points, lineup_raw, positions}
+    grouped: Dict[Tuple[str, str], Dict] = {}
+
+    for _, row in df.iterrows():
+        entry_name = str(row.get(entry_col, '')).strip()
+        lineup_raw = str(row.get(lineup_col, '')).strip()
+
+        if not entry_name or entry_name == 'nan':
+            continue
+        if not lineup_raw or lineup_raw == 'nan':
+            continue
+
+        # Parse rank and points
+        try:
+            rank = int(row.get(rank_col, 0)) if rank_col else 0
+        except (ValueError, TypeError):
+            rank = 0
+        try:
+            points = float(row.get(points_col, 0)) if points_col else 0.0
+        except (ValueError, TypeError):
+            points = 0.0
+
+        if points <= 0:
+            continue  # Skip entries with no score (incomplete)
+
+        username, entry_num, max_entries = parse_entry_name(entry_name)
+        key = (username, lineup_raw)
+
+        if key in grouped:
+            # Same user, same lineup — increment count, keep best rank
+            grouped[key]['entry_count'] += 1
+            if rank > 0 and (grouped[key]['rank'] == 0 or rank < grouped[key]['rank']):
+                grouped[key]['rank'] = rank
+            if points > grouped[key]['points']:
+                grouped[key]['points'] = points
+            if max_entries > grouped[key]['max_entries']:
+                grouped[key]['max_entries'] = max_entries
+        else:
+            positions = parse_lineup_string(lineup_raw)
+            grouped[key] = {
+                'username': username,
+                'max_entries': max_entries,
+                'entry_count': 1,
+                'rank': rank,
+                'points': points,
+                'lineup_raw': lineup_raw,
+                'pg': positions.get('PG', ''),
+                'sg': positions.get('SG', ''),
+                'sf': positions.get('SF', ''),
+                'pf': positions.get('PF', ''),
+                'c': positions.get('C', ''),
+                'g': positions.get('G', ''),
+                'f': positions.get('F', ''),
+                'util': positions.get('UTIL', ''),
+            }
+
+    return list(grouped.values())

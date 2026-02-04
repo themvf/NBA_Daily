@@ -12597,7 +12597,8 @@ if selected_page == "DFS Lineup Builder":
         "👥 Player Pool",
         "📊 Generated Lineups",
         "📈 Exposure Report",
-        "🎯 Model Accuracy"
+        "🎯 Model Accuracy",
+        "🦈 Opponent Analysis"
     ])
 
     # ==========================================================================
@@ -13402,8 +13403,23 @@ if selected_page == "DFS Lineup Builder":
 
                         ownership_map, actual_fpts_map = parse_contest_standings(tmp_path)
 
+                        # Also parse opponent entries (left side of CSV)
+                        from dfs_optimizer import parse_contest_entries
+                        import re as _re
+                        _cid_match = _re.search(r'(\d{6,})', contest_file.name)
+                        _contest_id = _cid_match.group(1) if _cid_match else date.today().strftime('%Y%m%d')
+                        try:
+                            contest_entries = parse_contest_entries(tmp_path, _contest_id)
+                            _unique_users = len(set(e['username'] for e in contest_entries))
+                        except (ValueError, KeyError):
+                            contest_entries = []
+                            _unique_users = 0
+
                         if ownership_map:
-                            st.success(f"✅ Parsed {len(ownership_map)} players from contest standings")
+                            st.success(
+                                f"✅ Parsed {len(ownership_map)} players, "
+                                f"{len(contest_entries)} unique lineups from {_unique_users} users"
+                            )
 
                             # Let user pick which slate this belongs to
                             contest_slate_options = all_dates if all_dates else []
@@ -13430,11 +13446,18 @@ if selected_page == "DFS Lineup Builder":
                             st.caption("Top 10 most-owned players:")
                             st.dataframe(preview_df, use_container_width=True, hide_index=True)
 
-                            if st.button("💾 Import Ownership Data", type="primary"):
+                            if st.button("💾 Import Contest Data", type="primary"):
                                 matched, unmatched = import_contest_results(
                                     dfs_conn, contest_slate, ownership_map, actual_fpts_map
                                 )
                                 st.toast(f"✅ Matched {matched} players, {unmatched} unmatched")
+
+                                # Import opponent entries
+                                from dfs_tracking import import_contest_entries as _import_entries
+                                lineups_imp, users_imp = _import_entries(
+                                    dfs_conn, contest_slate, _contest_id, contest_entries
+                                )
+                                st.toast(f"🦈 Imported {users_imp} users, {lineups_imp} unique lineups")
 
                                 # Recompute slate results with ownership data
                                 results = compute_and_store_slate_results(dfs_conn, contest_slate)
@@ -13761,6 +13784,168 @@ if selected_page == "DFS Lineup Builder":
 
         except Exception as e:
             st.error(f"❌ Error loading model accuracy: {e}")
+            import traceback
+            st.code(traceback.format_exc())
+
+    # ==========================================================================
+    # TAB 6: Opponent Analysis
+    # ==========================================================================
+    with builder_tabs[5]:
+        st.subheader("Opponent Analysis")
+        st.caption("Track opponents across contests to identify sharks and reverse-engineer their strategies")
+
+        try:
+            from dfs_tracking import (
+                create_dfs_tracking_tables as _create_tables,
+                get_opponent_contest_history,
+                get_shark_users,
+                get_shark_player_exposure,
+                get_shark_strategy_profile,
+            )
+            import plotly.express as px
+
+            _create_tables(dfs_conn)
+
+            # --- Contest Import Summary ---
+            contest_history = get_opponent_contest_history(dfs_conn)
+
+            if contest_history.empty:
+                st.info(
+                    "📊 No contest data imported yet. Upload a DraftKings contest standings CSV "
+                    "in the **Model Accuracy** tab to start tracking opponents."
+                )
+            else:
+                # Summary metrics
+                ch_m1, ch_m2, ch_m3, ch_m4 = st.columns(4)
+                ch_m1.metric("Contests Imported", len(contest_history))
+                ch_m2.metric("Total Entries", f"{int(contest_history['total_entries'].sum()):,}")
+                ch_m3.metric("Unique Users", f"{int(contest_history['unique_users'].sum()):,}")
+                date_range = f"{contest_history['slate_date'].min()} → {contest_history['slate_date'].max()}"
+                ch_m4.metric("Date Range", date_range if len(contest_history) > 1 else contest_history['slate_date'].iloc[0])
+
+                with st.expander("📋 Imported Contests"):
+                    ch_display = contest_history.copy()
+                    ch_display.columns = ['Contest ID', 'Slate Date', 'Entries', 'Users', 'Top Score', 'Imported']
+                    ch_display['Top Score'] = ch_display['Top Score'].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "—")
+                    st.dataframe(ch_display, use_container_width=True, hide_index=True)
+
+                # --- Shark Detection ---
+                st.divider()
+                st.subheader("🦈 Shark Detection")
+
+                shark_col1, shark_col2 = st.columns(2)
+                with shark_col1:
+                    min_contests = st.slider("Min contests to qualify", 1, 10, 3, key="shark_min_contests")
+                with shark_col2:
+                    min_top_pct = st.slider("OR avg finish in top %", 5, 50, 25, key="shark_top_pct")
+
+                sharks_df = get_shark_users(dfs_conn, min_contests=min_contests, min_top_pct=min_top_pct)
+
+                if sharks_df.empty:
+                    st.info(
+                        f"No sharks detected yet with these criteria. "
+                        f"Need users appearing in {min_contests}+ contests or avg finish in top {min_top_pct}%. "
+                        f"Import more contest CSVs to build the database."
+                    )
+                else:
+                    # Format shark table
+                    shark_display = sharks_df.copy()
+                    shark_display['avg_pts'] = shark_display['avg_pts'].apply(lambda x: f"{x:.1f}")
+                    shark_display['avg_pctile'] = shark_display['avg_pctile'].apply(
+                        lambda x: f"{x:.1f}%" if pd.notna(x) else "—"
+                    )
+                    shark_display.columns = [
+                        'Username', 'Contests', 'Avg Points', 'Avg Percentile',
+                        'Best Rank', 'Max Entries', 'Total Entries'
+                    ]
+                    st.dataframe(shark_display, use_container_width=True, hide_index=True)
+
+                    # --- Player Exposure Analysis ---
+                    st.divider()
+                    st.subheader("📊 Shark Player Preferences")
+                    st.caption("Which players do sharks roster most frequently?")
+
+                    shark_usernames = sharks_df['username'].tolist()
+                    exposure_df = get_shark_player_exposure(dfs_conn, shark_usernames)
+
+                    if not exposure_df.empty:
+                        # Bar chart of top players
+                        top_exposure = exposure_df.head(20)
+                        fig_exp = px.bar(
+                            top_exposure,
+                            x='player', y='exposure_pct',
+                            title='Top 20 Players by Shark Exposure',
+                            labels={'player': 'Player', 'exposure_pct': 'Exposure %'},
+                            color='exposure_pct',
+                            color_continuous_scale='Reds',
+                        )
+                        fig_exp.update_layout(height=400, showlegend=False, xaxis_tickangle=-45)
+                        st.plotly_chart(fig_exp, use_container_width=True)
+
+                        # Exposure table
+                        exp_display = exposure_df.head(30).copy()
+                        exp_display['exposure_pct'] = exp_display['exposure_pct'].apply(lambda x: f"{x:.1f}%")
+                        exp_display.columns = ['Player', 'Times Rostered', 'Contests In', 'Exposure %']
+                        st.dataframe(exp_display, use_container_width=True, hide_index=True)
+
+                    # --- Individual Shark Profile ---
+                    st.divider()
+                    st.subheader("🔍 Shark Profile")
+
+                    selected_shark = st.selectbox(
+                        "Select a shark to analyze",
+                        shark_usernames,
+                        help="Deep-dive into a specific opponent's strategy"
+                    )
+
+                    if selected_shark:
+                        profile = get_shark_strategy_profile(dfs_conn, selected_shark)
+
+                        if profile:
+                            # Metrics row
+                            sp_m1, sp_m2, sp_m3, sp_m4 = st.columns(4)
+                            sp_m1.metric("Contests", profile['contests'])
+                            sp_m2.metric("Unique Lineups", profile['total_lineups'])
+                            score = profile['score_stats']
+                            sp_m3.metric("Avg Score", f"{score['avg']:.1f}")
+                            consistency = max(0, (1 - score['std'] / score['avg']) * 100) if score['avg'] > 0 and score['std'] > 0 else 100
+                            sp_m4.metric("Consistency", f"{consistency:.0f}%")
+
+                            prof_cols = st.columns(2)
+
+                            # Favorite players
+                            with prof_cols[0]:
+                                st.markdown("**Favorite Players:**")
+                                if profile['favorite_players']:
+                                    fav_data = [{'Player': p, 'Times Used': c} for p, c in profile['favorite_players']]
+                                    fav_df = pd.DataFrame(fav_data)
+                                    st.dataframe(fav_df, use_container_width=True, hide_index=True)
+
+                            # Salary stats
+                            with prof_cols[1]:
+                                sal = profile['salary_stats']
+                                if sal.get('avg') is not None:
+                                    st.markdown("**Salary Usage:**")
+                                    st.write(f"Average: **${sal['avg']:,.0f}**")
+                                    st.write(f"Range: ${sal['min']:,} — ${sal['max']:,}")
+                                else:
+                                    st.info("Salary data unavailable (no matching projections for these slates)")
+
+                            # Lineup history
+                            with st.expander("📜 Lineup History"):
+                                if profile['lineup_history']:
+                                    hist_df = pd.DataFrame(profile['lineup_history'])
+                                    hist_df['points'] = hist_df['points'].apply(lambda x: f"{x:.1f}")
+                                    hist_df['salary'] = hist_df['salary'].apply(
+                                        lambda x: f"${x:,}" if pd.notna(x) else "—"
+                                    )
+                                    hist_df.columns = ['Contest ID', 'Slate Date', 'Rank', 'Points', 'Salary']
+                                    st.dataframe(hist_df, use_container_width=True, hide_index=True)
+                        else:
+                            st.info("No data found for this user.")
+
+        except Exception as e:
+            st.error(f"❌ Error loading opponent analysis: {e}")
             import traceback
             st.code(traceback.format_exc())
 

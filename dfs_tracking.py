@@ -118,6 +118,40 @@ def create_dfs_tracking_tables(conn: sqlite3.Connection) -> None:
         except sqlite3.OperationalError:
             pass  # Column already exists
 
+    # --- Opponent tracking tables ---
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS dfs_contest_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            contest_id TEXT NOT NULL,
+            slate_date TEXT NOT NULL,
+            username TEXT NOT NULL,
+            max_entries INTEGER DEFAULT 1,
+            entry_count INTEGER DEFAULT 1,
+            rank INTEGER,
+            points REAL,
+            lineup_raw TEXT,
+            pg TEXT, sg TEXT, sf TEXT, pf TEXT,
+            c TEXT, g TEXT, f TEXT, util TEXT,
+            total_salary INTEGER,
+            created_at TEXT DEFAULT (datetime('now')),
+            UNIQUE(contest_id, username, lineup_raw)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_dce_username
+            ON dfs_contest_entries(username);
+        CREATE INDEX IF NOT EXISTS idx_dce_slate
+            ON dfs_contest_entries(slate_date);
+
+        CREATE TABLE IF NOT EXISTS dfs_contest_meta (
+            contest_id TEXT PRIMARY KEY,
+            slate_date TEXT NOT NULL,
+            total_entries INTEGER,
+            unique_users INTEGER,
+            top_score REAL,
+            import_date TEXT DEFAULT (datetime('now'))
+        );
+    """)
+
     conn.commit()
 
 
@@ -730,3 +764,275 @@ def get_slate_lineup_df(conn: sqlite3.Connection, slate_date: str) -> pd.DataFra
         "ORDER BY lineup_num",
         conn, params=[slate_date]
     )
+
+
+# =============================================================================
+# Opponent Tracking — Import & Analysis
+# =============================================================================
+
+def import_contest_entries(
+    conn: sqlite3.Connection,
+    slate_date: str,
+    contest_id: str,
+    entries: List[Dict]
+) -> Tuple[int, int]:
+    """Import parsed contest entries into opponent tracking tables.
+
+    Args:
+        conn: SQLite connection
+        slate_date: Date string (YYYY-MM-DD)
+        contest_id: Contest identifier (e.g., "187849487")
+        entries: List of dicts from parse_contest_entries()
+
+    Returns:
+        Tuple of (unique_lineups_imported, unique_users_imported)
+    """
+    if not entries:
+        return 0, 0
+
+    cursor = conn.cursor()
+
+    # Build salary lookup from projections (best-effort enrichment)
+    salary_lookup = {}
+    proj_rows = cursor.execute(
+        "SELECT player_name, salary FROM dfs_slate_projections WHERE slate_date = ?",
+        (slate_date,)
+    ).fetchall()
+    for pname, sal in proj_rows:
+        salary_lookup[_normalize_name(pname)] = sal
+
+    users = set()
+    imported = 0
+
+    for entry in entries:
+        username = entry['username']
+        users.add(username)
+
+        # Best-effort salary enrichment
+        total_salary = None
+        pos_names = [entry.get(p, '') for p in ['pg', 'sg', 'sf', 'pf', 'c', 'g', 'f', 'util']]
+        salaries = []
+        for pn in pos_names:
+            if pn:
+                norm = _normalize_name(pn)
+                if norm in salary_lookup:
+                    salaries.append(salary_lookup[norm])
+        if len(salaries) == 8:
+            total_salary = sum(salaries)
+
+        cursor.execute("""
+            INSERT OR REPLACE INTO dfs_contest_entries (
+                contest_id, slate_date, username, max_entries, entry_count,
+                rank, points, lineup_raw,
+                pg, sg, sf, pf, c, g, f, util,
+                total_salary
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            contest_id, slate_date, username, entry['max_entries'],
+            entry['entry_count'], entry['rank'], entry['points'],
+            entry['lineup_raw'],
+            entry.get('pg', ''), entry.get('sg', ''), entry.get('sf', ''),
+            entry.get('pf', ''), entry.get('c', ''), entry.get('g', ''),
+            entry.get('f', ''), entry.get('util', ''),
+            total_salary,
+        ))
+        imported += 1
+
+    # Upsert contest metadata
+    total_entry_count = sum(e['entry_count'] for e in entries)
+    top_score = max((e['points'] for e in entries), default=0)
+    cursor.execute("""
+        INSERT OR REPLACE INTO dfs_contest_meta (
+            contest_id, slate_date, total_entries, unique_users, top_score
+        ) VALUES (?, ?, ?, ?, ?)
+    """, (contest_id, slate_date, total_entry_count, len(users), top_score))
+
+    conn.commit()
+    return imported, len(users)
+
+
+def _normalize_name(name: str) -> str:
+    """Normalize a player name for matching (lowercase, strip accents/suffixes)."""
+    n = name.strip().lower()
+    for suffix in [' jr.', ' jr', ' sr.', ' sr', ' iii', ' ii', ' iv']:
+        if n.endswith(suffix):
+            n = n[:-len(suffix)].strip()
+    n = unicodedata.normalize('NFKD', n).encode('ascii', 'ignore').decode('ascii')
+    return n
+
+
+def get_opponent_contest_history(conn: sqlite3.Connection) -> pd.DataFrame:
+    """Get list of imported contests with metadata."""
+    return pd.read_sql_query(
+        "SELECT contest_id, slate_date, total_entries, unique_users, top_score, "
+        "import_date FROM dfs_contest_meta ORDER BY slate_date DESC",
+        conn
+    )
+
+
+def get_shark_users(
+    conn: sqlite3.Connection,
+    min_contests: int = 3,
+    min_top_pct: float = 25.0
+) -> pd.DataFrame:
+    """Identify shark users across imported contests.
+
+    Sharks are users who appear in min_contests+ contests OR whose average
+    percentile finish is in the top min_top_pct%.
+
+    Returns:
+        DataFrame with columns: username, contests, avg_pts, avg_pctile,
+        best_rank, typical_max_entries, total_entries
+    """
+    return pd.read_sql_query("""
+        WITH user_stats AS (
+            SELECT
+                e.username,
+                COUNT(DISTINCT e.contest_id) AS contests,
+                AVG(e.points) AS avg_pts,
+                AVG(100.0 * e.rank / NULLIF(m.total_entries, 0)) AS avg_pctile,
+                MIN(e.rank) AS best_rank,
+                MAX(e.max_entries) AS typical_max_entries,
+                SUM(e.entry_count) AS total_entries
+            FROM dfs_contest_entries e
+            JOIN dfs_contest_meta m ON e.contest_id = m.contest_id
+            WHERE e.points > 0
+            GROUP BY e.username
+        )
+        SELECT * FROM user_stats
+        WHERE contests >= ? OR avg_pctile <= ?
+        ORDER BY avg_pctile ASC
+    """, conn, params=[min_contests, min_top_pct])
+
+
+def get_shark_player_exposure(
+    conn: sqlite3.Connection,
+    usernames: List[str]
+) -> pd.DataFrame:
+    """Get player exposure for a list of shark users.
+
+    Unpivots the 8 lineup position columns and counts how frequently
+    each player appears in shark lineups.
+
+    Returns:
+        DataFrame with columns: player, times_rostered, contests_in,
+        exposure_pct (% of shark lineups using this player)
+    """
+    if not usernames:
+        return pd.DataFrame()
+
+    placeholders = ','.join(['?'] * len(usernames))
+
+    return pd.read_sql_query(f"""
+        WITH rostered AS (
+            SELECT username, contest_id, pg AS player FROM dfs_contest_entries
+                WHERE username IN ({placeholders}) AND pg != ''
+            UNION ALL SELECT username, contest_id, sg FROM dfs_contest_entries
+                WHERE username IN ({placeholders}) AND sg != ''
+            UNION ALL SELECT username, contest_id, sf FROM dfs_contest_entries
+                WHERE username IN ({placeholders}) AND sf != ''
+            UNION ALL SELECT username, contest_id, pf FROM dfs_contest_entries
+                WHERE username IN ({placeholders}) AND pf != ''
+            UNION ALL SELECT username, contest_id, c FROM dfs_contest_entries
+                WHERE username IN ({placeholders}) AND c != ''
+            UNION ALL SELECT username, contest_id, g FROM dfs_contest_entries
+                WHERE username IN ({placeholders}) AND g != ''
+            UNION ALL SELECT username, contest_id, f FROM dfs_contest_entries
+                WHERE username IN ({placeholders}) AND f != ''
+            UNION ALL SELECT username, contest_id, util FROM dfs_contest_entries
+                WHERE username IN ({placeholders}) AND util != ''
+        ),
+        total_lineups AS (
+            SELECT COUNT(*) AS cnt FROM dfs_contest_entries
+            WHERE username IN ({placeholders})
+        )
+        SELECT
+            r.player,
+            COUNT(*) AS times_rostered,
+            COUNT(DISTINCT r.contest_id) AS contests_in,
+            ROUND(100.0 * COUNT(*) / NULLIF(t.cnt, 0), 1) AS exposure_pct
+        FROM rostered r, total_lineups t
+        GROUP BY r.player
+        ORDER BY times_rostered DESC
+        LIMIT 30
+    """, conn, params=usernames * 9)  # 8 UNION ALL + 1 total_lineups = 9 sets of placeholders
+
+
+def get_shark_strategy_profile(
+    conn: sqlite3.Connection,
+    username: str
+) -> Dict:
+    """Get detailed strategy profile for a single shark user.
+
+    Returns dict with:
+        - score_stats: avg, std, min, max of points
+        - salary_stats: avg, min, max total salary
+        - contests: number of contests
+        - total_lineups: number of unique lineups
+        - favorite_players: list of (player, count) tuples
+        - lineup_history: list of dicts (contest_id, slate_date, rank, points, lineup players)
+    """
+    # Score & salary stats
+    stats_df = pd.read_sql_query(
+        "SELECT points, total_salary, rank, contest_id, slate_date "
+        "FROM dfs_contest_entries WHERE username = ? AND points > 0 "
+        "ORDER BY slate_date DESC, rank ASC",
+        conn, params=[username]
+    )
+
+    if stats_df.empty:
+        return {}
+
+    score_stats = {
+        'avg': float(stats_df['points'].mean()),
+        'std': float(stats_df['points'].std()) if len(stats_df) > 1 else 0.0,
+        'min': float(stats_df['points'].min()),
+        'max': float(stats_df['points'].max()),
+    }
+
+    sal_valid = stats_df['total_salary'].dropna()
+    salary_stats = {
+        'avg': float(sal_valid.mean()) if not sal_valid.empty else None,
+        'min': int(sal_valid.min()) if not sal_valid.empty else None,
+        'max': int(sal_valid.max()) if not sal_valid.empty else None,
+    }
+
+    # Favorite players (unpivot)
+    fav_df = pd.read_sql_query("""
+        WITH rostered AS (
+            SELECT pg AS player FROM dfs_contest_entries WHERE username = ? AND pg != ''
+            UNION ALL SELECT sg FROM dfs_contest_entries WHERE username = ? AND sg != ''
+            UNION ALL SELECT sf FROM dfs_contest_entries WHERE username = ? AND sf != ''
+            UNION ALL SELECT pf FROM dfs_contest_entries WHERE username = ? AND pf != ''
+            UNION ALL SELECT c FROM dfs_contest_entries WHERE username = ? AND c != ''
+            UNION ALL SELECT g FROM dfs_contest_entries WHERE username = ? AND g != ''
+            UNION ALL SELECT f FROM dfs_contest_entries WHERE username = ? AND f != ''
+            UNION ALL SELECT util FROM dfs_contest_entries WHERE username = ? AND util != ''
+        )
+        SELECT player, COUNT(*) AS times_used
+        FROM rostered
+        GROUP BY player
+        ORDER BY times_used DESC
+        LIMIT 15
+    """, conn, params=[username] * 8)
+
+    # Lineup history
+    history = []
+    for _, row in stats_df.iterrows():
+        history.append({
+            'contest_id': row['contest_id'],
+            'slate_date': row['slate_date'],
+            'rank': int(row['rank']) if pd.notna(row['rank']) else None,
+            'points': float(row['points']),
+            'salary': int(row['total_salary']) if pd.notna(row['total_salary']) else None,
+        })
+
+    return {
+        'username': username,
+        'contests': int(stats_df['contest_id'].nunique()),
+        'total_lineups': len(stats_df),
+        'score_stats': score_stats,
+        'salary_stats': salary_stats,
+        'favorite_players': list(fav_df.itertuples(index=False, name=None)),
+        'lineup_history': history,
+    }
