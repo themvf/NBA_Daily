@@ -1403,7 +1403,7 @@ def parse_dk_csv(
 
         matched_names.append((name, name_to_id.get(normalize_name(name), {}).get('original_name', 'Unknown')))
 
-        # Check if player is injured
+        # Check if player is injured (from our API injury list)
         is_injured = player_id in injured_player_ids
         injury_status = ""
         if is_injured and player_id in injured_player_info:
@@ -1412,6 +1412,16 @@ def parse_dk_csv(
             if '(' in info and ')' in info:
                 injury_status = info.split('(')[-1].rstrip(')')
 
+        # Also detect DK-marked OUT: min salary ($3000) + 0.0 avg points
+        # DraftKings zeros out AvgPointsPerGame and sets salary to $3000
+        # for players they've confirmed as OUT, even if our API hasn't
+        # caught the designation yet.
+        dk_salary = int(row.get('salary', 0))
+        dk_avg_pts = float(row.get('avgpointspergame', -1))
+        if dk_salary <= 3000 and dk_avg_pts == 0.0 and not is_injured:
+            is_injured = True
+            injury_status = "OUT (DK)"
+
         player = DFSPlayer(
             player_id=player_id,
             name=name,
@@ -1419,7 +1429,7 @@ def parse_dk_csv(
             opponent=opponent,
             game_id=game_id,
             positions=positions,
-            salary=int(row.get('salary', 0)),
+            salary=dk_salary,
             dk_id=str(row.get('id', '')),
             is_injured=is_injured,
             injury_status=injury_status.upper() if injury_status else ""
@@ -1427,8 +1437,9 @@ def parse_dk_csv(
 
         players.append(player)
 
-    # Count injured players
+    # Count injured players (from API + DK-detected)
     injured_players = [p for p in players if p.is_injured]
+    dk_detected_out = [p for p in players if 'DK' in p.injury_status]
 
     metadata = {
         'total_players': len(df),
@@ -1442,6 +1453,8 @@ def parse_dk_csv(
         'match_rate': len(players) / len(df) * 100 if len(df) > 0 else 0,
         'injured_players': [(p.name, p.injury_status) for p in injured_players],
         'injured_count': len(injured_players),
+        'dk_detected_out': [(p.name, p.team) for p in dk_detected_out],
+        'dk_detected_out_count': len(dk_detected_out),
     }
 
     return players, metadata

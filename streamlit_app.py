@@ -12611,8 +12611,17 @@ if selected_page == "DFS Lineup Builder":
                         with st.expander(f"🏥 {metadata['injured_count']} Injured Players (Auto-Excluded)", expanded=True):
                             st.write("These players are OUT/DOUBTFUL and will be excluded from lineups:")
                             for name, status in metadata['injured_players']:
-                                status_emoji = "🔴" if status.upper() == "OUT" else "🟠"
+                                if 'DK' in status:
+                                    status_emoji = "🟡"  # DK-detected (not in our API)
+                                elif status.upper() == "OUT":
+                                    status_emoji = "🔴"
+                                else:
+                                    status_emoji = "🟠"
                                 st.caption(f"{status_emoji} {name} - {status}")
+
+                            dk_count = metadata.get('dk_detected_out_count', 0)
+                            if dk_count > 0:
+                                st.info(f"🟡 {dk_count} player(s) detected as OUT from DraftKings CSV (not in our injury API)")
 
                     # Game selection - exclude postponed/cancelled games
                     st.divider()
