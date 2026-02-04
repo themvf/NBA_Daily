@@ -12528,6 +12528,8 @@ if selected_page == "DFS Lineup Builder":
         st.session_state.dfs_all_games = []
     if 'dfs_exposure_targets' not in st.session_state:
         st.session_state.dfs_exposure_targets = {}
+    if 'dfs_projection_date' not in st.session_state:
+        st.session_state.dfs_projection_date = None
 
     # Get database connection
     dfs_conn = get_connection(str(db_path))
@@ -12560,7 +12562,8 @@ if selected_page == "DFS Lineup Builder":
         "📤 Upload & Configure",
         "👥 Player Pool",
         "📊 Generated Lineups",
-        "📈 Exposure Report"
+        "📈 Exposure Report",
+        "🎯 Model Accuracy"
     ])
 
     # ==========================================================================
@@ -12764,6 +12767,7 @@ if selected_page == "DFS Lineup Builder":
 
                         st.session_state.dfs_player_pool = projected_players
                         st.session_state.dfs_upload_metadata = metadata
+                        st.session_state.dfs_projection_date = str(projection_date) if projection_date else None
 
                         # Show projection summary
                         b2b_count = sum(1 for p in projected_players if getattr(p, 'days_rest', None) == 1)
@@ -13028,6 +13032,21 @@ if selected_page == "DFS Lineup Builder":
 
                     if lineups:
                         st.success(f"✅ Generated {len(lineups)} valid lineups!")
+
+                        # Auto-save slate projections + lineups for tracking
+                        try:
+                            from dfs_tracking import (
+                                create_dfs_tracking_tables,
+                                save_slate_projections,
+                                save_slate_lineups
+                            )
+                            slate_date = st.session_state.dfs_projection_date or str(date.today())
+                            create_dfs_tracking_tables(dfs_conn)
+                            save_slate_projections(dfs_conn, slate_date, players)
+                            save_slate_lineups(dfs_conn, slate_date, lineups)
+                            st.toast(f"📊 Slate saved for {slate_date} tracking")
+                        except Exception as e:
+                            st.warning(f"⚠️ Could not save slate for tracking: {e}")
                     else:
                         st.error("❌ Could not generate any valid lineups. Try adjusting constraints.")
 
@@ -13213,6 +13232,269 @@ if selected_page == "DFS Lineup Builder":
             else:
                 st.info("No significant stacks (2+ players from same game) found.")
 
+    # ==========================================================================
+    # TAB 5: Model Accuracy
+    # ==========================================================================
+    with builder_tabs[4]:
+        st.subheader("DFS Model Accuracy Tracking")
+        st.caption("Track how well our projections match actual performance across slates")
+
+        try:
+            from dfs_tracking import (
+                create_dfs_tracking_tables,
+                update_slate_actuals,
+                compute_and_store_slate_results,
+                get_dfs_accuracy_summary,
+                get_slate_dates,
+                get_pending_slate_dates,
+                get_slate_projection_df,
+                get_value_accuracy_df,
+                get_slate_lineup_df,
+            )
+            import plotly.express as px
+
+            create_dfs_tracking_tables(dfs_conn)
+
+            # --- Update Actuals Button ---
+            pending_dates = get_pending_slate_dates(dfs_conn)
+            all_dates = get_slate_dates(dfs_conn)
+
+            if not all_dates:
+                st.info("📊 No slates tracked yet. Generate lineups to start tracking model accuracy.")
+            else:
+                col_update1, col_update2 = st.columns([2, 1])
+                with col_update1:
+                    update_dates = st.multiselect(
+                        "Select slates to update",
+                        all_dates,
+                        default=pending_dates[:5] if pending_dates else [],
+                        help="Pick slate dates to pull actual results from game logs"
+                    )
+                with col_update2:
+                    st.write("")  # Spacing
+                    st.write("")
+                    if st.button("🔄 Update Actuals from Game Logs", type="primary", use_container_width=True):
+                        if update_dates:
+                            with st.spinner("Updating actuals..."):
+                                for sd in update_dates:
+                                    updated, not_found = update_slate_actuals(dfs_conn, sd)
+                                    results = compute_and_store_slate_results(dfs_conn, sd)
+                                    if results:
+                                        st.toast(f"✅ {sd}: {updated} players updated (MAE: {results['proj_mae']:.1f})")
+                                    else:
+                                        st.toast(f"⚠️ {sd}: {updated} updated, {not_found} not found — insufficient data for metrics")
+
+                                # S3 backup
+                                try:
+                                    from s3_storage import S3PredictionStorage
+                                    s3 = S3PredictionStorage()
+                                    if s3.is_connected():
+                                        success, msg = s3.upload_database(db_path)
+                                        if success:
+                                            st.toast("☁️ Database backed up to S3")
+                                except Exception:
+                                    pass
+
+                            st.rerun()
+                        else:
+                            st.warning("Select at least one slate date to update.")
+
+                # --- Summary Table ---
+                st.divider()
+                summary_df = get_dfs_accuracy_summary(dfs_conn)
+
+                if not summary_df.empty:
+                    st.subheader("📋 Slate Results Summary")
+
+                    display_summary = summary_df[[
+                        'slate_date', 'num_players', 'num_lineups',
+                        'proj_mae', 'proj_correlation', 'proj_within_range_pct',
+                        'best_lineup_actual_fpts', 'optimal_lineup_fpts', 'lineup_efficiency_pct'
+                    ]].copy()
+
+                    display_summary.columns = [
+                        'Date', 'Players', 'Lineups',
+                        'Proj MAE', 'Correlation', 'In Range %',
+                        'Best Lineup', 'Optimal', 'Efficiency %'
+                    ]
+
+                    # Format numeric columns
+                    for col in ['Proj MAE', 'Correlation', 'In Range %', 'Best Lineup', 'Optimal', 'Efficiency %']:
+                        display_summary[col] = display_summary[col].apply(
+                            lambda x: f"{x:.1f}" if pd.notna(x) else "—"
+                        )
+
+                    st.dataframe(display_summary, use_container_width=True, hide_index=True)
+
+                    # --- Trend Charts (3+ slates) ---
+                    if len(summary_df) >= 2:
+                        st.divider()
+                        st.subheader("📈 Trends Over Time")
+
+                        trend_cols = st.columns(2)
+
+                        with trend_cols[0]:
+                            # MAE over time
+                            fig_mae = px.line(
+                                summary_df.sort_values('slate_date'),
+                                x='slate_date', y='proj_mae',
+                                title='Projection MAE Over Time',
+                                labels={'slate_date': 'Slate Date', 'proj_mae': 'Mean Absolute Error'},
+                                markers=True
+                            )
+                            fig_mae.update_layout(height=350)
+                            st.plotly_chart(fig_mae, use_container_width=True)
+
+                        with trend_cols[1]:
+                            # Lineup efficiency over time
+                            eff_df = summary_df.dropna(subset=['lineup_efficiency_pct']).sort_values('slate_date')
+                            if not eff_df.empty:
+                                fig_eff = px.line(
+                                    eff_df,
+                                    x='slate_date', y='lineup_efficiency_pct',
+                                    title='Lineup Efficiency % Over Time',
+                                    labels={'slate_date': 'Slate Date', 'lineup_efficiency_pct': 'Efficiency %'},
+                                    markers=True
+                                )
+                                fig_eff.update_layout(height=350)
+                                st.plotly_chart(fig_eff, use_container_width=True)
+
+                        # Per-stat MAE comparison (latest slate)
+                        latest = summary_df.iloc[0]
+                        stat_mae_data = {
+                            'Stat': ['Points', 'Rebounds', 'Assists', 'Steals', 'Blocks', 'Turnovers', '3PM'],
+                            'MAE': [
+                                latest.get('stat_mae_points'),
+                                latest.get('stat_mae_rebounds'),
+                                latest.get('stat_mae_assists'),
+                                latest.get('stat_mae_steals'),
+                                latest.get('stat_mae_blocks'),
+                                latest.get('stat_mae_turnovers'),
+                                latest.get('stat_mae_fg3m'),
+                            ]
+                        }
+                        stat_mae_df = pd.DataFrame(stat_mae_data).dropna()
+
+                        if not stat_mae_df.empty:
+                            fig_stat = px.bar(
+                                stat_mae_df,
+                                x='Stat', y='MAE',
+                                title=f'Per-Stat MAE — {latest["slate_date"]}',
+                                color='MAE',
+                                color_continuous_scale='Reds',
+                            )
+                            fig_stat.update_layout(height=350, showlegend=False)
+                            st.plotly_chart(fig_stat, use_container_width=True)
+
+                    # --- Slate Detail ---
+                    st.divider()
+                    st.subheader("🔍 Slate Detail")
+
+                    detail_date = st.selectbox(
+                        "Select a slate to inspect",
+                        summary_df['slate_date'].tolist(),
+                        help="View detailed projection vs actual breakdown"
+                    )
+
+                    if detail_date:
+                        detail_df = get_slate_projection_df(dfs_conn, detail_date)
+
+                        if not detail_df.empty:
+                            # Scatter plot: projected vs actual FPTS
+                            fig_scatter = px.scatter(
+                                detail_df,
+                                x='proj_fpts', y='actual_fpts',
+                                hover_name='player_name',
+                                hover_data=['team', 'salary'],
+                                title=f'Projected vs Actual FPTS — {detail_date}',
+                                labels={'proj_fpts': 'Projected FPTS', 'actual_fpts': 'Actual FPTS'},
+                                trendline='ols',
+                            )
+                            # Add perfect prediction line
+                            max_val = max(detail_df['proj_fpts'].max(), detail_df['actual_fpts'].max())
+                            fig_scatter.add_shape(
+                                type='line', x0=0, y0=0, x1=max_val, y1=max_val,
+                                line=dict(color='gray', dash='dash', width=1)
+                            )
+                            fig_scatter.update_layout(height=500)
+                            st.plotly_chart(fig_scatter, use_container_width=True)
+
+                            # Key metrics for this slate
+                            slate_result_df = summary_df[summary_df['slate_date'] == detail_date]
+                            if not slate_result_df.empty:
+                                slate_result = slate_result_df.iloc[0]
+                                m1, m2, m3, m4 = st.columns(4)
+                                m1.metric("Proj MAE", f"{slate_result['proj_mae']:.1f}" if pd.notna(slate_result['proj_mae']) else "—")
+                                m2.metric("Correlation", f"{slate_result['proj_correlation']:.3f}" if pd.notna(slate_result['proj_correlation']) else "—")
+                                m3.metric("In Range %", f"{slate_result['proj_within_range_pct']:.1f}%" if pd.notna(slate_result['proj_within_range_pct']) else "—")
+                                m4.metric("Efficiency %", f"{slate_result['lineup_efficiency_pct']:.1f}%" if pd.notna(slate_result['lineup_efficiency_pct']) else "—")
+
+                            # Value accuracy table
+                            with st.expander("💰 Value Accuracy — Top & Bottom FPTS/$ Picks"):
+                                value_df = get_value_accuracy_df(dfs_conn, detail_date)
+                                if not value_df.empty:
+                                    st.markdown("**Top 10 by Projected FPTS/$:**")
+                                    top10 = value_df.head(10).copy()
+                                    top10['fpts_per_dollar'] = top10['fpts_per_dollar'].apply(lambda x: f"{x:.2f}")
+                                    top10['actual_fpts_per_dollar'] = top10['actual_fpts_per_dollar'].apply(lambda x: f"{x:.2f}")
+                                    top10['proj_fpts'] = top10['proj_fpts'].apply(lambda x: f"{x:.1f}")
+                                    top10['actual_fpts'] = top10['actual_fpts'].apply(lambda x: f"{x:.1f}")
+                                    top10['salary'] = top10['salary'].apply(lambda x: f"${x:,}")
+                                    top10['value_diff'] = top10['value_diff'].apply(lambda x: f"{x:+.1f}")
+                                    top10.columns = ['Player', 'Team', 'Salary', 'Proj $/K', 'Proj FPTS', 'Actual FPTS', 'Pos', 'Actual $/K', 'Diff']
+                                    st.dataframe(top10, use_container_width=True, hide_index=True)
+
+                                    st.markdown("**Bottom 10 by Projected FPTS/$:**")
+                                    bottom10 = value_df.tail(10).copy()
+                                    bottom10['fpts_per_dollar'] = bottom10['fpts_per_dollar'].apply(lambda x: f"{x:.2f}")
+                                    bottom10['actual_fpts_per_dollar'] = bottom10['actual_fpts_per_dollar'].apply(lambda x: f"{x:.2f}")
+                                    bottom10['proj_fpts'] = bottom10['proj_fpts'].apply(lambda x: f"{x:.1f}")
+                                    bottom10['actual_fpts'] = bottom10['actual_fpts'].apply(lambda x: f"{x:.1f}")
+                                    bottom10['salary'] = bottom10['salary'].apply(lambda x: f"${x:,}")
+                                    bottom10['value_diff'] = bottom10['value_diff'].apply(lambda x: f"{x:+.1f}")
+                                    bottom10.columns = ['Player', 'Team', 'Salary', 'Proj $/K', 'Proj FPTS', 'Actual FPTS', 'Pos', 'Actual $/K', 'Diff']
+                                    st.dataframe(bottom10, use_container_width=True, hide_index=True)
+
+                            # Lineup performance breakdown
+                            with st.expander("📊 Lineup Performance Breakdown"):
+                                lineup_perf = get_slate_lineup_df(dfs_conn, detail_date)
+                                if not lineup_perf.empty and lineup_perf['total_actual_fpts'].notna().any():
+                                    fig_lineup = px.bar(
+                                        lineup_perf.dropna(subset=['total_actual_fpts']),
+                                        x='lineup_num',
+                                        y=['total_proj_fpts', 'total_actual_fpts'],
+                                        barmode='group',
+                                        title=f'Lineup Performance — {detail_date}',
+                                        labels={'lineup_num': 'Lineup #', 'value': 'Fantasy Points', 'variable': 'Type'},
+                                    )
+                                    fig_lineup.update_layout(height=400)
+                                    st.plotly_chart(fig_lineup, use_container_width=True)
+                                else:
+                                    st.info("Lineup actuals not yet available. Click 'Update Actuals' after games complete.")
+
+                            # Full player projection table
+                            with st.expander("📋 Full Player Projections vs Actuals"):
+                                show_df = detail_df[['player_name', 'team', 'salary', 'proj_fpts', 'actual_fpts',
+                                                      'proj_points', 'actual_points', 'proj_rebounds', 'actual_rebounds',
+                                                      'proj_assists', 'actual_assists']].copy()
+                                show_df['error'] = show_df['actual_fpts'] - show_df['proj_fpts']
+                                show_df = show_df.sort_values('error', key=abs, ascending=False)
+                                show_df.columns = ['Player', 'Team', 'Salary', 'Proj FPTS', 'Actual FPTS',
+                                                   'Proj PTS', 'Act PTS', 'Proj REB', 'Act REB',
+                                                   'Proj AST', 'Act AST', 'Error']
+                                for col in ['Proj FPTS', 'Actual FPTS', 'Proj PTS', 'Act PTS', 'Proj REB', 'Act REB', 'Proj AST', 'Act AST', 'Error']:
+                                    show_df[col] = show_df[col].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "—")
+                                show_df['Salary'] = show_df['Salary'].apply(lambda x: f"${int(x):,}" if pd.notna(x) else "—")
+                                st.dataframe(show_df, use_container_width=True, hide_index=True)
+                        else:
+                            st.info("No actual data available for this slate yet.")
+                else:
+                    st.info("No slate results computed yet. Click 'Update Actuals' to compute accuracy metrics.")
+
+        except Exception as e:
+            st.error(f"❌ Error loading model accuracy: {e}")
+            import traceback
+            st.code(traceback.format_exc())
 
 st.divider()
 st.caption(
