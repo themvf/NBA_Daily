@@ -12,6 +12,7 @@ Tables:
 """
 
 import sqlite3
+import unicodedata
 import numpy as np
 import pandas as pd
 from datetime import datetime
@@ -103,6 +104,20 @@ def create_dfs_tracking_tables(conn: sqlite3.Connection) -> None:
             created_at TEXT
         );
     """)
+
+    # Migration-safe column additions (won't fail if columns already exist)
+    migrations = [
+        ("dfs_slate_projections", "ownership_proj", "REAL"),
+        ("dfs_slate_projections", "actual_ownership", "REAL"),
+        ("dfs_slate_results", "ownership_mae", "REAL"),
+        ("dfs_slate_results", "ownership_correlation", "REAL"),
+    ]
+    for table, col, col_type in migrations:
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
     conn.commit()
 
 
@@ -132,14 +147,15 @@ def save_slate_projections(
                 slate_date, player_id, player_name, team, opponent,
                 salary, positions, proj_fpts, proj_points, proj_rebounds,
                 proj_assists, proj_steals, proj_blocks, proj_turnovers,
-                proj_fg3m, proj_floor, proj_ceiling, fpts_per_dollar
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                proj_fg3m, proj_floor, proj_ceiling, fpts_per_dollar,
+                ownership_proj
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             slate_date, p.player_id, p.name, p.team, p.opponent,
             p.salary, ','.join(p.positions), p.proj_fpts, p.proj_points,
             p.proj_rebounds, p.proj_assists, p.proj_steals, p.proj_blocks,
             p.proj_turnovers, p.proj_fg3m, p.proj_floor, p.proj_ceiling,
-            p.fpts_per_dollar
+            p.fpts_per_dollar, p.ownership_proj
         ))
         saved += 1
 
@@ -323,6 +339,82 @@ def _update_lineup_actuals(conn: sqlite3.Connection, slate_date: str) -> None:
 
 
 # =============================================================================
+# Import Contest Results (post-contest ownership data)
+# =============================================================================
+
+def import_contest_results(
+    conn: sqlite3.Connection,
+    slate_date: str,
+    ownership_map: Dict[str, float],
+    actual_fpts_map: Dict[str, float]
+) -> Tuple[int, int]:
+    """Import actual ownership from contest standings CSV.
+
+    Matches player names from the contest CSV to dfs_slate_projections rows
+    and updates actual_ownership. Uses normalized name matching to handle
+    minor discrepancies (accents, suffixes, etc).
+
+    Args:
+        conn: SQLite connection
+        slate_date: Date string (YYYY-MM-DD)
+        ownership_map: {player_name: ownership_pct} from parse_contest_standings()
+        actual_fpts_map: {player_name: fpts} from parse_contest_standings()
+
+    Returns:
+        Tuple of (matched_count, unmatched_count)
+    """
+    cursor = conn.cursor()
+
+    # Get all projected players for this slate
+    rows = cursor.execute(
+        "SELECT player_id, player_name FROM dfs_slate_projections WHERE slate_date = ?",
+        (slate_date,)
+    ).fetchall()
+
+    if not rows:
+        return 0, len(ownership_map)
+
+    # Build normalized name lookup from contest data
+    # Normalize: lowercase, strip accents, remove suffixes like Jr./Sr./III
+    def _normalize(name: str) -> str:
+        n = name.strip().lower()
+        # Remove common suffixes
+        for suffix in [' jr.', ' jr', ' sr.', ' sr', ' iii', ' ii', ' iv']:
+            if n.endswith(suffix):
+                n = n[:-len(suffix)].strip()
+        # Strip accents (e.g., Nikola Jokić -> nikola jokic)
+        n = unicodedata.normalize('NFKD', n).encode('ascii', 'ignore').decode('ascii')
+        return n
+
+    contest_by_norm = {}
+    for name, own_pct in ownership_map.items():
+        norm = _normalize(name)
+        contest_by_norm[norm] = (name, own_pct, actual_fpts_map.get(name, 0.0))
+
+    matched = 0
+    unmatched_players = []
+
+    for player_id, player_name in rows:
+        norm_name = _normalize(player_name)
+
+        if norm_name in contest_by_norm:
+            _, own_pct, _ = contest_by_norm[norm_name]
+            cursor.execute(
+                "UPDATE dfs_slate_projections SET actual_ownership = ? "
+                "WHERE slate_date = ? AND player_id = ?",
+                (own_pct, slate_date, player_id)
+            )
+            matched += 1
+        else:
+            unmatched_players.append(player_name)
+
+    conn.commit()
+
+    unmatched_count = len(unmatched_players)
+    return matched, unmatched_count
+
+
+# =============================================================================
 # Optimal Lineup Computation
 # =============================================================================
 
@@ -479,6 +571,20 @@ def compute_and_store_slate_results(conn: sqlite3.Connection, slate_date: str) -
     else:
         lineup_efficiency = None
 
+    # --- Ownership Accuracy ---
+    ownership_mae = None
+    ownership_corr = None
+
+    if 'ownership_proj' in df.columns and 'actual_ownership' in df.columns:
+        own_df = df[['ownership_proj', 'actual_ownership']].dropna()
+        if len(own_df) >= 5:
+            own_errors = (own_df['actual_ownership'] - own_df['ownership_proj']).abs()
+            ownership_mae = float(own_errors.mean())
+            if own_df['ownership_proj'].std() > 0 and own_df['actual_ownership'].std() > 0:
+                ownership_corr = float(
+                    own_df['ownership_proj'].corr(own_df['actual_ownership'])
+                )
+
     # --- Value Accuracy ---
     value_df = df[['fpts_per_dollar', 'actual_fpts', 'salary']].dropna().copy()
     value_df = value_df[value_df['salary'] > 0]  # Guard against division by zero
@@ -521,6 +627,8 @@ def compute_and_store_slate_results(conn: sqlite3.Connection, slate_date: str) -
         'top10_value_avg_actual': top10_val_avg,
         'bottom10_value_avg_actual': bottom10_val_avg,
         'value_correlation': value_corr,
+        'ownership_mae': ownership_mae,
+        'ownership_correlation': ownership_corr,
         'created_at': datetime.now().isoformat(),
     }
 
@@ -533,6 +641,7 @@ def compute_and_store_slate_results(conn: sqlite3.Connection, slate_date: str) -
             best_lineup_actual_fpts, optimal_lineup_fpts, lineup_efficiency_pct,
             avg_lineup_actual_fpts,
             top10_value_avg_actual, bottom10_value_avg_actual, value_correlation,
+            ownership_mae, ownership_correlation,
             created_at
         ) VALUES (
             :slate_date, :num_players, :num_lineups,
@@ -542,6 +651,7 @@ def compute_and_store_slate_results(conn: sqlite3.Connection, slate_date: str) -
             :best_lineup_actual_fpts, :optimal_lineup_fpts, :lineup_efficiency_pct,
             :avg_lineup_actual_fpts,
             :top10_value_avg_actual, :bottom10_value_avg_actual, :value_correlation,
+            :ownership_mae, :ownership_correlation,
             :created_at
         )
     """, results)

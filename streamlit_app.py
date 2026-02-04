@@ -13332,7 +13332,9 @@ if selected_page == "DFS Lineup Builder":
                 get_slate_projection_df,
                 get_value_accuracy_df,
                 get_slate_lineup_df,
+                import_contest_results,
             )
+            from dfs_optimizer import parse_contest_standings
             import plotly.express as px
 
             create_dfs_tracking_tables(dfs_conn)
@@ -13381,6 +13383,83 @@ if selected_page == "DFS Lineup Builder":
                         else:
                             st.warning("Select at least one slate date to update.")
 
+                # --- Contest Results Upload ---
+                st.divider()
+                st.subheader("📥 Import Contest Results")
+                contest_file = st.file_uploader(
+                    "Upload DraftKings Contest Standings CSV",
+                    type=['csv'],
+                    help="Download from DraftKings after contest completes (contest-standings-*.csv). "
+                         "Extracts actual ownership (%Drafted) and FPTS per player."
+                )
+                if contest_file:
+                    import tempfile, os
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.csv')
+                    tmp_path = tmp.name
+                    try:
+                        tmp.write(contest_file.read())
+                        tmp.close()
+
+                        ownership_map, actual_fpts_map = parse_contest_standings(tmp_path)
+
+                        if ownership_map:
+                            st.success(f"✅ Parsed {len(ownership_map)} players from contest standings")
+
+                            # Let user pick which slate this belongs to
+                            contest_slate_options = all_dates if all_dates else []
+                            # Also offer today's date
+                            today_str = date.today().strftime('%Y-%m-%d')
+                            if today_str not in contest_slate_options:
+                                contest_slate_options = [today_str] + contest_slate_options
+
+                            contest_slate = st.selectbox(
+                                "Match to slate date",
+                                contest_slate_options,
+                                help="Select which slate these contest results belong to"
+                            )
+
+                            # Preview top-10 owned players
+                            preview_data = sorted(
+                                ownership_map.items(), key=lambda x: x[1], reverse=True
+                            )[:10]
+                            preview_df = pd.DataFrame(preview_data, columns=['Player', 'Own%'])
+                            preview_df['FPTS'] = preview_df['Player'].map(actual_fpts_map).apply(
+                                lambda x: f"{x:.1f}" if pd.notna(x) else "—"
+                            )
+                            preview_df['Own%'] = preview_df['Own%'].apply(lambda x: f"{x:.1f}%")
+                            st.caption("Top 10 most-owned players:")
+                            st.dataframe(preview_df, use_container_width=True, hide_index=True)
+
+                            if st.button("💾 Import Ownership Data", type="primary"):
+                                matched, unmatched = import_contest_results(
+                                    dfs_conn, contest_slate, ownership_map, actual_fpts_map
+                                )
+                                st.toast(f"✅ Matched {matched} players, {unmatched} unmatched")
+
+                                # Recompute slate results with ownership data
+                                results = compute_and_store_slate_results(dfs_conn, contest_slate)
+                                if results and results.get('ownership_mae') is not None:
+                                    st.toast(f"📊 Ownership MAE: {results['ownership_mae']:.1f}%")
+
+                                # S3 backup
+                                try:
+                                    _s3_backup_db(db_path, toast=True)
+                                except Exception:
+                                    pass
+
+                                st.rerun()
+                        else:
+                            st.warning("⚠️ No player ownership data found in CSV. Check the file format.")
+
+                    except Exception as e:
+                        st.error(f"❌ Error parsing contest CSV: {e}")
+                    finally:
+                        if os.path.exists(tmp_path):
+                            try:
+                                os.unlink(tmp_path)
+                            except OSError:
+                                pass
+
                 # --- Summary Table ---
                 st.divider()
                 summary_df = get_dfs_accuracy_summary(dfs_conn)
@@ -13388,20 +13467,27 @@ if selected_page == "DFS Lineup Builder":
                 if not summary_df.empty:
                     st.subheader("📋 Slate Results Summary")
 
-                    display_summary = summary_df[[
+                    # Include ownership columns if they exist
+                    summary_cols = [
                         'slate_date', 'num_players', 'num_lineups',
                         'proj_mae', 'proj_correlation', 'proj_within_range_pct',
                         'best_lineup_actual_fpts', 'optimal_lineup_fpts', 'lineup_efficiency_pct'
-                    ]].copy()
-
-                    display_summary.columns = [
+                    ]
+                    col_names = [
                         'Date', 'Players', 'Lineups',
                         'Proj MAE', 'Correlation', 'In Range %',
                         'Best Lineup', 'Optimal', 'Efficiency %'
                     ]
+                    if 'ownership_mae' in summary_df.columns:
+                        summary_cols.extend(['ownership_mae', 'ownership_correlation'])
+                        col_names.extend(['Own MAE', 'Own Corr'])
+
+                    display_summary = summary_df[summary_cols].copy()
+                    display_summary.columns = col_names
 
                     # Format numeric columns
-                    for col in ['Proj MAE', 'Correlation', 'In Range %', 'Best Lineup', 'Optimal', 'Efficiency %']:
+                    fmt_cols = [c for c in display_summary.columns if c not in ('Date', 'Players', 'Lineups')]
+                    for col in fmt_cols:
                         display_summary[col] = display_summary[col].apply(
                             lambda x: f"{x:.1f}" if pd.notna(x) else "—"
                         )
@@ -13510,6 +13596,82 @@ if selected_page == "DFS Lineup Builder":
                                 m2.metric("Correlation", f"{slate_result['proj_correlation']:.3f}" if pd.notna(slate_result['proj_correlation']) else "—")
                                 m3.metric("In Range %", f"{slate_result['proj_within_range_pct']:.1f}%" if pd.notna(slate_result['proj_within_range_pct']) else "—")
                                 m4.metric("Efficiency %", f"{slate_result['lineup_efficiency_pct']:.1f}%" if pd.notna(slate_result['lineup_efficiency_pct']) else "—")
+
+                            # --- Ownership Analysis ---
+                            has_ownership = (
+                                'ownership_proj' in detail_df.columns
+                                and 'actual_ownership' in detail_df.columns
+                                and detail_df['actual_ownership'].notna().sum() >= 5
+                            )
+                            if has_ownership:
+                                with st.expander("🎯 Ownership Analysis", expanded=True):
+                                    own_df = detail_df[['player_name', 'team', 'salary',
+                                                         'ownership_proj', 'actual_ownership',
+                                                         'actual_fpts']].dropna(
+                                        subset=['ownership_proj', 'actual_ownership']
+                                    ).copy()
+
+                                    if not own_df.empty:
+                                        # Ownership metrics
+                                        own_m1, own_m2, own_m3 = st.columns(3)
+                                        own_err = (own_df['actual_ownership'] - own_df['ownership_proj']).abs()
+                                        own_mae = own_err.mean()
+                                        own_m1.metric("Ownership MAE", f"{own_mae:.1f}%")
+
+                                        if own_df['ownership_proj'].std() > 0 and own_df['actual_ownership'].std() > 0:
+                                            own_corr = own_df['ownership_proj'].corr(own_df['actual_ownership'])
+                                            own_m2.metric("Ownership Correlation", f"{own_corr:.3f}")
+                                        else:
+                                            own_m2.metric("Ownership Correlation", "—")
+
+                                        own_m3.metric("Players w/ Ownership", str(len(own_df)))
+
+                                        # Scatter: Projected vs Actual Ownership
+                                        fig_own = px.scatter(
+                                            own_df,
+                                            x='ownership_proj', y='actual_ownership',
+                                            hover_name='player_name',
+                                            hover_data=['team', 'salary', 'actual_fpts'],
+                                            title=f'Projected vs Actual Ownership — {detail_date}',
+                                            labels={'ownership_proj': 'Projected Own%', 'actual_ownership': 'Actual Own%'},
+                                            trendline='ols',
+                                        )
+                                        max_own = max(own_df['ownership_proj'].max(), own_df['actual_ownership'].max())
+                                        fig_own.add_shape(
+                                            type='line', x0=0, y0=0, x1=max_own, y1=max_own,
+                                            line=dict(color='gray', dash='dash', width=1)
+                                        )
+                                        fig_own.update_layout(height=450)
+                                        st.plotly_chart(fig_own, use_container_width=True)
+
+                                        # Biggest Ownership Misses
+                                        own_df['own_error'] = own_df['actual_ownership'] - own_df['ownership_proj']
+                                        own_df['abs_error'] = own_df['own_error'].abs()
+                                        misses = own_df.nlargest(10, 'abs_error').copy()
+                                        misses_display = misses[['player_name', 'team', 'salary',
+                                                                  'ownership_proj', 'actual_ownership',
+                                                                  'own_error', 'actual_fpts']].copy()
+                                        misses_display.columns = ['Player', 'Team', 'Salary',
+                                                                   'Proj Own%', 'Actual Own%',
+                                                                   'Error', 'Actual FPTS']
+                                        for c in ['Proj Own%', 'Actual Own%', 'Error']:
+                                            misses_display[c] = misses_display[c].apply(lambda x: f"{x:+.1f}%" if c == 'Error' else f"{x:.1f}%")
+                                        misses_display['Actual FPTS'] = misses_display['Actual FPTS'].apply(lambda x: f"{x:.1f}")
+                                        misses_display['Salary'] = misses_display['Salary'].apply(lambda x: f"${int(x):,}" if pd.notna(x) else "—")
+                                        st.markdown("**Biggest Ownership Misses** (where our model was most wrong):")
+                                        st.dataframe(misses_display, use_container_width=True, hide_index=True)
+
+                                        # Best Leverage Plays (low ownership + high actual FPTS)
+                                        leverage_df = own_df[own_df['actual_ownership'] <= 15].nlargest(10, 'actual_fpts').copy()
+                                        if not leverage_df.empty:
+                                            lev_display = leverage_df[['player_name', 'team', 'salary',
+                                                                        'actual_ownership', 'actual_fpts']].copy()
+                                            lev_display.columns = ['Player', 'Team', 'Salary', 'Actual Own%', 'Actual FPTS']
+                                            lev_display['Actual Own%'] = lev_display['Actual Own%'].apply(lambda x: f"{x:.1f}%")
+                                            lev_display['Actual FPTS'] = lev_display['Actual FPTS'].apply(lambda x: f"{x:.1f}")
+                                            lev_display['Salary'] = lev_display['Salary'].apply(lambda x: f"${int(x):,}" if pd.notna(x) else "—")
+                                            st.markdown("**Best Leverage Plays** (≤15% owned, highest actual FPTS):")
+                                            st.dataframe(lev_display, use_container_width=True, hide_index=True)
 
                             # Value accuracy table
                             with st.expander("💰 Value Accuracy — Top & Bottom FPTS/$ Picks"):

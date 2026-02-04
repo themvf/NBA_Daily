@@ -511,8 +511,9 @@ class DFSPlayer:
     is_injured: bool = False     # Player is OUT/DOUBTFUL - auto-excluded
     injury_status: str = ""      # Injury status (OUT, DOUBTFUL, etc.)
 
-    # DraftKings ID for export
+    # DraftKings data
     dk_id: str = ""
+    dk_avg_pts: float = 0.0  # AvgPointsPerGame from DK CSV
 
     # Rest day tracking (sophisticated predictions)
     days_rest: Optional[int] = None
@@ -543,9 +544,10 @@ class DFSPlayer:
         if self.salary > 0:
             self.fpts_per_dollar = (self.proj_fpts / self.salary) * 1000
 
-        # Leverage score: ceiling upside relative to expected ownership
+        # Leverage score: projection + amplified upside, relative to ownership
         if self.ownership_proj > 0:
-            self.leverage_score = self.proj_ceiling / self.ownership_proj
+            upside = max(0, self.proj_ceiling - self.proj_fpts)
+            self.leverage_score = (self.proj_fpts + upside * 1.5) / max(1, self.ownership_proj)
 
     def can_fill_slot(self, slot: str) -> bool:
         """Check if player can fill a roster slot."""
@@ -848,6 +850,43 @@ STAT_OPP_ADJUSTMENT_MAP = {
     'assists':  {'defense_key': 'avg_allowed_ast', 'league_avg': LEAGUE_AVG_TEAM_AST},
     'fg3m':     {'defense_key': 'avg_allowed_fg3m', 'league_avg': LEAGUE_AVG_TEAM_FG3M},
 }
+
+
+def _estimate_ownership(player) -> float:
+    """Estimate ownership % using salary, value, and DK visibility factors.
+
+    Key drivers of DFS ownership:
+    1. Value (FPTS/$) — optimizers push everyone toward high-value plays
+    2. DK AvgPointsPerGame — visible on the DK player card, influences casual players
+    3. Salary tier — stars are always popular; cheap value plays enable them
+    """
+    if player.salary <= 0 or player.proj_fpts <= 0:
+        return 1.0
+
+    # Factor 1: Value score (0-10 range, normalized)
+    value_score = min(10, player.fpts_per_dollar)
+
+    # Factor 2: DK visibility (AvgPointsPerGame normalized to 0-10)
+    dk_avg = getattr(player, 'dk_avg_pts', 0.0) or 0.0
+    dk_visibility = min(10, dk_avg / 7) if dk_avg > 0 else value_score * 0.7
+
+    # Factor 3: Salary tier multiplier
+    if player.salary >= 9000:
+        salary_mult = 1.3   # Stars are always popular
+    elif player.salary >= 7000:
+        salary_mult = 1.0   # Mid-high tier
+    elif player.salary >= 5000:
+        salary_mult = 1.1   # Mid-range value plays
+    else:
+        salary_mult = 1.2   # Cheap plays enable expensive stars
+
+    # Combine: weighted average with salary multiplier
+    raw_score = (value_score * 0.5 + dk_visibility * 0.5) * salary_mult
+
+    # Scale to realistic ownership range (1-50%)
+    ownership = min(50.0, max(1.0, raw_score * 3.0))
+
+    return round(ownership, 1)
 
 
 def _project_stat_multi_factor(
@@ -1277,14 +1316,13 @@ def generate_player_projections(
     if player.salary > 0:
         player.fpts_per_dollar = (player.proj_fpts / player.salary) * 1000
 
-    # Estimate ownership (higher value = higher ownership)
-    if player.salary > 0 and player.proj_fpts > 0:
-        value_score = player.fpts_per_dollar
-        player.ownership_proj = min(30.0, max(1.0, value_score * 3))
+    # Estimate ownership using multi-factor model
+    player.ownership_proj = _estimate_ownership(player)
 
-    # Leverage score (ceiling / ownership)
+    # Leverage score: projection + amplified upside, relative to ownership
     if player.ownership_proj > 0:
-        player.leverage_score = player.proj_ceiling / player.ownership_proj
+        upside = max(0, player.proj_ceiling - player.proj_fpts)
+        player.leverage_score = (player.proj_fpts + upside * 1.5) / max(1, player.ownership_proj)
 
     # Get player position for display
     player.position = _get_player_position(conn, player.player_id)
@@ -1431,6 +1469,7 @@ def parse_dk_csv(
             positions=positions,
             salary=dk_salary,
             dk_id=str(row.get('id', '')),
+            dk_avg_pts=dk_avg_pts if dk_avg_pts >= 0 else 0.0,
             is_injured=is_injured,
             injury_status=injury_status.upper() if injury_status else ""
         )
@@ -1684,10 +1723,11 @@ def generate_diversified_lineups(
 
     # Strategy configuration: (strategy, randomization_factor, target_count_pct)
     strategies = [
-        ('projection', 0.25, 0.25),  # 25% of lineups, moderate randomization
-        ('ceiling', 0.30, 0.30),     # 30% of lineups, higher randomization
-        ('value', 0.25, 0.20),       # 20% of lineups, moderate randomization
-        ('projection', 0.60, 0.25), # 25% "balanced" - high randomization
+        ('projection', 0.25, 0.20),  # 20% — core projection-optimal
+        ('ceiling', 0.30, 0.25),     # 25% — upside-focused
+        ('value', 0.25, 0.15),       # 15% — value-focused
+        ('leverage', 0.35, 0.15),    # 15% — low-own/high-ceiling contrarian
+        ('projection', 0.60, 0.25),  # 25% — balanced high-randomization
     ]
 
     total_generated = 0
@@ -1822,3 +1862,84 @@ def generate_stack_report(lineups: List[DFSLineup]) -> pd.DataFrame:
         df = df.sort_values(['stack_size', 'count'], ascending=[False, False])
 
     return df
+
+
+# =============================================================================
+# Contest Results Parser
+# =============================================================================
+
+def parse_contest_standings(csv_path) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """Parse DraftKings contest standings CSV to extract actual ownership and FPTS.
+
+    The DK contest standings CSV has a dual-column layout:
+    - Left (cols 0-5): Entry standings (Rank, EntryId, EntryName, TimeRemaining, Points, Lineup)
+    - Col 6: Empty separator
+    - Right (cols 7-10): Player data (Player, Roster Position, %Drafted, FPTS)
+
+    The player data is a separate list sorted by %Drafted descending.
+
+    Args:
+        csv_path: Path to contest standings CSV file.
+
+    Returns:
+        Tuple of:
+        - ownership_map: {player_name: ownership_pct} (e.g., {"Kyle Kuzma": 15.41})
+        - actual_fpts_map: {player_name: fpts} (e.g., {"Kyle Kuzma": 57.0})
+    """
+    df = pd.read_csv(csv_path, encoding='utf-8-sig')
+
+    ownership_map = {}
+    actual_fpts_map = {}
+
+    # The player data is in columns: Player, Roster Position, %Drafted, FPTS
+    # These are columns index 7, 8, 9, 10 (after the empty separator col 6)
+    cols = df.columns.tolist()
+
+    # Find the Player and %Drafted columns by name
+    player_col = None
+    drafted_col = None
+    fpts_col = None
+
+    for i, col in enumerate(cols):
+        col_lower = str(col).strip().lower()
+        if col_lower == 'player':
+            player_col = col
+        elif col_lower == '%drafted':
+            drafted_col = col
+        elif col_lower == 'fpts':
+            fpts_col = col
+
+    if player_col is None or drafted_col is None:
+        raise ValueError(
+            f"Could not find 'Player' and '%Drafted' columns. "
+            f"Available columns: {cols}"
+        )
+
+    for _, row in df.iterrows():
+        player_name = str(row.get(player_col, '')).strip()
+        if not player_name or player_name == 'nan':
+            continue
+
+        # Parse %Drafted (e.g., "48.22%" -> 48.22)
+        drafted_str = str(row.get(drafted_col, '0')).strip().replace('%', '')
+        try:
+            ownership = float(drafted_str)
+            if not (0 <= ownership <= 100):
+                continue  # Skip invalid ownership values
+        except (ValueError, TypeError):
+            continue
+
+        # Parse FPTS
+        fpts = 0.0
+        if fpts_col:
+            try:
+                fpts = float(row.get(fpts_col, 0))
+            except (ValueError, TypeError):
+                fpts = 0.0
+
+        # Only keep first occurrence (highest ownership if duplicates)
+        if player_name not in ownership_map:
+            ownership_map[player_name] = ownership
+            actual_fpts_map[player_name] = fpts
+
+    return ownership_map, actual_fpts_map
