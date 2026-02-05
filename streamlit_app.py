@@ -13361,42 +13361,38 @@ if selected_page == "DFS Lineup Builder":
             if not all_dates:
                 st.info("📊 No slates tracked yet. Generate lineups to start tracking model accuracy.")
             else:
-                col_update1, col_update2 = st.columns([2, 1])
-                with col_update1:
-                    update_dates = st.multiselect(
-                        "Select slates to update",
-                        all_dates,
-                        default=pending_dates[:5] if pending_dates else [],
-                        help="Pick slate dates to pull actual results from game logs"
-                    )
-                with col_update2:
-                    st.write("")  # Spacing
-                    st.write("")
-                    if st.button("🔄 Update Actuals from Game Logs", type="primary", use_container_width=True):
-                        if update_dates:
-                            with st.spinner("Updating actuals..."):
-                                for sd in update_dates:
-                                    updated, not_found = update_slate_actuals(dfs_conn, sd)
-                                    results = compute_and_store_slate_results(dfs_conn, sd)
-                                    if results:
-                                        st.toast(f"✅ {sd}: {updated} players updated (MAE: {results['proj_mae']:.1f})")
-                                    else:
-                                        st.toast(f"⚠️ {sd}: {updated} updated, {not_found} not found — insufficient data for metrics")
+                # Show pending slates count
+                if pending_dates:
+                    st.info(f"📋 **{len(pending_dates)} slate(s)** pending actuals update: {', '.join(pending_dates[:5])}{'...' if len(pending_dates) > 5 else ''}")
 
-                                # S3 backup
-                                try:
-                                    from s3_storage import S3PredictionStorage
-                                    s3 = S3PredictionStorage()
-                                    if s3.is_connected():
-                                        success, msg = s3.upload_database(db_path)
-                                        if success:
-                                            st.toast("☁️ Database backed up to S3")
-                                except Exception:
-                                    pass
+                if st.button("🔄 Update All Pending Slates", type="primary"):
+                    if pending_dates:
+                        with st.spinner(f"Updating {len(pending_dates)} slate(s)..."):
+                            success_count = 0
+                            for sd in pending_dates:
+                                updated, not_found = update_slate_actuals(dfs_conn, sd)
+                                results = compute_and_store_slate_results(dfs_conn, sd)
+                                if results:
+                                    st.toast(f"✅ {sd}: {updated} players (MAE: {results['proj_mae']:.1f})")
+                                    success_count += 1
+                                else:
+                                    st.toast(f"⚠️ {sd}: insufficient data")
 
-                            st.rerun()
-                        else:
-                            st.warning("Select at least one slate date to update.")
+                            # S3 backup
+                            try:
+                                from s3_storage import S3PredictionStorage
+                                s3 = S3PredictionStorage()
+                                if s3.is_connected():
+                                    success, msg = s3.upload_database(db_path)
+                                    if success:
+                                        st.toast("☁️ Database backed up to S3")
+                            except Exception:
+                                pass
+
+                        st.success(f"✅ Updated {success_count}/{len(pending_dates)} slates")
+                        st.rerun()
+                    else:
+                        st.info("All slates already have actuals. Nothing to update.")
 
                 # --- Contest Results Upload ---
                 st.divider()
@@ -13899,7 +13895,10 @@ if selected_page == "DFS Lineup Builder":
                         # Exposure table
                         exp_display = exposure_df.head(30).copy()
                         exp_display['exposure_pct'] = exp_display['exposure_pct'].apply(lambda x: f"{x:.1f}%")
-                        exp_display.columns = ['Player', 'Times Rostered', 'Contests In', 'Exposure %']
+                        exp_display['avg_salary'] = exp_display['avg_salary'].apply(
+                            lambda x: f"${int(x):,}" if pd.notna(x) else "—"
+                        )
+                        exp_display.columns = ['Player', 'Times Rostered', 'Contests In', 'Exposure %', 'Avg Salary']
                         st.dataframe(exp_display, use_container_width=True, hide_index=True)
 
                     # --- Individual Shark Profile ---
@@ -13931,7 +13930,16 @@ if selected_page == "DFS Lineup Builder":
                             with prof_cols[0]:
                                 st.markdown("**Favorite Players:**")
                                 if profile['favorite_players']:
-                                    fav_data = [{'Player': p, 'Times Used': c} for p, c in profile['favorite_players']]
+                                    fav_data = []
+                                    for item in profile['favorite_players']:
+                                        player_name = item[0]
+                                        times_used = item[1]
+                                        salary = item[2] if len(item) > 2 else None
+                                        fav_data.append({
+                                            'Player': player_name,
+                                            'Times': times_used,
+                                            'Avg Salary': f"${int(salary):,}" if pd.notna(salary) and salary else "—"
+                                        })
                                     fav_df = pd.DataFrame(fav_data)
                                     st.dataframe(fav_df, use_container_width=True, hide_index=True)
 

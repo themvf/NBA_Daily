@@ -912,11 +912,12 @@ def get_shark_player_exposure(
     """Get player exposure for a list of shark users.
 
     Unpivots the 8 lineup position columns and counts how frequently
-    each player appears in shark lineups.
+    each player appears in shark lineups. Joins with projections to get
+    average salary.
 
     Returns:
         DataFrame with columns: player, times_rostered, contests_in,
-        exposure_pct (% of shark lineups using this player)
+        exposure_pct, avg_salary
     """
     if not usernames:
         return pd.DataFrame()
@@ -925,22 +926,22 @@ def get_shark_player_exposure(
 
     return pd.read_sql_query(f"""
         WITH rostered AS (
-            SELECT username, contest_id, pg AS player FROM dfs_contest_entries
-                WHERE username IN ({placeholders}) AND pg != ''
-            UNION ALL SELECT username, contest_id, sg FROM dfs_contest_entries
-                WHERE username IN ({placeholders}) AND sg != ''
-            UNION ALL SELECT username, contest_id, sf FROM dfs_contest_entries
-                WHERE username IN ({placeholders}) AND sf != ''
-            UNION ALL SELECT username, contest_id, pf FROM dfs_contest_entries
-                WHERE username IN ({placeholders}) AND pf != ''
-            UNION ALL SELECT username, contest_id, c FROM dfs_contest_entries
-                WHERE username IN ({placeholders}) AND c != ''
-            UNION ALL SELECT username, contest_id, g FROM dfs_contest_entries
-                WHERE username IN ({placeholders}) AND g != ''
-            UNION ALL SELECT username, contest_id, f FROM dfs_contest_entries
-                WHERE username IN ({placeholders}) AND f != ''
-            UNION ALL SELECT username, contest_id, util FROM dfs_contest_entries
-                WHERE username IN ({placeholders}) AND util != ''
+            SELECT e.username, e.contest_id, e.slate_date, e.pg AS player FROM dfs_contest_entries e
+                WHERE e.username IN ({placeholders}) AND e.pg != ''
+            UNION ALL SELECT e.username, e.contest_id, e.slate_date, e.sg FROM dfs_contest_entries e
+                WHERE e.username IN ({placeholders}) AND e.sg != ''
+            UNION ALL SELECT e.username, e.contest_id, e.slate_date, e.sf FROM dfs_contest_entries e
+                WHERE e.username IN ({placeholders}) AND e.sf != ''
+            UNION ALL SELECT e.username, e.contest_id, e.slate_date, e.pf FROM dfs_contest_entries e
+                WHERE e.username IN ({placeholders}) AND e.pf != ''
+            UNION ALL SELECT e.username, e.contest_id, e.slate_date, e.c FROM dfs_contest_entries e
+                WHERE e.username IN ({placeholders}) AND e.c != ''
+            UNION ALL SELECT e.username, e.contest_id, e.slate_date, e.g FROM dfs_contest_entries e
+                WHERE e.username IN ({placeholders}) AND e.g != ''
+            UNION ALL SELECT e.username, e.contest_id, e.slate_date, e.f FROM dfs_contest_entries e
+                WHERE e.username IN ({placeholders}) AND e.f != ''
+            UNION ALL SELECT e.username, e.contest_id, e.slate_date, e.util FROM dfs_contest_entries e
+                WHERE e.username IN ({placeholders}) AND e.util != ''
         ),
         total_lineups AS (
             SELECT COUNT(*) AS cnt FROM dfs_contest_entries
@@ -950,8 +951,13 @@ def get_shark_player_exposure(
             r.player,
             COUNT(*) AS times_rostered,
             COUNT(DISTINCT r.contest_id) AS contests_in,
-            ROUND(100.0 * COUNT(*) / NULLIF(t.cnt, 0), 1) AS exposure_pct
-        FROM rostered r, total_lineups t
+            ROUND(100.0 * COUNT(*) / NULLIF(t.cnt, 0), 1) AS exposure_pct,
+            ROUND(AVG(p.salary), 0) AS avg_salary
+        FROM rostered r
+        CROSS JOIN total_lineups t
+        LEFT JOIN dfs_slate_projections p
+            ON r.slate_date = p.slate_date
+            AND LOWER(r.player) = LOWER(p.player_name)
         GROUP BY r.player
         ORDER BY times_rostered DESC
         LIMIT 30
@@ -997,21 +1003,24 @@ def get_shark_strategy_profile(
         'max': int(sal_valid.max()) if not sal_valid.empty else None,
     }
 
-    # Favorite players (unpivot)
+    # Favorite players (unpivot with salary join)
     fav_df = pd.read_sql_query("""
         WITH rostered AS (
-            SELECT pg AS player FROM dfs_contest_entries WHERE username = ? AND pg != ''
-            UNION ALL SELECT sg FROM dfs_contest_entries WHERE username = ? AND sg != ''
-            UNION ALL SELECT sf FROM dfs_contest_entries WHERE username = ? AND sf != ''
-            UNION ALL SELECT pf FROM dfs_contest_entries WHERE username = ? AND pf != ''
-            UNION ALL SELECT c FROM dfs_contest_entries WHERE username = ? AND c != ''
-            UNION ALL SELECT g FROM dfs_contest_entries WHERE username = ? AND g != ''
-            UNION ALL SELECT f FROM dfs_contest_entries WHERE username = ? AND f != ''
-            UNION ALL SELECT util FROM dfs_contest_entries WHERE username = ? AND util != ''
+            SELECT e.slate_date, e.pg AS player FROM dfs_contest_entries e WHERE e.username = ? AND e.pg != ''
+            UNION ALL SELECT e.slate_date, e.sg FROM dfs_contest_entries e WHERE e.username = ? AND e.sg != ''
+            UNION ALL SELECT e.slate_date, e.sf FROM dfs_contest_entries e WHERE e.username = ? AND e.sf != ''
+            UNION ALL SELECT e.slate_date, e.pf FROM dfs_contest_entries e WHERE e.username = ? AND e.pf != ''
+            UNION ALL SELECT e.slate_date, e.c FROM dfs_contest_entries e WHERE e.username = ? AND e.c != ''
+            UNION ALL SELECT e.slate_date, e.g FROM dfs_contest_entries e WHERE e.username = ? AND e.g != ''
+            UNION ALL SELECT e.slate_date, e.f FROM dfs_contest_entries e WHERE e.username = ? AND e.f != ''
+            UNION ALL SELECT e.slate_date, e.util FROM dfs_contest_entries e WHERE e.username = ? AND e.util != ''
         )
-        SELECT player, COUNT(*) AS times_used
-        FROM rostered
-        GROUP BY player
+        SELECT r.player, COUNT(*) AS times_used, ROUND(AVG(p.salary), 0) AS avg_salary
+        FROM rostered r
+        LEFT JOIN dfs_slate_projections p
+            ON r.slate_date = p.slate_date
+            AND LOWER(r.player) = LOWER(p.player_name)
+        GROUP BY r.player
         ORDER BY times_used DESC
         LIMIT 15
     """, conn, params=[username] * 8)
