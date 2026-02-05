@@ -12573,6 +12573,14 @@ if selected_page == "DFS Lineup Builder":
         st.subheader("⚙️ Builder Settings")
         num_lineups = st.slider("Number of lineups", 1, 100, 20, step=1)
         max_exposure = st.slider("Max player exposure %", 20, 60, 40, step=5) / 100
+        min_salary = st.slider(
+            "Min player salary",
+            min_value=3000,
+            max_value=5000,
+            value=3000,
+            step=100,
+            help="Filter out players below this salary. Set to $3,100+ to exclude cheap $3K players that may be inactive."
+        )
 
         st.divider()
         st.subheader("📋 DraftKings Rules")
@@ -13096,9 +13104,15 @@ if selected_page == "DFS Lineup Builder":
                         progress_bar.progress(current / total if total > 0 else 0)
                         status_text.text(message)
 
+                    # Apply salary minimum filter
+                    filtered_players = [p for p in players if p.salary >= min_salary]
+                    salary_filtered_count = len(players) - len(filtered_players)
+                    if salary_filtered_count > 0:
+                        st.info(f"💰 Filtered out {salary_filtered_count} players below ${min_salary:,} salary")
+
                     with st.spinner("Optimizing lineups..."):
                         lineups = dfs.generate_diversified_lineups(
-                            player_pool=players,
+                            player_pool=filtered_players,
                             num_lineups=num_lineups,
                             max_player_exposure=max_exposure,
                             progress_callback=update_progress,
