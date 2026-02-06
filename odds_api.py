@@ -908,6 +908,352 @@ def auto_backup_to_s3(db_path: str = 'nba_stats.db') -> bool:
         return False
 
 
+# =============================================================================
+# Vegas Ensemble Integration (for Projection Blending)
+# =============================================================================
+
+def get_vegas_ensemble_projection(
+    conn: sqlite3.Connection,
+    player_id: int,
+    game_date: str,
+    our_projection: float,
+    vegas_weight: float = 0.30,
+    dynamic_weighting: bool = True
+) -> Tuple[float, Dict[str, Any]]:
+    """
+    Blend our projection with FanDuel Over/Under line for ensemble prediction.
+
+    Vegas lines capture market consensus including:
+    - Injury news that may not be in our model yet
+    - Lineup changes and rotation adjustments
+    - Sharp money movements from professional bettors
+
+    Formula: ensemble = (1 - vegas_weight) * our_projection + vegas_weight * vegas_ou
+
+    Dynamic weighting adjusts vegas_weight based on:
+    - Divergence: Increase Vegas weight when our projection differs significantly
+    - Recent injury returns: Vegas may have better info on returning players
+    - New team situations: Vegas better at pricing trades/acquisitions
+
+    Args:
+        conn: Database connection
+        player_id: Player's database ID
+        game_date: Game date (YYYY-MM-DD)
+        our_projection: Our model's PPG projection
+        vegas_weight: Base weight for Vegas line (default 0.30 = 30%)
+        dynamic_weighting: If True, adjust weight based on divergence
+
+    Returns:
+        Tuple of (ensemble_projection, analytics_dict)
+        analytics_dict contains:
+        - vegas_ou: The FanDuel O/U line
+        - weight_used: Actual weight applied
+        - divergence_pct: How much our projection differs from Vegas
+        - adjustment: Points added/subtracted from our projection
+    """
+    cursor = conn.cursor()
+    analytics = {
+        'vegas_ou': None,
+        'weight_used': 0.0,
+        'divergence_pct': 0.0,
+        'adjustment': 0.0,
+        'blended': False,
+        'reason': 'No Vegas data'
+    }
+
+    # Query for FanDuel O/U line
+    cursor.execute("""
+        SELECT fanduel_ou, fanduel_over_odds, fanduel_under_odds
+        FROM predictions
+        WHERE player_id = ? AND game_date = ?
+        AND fanduel_ou IS NOT NULL
+    """, (player_id, game_date))
+
+    result = cursor.fetchone()
+
+    if not result or result[0] is None:
+        return our_projection, analytics
+
+    vegas_ou = result[0]
+    over_odds = result[1]
+    under_odds = result[2]
+
+    analytics['vegas_ou'] = vegas_ou
+
+    # Calculate divergence
+    if our_projection > 0:
+        divergence_pct = abs(vegas_ou - our_projection) / our_projection * 100
+    else:
+        divergence_pct = 0
+
+    analytics['divergence_pct'] = round(divergence_pct, 1)
+
+    # Dynamic weighting
+    effective_weight = vegas_weight
+
+    if dynamic_weighting:
+        # Increase Vegas weight when divergence is high (>20%)
+        # This suggests Vegas has information we don't
+        if divergence_pct > 30:
+            effective_weight = min(0.50, vegas_weight + 0.15)  # Max 50% Vegas
+            analytics['reason'] = 'High divergence - trusting Vegas more'
+        elif divergence_pct > 20:
+            effective_weight = min(0.45, vegas_weight + 0.10)
+            analytics['reason'] = 'Moderate divergence - increased Vegas weight'
+        else:
+            analytics['reason'] = 'Normal blending'
+
+        # If odds are heavily skewed to one side, Vegas has strong conviction
+        if over_odds and under_odds:
+            odds_skew = abs(over_odds - under_odds)
+            if odds_skew > 30:  # Significant skew
+                effective_weight = min(0.50, effective_weight + 0.05)
+                analytics['reason'] += ' + Vegas has conviction'
+
+    analytics['weight_used'] = round(effective_weight, 2)
+
+    # Calculate ensemble projection
+    ensemble = (1 - effective_weight) * our_projection + effective_weight * vegas_ou
+    ensemble = round(ensemble, 1)
+
+    analytics['adjustment'] = round(ensemble - our_projection, 1)
+    analytics['blended'] = True
+
+    return ensemble, analytics
+
+
+def get_vegas_game_environment(
+    conn: sqlite3.Connection,
+    game_date: str,
+    team_abbrev: str
+) -> Dict[str, Any]:
+    """
+    Get game environment factors derived from Vegas odds.
+
+    This provides context about the game that affects player scoring:
+    - Pace score: High-total games mean more possessions and scoring chances
+    - Blowout risk: Large spreads suggest stars may rest in 4th quarter
+    - OT probability: Close games have higher overtime likelihood
+    - Stack score: Indicates quality of same-game stacking
+
+    Args:
+        conn: Database connection
+        game_date: Game date (YYYY-MM-DD)
+        team_abbrev: Team abbreviation (e.g., 'LAL', 'BOS')
+
+    Returns:
+        Dict with environment factors:
+        - pace_score: game_total / 228 (league avg) - >1 means faster pace
+        - blowout_risk: 0-1 scale, higher = more risk of blowout
+        - ot_probability: 0-1 scale, probability of overtime
+        - stack_score: 0-1 scale, quality for same-game stacking
+        - volatility_multiplier: Factor to expand projection ranges
+        - spread: Point spread (negative = favorite)
+        - total: Game total points (O/U)
+        - is_home: Whether the team is home
+    """
+    cursor = conn.cursor()
+
+    result = {
+        'pace_score': 1.0,
+        'blowout_risk': 0.0,
+        'ot_probability': 0.06,  # League base rate ~6%
+        'stack_score': 0.5,
+        'volatility_multiplier': 1.0,
+        'spread': None,
+        'total': None,
+        'is_home': None,
+        'found': False
+    }
+
+    # Query game_odds table
+    cursor.execute("""
+        SELECT home_team, away_team, spread, total, blowout_risk,
+               ot_probability, stack_score, volatility_multiplier
+        FROM game_odds
+        WHERE date(game_date) = date(?)
+        AND (home_team = ? OR away_team = ?)
+    """, (game_date, team_abbrev, team_abbrev))
+
+    row = cursor.fetchone()
+
+    if not row:
+        return result
+
+    home_team, away_team, spread, total, blowout_risk, ot_prob, stack_score, volatility = row
+
+    result['found'] = True
+    result['is_home'] = (team_abbrev == home_team)
+    result['spread'] = spread
+    result['total'] = total
+
+    # Use stored values if available, otherwise calculate
+    if total:
+        result['pace_score'] = round(total / 228.0, 3)  # 228 is league avg total
+
+    if blowout_risk is not None:
+        result['blowout_risk'] = blowout_risk
+    elif spread is not None:
+        # Calculate blowout risk from spread
+        abs_spread = abs(spread)
+        if abs_spread >= 12:
+            result['blowout_risk'] = min(0.85, 0.6 + (abs_spread - 12) * 0.03)
+        elif abs_spread >= 8:
+            result['blowout_risk'] = 0.4 + (abs_spread - 8) * 0.05
+        else:
+            result['blowout_risk'] = max(0.1, abs_spread * 0.05)
+
+    if ot_prob is not None:
+        result['ot_probability'] = ot_prob
+    elif spread is not None:
+        # Calculate OT probability from spread
+        abs_spread = abs(spread)
+        if abs_spread <= 3.5:
+            result['ot_probability'] = 0.09  # 9% for very close games
+        elif abs_spread <= 6:
+            result['ot_probability'] = 0.07
+        else:
+            result['ot_probability'] = 0.05  # Below base rate for blowouts
+
+    if stack_score is not None:
+        result['stack_score'] = stack_score
+    elif spread is not None and total is not None:
+        # Calculate stack score from spread + total
+        abs_spread = abs(spread)
+        if abs_spread <= 4 and total >= 228:
+            result['stack_score'] = 0.85  # Ideal stacking game
+        elif abs_spread <= 6 and total >= 220:
+            result['stack_score'] = 0.70
+        elif abs_spread <= 8:
+            result['stack_score'] = 0.50
+        else:
+            result['stack_score'] = 0.30  # Avoid stacking blowouts
+
+    if volatility is not None:
+        result['volatility_multiplier'] = volatility
+    elif spread is not None:
+        # Calculate volatility multiplier
+        volatility = 1.0
+        abs_spread = abs(spread)
+        if abs_spread <= 4:
+            volatility += 0.10  # Close games are more volatile
+        if total and total >= 235:
+            volatility += 0.05  # High-scoring games are volatile
+
+        result['volatility_multiplier'] = round(volatility, 2)
+
+    return result
+
+
+def get_vegas_adjusted_projection(
+    conn: sqlite3.Connection,
+    player_id: int,
+    player_name: str,
+    team_abbrev: str,
+    game_date: str,
+    base_projection: float,
+    base_floor: float,
+    base_ceiling: float,
+    season_avg: float,
+    is_star: bool = False
+) -> Tuple[float, float, float, Dict[str, Any]]:
+    """
+    Apply full Vegas adjustments to a player's projection.
+
+    This is the main entry point for Vegas integration into the projection pipeline.
+    It applies:
+    1. Ensemble blending with FanDuel O/U (30% weight)
+    2. Game environment adjustments (blowout risk, pace)
+    3. Volatility adjustments to floor/ceiling ranges
+
+    Args:
+        conn: Database connection
+        player_id: Player's database ID
+        player_name: Player name (for logging)
+        team_abbrev: Team abbreviation
+        game_date: Game date (YYYY-MM-DD)
+        base_projection: Our model's base projection
+        base_floor: Our model's floor estimate
+        base_ceiling: Our model's ceiling estimate
+        season_avg: Player's season scoring average
+        is_star: Whether player is a star (season avg >= 22)
+
+    Returns:
+        Tuple of (adjusted_projection, adjusted_floor, adjusted_ceiling, analytics_dict)
+    """
+    analytics = {
+        'vegas_applied': False,
+        'ensemble': {},
+        'environment': {},
+        'adjustments': []
+    }
+
+    # Step 1: Ensemble blend with FanDuel O/U
+    projection, ensemble_data = get_vegas_ensemble_projection(
+        conn, player_id, game_date, base_projection
+    )
+    analytics['ensemble'] = ensemble_data
+
+    if ensemble_data['blended']:
+        analytics['vegas_applied'] = True
+        analytics['adjustments'].append(f"Vegas blend: {ensemble_data['adjustment']:+.1f}")
+
+    # Step 2: Get game environment
+    environment = get_vegas_game_environment(conn, game_date, team_abbrev)
+    analytics['environment'] = environment
+
+    # Step 3: Apply game environment adjustments
+    floor = base_floor
+    ceiling = base_ceiling
+
+    if environment['found']:
+        analytics['vegas_applied'] = True
+
+        # Blowout risk adjustment for stars
+        if environment['blowout_risk'] >= 0.6 and is_star:
+            # Stars get benched in blowouts - reduce projection
+            blowout_penalty = 0.95  # 5% reduction
+            projection = projection * blowout_penalty
+            ceiling = ceiling * 0.92  # Ceiling reduced more (less upside)
+            analytics['adjustments'].append(f"Blowout risk ({environment['blowout_risk']:.0%}): -5%")
+
+        # High pace game boost
+        if environment['pace_score'] > 1.05:  # >5% faster than average
+            pace_bonus = 1 + (environment['pace_score'] - 1) * 0.5  # Half the pace diff
+            projection = projection * pace_bonus
+            ceiling = ceiling * (1 + (environment['pace_score'] - 1) * 0.8)  # Ceiling benefits more
+            analytics['adjustments'].append(f"High pace ({environment['pace_score']:.2f}): +{(pace_bonus-1)*100:.1f}%")
+
+        # Volatility adjustment to ranges
+        if environment['volatility_multiplier'] != 1.0:
+            # Expand ranges based on volatility
+            mid = (floor + ceiling) / 2
+            half_range = (ceiling - floor) / 2
+            new_half_range = half_range * environment['volatility_multiplier']
+            floor = mid - new_half_range
+            ceiling = mid + new_half_range
+            analytics['adjustments'].append(f"Volatility: x{environment['volatility_multiplier']:.2f}")
+
+        # OT probability boost to ceiling
+        if environment['ot_probability'] > 0.08:
+            ot_ceiling_boost = 1 + (environment['ot_probability'] - 0.06) * 2
+            ceiling = ceiling * ot_ceiling_boost
+            analytics['adjustments'].append(f"OT likelihood ({environment['ot_probability']:.0%}): ceiling +{(ot_ceiling_boost-1)*100:.1f}%")
+
+    # Ensure reasonable bounds
+    floor = max(0, round(floor, 1))
+    ceiling = round(ceiling, 1)
+    projection = round(projection, 1)
+
+    # Ensure projection is within range
+    if projection < floor:
+        projection = floor
+    if projection > ceiling:
+        projection = (projection + ceiling) / 2
+
+    return projection, floor, ceiling, analytics
+
+
 if __name__ == "__main__":
     # Simple test
     print("The Odds API Integration Module")

@@ -47,6 +47,19 @@ try:
 except ImportError:
     SOPHISTICATED_PREDICTIONS = False
 
+# Import correlation model for GPP optimization
+try:
+    from correlation_model import (
+        PlayerCorrelationModel,
+        PlayerSlateInfo,
+        CorrelatedSimResult,
+        create_player_slate_info,
+        CorrelationConfig
+    )
+    CORRELATION_MODEL_AVAILABLE = True
+except ImportError:
+    CORRELATION_MODEL_AVAILABLE = False
+
 
 # =============================================================================
 # Injury Filtering
@@ -527,6 +540,17 @@ class DFSPlayer:
 
     # Player position for PPM lookups
     position: str = ""
+
+    # Correlation model outputs (GPP optimization)
+    p_top1: float = 0.0           # Probability of being #1 scorer on slate
+    p_top3: float = 0.0           # Probability of top 3 finish
+    expected_rank: float = 0.0    # Expected rank on slate
+    support_score: float = 0.0    # P(top-10 | not #1) for lineup support
+    sigma: float = 0.0            # Scoring standard deviation for simulations
+
+    # Stack scoring
+    stack_score: float = 0.0      # Game stacking quality (0-1)
+    is_star: bool = False         # Season avg >= 25 PPG
 
     def calculate_projections(self) -> None:
         """Calculate derived projection values."""
@@ -1497,6 +1521,208 @@ def parse_dk_csv(
     }
 
     return players, metadata
+
+
+# =============================================================================
+# Correlation Model Integration for GPP Optimization
+# =============================================================================
+
+def enrich_players_with_correlation_model(
+    players: List[DFSPlayer],
+    conn: Optional[sqlite3.Connection] = None,
+    game_date: str = "",
+    n_simulations: int = 10000
+) -> List[DFSPlayer]:
+    """
+    Run correlation model simulations and enrich player pool with p_top1, p_top3.
+
+    The correlation model captures:
+    - Same-game correlations (players in same game are positively correlated)
+    - Teammate negative correlations (usage competition)
+    - Game environment effects (OT likelihood, high totals)
+
+    This helps identify GPP-optimal players who have:
+    - High p_top1: Good chance of being the #1 scorer (tournament upside)
+    - High p_top3: Good chance of top-3 finish (consistent high production)
+
+    Args:
+        players: List of DFSPlayer objects to enrich
+        conn: Database connection for game environment data
+        game_date: Game date for environment lookup
+        n_simulations: Number of Monte Carlo simulations
+
+    Returns:
+        Enriched list of DFSPlayer objects with correlation metrics
+    """
+    if not CORRELATION_MODEL_AVAILABLE:
+        return players
+
+    if not players:
+        return players
+
+    # Convert DFSPlayers to PlayerSlateInfo for simulation
+    slate_info = []
+    for p in players:
+        if p.is_injured or p.is_excluded:
+            continue
+
+        # Calculate sigma from ceiling/floor
+        if p.proj_ceiling > p.proj_floor:
+            sigma = (p.proj_ceiling - p.proj_floor) / 4  # Approximate 2 std devs
+        else:
+            sigma = p.proj_fpts * 0.20  # Fallback: 20% of projection
+
+        slate_info.append(PlayerSlateInfo(
+            player_id=p.player_id,
+            player_name=p.name,
+            team=p.team,
+            game_id=p.game_id,
+            mean_score=p.proj_fpts,
+            sigma=max(sigma, 1.0),
+            is_star=p.proj_points >= 25  # Star if 25+ projected points
+        ))
+
+    if len(slate_info) < 3:
+        return players
+
+    # Get game environment data for enhanced correlation
+    game_environments = {}
+    if conn and game_date:
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT game_id, ot_probability, stack_score, total
+                FROM game_odds
+                WHERE date(game_date) = date(?)
+            """, (game_date,))
+
+            for row in cursor.fetchall():
+                gid, ot_prob, stack, total = row
+                game_environments[gid] = {
+                    'ot_probability': ot_prob or 0.06,
+                    'stack_score': stack or 0.5,
+                    'total': total or 228
+                }
+        except Exception:
+            pass
+
+    # Run correlated simulation
+    try:
+        config = CorrelationConfig(n_simulations=n_simulations, random_seed=42)
+        model = PlayerCorrelationModel(config)
+        results = model.run_correlated_simulation(slate_info, game_environments)
+
+        # Build lookup by player_id
+        results_dict = {r.player_id: r for r in results}
+
+        # Enrich players
+        for p in players:
+            if p.player_id in results_dict:
+                r = results_dict[p.player_id]
+                p.p_top1 = r.p_top1
+                p.p_top3 = r.p_top3
+                p.expected_rank = r.expected_rank
+                p.support_score = r.support_score
+                p.sigma = r.sigma_used
+
+                # Update stack score from game environment
+                if p.game_id in game_environments:
+                    p.stack_score = game_environments[p.game_id].get('stack_score', 0.5)
+
+                # Mark as star
+                p.is_star = p.proj_points >= 25
+
+    except Exception as e:
+        # If simulation fails, continue with basic projections
+        pass
+
+    return players
+
+
+def apply_correlation_ceiling_boost(
+    players: List[DFSPlayer],
+    stack_threshold: float = 0.7
+) -> List[DFSPlayer]:
+    """
+    Apply ceiling boost for players in high-correlation games.
+
+    Players in games with:
+    - High totals (shootout potential)
+    - Tight spreads (competitive throughout)
+    - High OT probability
+
+    Get ceiling boosts because these games have more upside variance.
+
+    Args:
+        players: List of DFSPlayer objects
+        stack_threshold: Minimum stack_score for boost (default 0.7)
+
+    Returns:
+        Players with adjusted ceilings
+    """
+    for p in players:
+        if p.stack_score >= stack_threshold:
+            # Good stacking game - boost ceiling by 8%
+            ceiling_boost = 1.08
+            p.proj_ceiling = p.proj_ceiling * ceiling_boost
+
+            # Stars in good stacking games get extra leverage
+            if p.is_star:
+                p.leverage_score = p.leverage_score * 1.10
+
+        elif p.stack_score >= 0.5:
+            # Moderate stacking game - slight boost
+            p.proj_ceiling = p.proj_ceiling * 1.03
+
+    return players
+
+
+def rank_players_by_gpp_value(
+    players: List[DFSPlayer],
+    p_top3_weight: float = 0.4,
+    ceiling_weight: float = 0.3,
+    value_weight: float = 0.3
+) -> List[DFSPlayer]:
+    """
+    Rank players by GPP-optimal composite score.
+
+    Combines:
+    - p_top3: Probability of top-3 finish (tournament upside)
+    - proj_ceiling: Maximum outcome
+    - fpts_per_dollar: Salary efficiency
+
+    Args:
+        players: List of DFSPlayer objects
+        p_top3_weight: Weight for p_top3 (default 0.4)
+        ceiling_weight: Weight for ceiling (default 0.3)
+        value_weight: Weight for value (default 0.3)
+
+    Returns:
+        Players sorted by GPP composite score
+    """
+    # Normalize each metric to 0-1 scale
+    if not players:
+        return players
+
+    # Get max values for normalization
+    max_p_top3 = max(p.p_top3 for p in players) or 1.0
+    max_ceiling = max(p.proj_ceiling for p in players) or 1.0
+    max_value = max(p.fpts_per_dollar for p in players) or 1.0
+
+    for p in players:
+        # Normalize each component
+        norm_p_top3 = p.p_top3 / max_p_top3 if max_p_top3 > 0 else 0
+        norm_ceiling = p.proj_ceiling / max_ceiling if max_ceiling > 0 else 0
+        norm_value = p.fpts_per_dollar / max_value if max_value > 0 else 0
+
+        # Composite GPP score
+        p.leverage_score = (
+            norm_p_top3 * p_top3_weight +
+            norm_ceiling * ceiling_weight +
+            norm_value * value_weight
+        ) * 100  # Scale to 0-100
+
+    return sorted(players, key=lambda x: x.leverage_score, reverse=True)
 
 
 # =============================================================================

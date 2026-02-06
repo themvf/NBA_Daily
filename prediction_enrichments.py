@@ -29,6 +29,22 @@ from game_script import get_minutes_adjustment, classify_game_script
 from depth_chart import get_player_roles_for_slate
 from position_ppm_stats import get_position_matchup_factor
 
+# Constants for new factors
+HOME_COURT_MULTIPLIER = 1.025      # +2.5% scoring boost at home
+DENVER_ALTITUDE_PENALTY = 0.97    # -3% for teams visiting Denver
+DENVER_TEAM_ABBREV = 'DEN'
+
+# Position-specific ceiling adjustments (guards have higher variance than centers)
+POSITION_CEILING_ADJUSTMENTS = {
+    'PG': 0.05,     # +5% ceiling - guards have more 3PT variance
+    'SG': 0.05,     # +5% ceiling
+    'G': 0.05,      # +5% ceiling (guard flex)
+    'SF': 0.02,     # +2% ceiling - moderate variance
+    'PF': 0.00,     # Neutral
+    'F': 0.01,      # +1% ceiling (forward flex)
+    'C': -0.03,     # -3% ceiling - centers are most consistent
+}
+
 
 def apply_enrichments_to_predictions(
     conn: sqlite3.Connection,
@@ -70,6 +86,10 @@ def apply_enrichments_to_predictions(
         'well_rested_count': 0,
         'blowout_games': 0,
         'close_games': 0,
+        'home_players': 0,
+        'denver_visitors': 0,
+        'guard_ceiling_boosts': 0,
+        'center_ceiling_adjustments': 0,
         'errors': []
     }
 
@@ -190,6 +210,19 @@ def apply_enrichments_to_predictions(
             pos_factor = get_position_matchup_factor(conn, opponent_id, player_position)
 
             # ===========================================================================
+            # Determine home/away status and opponent
+            # ===========================================================================
+            is_home = False
+            opponent_abbrev = None
+
+            for gid, gdata in game_scripts.items():
+                team_abbrev = _get_team_abbrev(conn, team_id)
+                if team_abbrev in [gdata['home_team'], gdata['away_team']]:
+                    is_home = (team_abbrev == gdata['home_team'])
+                    opponent_abbrev = gdata['away_team'] if is_home else gdata['home_team']
+                    break
+
+            # ===========================================================================
             # Apply adjustments to projection if enabled
             # ===========================================================================
             adjusted_proj = proj
@@ -211,6 +244,39 @@ def apply_enrichments_to_predictions(
                 adjusted_proj += minutes_adj
                 adjusted_floor += minutes_adj * 0.5  # Less impact on floor
                 adjusted_ceiling += minutes_adj * 1.5  # More impact on ceiling
+
+                # ===========================================================================
+                # NEW: Home Court Advantage (+2.5% for home team)
+                # ===========================================================================
+                if is_home:
+                    adjusted_proj *= HOME_COURT_MULTIPLIER
+                    adjusted_floor *= HOME_COURT_MULTIPLIER
+                    adjusted_ceiling *= HOME_COURT_MULTIPLIER
+                    stats['home_players'] += 1
+
+                # ===========================================================================
+                # NEW: Denver Altitude Penalty (-3% for visitors at Denver)
+                # ===========================================================================
+                if opponent_abbrev == DENVER_TEAM_ABBREV and not is_home:
+                    # Player is visiting Denver - altitude penalty
+                    adjusted_proj *= DENVER_ALTITUDE_PENALTY
+                    adjusted_floor *= DENVER_ALTITUDE_PENALTY
+                    # Ceiling less affected (adrenaline can compensate)
+                    adjusted_ceiling *= (DENVER_ALTITUDE_PENALTY + 0.01)  # -2% on ceiling
+                    stats['denver_visitors'] += 1
+
+                # ===========================================================================
+                # NEW: Position-Specific Ceiling Adjustments
+                # ===========================================================================
+                player_pos = player_position.upper() if player_position else ""
+                ceiling_adjustment = POSITION_CEILING_ADJUSTMENTS.get(player_pos, 0.0)
+
+                if ceiling_adjustment != 0:
+                    adjusted_ceiling *= (1 + ceiling_adjustment)
+                    if ceiling_adjustment > 0:
+                        stats['guard_ceiling_boosts'] += 1
+                    else:
+                        stats['center_ceiling_adjustments'] += 1
 
                 # Round to 1 decimal
                 adjusted_proj = round(adjusted_proj, 1)
@@ -263,6 +329,10 @@ def apply_enrichments_to_predictions(
         print(f"    - Well rested (3+ days): {stats['well_rested_count']}")
         print(f"    - Blowout games: {stats['blowout_games']}")
         print(f"    - Close games: {stats['close_games']}")
+        print(f"    - Home players (+2.5%): {stats['home_players']}")
+        print(f"    - Denver visitors (-3%): {stats['denver_visitors']}")
+        print(f"    - Guard ceiling boosts: {stats['guard_ceiling_boosts']}")
+        print(f"    - Center ceiling adjustments: {stats['center_ceiling_adjustments']}")
         if stats['errors']:
             print(f"    - Errors: {len(stats['errors'])}")
 
@@ -301,6 +371,108 @@ def _get_player_position(conn: sqlite3.Connection, player_id: int) -> str:
     position = result[0] if result else "Guard"
     _player_position_cache[player_id] = position
     return position
+
+
+# =============================================================================
+# Additional Factor Functions (can be called independently)
+# =============================================================================
+
+def get_home_court_factor(is_home: bool) -> float:
+    """
+    Get home court advantage multiplier.
+
+    NBA teams score approximately 2.5% more at home due to:
+    - Crowd support and energy
+    - No travel fatigue
+    - Familiar surroundings
+    - Favorable referee tendencies (slight)
+
+    Args:
+        is_home: Whether the player's team is home
+
+    Returns:
+        Multiplier (1.025 for home, 1.0 for away)
+    """
+    return HOME_COURT_MULTIPLIER if is_home else 1.0
+
+
+def get_altitude_factor(opponent_team: str, is_home: bool) -> float:
+    """
+    Get altitude adjustment factor for Denver games.
+
+    Denver's altitude (5,280 feet) affects visiting teams:
+    - Reduced oxygen affects endurance
+    - Players tire faster in 4th quarter
+    - Effects are stronger in first visit of season
+
+    Args:
+        opponent_team: Opponent team abbreviation
+        is_home: Whether the player's team is home
+
+    Returns:
+        Multiplier (0.97 for visiting Denver, 1.0 otherwise)
+    """
+    if opponent_team == DENVER_TEAM_ABBREV and not is_home:
+        return DENVER_ALTITUDE_PENALTY
+    return 1.0
+
+
+def get_position_ceiling_factor(position: str) -> float:
+    """
+    Get position-specific ceiling adjustment factor.
+
+    Guards have higher scoring variance due to:
+    - More 3-point attempts (high variance shots)
+    - More ball handling opportunities
+    - Higher usage rate variance
+
+    Centers are more consistent due to:
+    - More shots at the rim (high percentage)
+    - Less dependent on shooting variance
+    - More predictable minutes
+
+    Args:
+        position: Player's position (PG, SG, SF, PF, C, G, F)
+
+    Returns:
+        Ceiling adjustment factor (added to ceiling multiplier)
+    """
+    pos = position.upper() if position else ""
+    return POSITION_CEILING_ADJUSTMENTS.get(pos, 0.0)
+
+
+def get_combined_context_factor(
+    is_home: bool,
+    opponent_team: str,
+    position: str
+) -> Dict:
+    """
+    Get all context factors in a single call.
+
+    Args:
+        is_home: Whether player's team is home
+        opponent_team: Opponent team abbreviation
+        position: Player's position
+
+    Returns:
+        Dict with all applicable factors and total multiplier
+    """
+    home_factor = get_home_court_factor(is_home)
+    altitude_factor = get_altitude_factor(opponent_team, is_home)
+    position_ceiling = get_position_ceiling_factor(position)
+
+    # Combined projection multiplier (home + altitude)
+    projection_multiplier = home_factor * altitude_factor
+
+    return {
+        'home_factor': home_factor,
+        'altitude_factor': altitude_factor,
+        'position_ceiling_adjustment': position_ceiling,
+        'projection_multiplier': round(projection_multiplier, 4),
+        'is_home': is_home,
+        'is_denver_away': (opponent_team == DENVER_TEAM_ABBREV and not is_home),
+        'factors_applied': []
+    }
 
 
 # =============================================================================

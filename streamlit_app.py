@@ -40,6 +40,8 @@ import backtest_portfolio
 import preset_ab_test
 from enrichment_monitor import ensure_enrichment_columns
 import dfs_optimizer as dfs
+import odds_api
+import coefficient_calibrator as coeff_cal
 
 DEFAULT_DB_PATH = Path(__file__).with_name("nba_stats.db")
 DEFAULT_PREDICTIONS_PATH = Path(__file__).with_name("predictions.csv")
@@ -1879,6 +1881,9 @@ def calculate_smart_ppg_projection(
     avg_minutes_last5: Optional[float] = None,  # Last 5 games average minutes
     avg_usg_last5: Optional[float] = None,  # Last 5 games average usage
     usage_pct: Optional[float] = None,  # Season usage percentage
+    # Vegas integration parameters (NEW)
+    player_id: Optional[int] = None,  # For Vegas O/U lookup
+    team_abbrev: str = "",  # Team abbreviation for game environment
 ) -> tuple[float, float, float, float, dict, str]:
     """
     Calculate smart PPG projection using multi-factor weighted model.
@@ -2142,6 +2147,59 @@ def calculate_smart_ppg_projection(
             # If opponent injury calculation fails, continue without boost
             pass
 
+    # ==========================================================================
+    # VEGAS ENSEMBLE INTEGRATION (NEW - Phase 2)
+    # Blend our projection with FanDuel O/U line for market consensus
+    # Vegas captures injury news, lineup changes, and sharp money movements
+    # ==========================================================================
+    vegas_blended = False
+    vegas_analytics = {}
+
+    if conn is not None and player_id is not None and game_date:
+        try:
+            # Get FanDuel O/U and blend with our projection (30% Vegas weight)
+            blended_proj, vegas_analytics = odds_api.get_vegas_ensemble_projection(
+                conn=conn,
+                player_id=player_id,
+                game_date=game_date,
+                our_projection=projection,
+                vegas_weight=0.30,
+                dynamic_weighting=True
+            )
+
+            if vegas_analytics.get('blended', False):
+                projection = blended_proj
+                vegas_blended = True
+                analytics_indicators += "🎰"  # Vegas blend indicator
+
+        except Exception:
+            # Vegas integration failed - continue with base projection
+            pass
+
+    # ==========================================================================
+    # GAME ENVIRONMENT ADJUSTMENTS (NEW)
+    # Apply blowout risk penalties and high-pace boosts from Vegas odds
+    # ==========================================================================
+    if conn is not None and team_abbrev and game_date:
+        try:
+            game_env = odds_api.get_vegas_game_environment(conn, game_date, team_abbrev)
+
+            if game_env.get('found', False):
+                # Blowout risk adjustment for star players (22+ PPG)
+                blowout_risk = game_env.get('blowout_risk', 0)
+                if blowout_risk >= 0.6 and season_avg >= 22:
+                    # Stars get benched in blowouts - reduce projection by 5%
+                    projection = projection * 0.95
+
+                # High pace game boost
+                pace_score = game_env.get('pace_score', 1.0)
+                if pace_score > 1.05:  # >5% faster than league average
+                    pace_bonus = 1 + (pace_score - 1) * 0.4  # 40% of pace diff
+                    projection = projection * pace_bonus
+
+        except Exception:
+            pass
+
     # FIX 2: Add regression to mean for high scorers (22+ PPG)
     # High scorers are over-projected by ~3.5 PPG on average
     if projection >= 22.0:
@@ -2225,49 +2283,69 @@ def calculate_smart_ppg_projection(
     # This prevents ranges from collapsing when confidence is high
     uncertainty = 1.0 - confidence_score  # High confidence → low uncertainty (0.05 to 0.95)
 
+    # ==========================================================================
+    # FLOOR CALCULATION with optional calibrated coefficients
+    # NEW: Can use data-driven multipliers from coefficient_calibrator
+    # ==========================================================================
+    # Try to load calibrated coefficients if database available
+    calibrated_coeffs = None
+    if conn is not None:
+        try:
+            calibrated_coeffs = coeff_cal.load_calibrated_coefficients(conn)
+        except Exception:
+            pass
+
     # FLOOR: Conservative estimate (bad game scenario)
-    # Base floor: 14% below projection (inherent game variance + off-night risk)
-    # Uncertainty adjustment: scale between 80% and 120% of base
-    # UPDATED: Widened from 9% to 14% based on actual prediction log analysis
-    # showing only 13% hit rate with narrower ranges
-    floor_base_interval = season_avg * 0.14
-    floor_uncertainty_factor = 0.8 + (0.4 * uncertainty)
-    floor_interval = floor_base_interval * floor_uncertainty_factor
-    floor = max(0, projection - floor_interval)
-
-    # CEILING: 90th percentile outcome (explosive game scenario)
-    # For tournament play, ceiling must represent what happens when everything goes right:
-    # - Hot shooting night (3-4 extra made shots = +6-12 points)
-    # - Blowout/Overtime (extra minutes = +15-25% production)
-    # - Weak defense matchup (already partially captured in projection)
-    # - High usage game (injury to teammate, foul trouble for others)
-    #
-    # Statistical analysis of NBA player game logs shows:
-    # - Top 10% of games for star players (25+ season PPG): +60-80% above average
-    # - Top 10% of games for role players (15-20 PPG): +50-70% above average
-    # - Top 10% of games for bench players (<15 PPG): +80-120% above average
-    #
-    # Formula: Base ceiling multiplier adjusted by player tier and uncertainty
-    # UPDATED: Increased multipliers by 15-20% based on prediction log analysis
-    # showing under-projection of breakout performances (only 13% hit rate)
-    if season_avg >= 25:
-        # Star players: 70-95% upside (e.g., 28 PPG → 48-55 ceiling)
-        ceiling_base_multiplier = 0.70
-        ceiling_uncertainty_bonus = 0.25 * uncertainty  # More uncertainty = higher ceiling
-    elif season_avg >= 20:
-        # High-volume scorers: 65-90% upside (e.g., 22 PPG → 36-42 ceiling)
-        ceiling_base_multiplier = 0.65
-        ceiling_uncertainty_bonus = 0.25 * uncertainty
-    elif season_avg >= 15:
-        # Mid-tier players: 60-85% upside (e.g., 17 PPG → 27-31 ceiling)
-        ceiling_base_multiplier = 0.60
-        ceiling_uncertainty_bonus = 0.25 * uncertainty
+    # Use calibrated multiplier if available, otherwise use formula
+    if calibrated_coeffs and calibrated_coeffs.confidence_level in ['high', 'medium']:
+        # Use learned floor multiplier based on projection tier
+        floor_mult = calibrated_coeffs.get_floor_multiplier_for_projection(projection)
+        floor = projection * floor_mult
     else:
-        # Role/bench players: 85-120% upside (e.g., 10 PPG → 18-22 ceiling)
-        ceiling_base_multiplier = 0.85
-        ceiling_uncertainty_bonus = 0.35 * uncertainty
+        # Fallback: Base floor 14% below projection + uncertainty adjustment
+        floor_base_interval = season_avg * 0.14
+        floor_uncertainty_factor = 0.8 + (0.4 * uncertainty)
+        floor_interval = floor_base_interval * floor_uncertainty_factor
+        floor = max(0, projection - floor_interval)
 
-    ceiling_multiplier = ceiling_base_multiplier + ceiling_uncertainty_bonus
+    # ==========================================================================
+    # CEILING CALCULATION with optional calibrated coefficients
+    # NEW: Can use data-driven multipliers from coefficient_calibrator
+    # ==========================================================================
+    # CEILING: 90th percentile outcome (explosive game scenario)
+    # For tournament play, ceiling must represent what happens when everything goes right
+
+    if calibrated_coeffs and calibrated_coeffs.confidence_level in ['high', 'medium']:
+        # Use learned ceiling multiplier based on projection tier
+        ceiling_multiplier = calibrated_coeffs.get_ceiling_multiplier_for_projection(projection) - 1.0
+        # Add uncertainty bonus (10-20% additional based on data quality)
+        ceiling_uncertainty_bonus = 0.15 * uncertainty
+        ceiling_multiplier += ceiling_uncertainty_bonus
+
+        # Apply position-specific ceiling adjustment from calibrated coefficients
+        position_ceiling_adj = calibrated_coeffs.get_position_ceiling_adjustment(player_position)
+        ceiling_multiplier += position_ceiling_adj
+    else:
+        # Fallback: Original tiered calculation
+        # Formula: Base ceiling multiplier adjusted by player tier and uncertainty
+        if season_avg >= 25:
+            # Star players: 70-95% upside (e.g., 28 PPG → 48-55 ceiling)
+            ceiling_base_multiplier = 0.70
+            ceiling_uncertainty_bonus = 0.25 * uncertainty
+        elif season_avg >= 20:
+            # High-volume scorers: 65-90% upside (e.g., 22 PPG → 36-42 ceiling)
+            ceiling_base_multiplier = 0.65
+            ceiling_uncertainty_bonus = 0.25 * uncertainty
+        elif season_avg >= 15:
+            # Mid-tier players: 60-85% upside (e.g., 17 PPG → 27-31 ceiling)
+            ceiling_base_multiplier = 0.60
+            ceiling_uncertainty_bonus = 0.25 * uncertainty
+        else:
+            # Role/bench players: 85-120% upside (e.g., 10 PPG → 18-22 ceiling)
+            ceiling_base_multiplier = 0.85
+            ceiling_uncertainty_bonus = 0.35 * uncertainty
+
+        ceiling_multiplier = ceiling_base_multiplier + ceiling_uncertainty_bonus
 
     # PPM CONSISTENCY ADJUSTMENT: Adjust floor/ceiling by player PPM consistency
     # High consistency players = tighter ranges (smaller intervals)
@@ -2436,6 +2514,12 @@ def calculate_smart_ppg_projection(
         "opponent_injury_detected": opponent_injury_detected,  # Track opponent injuries
         "opponent_injury_boost_projection": opponent_injury_boost,  # Projection boost %
         "opponent_injury_boost_ceiling": opponent_injury_ceiling_boost,  # Ceiling boost %
+        # NEW: Vegas integration tracking
+        "vegas_blended": vegas_blended,
+        "vegas_ou": vegas_analytics.get('vegas_ou') if vegas_analytics else None,
+        "vegas_weight": vegas_analytics.get('weight_used', 0) if vegas_analytics else 0,
+        "vegas_divergence": vegas_analytics.get('divergence_pct', 0) if vegas_analytics else 0,
+        "used_calibrated_coeffs": calibrated_coeffs is not None and calibrated_coeffs.confidence_level in ['high', 'medium'],
         "components": {
             k: {"value": components[k], "weight": weights[k] * 100}
             for k in components

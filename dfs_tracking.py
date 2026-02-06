@@ -964,6 +964,337 @@ def get_shark_player_exposure(
     """, conn, params=usernames * 9)  # 8 UNION ALL + 1 total_lineups = 9 sets of placeholders
 
 
+# =============================================================================
+# Prediction Accuracy Analysis (for Model Improvement)
+# =============================================================================
+
+def analyze_prediction_accuracy(
+    conn: sqlite3.Connection,
+    days: int = 30
+) -> Dict:
+    """
+    Analyze prediction accuracy to identify systematic biases by tier, position, and opponent.
+
+    This diagnostic function helps identify where the model is over/under-predicting
+    to guide coefficient calibration and model improvements.
+
+    Args:
+        conn: SQLite database connection
+        days: Number of days to analyze (default 30)
+
+    Returns:
+        Dict with comprehensive accuracy analysis:
+        - tier_accuracy: MAE and bias by projected PPG tier
+        - confidence_accuracy: MAE by confidence bucket
+        - floor_ceiling_hit_rates: How often actual falls within projected range
+        - position_accuracy: MAE by position (if available)
+        - recent_trends: 7-day rolling MAE trend
+    """
+    cursor = conn.cursor()
+    results = {
+        'tier_accuracy': [],
+        'confidence_accuracy': [],
+        'floor_ceiling_hit_rates': [],
+        'position_accuracy': [],
+        'recent_trends': [],
+        'overall_stats': {},
+        'errors': []
+    }
+
+    try:
+        # Query 1: MAE by projected PPG tier
+        tier_query = """
+            SELECT
+                CASE
+                    WHEN proj_fpts >= 40 THEN 'Star (40+ FPTS)'
+                    WHEN proj_fpts >= 30 THEN 'Starter (30-40 FPTS)'
+                    WHEN proj_fpts >= 20 THEN 'Role (20-30 FPTS)'
+                    ELSE 'Bench (<20 FPTS)'
+                END as tier,
+                COUNT(*) as n,
+                ROUND(AVG(actual_fpts - proj_fpts), 2) as bias,
+                ROUND(AVG(ABS(actual_fpts - proj_fpts)), 2) as mae,
+                ROUND(AVG(proj_fpts), 1) as avg_projected,
+                ROUND(AVG(actual_fpts), 1) as avg_actual
+            FROM dfs_slate_projections
+            WHERE actual_fpts IS NOT NULL
+            AND did_play = 1
+            AND slate_date >= date('now', '-' || ? || ' days')
+            GROUP BY tier
+            ORDER BY avg_projected DESC
+        """
+
+        for row in cursor.execute(tier_query, (days,)).fetchall():
+            results['tier_accuracy'].append({
+                'tier': row[0],
+                'n': row[1],
+                'bias': row[2],
+                'mae': row[3],
+                'avg_projected': row[4],
+                'avg_actual': row[5]
+            })
+
+        # Query 2: Floor/Ceiling hit rates by tier
+        floor_ceiling_query = """
+            SELECT
+                CASE
+                    WHEN proj_fpts >= 40 THEN 'Star (40+ FPTS)'
+                    WHEN proj_fpts >= 30 THEN 'Starter (30-40 FPTS)'
+                    WHEN proj_fpts >= 20 THEN 'Role (20-30 FPTS)'
+                    ELSE 'Bench (<20 FPTS)'
+                END as tier,
+                COUNT(*) as n,
+                SUM(CASE WHEN actual_fpts >= proj_floor AND actual_fpts <= proj_ceiling THEN 1 ELSE 0 END) as within_range,
+                SUM(CASE WHEN actual_fpts < proj_floor THEN 1 ELSE 0 END) as below_floor,
+                SUM(CASE WHEN actual_fpts > proj_ceiling THEN 1 ELSE 0 END) as above_ceiling,
+                ROUND(AVG(proj_floor), 1) as avg_floor,
+                ROUND(AVG(proj_ceiling), 1) as avg_ceiling,
+                ROUND(AVG(actual_fpts), 1) as avg_actual
+            FROM dfs_slate_projections
+            WHERE actual_fpts IS NOT NULL
+            AND did_play = 1
+            AND proj_floor IS NOT NULL
+            AND proj_ceiling IS NOT NULL
+            AND slate_date >= date('now', '-' || ? || ' days')
+            GROUP BY tier
+            ORDER BY avg_actual DESC
+        """
+
+        for row in cursor.execute(floor_ceiling_query, (days,)).fetchall():
+            n = row[1]
+            within = row[2]
+            below = row[3]
+            above = row[4]
+
+            results['floor_ceiling_hit_rates'].append({
+                'tier': row[0],
+                'n': n,
+                'within_range_pct': round(100 * within / n, 1) if n > 0 else 0,
+                'below_floor_pct': round(100 * below / n, 1) if n > 0 else 0,
+                'above_ceiling_pct': round(100 * above / n, 1) if n > 0 else 0,
+                'avg_floor': row[5],
+                'avg_ceiling': row[6],
+                'avg_actual': row[7]
+            })
+
+        # Query 3: Overall statistics
+        overall_query = """
+            SELECT
+                COUNT(*) as total_predictions,
+                ROUND(AVG(actual_fpts - proj_fpts), 2) as overall_bias,
+                ROUND(AVG(ABS(actual_fpts - proj_fpts)), 2) as overall_mae,
+                ROUND(
+                    100.0 * SUM(CASE
+                        WHEN actual_fpts >= proj_floor AND actual_fpts <= proj_ceiling
+                        THEN 1 ELSE 0
+                    END) / COUNT(*),
+                1) as overall_hit_rate
+            FROM dfs_slate_projections
+            WHERE actual_fpts IS NOT NULL
+            AND did_play = 1
+            AND slate_date >= date('now', '-' || ? || ' days')
+        """
+
+        overall = cursor.execute(overall_query, (days,)).fetchone()
+        if overall:
+            results['overall_stats'] = {
+                'total_predictions': overall[0],
+                'overall_bias': overall[1],
+                'overall_mae': overall[2],
+                'overall_hit_rate': overall[3],
+                'days_analyzed': days
+            }
+
+        # Query 4: 7-day rolling MAE trend (for monitoring improvement)
+        trend_query = """
+            SELECT
+                slate_date,
+                COUNT(*) as n,
+                ROUND(AVG(actual_fpts - proj_fpts), 2) as bias,
+                ROUND(AVG(ABS(actual_fpts - proj_fpts)), 2) as mae,
+                ROUND(
+                    100.0 * SUM(CASE
+                        WHEN actual_fpts >= proj_floor AND actual_fpts <= proj_ceiling
+                        THEN 1 ELSE 0
+                    END) / COUNT(*),
+                1) as hit_rate
+            FROM dfs_slate_projections
+            WHERE actual_fpts IS NOT NULL
+            AND did_play = 1
+            AND slate_date >= date('now', '-' || ? || ' days')
+            GROUP BY slate_date
+            ORDER BY slate_date DESC
+            LIMIT 14
+        """
+
+        for row in cursor.execute(trend_query, (days,)).fetchall():
+            results['recent_trends'].append({
+                'date': row[0],
+                'n': row[1],
+                'bias': row[2],
+                'mae': row[3],
+                'hit_rate': row[4]
+            })
+
+    except Exception as e:
+        results['errors'].append(f"Analysis error: {str(e)}")
+
+    return results
+
+
+def learn_floor_ceiling_from_data(
+    conn: sqlite3.Connection,
+    days: int = 60
+) -> Dict[str, Tuple[float, float]]:
+    """
+    Learn actual 10th/90th percentile ratios by tier from historical data.
+
+    This provides data-driven floor/ceiling multipliers instead of hardcoded values.
+    The multipliers represent what percentage of the projection the actual
+    10th percentile (floor) and 90th percentile (ceiling) outcomes were.
+
+    Args:
+        conn: SQLite database connection
+        days: Number of days of history to analyze (default 60)
+
+    Returns:
+        Dict mapping tier -> (floor_multiplier, ceiling_multiplier)
+        Example: {'Star (40+ FPTS)': (0.72, 1.45), ...}
+
+        floor_multiplier: actual_10th_pct / avg_projection
+        ceiling_multiplier: actual_90th_pct / avg_projection
+    """
+    cursor = conn.cursor()
+    results = {}
+
+    # Define tiers with projection ranges
+    tiers = [
+        ('Star (40+ FPTS)', 40, 999),
+        ('Starter (30-40 FPTS)', 30, 40),
+        ('Role (20-30 FPTS)', 20, 30),
+        ('Bench (<20 FPTS)', 0, 20),
+    ]
+
+    for tier_name, min_proj, max_proj in tiers:
+        try:
+            # Get all actual/projected pairs for this tier
+            query = """
+                SELECT proj_fpts, actual_fpts
+                FROM dfs_slate_projections
+                WHERE actual_fpts IS NOT NULL
+                AND did_play = 1
+                AND proj_fpts >= ? AND proj_fpts < ?
+                AND slate_date >= date('now', '-' || ? || ' days')
+            """
+
+            rows = cursor.execute(query, (min_proj, max_proj, days)).fetchall()
+
+            if len(rows) >= 20:  # Need minimum sample size
+                projections = [r[0] for r in rows]
+                actuals = [r[1] for r in rows]
+
+                avg_projection = np.mean(projections)
+
+                # Calculate actual 10th and 90th percentiles
+                actual_10th = np.percentile(actuals, 10)
+                actual_90th = np.percentile(actuals, 90)
+
+                # Calculate multipliers relative to average projection
+                floor_mult = actual_10th / avg_projection if avg_projection > 0 else 0.8
+                ceiling_mult = actual_90th / avg_projection if avg_projection > 0 else 1.3
+
+                results[tier_name] = {
+                    'floor_multiplier': round(floor_mult, 3),
+                    'ceiling_multiplier': round(ceiling_mult, 3),
+                    'sample_size': len(rows),
+                    'avg_projection': round(avg_projection, 1),
+                    'actual_10th_pct': round(actual_10th, 1),
+                    'actual_90th_pct': round(actual_90th, 1),
+                    'actual_median': round(np.median(actuals), 1)
+                }
+            else:
+                # Insufficient data - use defaults
+                results[tier_name] = {
+                    'floor_multiplier': 0.80,
+                    'ceiling_multiplier': 1.35,
+                    'sample_size': len(rows),
+                    'note': 'Insufficient data - using defaults'
+                }
+
+        except Exception as e:
+            results[tier_name] = {
+                'floor_multiplier': 0.80,
+                'ceiling_multiplier': 1.35,
+                'error': str(e)
+            }
+
+    return results
+
+
+def get_prediction_bias_by_team(
+    conn: sqlite3.Connection,
+    days: int = 30
+) -> pd.DataFrame:
+    """
+    Analyze prediction bias by opponent team to identify defensive mismatches.
+
+    Helps identify teams against which the model consistently over/under-predicts.
+
+    Returns:
+        DataFrame with columns: opponent, n, bias, mae
+    """
+    query = """
+        SELECT
+            opponent as team,
+            COUNT(*) as n,
+            ROUND(AVG(actual_fpts - proj_fpts), 2) as bias,
+            ROUND(AVG(ABS(actual_fpts - proj_fpts)), 2) as mae
+        FROM dfs_slate_projections
+        WHERE actual_fpts IS NOT NULL
+        AND did_play = 1
+        AND slate_date >= date('now', '-' || ? || ' days')
+        GROUP BY opponent
+        HAVING COUNT(*) >= 5
+        ORDER BY bias DESC
+    """
+
+    return pd.read_sql_query(query, conn, params=[days])
+
+
+def validate_model_changes(conn: sqlite3.Connection, days: int = 7) -> Dict:
+    """
+    Quick validation check for model changes.
+
+    Run this after implementing model improvements to verify:
+    1. MAE is improving (or at least not getting worse)
+    2. Floor-ceiling hit rate is improving
+    3. Bias is closer to zero
+
+    Returns:
+        Dict with validation metrics and pass/fail indicators
+    """
+    analysis = analyze_prediction_accuracy(conn, days)
+
+    overall = analysis.get('overall_stats', {})
+
+    validation = {
+        'mae': overall.get('overall_mae', 0),
+        'hit_rate': overall.get('overall_hit_rate', 0),
+        'bias': overall.get('overall_bias', 0),
+        'n': overall.get('total_predictions', 0),
+        'checks': {}
+    }
+
+    # Check thresholds
+    validation['checks']['mae_acceptable'] = validation['mae'] < 12.0  # Target: <12 FPTS MAE
+    validation['checks']['hit_rate_acceptable'] = validation['hit_rate'] > 45.0  # Target: >45%
+    validation['checks']['bias_acceptable'] = abs(validation['bias']) < 2.0  # Target: within ±2
+
+    validation['overall_pass'] = all(validation['checks'].values())
+
+    return validation
+
+
 def get_shark_strategy_profile(
     conn: sqlite3.Connection,
     username: str
