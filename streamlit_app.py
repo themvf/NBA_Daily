@@ -13579,7 +13579,13 @@ if selected_page == "DFS Lineup Builder":
                                     st.toast(f"✅ {sd}: {updated} players (MAE: {results['proj_mae']:.1f})")
                                     success_count += 1
                                 else:
-                                    st.toast(f"⚠️ {sd}: insufficient data")
+                                    # Provide detailed diagnostic info
+                                    if updated == 0 and not_found > 0:
+                                        st.toast(f"⚠️ {sd}: No game data yet ({not_found} players awaiting results)")
+                                    elif updated < 3:
+                                        st.toast(f"⚠️ {sd}: Only {updated} players found - need 3+ for stats")
+                                    else:
+                                        st.toast(f"⚠️ {sd}: insufficient data (updated={updated}, not_found={not_found})")
 
                             # S3 backup
                             try:
@@ -13596,6 +13602,33 @@ if selected_page == "DFS Lineup Builder":
                         st.rerun()
                     else:
                         st.info("All slates already have actuals. Nothing to update.")
+
+                # Diagnostic view for pending slates
+                if pending_dates:
+                    with st.expander("🔍 Pending Slate Diagnostics"):
+                        any_missing = False
+                        for sd in pending_dates[:5]:  # Limit to first 5
+                            # Count projections for this slate
+                            proj_count = dfs_conn.execute(
+                                "SELECT COUNT(*) FROM dfs_slate_projections WHERE slate_date = ?",
+                                (sd,)
+                            ).fetchone()[0]
+
+                            # Count matching game logs
+                            game_data_count = dfs_conn.execute(
+                                """SELECT COUNT(*) FROM dfs_slate_projections p
+                                   JOIN player_game_logs g ON p.player_id = g.player_id AND p.slate_date = g.game_date
+                                   WHERE p.slate_date = ?""",
+                                (sd,)
+                            ).fetchone()[0]
+
+                            status_icon = "✅" if game_data_count >= 3 else "⏳"
+                            st.caption(f"{status_icon} **{sd}**: {proj_count} projected players, {game_data_count} with game data")
+                            if game_data_count < 3:
+                                any_missing = True
+
+                        if any_missing:
+                            st.info("💡 **Tip**: If game data is missing, run the data fetcher for those dates first, or wait until games complete.")
 
                 # --- Contest Results Upload ---
                 st.divider()
