@@ -12734,46 +12734,95 @@ if selected_page == "Model Review":
         st.success("✅ No major issues detected! Model is performing well.")
 
 
-def _enrich_players_with_vegas_signals(conn, players, game_date):
+def _enrich_players_with_vegas_signals(conn, players, game_date, debug=False):
     """
     Query vegas_implied_fpts from predictions table and compute edge
     vs our DFS optimizer projections for each player.
 
     Returns: Dict[player_id -> {vegas_fpts, edge_pct, signal, suggest_exposure}]
+    If debug=True, also returns diagnostic info via st.write().
     """
+    diag = {}  # diagnostic info
+
+    # Step 1: Query predictions with vegas data
     try:
         cursor = conn.execute("""
-            SELECT player_name, vegas_implied_fpts, dfs_salary
+            SELECT player_name, vegas_implied_fpts
             FROM predictions
             WHERE game_date = ? AND vegas_implied_fpts IS NOT NULL
         """, [game_date])
         rows = cursor.fetchall()
-    except Exception:
+        diag['query_date'] = game_date
+        diag['rows_with_vegas'] = len(rows)
+    except Exception as e:
+        diag['query_error'] = str(e)
+        # Try simpler query to diagnose
+        try:
+            cursor2 = conn.execute(
+                "SELECT COUNT(*) FROM predictions WHERE game_date = ?", [game_date]
+            )
+            total = cursor2.fetchone()[0]
+            diag['total_predictions_for_date'] = total
+        except Exception as e2:
+            diag['count_error'] = str(e2)
+
+        if debug:
+            st.warning(f"Vegas query failed: {diag}")
         return {}
+
+    if debug:
+        # Additional diagnostics
+        try:
+            cursor3 = conn.execute(
+                "SELECT COUNT(*), COUNT(vegas_implied_fpts), COUNT(fanduel_ou) "
+                "FROM predictions WHERE game_date = ?", [game_date]
+            )
+            total_row = cursor3.fetchone()
+            diag['total_preds'] = total_row[0]
+            diag['with_vegas_fpts'] = total_row[1]
+            diag['with_fanduel_ou'] = total_row[2]
+        except Exception:
+            pass
+        try:
+            dates_cursor = conn.execute(
+                "SELECT DISTINCT game_date FROM predictions ORDER BY game_date DESC LIMIT 5"
+            )
+            diag['recent_game_dates'] = [r[0] for r in dates_cursor.fetchall()]
+        except Exception:
+            pass
 
     if not rows:
+        if debug:
+            st.info(f"Diagnostics: {diag}")
         return {}
 
-    # Build lookup: lowercase player_name -> (vegas_fpts, salary)
+    # Step 2: Build lookup: lowercase player_name -> vegas_fpts
     vegas_lookup = {}
     for row in rows:
         pname = row[0].strip().lower() if row[0] else ""
         vfpts = row[1]
-        sal = row[2] or 0
         if pname and vfpts:
-            vegas_lookup[pname] = (vfpts, sal)
+            vegas_lookup[pname] = vfpts
 
+    diag['vegas_lookup_size'] = len(vegas_lookup)
+
+    # Step 3: Match to DFSPlayer objects and compute edge
     signals = {}
+    matched = 0
+    unmatched_sample = []
     for p in players:
         player_key = p.name.strip().lower()
         if player_key not in vegas_lookup:
+            if len(unmatched_sample) < 3:
+                unmatched_sample.append(player_key)
             continue
 
-        vegas_fpts, _ = vegas_lookup[player_key]
+        matched += 1
+        vegas_fpts = vegas_lookup[player_key]
         proj_fpts = p.proj_fpts
 
         if proj_fpts < 1.0:
-            continue  # Skip very low projections to avoid extreme edge %
+            continue
 
         edge_pct = ((vegas_fpts - proj_fpts) / proj_fpts) * 100
 
@@ -12794,6 +12843,16 @@ def _enrich_players_with_vegas_signals(conn, players, game_date):
             'signal': signal,
             'suggest_exposure': suggest_exposure,
         }
+
+    diag['players_in_pool'] = len(players)
+    diag['matched'] = matched
+    diag['signals_generated'] = len(signals)
+
+    if debug:
+        st.info(f"Diagnostics: {diag}")
+        if unmatched_sample:
+            vegas_sample = list(vegas_lookup.keys())[:3]
+            st.caption(f"Sample unmatched DFS names: {unmatched_sample} | Sample DB names: {vegas_sample}")
 
     return signals
 
@@ -13358,14 +13417,12 @@ if selected_page == "DFS Lineup Builder":
                 # after fetching props post-projection
                 if st.button("🔄 Load / Recalculate Vegas Signals", help="Query props from database and compute edge signals"):
                     game_dt = st.session_state.get('dfs_projection_date') or str(date.today())
-                    refreshed = _enrich_players_with_vegas_signals(dfs_conn, players, game_dt)
+                    refreshed = _enrich_players_with_vegas_signals(dfs_conn, players, game_dt, debug=True)
                     st.session_state.dfs_vegas_signals = refreshed
                     if refreshed:
                         rc = sum(1 for s in refreshed.values() if s['signal'] == 'BOOST')
                         st.success(f"Loaded signals for {len(refreshed)} players — {rc} BOOST candidate(s)")
-                    else:
-                        st.warning("No Vegas prop data found. Make sure FanDuel props have been fetched for this game date.")
-                    st.rerun()
+                        st.rerun()
 
                 if not vegas_sigs:
                     st.caption("Click the button above to load Vegas signals after fetching FanDuel props.")
