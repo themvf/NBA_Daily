@@ -33,11 +33,11 @@ FUZZY_MATCH_THRESHOLD = 85      # Minimum similarity score
 # All fetched in a single request per event (efficient!)
 EXTENDED_PROP_MARKETS = [
     "player_points",                    # 1 FPTS per point
-    "player_rebounds",                  # 1.2 FPTS per rebound
+    "player_rebounds",                  # 1.25 FPTS per rebound
     "player_assists",                   # 1.5 FPTS per assist
     "player_threes",                    # 0.5 FPTS bonus per 3PM
-    "player_steals",                    # 3 FPTS per steal (HIGH VALUE!)
-    "player_blocks",                    # 3 FPTS per block (HIGH VALUE!)
+    "player_steals",                    # 2 FPTS per steal
+    "player_blocks",                    # 2 FPTS per block
     "player_points_rebounds_assists",   # PRA combo - fantasy proxy!
 ]
 
@@ -52,14 +52,14 @@ MARKET_COLUMN_MAP = {
     "player_points_rebounds_assists": "fanduel_pra_ou",  # Fantasy proxy!
 }
 
-# FanDuel DFS scoring weights (for converting stat lines to FPTS)
+# DraftKings DFS scoring weights (for converting stat lines to FPTS)
 DFS_WEIGHTS = {
     "points": 1.0,
-    "rebounds": 1.2,
+    "rebounds": 1.25,
     "assists": 1.5,
     "threes": 0.5,  # Bonus only (points already counted)
-    "steals": 3.0,
-    "blocks": 3.0,
+    "steals": 2.0,
+    "blocks": 2.0,
 }
 
 
@@ -713,13 +713,13 @@ def calculate_vegas_implied_fpts(
     """
     Calculate Vegas-implied fantasy points from player props.
 
-    FanDuel DFS Scoring:
+    DraftKings DFS Scoring:
     - Points: 1 FPTS each
-    - Rebounds: 1.2 FPTS each
+    - Rebounds: 1.25 FPTS each
     - Assists: 1.5 FPTS each
     - 3PM: 0.5 FPTS bonus (points already counted)
-    - Steals: 3 FPTS each
-    - Blocks: 3 FPTS each
+    - Steals: 2 FPTS each
+    - Blocks: 2 FPTS each
     - Turnovers: -0.5 FPTS each
 
     Strategy:
@@ -791,7 +791,7 @@ def calculate_vegas_implied_fpts(
         # Estimate 3PM from points (~0.1 per point for average player)
         fpts += (points_ou * 0.1) * DFS_WEIGHTS["threes"]
 
-    # Add steals and blocks (HIGH VALUE!)
+    # Add steals and blocks
     if stl_ou is not None:
         fpts += stl_ou * DFS_WEIGHTS["steals"]
     else:
