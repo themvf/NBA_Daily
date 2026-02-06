@@ -12666,6 +12666,15 @@ if selected_page == "DFS Lineup Builder":
             help="Filter out players below this salary. Set to $3,100+ to exclude cheap $3K players that may be inactive."
         )
 
+        max_remaining_salary = st.slider(
+            "Max remaining salary",
+            min_value=0,
+            max_value=3000,
+            value=1000,
+            step=100,
+            help="Maximum unused salary allowed per lineup. Lower values force fuller salary usage. $0 = must use exactly $50,000."
+        )
+
         st.divider()
         st.subheader("📋 DraftKings Rules")
         st.markdown("""
@@ -13194,6 +13203,9 @@ if selected_page == "DFS Lineup Builder":
                     if salary_filtered_count > 0:
                         st.info(f"💰 Filtered out {salary_filtered_count} players below ${min_salary:,} salary")
 
+                    # Calculate minimum salary floor from max remaining
+                    min_salary_floor = dfs.SALARY_CAP - max_remaining_salary
+
                     with st.spinner("Optimizing lineups..."):
                         lineups = dfs.generate_diversified_lineups(
                             player_pool=filtered_players,
@@ -13201,7 +13213,8 @@ if selected_page == "DFS Lineup Builder":
                             max_player_exposure=max_exposure,
                             progress_callback=update_progress,
                             excluded_games=st.session_state.dfs_excluded_games,
-                            exposure_targets=st.session_state.dfs_exposure_targets
+                            exposure_targets=st.session_state.dfs_exposure_targets,
+                            min_salary_floor=min_salary_floor
                         )
 
                     progress_bar.empty()

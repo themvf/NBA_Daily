@@ -1737,7 +1737,8 @@ def optimize_lineup_randomized(
     max_exposure: Optional[Dict[int, float]] = None,
     current_exposures: Optional[Dict[int, int]] = None,
     num_lineups_total: int = 1,
-    randomization_factor: float = 0.3
+    randomization_factor: float = 0.3,
+    min_salary_floor: int = 0
 ) -> Optional[DFSLineup]:
     """
     Build an optimized lineup with controlled randomization for diversity.
@@ -1754,6 +1755,7 @@ def optimize_lineup_randomized(
         current_exposures: Current lineup count per player
         num_lineups_total: Total lineups being generated
         randomization_factor: How much randomness (0=greedy, 1=random)
+        min_salary_floor: Minimum total salary required (e.g., 49000 means max $1000 remaining)
 
     Returns:
         Optimized DFSLineup or None if no valid lineup found
@@ -1820,19 +1822,34 @@ def optimize_lineup_randomized(
 
         # Find all valid candidates for this slot
         candidates = []
+        remaining_slots = sum(1 for s in ROSTER_SLOTS if s not in lineup.players and s != slot)
+
         for player in available:
             if player.player_id in used_player_ids:
                 continue
             if not player.can_fill_slot(slot):
                 continue
 
-            # Check salary constraint
+            # Check salary cap constraint (don't exceed max)
             tentative_salary = lineup.total_salary + player.salary
-            remaining_slots = sum(1 for s in ROSTER_SLOTS if s not in lineup.players and s != slot)
-            min_salary_needed = remaining_slots * 3500  # Conservative minimum
+            min_salary_needed = remaining_slots * 3500  # Conservative minimum for remaining
 
             if tentative_salary + min_salary_needed > SALARY_CAP:
                 continue
+
+            # Check salary floor constraint (must hit minimum)
+            # If we have a floor, check if we can still reach it
+            if min_salary_floor > 0:
+                # Estimate max salary we could add in remaining slots
+                # (assume we can find players around $8000 avg for remaining)
+                max_remaining_salary = remaining_slots * 9500  # Optimistic max
+                if tentative_salary + max_remaining_salary < min_salary_floor:
+                    # Even with expensive players for remaining slots, we can't hit floor
+                    continue
+
+                # For the LAST slot, enforce the floor strictly
+                if remaining_slots == 0 and tentative_salary < min_salary_floor:
+                    continue
 
             # Check we can still get 2 games
             if remaining_slots == 0:
@@ -1850,13 +1867,32 @@ def optimize_lineup_randomized(
         max_score = max(scores)
         min_score = min(scores)
 
+        # Calculate if we need to spend more to hit salary floor
+        salary_boost_factor = 0.0
+        if min_salary_floor > 0:
+            current_salary = lineup.total_salary
+            salary_deficit = min_salary_floor - current_salary
+            # How much do we need per remaining slot (including this one)?
+            slots_left = remaining_slots + 1
+            target_per_slot = salary_deficit / slots_left if slots_left > 0 else 0
+
+            # If we need high-salary players, boost their weights
+            if target_per_slot > 5000:  # Need expensive players
+                salary_boost_factor = 0.3  # 30% weight boost for salary
+
         # Normalize scores and apply randomization
         if max_score > min_score:
             weights = []
-            for score in scores:
+            for i, score in enumerate(scores):
                 normalized = (score - min_score) / (max_score - min_score)
                 # Mix between score-based and uniform
                 weight = (1 - randomization_factor) * normalized + randomization_factor * 1.0
+
+                # Boost weight for higher-salary players when we need to spend
+                if salary_boost_factor > 0:
+                    salary_normalized = candidates[i].salary / 10000  # Normalize salary (0-1 range roughly)
+                    weight = weight * (1 + salary_boost_factor * salary_normalized)
+
                 weights.append(max(0.01, weight))
         else:
             weights = [1.0] * len(candidates)
@@ -1872,6 +1908,10 @@ def optimize_lineup_randomized(
 
     # Validate final lineup
     if lineup.is_valid:
+        # Check minimum salary floor constraint
+        if min_salary_floor > 0 and lineup.total_salary < min_salary_floor:
+            # Lineup doesn't use enough salary - reject it
+            return None
         return lineup
 
     return None
@@ -1883,7 +1923,8 @@ def generate_diversified_lineups(
     max_player_exposure: float = 0.50,  # 50% max exposure (was 40%)
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     excluded_games: Optional[Set[str]] = None,
-    exposure_targets: Optional[Dict[int, float]] = None
+    exposure_targets: Optional[Dict[int, float]] = None,
+    min_salary_floor: int = 0
 ) -> List[DFSLineup]:
     """
     Generate diversified GPP tournament lineups using randomized optimization.
@@ -1902,6 +1943,9 @@ def generate_diversified_lineups(
         excluded_games: Set of game_ids to exclude (for postponed games)
         exposure_targets: Dict mapping player_id -> target exposure fraction
                           (e.g. {12345: 0.30} means 30% of lineups)
+        min_salary_floor: Minimum total salary required per lineup (e.g., 49000).
+                          Lineups using less salary will be rejected.
+                          Set to SALARY_CAP - max_remaining (e.g., 50000 - 1000 = 49000).
 
     Returns:
         List of valid DFSLineup objects
@@ -2002,7 +2046,8 @@ def generate_diversified_lineups(
                 max_exposure=max_exp,
                 current_exposures=exposures,
                 num_lineups_total=num_lineups,
-                randomization_factor=rand_factor
+                randomization_factor=rand_factor,
+                min_salary_floor=min_salary_floor
             )
 
             if lineup and lineup.is_valid:
