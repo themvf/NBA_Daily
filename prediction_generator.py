@@ -221,7 +221,38 @@ def generate_predictions_for_date(
         total_games = len(data['games_df'])
         result['games_processed'] = 0
 
+        # Step 1.5: Fetch FanDuel odds BEFORE generating predictions
+        # This ensures Vegas data is available for projection blending
+        if progress_callback:
+            progress_callback(0, total_games, "Fetching FanDuel odds (for Vegas blend)...")
+
+        try:
+            import odds_api
+            odds_api.create_odds_tables(data['games_conn'])
+            odds_api.upgrade_predictions_for_fanduel(data['games_conn'])
+
+            should_fetch, reason = odds_api.should_fetch_odds(data['games_conn'], game_date)
+            if should_fetch:
+                odds_result = odds_api.fetch_fanduel_lines_for_date(
+                    data['games_conn'], game_date, extended_markets=True
+                )
+                result['summary']['fanduel_lines_matched'] = odds_result.get('players_matched', 0)
+                result['summary']['fanduel_extended_stats'] = odds_result.get('extended_stats_found', 0)
+                result['summary']['fanduel_api_requests'] = odds_result.get('api_requests_used', 0)
+                if odds_result.get('error'):
+                    result['errors'].append(f"FanDuel fetch: {odds_result['error']}")
+            else:
+                result['summary']['fanduel_lines_matched'] = 0
+                result['summary']['fanduel_skip_reason'] = reason
+        except ImportError:
+            # odds_api module not available - skip silently
+            pass
+        except Exception as e:
+            # Log but don't fail predictions for odds errors
+            result['errors'].append(f"FanDuel fetch warning: {str(e)[:50]}")
+
         # Step 2: Iterate through games and generate predictions
+        # (Vegas data now available for projection blending)
         for game_idx, (_, matchup) in enumerate(data['games_df'].iterrows()):
             if progress_callback:
                 away_team = matchup.get("Away", "")
@@ -267,32 +298,10 @@ def generate_predictions_for_date(
             result['summary']['avg_confidence'] = confidence_sum / player_count
             result['summary']['avg_dfs_score'] = dfs_score_sum / player_count
 
-        # Step 4: Fetch FanDuel odds (optional, fails gracefully)
-        if progress_callback:
-            progress_callback(total_games, total_games, "Fetching FanDuel lines...")
+        # Note: FanDuel odds were fetched in Step 1.5 (before predictions)
+        # This ensures Vegas data is available during projection calculation
 
-        try:
-            import odds_api
-            odds_api.create_odds_tables(data['games_conn'])
-
-            should_fetch, reason = odds_api.should_fetch_odds(data['games_conn'], game_date)
-            if should_fetch:
-                odds_result = odds_api.fetch_fanduel_lines_for_date(data['games_conn'], game_date)
-                result['summary']['fanduel_lines_matched'] = odds_result.get('players_matched', 0)
-                result['summary']['fanduel_api_requests'] = odds_result.get('api_requests_used', 0)
-                if odds_result.get('error'):
-                    result['errors'].append(f"FanDuel fetch: {odds_result['error']}")
-            else:
-                result['summary']['fanduel_lines_matched'] = 0
-                result['summary']['fanduel_skip_reason'] = reason
-        except ImportError:
-            # odds_api module not available - skip silently
-            pass
-        except Exception as e:
-            # Log but don't fail predictions for odds errors
-            result['errors'].append(f"FanDuel fetch warning: {str(e)[:50]}")
-
-        # Step 5: Run Monte Carlo simulation and persist results
+        # Step 4: Run Monte Carlo simulation and persist results
         # This ensures p_top3, p_top1, top_scorer_score are populated for backtest
         if progress_callback:
             progress_callback(total_games, total_games, "Running top-3 simulation...")

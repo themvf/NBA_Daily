@@ -6390,6 +6390,112 @@ if selected_page == "Admin Panel":
 
     st.divider()
 
+    # ==========================================================================
+    # The Odds API Usage Tracker
+    # ==========================================================================
+    st.subheader("🎰 The Odds API Usage")
+    st.caption("Track your API budget for FanDuel player props")
+
+    try:
+        import odds_api
+        admin_conn = get_connection(str(db_path))
+
+        # Create tables if needed
+        odds_api.create_odds_tables(admin_conn)
+
+        # Get monthly usage
+        monthly_usage = odds_api.get_monthly_api_usage(admin_conn)
+        budget_limit = odds_api.MAX_API_REQUESTS_PER_MONTH
+
+        # Calculate percentages
+        usage_pct = (monthly_usage / budget_limit) * 100 if budget_limit > 0 else 0
+        remaining = budget_limit - monthly_usage
+
+        # Display metrics
+        api_col1, api_col2, api_col3 = st.columns(3)
+
+        with api_col1:
+            st.metric(
+                "Monthly Usage",
+                f"{monthly_usage}/{budget_limit}",
+                delta=f"{remaining} remaining",
+                delta_color="normal" if remaining > 100 else "inverse"
+            )
+
+        with api_col2:
+            # Progress bar with color coding
+            if usage_pct < 50:
+                color = "🟢"
+            elif usage_pct < 80:
+                color = "🟡"
+            else:
+                color = "🔴"
+            st.metric("Budget Used", f"{color} {usage_pct:.1f}%")
+
+        with api_col3:
+            # Check API key status
+            api_key = odds_api.get_api_key()
+            if api_key:
+                st.metric("API Key", "✅ Configured", delta=f"{api_key[:8]}...")
+            else:
+                st.metric("API Key", "❌ Not Set", delta="Add to secrets.toml")
+
+        # Progress bar
+        st.progress(min(1.0, usage_pct / 100), text=f"API Budget: {monthly_usage} of {budget_limit} requests used")
+
+        # Fetch history
+        with st.expander("📜 Recent Fetch History", expanded=False):
+            cursor = admin_conn.cursor()
+            cursor.execute("""
+                SELECT
+                    fetch_date,
+                    game_date,
+                    events_fetched,
+                    players_matched,
+                    api_requests_used,
+                    remaining_requests,
+                    error_message
+                FROM odds_fetch_log
+                ORDER BY created_at DESC
+                LIMIT 10
+            """)
+            fetch_history = cursor.fetchall()
+
+            if fetch_history:
+                import pandas as pd
+                history_df = pd.DataFrame(fetch_history, columns=[
+                    'Fetch Date', 'Game Date', 'Events', 'Players Matched',
+                    'API Requests', 'Remaining', 'Error'
+                ])
+                # Format error column
+                history_df['Status'] = history_df['Error'].apply(
+                    lambda x: '❌ ' + str(x)[:30] if x else '✅ Success'
+                )
+                history_df = history_df.drop('Error', axis=1)
+                st.dataframe(history_df, use_container_width=True, hide_index=True)
+            else:
+                st.info("No fetch history yet. Click 'Fetch FanDuel Lines' on the Vegas Comparison tab.")
+
+        # Budget recommendations
+        if usage_pct >= 80:
+            st.warning(f"""
+            ⚠️ **Budget Alert:** You've used {usage_pct:.0f}% of your monthly API budget.
+
+            **Options:**
+            - Upgrade your [The Odds API](https://the-odds-api.com/) plan
+            - Wait until next month (resets on the 1st)
+            - Reduce fetch frequency
+            """)
+        elif usage_pct >= 50:
+            st.info(f"💡 You've used {monthly_usage} requests. Budget resets on the 1st of next month.")
+
+    except ImportError:
+        st.info("odds_api module not available")
+    except Exception as e:
+        st.error(f"Error loading API usage: {e}")
+
+    st.divider()
+
     # Position Data Management Section
     st.subheader("🏀 Player Position Data")
     st.write("Populate Guard/Forward/Center positions from NBA API for position-specific PPM analysis")
