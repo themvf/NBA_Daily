@@ -1444,11 +1444,12 @@ def analyze_top_finishers(
         WHERE slate_date = ?
     """, conn, params=[slate_date])
 
-    # Create lookup by normalized name
-    player_lookup = {}
+    # Create multiple lookups for flexible name matching
+    player_lookup = {}          # normalized full name -> info
+    last_name_lookup = {}       # last_name -> list of infos (for fallback)
+
     for _, row in player_info.iterrows():
-        norm_name = _normalize_name(row['player_name'])
-        player_lookup[norm_name] = {
+        info = {
             'name': row['player_name'],
             'team': row['team'],
             'salary': row['salary'],
@@ -1456,6 +1457,46 @@ def analyze_top_finishers(
             'fpts': row['actual_fpts'],
             'opponent': row['opponent']
         }
+
+        norm_name = _normalize_name(row['player_name'])
+        player_lookup[norm_name] = info
+
+        # Also index by last name for fallback matching
+        parts = norm_name.split()
+        if parts:
+            last_name = parts[-1]
+            if last_name not in last_name_lookup:
+                last_name_lookup[last_name] = []
+            last_name_lookup[last_name].append(info)
+
+    def find_player_info(player_name: str) -> dict:
+        """Find player info with fallback matching."""
+        norm = _normalize_name(player_name)
+
+        # Try exact normalized match first
+        if norm in player_lookup:
+            return player_lookup[norm]
+
+        # Fallback: try last name match
+        parts = norm.split()
+        if parts:
+            last_name = parts[-1]
+            first_initial = parts[0][0] if parts else ''
+
+            candidates = last_name_lookup.get(last_name, [])
+
+            # If only one player with that last name, use it
+            if len(candidates) == 1:
+                return candidates[0]
+
+            # If multiple, try to match first initial
+            if len(candidates) > 1 and first_initial:
+                for c in candidates:
+                    c_norm = _normalize_name(c['name'])
+                    if c_norm.startswith(first_initial):
+                        return c
+
+        return {}
 
     # Position slots
     positions = ['pg', 'sg', 'sf', 'pf', 'c', 'g', 'f', 'util']
@@ -1486,8 +1527,8 @@ def analyze_top_finishers(
             if not player_name or pd.isna(player_name):
                 continue
 
-            norm_name = _normalize_name(player_name)
-            info = player_lookup.get(norm_name, {})
+            # Use flexible matching with fallback
+            info = find_player_info(player_name)
 
             player_data = {
                 'position': label,
