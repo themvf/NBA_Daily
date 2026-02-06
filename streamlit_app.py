@@ -13291,10 +13291,23 @@ if selected_page == "DFS Lineup Builder":
                         boost_players.append((p, sig))
 
             with st.expander("🎰 Vegas Edge Suggestions", expanded=bool(boost_players)):
+                # Recalculate button — always visible so user can load signals
+                # after fetching props post-projection
+                if st.button("🔄 Load / Recalculate Vegas Signals", help="Query props from database and compute edge signals"):
+                    game_dt = st.session_state.get('dfs_projection_date') or str(date.today())
+                    refreshed = _enrich_players_with_vegas_signals(dfs_conn, players, game_dt)
+                    st.session_state.dfs_vegas_signals = refreshed
+                    if refreshed:
+                        rc = sum(1 for s in refreshed.values() if s['signal'] == 'BOOST')
+                        st.success(f"Loaded signals for {len(refreshed)} players — {rc} BOOST candidate(s)")
+                    else:
+                        st.warning("No Vegas prop data found. Make sure FanDuel props have been fetched for this game date.")
+                    st.rerun()
+
                 if not vegas_sigs:
-                    st.caption("No Vegas prop data available. Fetch FanDuel props first, then refresh.")
+                    st.caption("Click the button above to load Vegas signals after fetching FanDuel props.")
                 elif not boost_players:
-                    st.caption("No BOOST candidates found (edge ≥ +10% at salary < $7K).")
+                    st.caption("No BOOST candidates found (edge ≥ +10% at salary < $7K). Signals are loaded for the player pool table above.")
                 else:
                     # Summary metrics
                     avg_edge = sum(s['edge_pct'] for _, s in boost_players) / len(boost_players)
@@ -13316,33 +13329,19 @@ if selected_page == "DFS Lineup Builder":
                     st.dataframe(pd.DataFrame(boost_data), use_container_width=True, hide_index=True)
 
                     # Apply button
-                    btn_col1, btn_col2 = st.columns(2)
-                    with btn_col1:
-                        if st.button("🚀 Apply Vegas Boost Suggestions", help="Add BOOST players to exposure targets at 25%"):
-                            current_targets = dict(st.session_state.dfs_exposure_targets)
-                            added = 0
-                            for p, _ in boost_players:
-                                if p.player_id not in current_targets:
-                                    current_targets[p.player_id] = 0.25
-                                    added += 1
-                            st.session_state.dfs_exposure_targets = current_targets
-                            if added:
-                                st.success(f"Added {added} BOOST player(s) to exposure targets at 25%")
-                            else:
-                                st.info("All BOOST players already have exposure targets set.")
-                            st.rerun()
-
-                    with btn_col2:
-                        if st.button("🔄 Recalculate Signals", help="Recompute edge signals from cached props data"):
-                            game_dt = st.session_state.get('dfs_projection_date') or str(date.today())
-                            refreshed = _enrich_players_with_vegas_signals(dfs_conn, players, game_dt)
-                            st.session_state.dfs_vegas_signals = refreshed
-                            if refreshed:
-                                rc = sum(1 for s in refreshed.values() if s['signal'] == 'BOOST')
-                                st.success(f"Refreshed — {rc} BOOST candidate(s) found")
-                            else:
-                                st.warning("No Vegas prop data found for this game date.")
-                            st.rerun()
+                    if st.button("🚀 Apply Vegas Boost Suggestions", help="Add BOOST players to exposure targets at 25%"):
+                        current_targets = dict(st.session_state.dfs_exposure_targets)
+                        added = 0
+                        for p, _ in boost_players:
+                            if p.player_id not in current_targets:
+                                current_targets[p.player_id] = 0.25
+                                added += 1
+                        st.session_state.dfs_exposure_targets = current_targets
+                        if added:
+                            st.success(f"Added {added} BOOST player(s) to exposure targets at 25%")
+                        else:
+                            st.info("All BOOST players already have exposure targets set.")
+                        st.rerun()
 
                     st.caption("Players where Vegas implied FPTS exceeds our projection by ≥10% at salary < $7K. "
                                "These are value plays where the market sees upside our model may underweight.")
