@@ -22,12 +22,45 @@ import os
 # Constants
 BASE_URL = "https://api.the-odds-api.com/v4"
 SPORT = "basketball_nba"
-MARKET = "player_points"
+MARKET = "player_points"  # Legacy single market (for compatibility)
 BOOKMAKER = "fanduel"
 MAX_API_REQUESTS_PER_MONTH = 500
 BUDGET_WARNING_THRESHOLD = 0.80  # Warn at 80%
 BUDGET_BLOCK_THRESHOLD = 0.95   # Block at 95%
 FUZZY_MATCH_THRESHOLD = 85      # Minimum similarity score
+
+# Extended player prop markets for DFS stat analysis
+# All fetched in a single request per event (efficient!)
+EXTENDED_PROP_MARKETS = [
+    "player_points",                    # 1 FPTS per point
+    "player_rebounds",                  # 1.2 FPTS per rebound
+    "player_assists",                   # 1.5 FPTS per assist
+    "player_threes",                    # 0.5 FPTS bonus per 3PM
+    "player_steals",                    # 3 FPTS per steal (HIGH VALUE!)
+    "player_blocks",                    # 3 FPTS per block (HIGH VALUE!)
+    "player_points_rebounds_assists",   # PRA combo - fantasy proxy!
+]
+
+# Market key to database column mapping
+MARKET_COLUMN_MAP = {
+    "player_points": "fanduel_ou",           # Points - existing column
+    "player_rebounds": "fanduel_reb_ou",
+    "player_assists": "fanduel_ast_ou",
+    "player_threes": "fanduel_3pm_ou",
+    "player_steals": "fanduel_stl_ou",
+    "player_blocks": "fanduel_blk_ou",
+    "player_points_rebounds_assists": "fanduel_pra_ou",  # Fantasy proxy!
+}
+
+# FanDuel DFS scoring weights (for converting stat lines to FPTS)
+DFS_WEIGHTS = {
+    "points": 1.0,
+    "rebounds": 1.2,
+    "assists": 1.5,
+    "threes": 0.5,  # Bonus only (points already counted)
+    "steals": 3.0,
+    "blocks": 3.0,
+}
 
 
 def get_api_key() -> Optional[str]:
@@ -112,13 +145,23 @@ def upgrade_predictions_for_fanduel(conn: sqlite3.Connection) -> None:
     cursor.execute("PRAGMA table_info(predictions)")
     existing_columns = {row[1] for row in cursor.fetchall()}
 
-    # New columns to add
+    # Core columns (existing)
     new_columns = {
         'fanduel_ou': 'REAL DEFAULT NULL',
         'fanduel_over_odds': 'INTEGER DEFAULT NULL',
         'fanduel_under_odds': 'INTEGER DEFAULT NULL',
         'fanduel_fetched_at': 'TEXT DEFAULT NULL',
         'odds_event_id': 'TEXT DEFAULT NULL',
+        # Extended stat prop columns
+        'fanduel_reb_ou': 'REAL DEFAULT NULL',      # Rebounds O/U
+        'fanduel_ast_ou': 'REAL DEFAULT NULL',      # Assists O/U
+        'fanduel_3pm_ou': 'REAL DEFAULT NULL',      # 3-pointers made O/U
+        'fanduel_stl_ou': 'REAL DEFAULT NULL',      # Steals O/U
+        'fanduel_blk_ou': 'REAL DEFAULT NULL',      # Blocks O/U
+        'fanduel_pra_ou': 'REAL DEFAULT NULL',      # PRA combo (fantasy proxy!)
+        # Vegas-implied fantasy points
+        'vegas_implied_fpts': 'REAL DEFAULT NULL',  # Calculated from all props
+        'vegas_vs_proj_diff': 'REAL DEFAULT NULL',  # Difference from our projection
     }
 
     # Add missing columns
@@ -393,24 +436,43 @@ def store_game_odds_from_api(conn: sqlite3.Connection, games: List[Dict]) -> int
 
 def get_player_props_for_event(
     api_key: str,
-    event_id: str
+    event_id: str,
+    extended_markets: bool = False
 ) -> Tuple[Dict[str, Dict], int]:
     """
-    Fetch player points props for a specific event.
+    Fetch player props for a specific event.
 
     Args:
         api_key: The Odds API key
         event_id: Event ID from get_nba_events
+        extended_markets: If True, fetch all stat props (reb, ast, 3pm, stl, blk, PRA)
 
     Returns:
         (player_lines dict, requests_used)
-        player_lines: {player_name: {ou: float, over_odds: int, under_odds: int}}
+        player_lines: {player_name: {
+            ou: float,              # Points O/U
+            over_odds: int,
+            under_odds: int,
+            reb_ou: float,          # Rebounds O/U (if extended)
+            ast_ou: float,          # Assists O/U (if extended)
+            fg3m_ou: float,         # 3PM O/U (if extended)
+            stl_ou: float,          # Steals O/U (if extended)
+            blk_ou: float,          # Blocks O/U (if extended)
+            pra_ou: float,          # PRA combo (if extended)
+        }}
     """
     url = f"{BASE_URL}/sports/{SPORT}/events/{event_id}/odds"
+
+    # Determine which markets to fetch
+    if extended_markets:
+        markets = ",".join(EXTENDED_PROP_MARKETS)
+    else:
+        markets = MARKET
+
     params = {
         "apiKey": api_key,
         "regions": "us",
-        "markets": MARKET,
+        "markets": markets,
         "bookmakers": BOOKMAKER,
     }
 
@@ -420,30 +482,67 @@ def get_player_props_for_event(
     data = response.json()
     player_lines = {}
 
-    # Parse the response to extract player lines
+    # Parse the response to extract player lines for all markets
     if "bookmakers" in data:
         for bookmaker in data["bookmakers"]:
             if bookmaker.get("key") == BOOKMAKER:
                 for market in bookmaker.get("markets", []):
-                    if market.get("key") == MARKET:
-                        for outcome in market.get("outcomes", []):
-                            player_name = outcome.get("description", "")
-                            point = outcome.get("point")
-                            price = outcome.get("price")
-                            outcome_name = outcome.get("name", "").lower()
+                    market_key = market.get("key", "")
 
-                            if player_name and point is not None:
-                                if player_name not in player_lines:
-                                    player_lines[player_name] = {
-                                        "ou": point,
-                                        "over_odds": None,
-                                        "under_odds": None,
-                                    }
+                    for outcome in market.get("outcomes", []):
+                        player_name = outcome.get("description", "")
+                        point = outcome.get("point")
+                        price = outcome.get("price")
+                        outcome_name = outcome.get("name", "").lower()
 
-                                if outcome_name == "over":
-                                    player_lines[player_name]["over_odds"] = price
-                                elif outcome_name == "under":
-                                    player_lines[player_name]["under_odds"] = price
+                        if not player_name or point is None:
+                            continue
+
+                        # Initialize player entry if needed
+                        if player_name not in player_lines:
+                            player_lines[player_name] = {
+                                "ou": None,
+                                "over_odds": None,
+                                "under_odds": None,
+                                "reb_ou": None,
+                                "ast_ou": None,
+                                "fg3m_ou": None,
+                                "stl_ou": None,
+                                "blk_ou": None,
+                                "pra_ou": None,
+                            }
+
+                        # Map market to appropriate field
+                        if market_key == "player_points":
+                            player_lines[player_name]["ou"] = point
+                            if outcome_name == "over":
+                                player_lines[player_name]["over_odds"] = price
+                            elif outcome_name == "under":
+                                player_lines[player_name]["under_odds"] = price
+
+                        elif market_key == "player_rebounds":
+                            if outcome_name == "over":  # Use Over line as the O/U
+                                player_lines[player_name]["reb_ou"] = point
+
+                        elif market_key == "player_assists":
+                            if outcome_name == "over":
+                                player_lines[player_name]["ast_ou"] = point
+
+                        elif market_key == "player_threes":
+                            if outcome_name == "over":
+                                player_lines[player_name]["fg3m_ou"] = point
+
+                        elif market_key == "player_steals":
+                            if outcome_name == "over":
+                                player_lines[player_name]["stl_ou"] = point
+
+                        elif market_key == "player_blocks":
+                            if outcome_name == "over":
+                                player_lines[player_name]["blk_ou"] = point
+
+                        elif market_key == "player_points_rebounds_assists":
+                            if outcome_name == "over":
+                                player_lines[player_name]["pra_ou"] = point
 
     return player_lines, 1
 
@@ -545,15 +644,35 @@ def update_prediction_with_odds(
     fanduel_ou: float,
     fanduel_over_odds: Optional[int],
     fanduel_under_odds: Optional[int],
-    event_id: Optional[str] = None
+    event_id: Optional[str] = None,
+    # Extended stat props
+    reb_ou: Optional[float] = None,
+    ast_ou: Optional[float] = None,
+    fg3m_ou: Optional[float] = None,
+    stl_ou: Optional[float] = None,
+    blk_ou: Optional[float] = None,
+    pra_ou: Optional[float] = None,
 ) -> bool:
     """
-    Update a prediction record with FanDuel odds data.
+    Update a prediction record with FanDuel odds data (including extended stats).
 
     Returns:
         True if updated, False if prediction not found
     """
     cursor = conn.cursor()
+
+    # Calculate Vegas-implied FPTS if we have enough data
+    vegas_implied_fpts = None
+    if fanduel_ou is not None:
+        vegas_implied_fpts = calculate_vegas_implied_fpts(
+            points_ou=fanduel_ou,
+            reb_ou=reb_ou,
+            ast_ou=ast_ou,
+            fg3m_ou=fg3m_ou,
+            stl_ou=stl_ou,
+            blk_ou=blk_ou,
+            pra_ou=pra_ou
+        )
 
     cursor.execute("""
         UPDATE predictions
@@ -561,12 +680,134 @@ def update_prediction_with_odds(
             fanduel_over_odds = ?,
             fanduel_under_odds = ?,
             fanduel_fetched_at = CURRENT_TIMESTAMP,
-            odds_event_id = ?
+            odds_event_id = ?,
+            fanduel_reb_ou = ?,
+            fanduel_ast_ou = ?,
+            fanduel_3pm_ou = ?,
+            fanduel_stl_ou = ?,
+            fanduel_blk_ou = ?,
+            fanduel_pra_ou = ?,
+            vegas_implied_fpts = ?
         WHERE player_id = ? AND game_date = ?
-    """, (fanduel_ou, fanduel_over_odds, fanduel_under_odds, event_id, player_id, game_date))
+    """, (
+        fanduel_ou, fanduel_over_odds, fanduel_under_odds, event_id,
+        reb_ou, ast_ou, fg3m_ou, stl_ou, blk_ou, pra_ou,
+        vegas_implied_fpts,
+        player_id, game_date
+    ))
 
     conn.commit()
     return cursor.rowcount > 0
+
+
+def calculate_vegas_implied_fpts(
+    points_ou: Optional[float] = None,
+    reb_ou: Optional[float] = None,
+    ast_ou: Optional[float] = None,
+    fg3m_ou: Optional[float] = None,
+    stl_ou: Optional[float] = None,
+    blk_ou: Optional[float] = None,
+    pra_ou: Optional[float] = None,
+    turnovers_estimate: float = 1.5,  # League avg ~1.5 TOV
+) -> Optional[float]:
+    """
+    Calculate Vegas-implied fantasy points from player props.
+
+    FanDuel DFS Scoring:
+    - Points: 1 FPTS each
+    - Rebounds: 1.2 FPTS each
+    - Assists: 1.5 FPTS each
+    - 3PM: 0.5 FPTS bonus (points already counted)
+    - Steals: 3 FPTS each
+    - Blocks: 3 FPTS each
+    - Turnovers: -0.5 FPTS each
+
+    Strategy:
+    1. If PRA combo is available, use it (most accurate single proxy)
+    2. Otherwise, sum individual stat props × weights
+    3. Apply adjustments for 3PM bonus and turnovers
+
+    Args:
+        points_ou: Points O/U line
+        reb_ou: Rebounds O/U line
+        ast_ou: Assists O/U line
+        fg3m_ou: 3-pointers made O/U line
+        stl_ou: Steals O/U line
+        blk_ou: Blocks O/U line
+        pra_ou: Points+Rebounds+Assists combo O/U
+        turnovers_estimate: Estimated turnovers (default 1.5)
+
+    Returns:
+        Estimated fantasy points, or None if insufficient data
+    """
+    if points_ou is None:
+        return None
+
+    fpts = 0.0
+
+    # Method 1: Use PRA combo if available (most reliable)
+    if pra_ou is not None:
+        # PRA = P + R + A, but DFS weights are 1, 1.2, 1.5
+        # We need to estimate the breakdown
+        # Average NBA breakdown: 60% P, 22% R, 18% A
+        estimated_pts = pra_ou * 0.60
+        estimated_reb = pra_ou * 0.22
+        estimated_ast = pra_ou * 0.18
+
+        # But use individual lines if available to refine
+        if reb_ou is not None:
+            estimated_reb = reb_ou
+        if ast_ou is not None:
+            estimated_ast = ast_ou
+        if points_ou is not None:
+            estimated_pts = points_ou
+
+        fpts = (
+            estimated_pts * DFS_WEIGHTS["points"] +
+            estimated_reb * DFS_WEIGHTS["rebounds"] +
+            estimated_ast * DFS_WEIGHTS["assists"]
+        )
+
+    # Method 2: Build from individual props
+    else:
+        fpts = points_ou * DFS_WEIGHTS["points"]
+
+        if reb_ou is not None:
+            fpts += reb_ou * DFS_WEIGHTS["rebounds"]
+        else:
+            # Estimate rebounds from points (very rough: ~0.2 R per P)
+            fpts += (points_ou * 0.2) * DFS_WEIGHTS["rebounds"]
+
+        if ast_ou is not None:
+            fpts += ast_ou * DFS_WEIGHTS["assists"]
+        else:
+            # Estimate assists from points (rough: ~0.15 A per P)
+            fpts += (points_ou * 0.15) * DFS_WEIGHTS["assists"]
+
+    # Add 3PM bonus (0.5 FPTS per 3 made, on top of the 3 points)
+    if fg3m_ou is not None:
+        fpts += fg3m_ou * DFS_WEIGHTS["threes"]
+    else:
+        # Estimate 3PM from points (~0.1 per point for average player)
+        fpts += (points_ou * 0.1) * DFS_WEIGHTS["threes"]
+
+    # Add steals and blocks (HIGH VALUE!)
+    if stl_ou is not None:
+        fpts += stl_ou * DFS_WEIGHTS["steals"]
+    else:
+        # League avg ~0.8 steals
+        fpts += 0.8 * DFS_WEIGHTS["steals"]
+
+    if blk_ou is not None:
+        fpts += blk_ou * DFS_WEIGHTS["blocks"]
+    else:
+        # League avg ~0.5 blocks
+        fpts += 0.5 * DFS_WEIGHTS["blocks"]
+
+    # Subtract turnovers
+    fpts -= turnovers_estimate * 0.5
+
+    return round(fpts, 1)
 
 
 def log_fetch_attempt(
@@ -602,10 +843,11 @@ def log_fetch_attempt(
 def fetch_fanduel_lines_for_date(
     conn: sqlite3.Connection,
     game_date: date,
-    force: bool = False
+    force: bool = False,
+    extended_markets: bool = True  # NEW: Fetch all stat props by default
 ) -> Dict[str, Any]:
     """
-    Fetch FanDuel player points lines for all games on a date.
+    Fetch FanDuel player props for all games on a date.
 
     This is the main entry point for fetching odds.
 
@@ -613,14 +855,17 @@ def fetch_fanduel_lines_for_date(
         conn: Database connection
         game_date: Date to fetch odds for
         force: If True, bypass the "already fetched" safeguard (for injury updates)
+        extended_markets: If True (default), fetch all stat props (reb, ast, 3pm, stl, blk, PRA)
+                         This is efficient - all markets are fetched in a single request per event
 
     Returns:
         Dict with keys:
             - success: bool
-            - lines: Dict[player_id, {ou, over_odds, under_odds}]
+            - lines: Dict[player_id, {ou, over_odds, under_odds, reb_ou, ast_ou, ...}]
             - players_matched: int
             - events_fetched: int
             - api_requests_used: int
+            - extended_stats_found: int (count of players with extended stat props)
             - error: Optional[str]
     """
     result = {
@@ -629,6 +874,7 @@ def fetch_fanduel_lines_for_date(
         "players_matched": 0,
         "events_fetched": 0,
         "api_requests_used": 0,
+        "extended_stats_found": 0,
         "error": None,
     }
 
@@ -708,7 +954,9 @@ def fetch_fanduel_lines_for_date(
                 continue
 
             try:
-                player_lines, req_count = get_player_props_for_event(api_key, event_id)
+                player_lines, req_count = get_player_props_for_event(
+                    api_key, event_id, extended_markets=extended_markets
+                )
                 total_requests += req_count
 
                 # Map and store lines
@@ -716,19 +964,36 @@ def fetch_fanduel_lines_for_date(
                     player_id, confidence, method = map_player_name_to_id(fanduel_name, conn)
 
                     if player_id:
-                        # Update prediction record
+                        # Update prediction record with all available props
                         updated = update_prediction_with_odds(
                             conn=conn,
                             player_id=player_id,
                             game_date=game_date_str,
-                            fanduel_ou=line_data["ou"],
-                            fanduel_over_odds=line_data["over_odds"],
-                            fanduel_under_odds=line_data["under_odds"],
-                            event_id=event_id
+                            fanduel_ou=line_data.get("ou"),
+                            fanduel_over_odds=line_data.get("over_odds"),
+                            fanduel_under_odds=line_data.get("under_odds"),
+                            event_id=event_id,
+                            # Extended stat props
+                            reb_ou=line_data.get("reb_ou"),
+                            ast_ou=line_data.get("ast_ou"),
+                            fg3m_ou=line_data.get("fg3m_ou"),
+                            stl_ou=line_data.get("stl_ou"),
+                            blk_ou=line_data.get("blk_ou"),
+                            pra_ou=line_data.get("pra_ou"),
                         )
 
                         if updated:
                             result["lines"][player_id] = line_data
+                            # Track if extended stats were found
+                            if any([
+                                line_data.get("reb_ou"),
+                                line_data.get("ast_ou"),
+                                line_data.get("fg3m_ou"),
+                                line_data.get("stl_ou"),
+                                line_data.get("blk_ou"),
+                                line_data.get("pra_ou"),
+                            ]):
+                                result["extended_stats_found"] += 1
                             result["players_matched"] += 1
 
                 # Small delay between requests to be nice to API
@@ -1252,6 +1517,293 @@ def get_vegas_adjusted_projection(
         projection = (projection + ceiling) / 2
 
     return projection, floor, ceiling, analytics
+
+
+# =============================================================================
+# Mispricing Detection for DFS Edge
+# =============================================================================
+
+def detect_stat_mispricings(
+    conn: sqlite3.Connection,
+    game_date: str,
+    min_divergence_pct: float = 15.0,
+    include_marginal_players: bool = True
+) -> List[Dict[str, Any]]:
+    """
+    Detect players where Vegas props significantly differ from our projections.
+
+    This is the key value of extended prop markets - finding edge cases where:
+    1. Vegas has info we don't (injury news, lineup changes)
+    2. Market is inefficient on peripheral stats (rebounds, assists for mid-tier players)
+    3. PRA combo reveals fantasy upside not captured in individual stat models
+
+    Args:
+        conn: Database connection
+        game_date: Game date (YYYY-MM-DD)
+        min_divergence_pct: Minimum % difference to flag (default 15%)
+        include_marginal_players: Include players with salary < $5000
+
+    Returns:
+        List of mispricing dicts, sorted by edge potential:
+        {
+            player_name, salary, position,
+            our_proj, vegas_implied, divergence_pct,
+            stat_mispricings: [{stat, our_value, vegas_value, edge}],
+            recommendation: "BOOST" | "FADE" | "WATCH"
+        }
+    """
+    cursor = conn.cursor()
+
+    # Query players with Vegas data
+    cursor.execute("""
+        SELECT
+            p.player_name,
+            p.team_name,
+            p.projected_ppg,
+            p.proj_floor,
+            p.proj_ceiling,
+            p.proj_rebounds,
+            p.proj_assists,
+            p.proj_fg3m,
+            p.proj_steals,
+            p.proj_blocks,
+            p.fanduel_ou,
+            p.fanduel_reb_ou,
+            p.fanduel_ast_ou,
+            p.fanduel_3pm_ou,
+            p.fanduel_stl_ou,
+            p.fanduel_blk_ou,
+            p.fanduel_pra_ou,
+            p.vegas_implied_fpts,
+            p.dfs_salary,
+            p.position
+        FROM predictions p
+        WHERE p.game_date = ?
+        AND p.fanduel_ou IS NOT NULL
+    """, (game_date,))
+
+    columns = [
+        'player_name', 'team_name', 'projected_ppg', 'proj_floor', 'proj_ceiling',
+        'proj_rebounds', 'proj_assists', 'proj_fg3m', 'proj_steals', 'proj_blocks',
+        'fanduel_ou', 'fanduel_reb_ou', 'fanduel_ast_ou', 'fanduel_3pm_ou',
+        'fanduel_stl_ou', 'fanduel_blk_ou', 'fanduel_pra_ou', 'vegas_implied_fpts',
+        'dfs_salary', 'position'
+    ]
+
+    mispricings = []
+
+    for row in cursor.fetchall():
+        data = dict(zip(columns, row))
+
+        # Skip low-salary players if not including marginal
+        salary = data.get('dfs_salary') or 0
+        if not include_marginal_players and salary < 5000:
+            continue
+
+        our_fpts = data.get('projected_ppg') or 0
+        vegas_fpts = data.get('vegas_implied_fpts')
+
+        # Calculate overall divergence
+        if our_fpts > 0 and vegas_fpts:
+            overall_divergence = ((vegas_fpts - our_fpts) / our_fpts) * 100
+        else:
+            overall_divergence = 0
+
+        # Check individual stat mispricings
+        stat_mispricings = []
+
+        stat_checks = [
+            ('points', data.get('projected_ppg'), data.get('fanduel_ou'), 1.0),
+            ('rebounds', data.get('proj_rebounds'), data.get('fanduel_reb_ou'), 1.2),
+            ('assists', data.get('proj_assists'), data.get('fanduel_ast_ou'), 1.5),
+            ('3pm', data.get('proj_fg3m'), data.get('fanduel_3pm_ou'), 0.5),
+            ('steals', data.get('proj_steals'), data.get('fanduel_stl_ou'), 3.0),
+            ('blocks', data.get('proj_blocks'), data.get('fanduel_blk_ou'), 3.0),
+        ]
+
+        for stat_name, our_val, vegas_val, fpts_weight in stat_checks:
+            if our_val and vegas_val and our_val > 0:
+                divergence = ((vegas_val - our_val) / our_val) * 100
+                edge_fpts = (vegas_val - our_val) * fpts_weight
+
+                if abs(divergence) >= min_divergence_pct:
+                    stat_mispricings.append({
+                        'stat': stat_name,
+                        'our_value': round(our_val, 1),
+                        'vegas_value': round(vegas_val, 1),
+                        'divergence_pct': round(divergence, 1),
+                        'edge_fpts': round(edge_fpts, 1),
+                        'direction': 'OVER' if divergence > 0 else 'UNDER'
+                    })
+
+        # Only include if there's meaningful divergence
+        if abs(overall_divergence) >= min_divergence_pct or stat_mispricings:
+            # Determine recommendation
+            if overall_divergence >= 15:
+                recommendation = "BOOST"  # Vegas sees more upside
+            elif overall_divergence <= -15:
+                recommendation = "FADE"   # Vegas sees less upside
+            else:
+                recommendation = "WATCH"  # Individual stat edges
+
+            mispricings.append({
+                'player_name': data['player_name'],
+                'team': data['team_name'],
+                'salary': salary,
+                'position': data.get('position', ''),
+                'our_proj_fpts': round(our_fpts, 1),
+                'vegas_implied_fpts': round(vegas_fpts, 1) if vegas_fpts else None,
+                'overall_divergence_pct': round(overall_divergence, 1),
+                'stat_mispricings': stat_mispricings,
+                'recommendation': recommendation,
+                # Additional context
+                'proj_floor': data.get('proj_floor'),
+                'proj_ceiling': data.get('proj_ceiling'),
+                'pra_ou': data.get('fanduel_pra_ou'),
+            })
+
+    # Sort by absolute divergence (biggest edges first)
+    mispricings.sort(key=lambda x: abs(x['overall_divergence_pct']), reverse=True)
+
+    return mispricings
+
+
+def get_vegas_stat_blend(
+    conn: sqlite3.Connection,
+    player_id: int,
+    game_date: str,
+    stat_name: str,
+    our_projection: float,
+    vegas_weight: float = 0.35
+) -> Tuple[float, Dict[str, Any]]:
+    """
+    Blend our stat projection with Vegas O/U for a specific stat.
+
+    This is the stat-level equivalent of get_vegas_ensemble_projection().
+    Particularly valuable for:
+    - Rebounds for stretch 4s (Vegas may price rest differently)
+    - Assists for backup PGs (matchup-dependent)
+    - Steals/blocks for defensive specialists
+
+    Args:
+        conn: Database connection
+        player_id: Player's database ID
+        game_date: Game date (YYYY-MM-DD)
+        stat_name: One of 'rebounds', 'assists', 'fg3m', 'steals', 'blocks'
+        our_projection: Our model's projection for this stat
+        vegas_weight: Weight for Vegas line (default 35% - slightly higher than points)
+
+    Returns:
+        (blended_projection, analytics_dict)
+    """
+    # Map stat name to database column
+    stat_column_map = {
+        'rebounds': 'fanduel_reb_ou',
+        'assists': 'fanduel_ast_ou',
+        'fg3m': 'fanduel_3pm_ou',
+        'threes': 'fanduel_3pm_ou',
+        'steals': 'fanduel_stl_ou',
+        'blocks': 'fanduel_blk_ou',
+    }
+
+    column = stat_column_map.get(stat_name.lower())
+    if not column:
+        return our_projection, {'blended': False, 'reason': f'Unknown stat: {stat_name}'}
+
+    cursor = conn.cursor()
+    cursor.execute(f"""
+        SELECT {column} FROM predictions
+        WHERE player_id = ? AND game_date = ?
+    """, (player_id, game_date))
+
+    result = cursor.fetchone()
+
+    analytics = {
+        'stat': stat_name,
+        'our_projection': our_projection,
+        'vegas_ou': None,
+        'weight_used': 0.0,
+        'adjustment': 0.0,
+        'blended': False,
+        'reason': 'No Vegas data'
+    }
+
+    if not result or result[0] is None:
+        return our_projection, analytics
+
+    vegas_ou = result[0]
+    analytics['vegas_ou'] = vegas_ou
+
+    # Calculate divergence
+    if our_projection > 0:
+        divergence_pct = abs(vegas_ou - our_projection) / our_projection * 100
+    else:
+        divergence_pct = 0
+
+    # Dynamic weighting - trust Vegas more for peripheral stats
+    effective_weight = vegas_weight
+
+    # Higher weight for stats with larger divergence
+    if divergence_pct > 25:
+        effective_weight = min(0.50, vegas_weight + 0.10)
+        analytics['reason'] = 'Large divergence - trusting Vegas more'
+    elif divergence_pct > 15:
+        effective_weight = min(0.45, vegas_weight + 0.05)
+        analytics['reason'] = 'Moderate divergence'
+    else:
+        analytics['reason'] = 'Normal blending'
+
+    analytics['weight_used'] = round(effective_weight, 2)
+
+    # Blend
+    blended = (1 - effective_weight) * our_projection + effective_weight * vegas_ou
+    blended = round(blended, 1)
+
+    analytics['adjustment'] = round(blended - our_projection, 1)
+    analytics['blended'] = True
+
+    return blended, analytics
+
+
+def format_mispricing_summary(mispricings: List[Dict]) -> str:
+    """
+    Format mispricings for display in Streamlit UI.
+
+    Returns a markdown-formatted string.
+    """
+    if not mispricings:
+        return "No significant mispricings detected."
+
+    lines = ["### 🎯 Vegas Mispricing Alerts\n"]
+
+    boost_players = [m for m in mispricings if m['recommendation'] == 'BOOST']
+    fade_players = [m for m in mispricings if m['recommendation'] == 'FADE']
+
+    if boost_players:
+        lines.append("**🚀 BOOST (Vegas sees more upside):**")
+        for p in boost_players[:5]:
+            stat_edges = ', '.join([
+                f"{s['stat']}: {s['direction']} ({s['edge_fpts']:+.1f} FPTS)"
+                for s in p['stat_mispricings'][:2]
+            ])
+            lines.append(
+                f"- **{p['player_name']}** (${p['salary']:,}): "
+                f"Our {p['our_proj_fpts']} → Vegas {p['vegas_implied_fpts']} "
+                f"({p['overall_divergence_pct']:+.0f}%)"
+            )
+            if stat_edges:
+                lines.append(f"  - {stat_edges}")
+
+    if fade_players:
+        lines.append("\n**📉 FADE (Vegas sees less upside):**")
+        for p in fade_players[:5]:
+            lines.append(
+                f"- **{p['player_name']}** (${p['salary']:,}): "
+                f"Our {p['our_proj_fpts']} → Vegas {p['vegas_implied_fpts']} "
+                f"({p['overall_divergence_pct']:+.0f}%)"
+            )
+
+    return '\n'.join(lines)
 
 
 if __name__ == "__main__":
