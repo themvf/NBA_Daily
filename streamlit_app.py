@@ -12805,7 +12805,8 @@ if selected_page == "DFS Lineup Builder":
         "📊 Generated Lineups",
         "📈 Exposure Report",
         "🎯 Model Accuracy",
-        "🦈 Opponent Analysis"
+        "🦈 Opponent Analysis",
+        "🎰 FanDuel Props"
     ])
 
     # ==========================================================================
@@ -14396,6 +14397,271 @@ if selected_page == "DFS Lineup Builder":
             st.error(f"❌ Error loading opponent analysis: {e}")
             import traceback
             st.code(traceback.format_exc())
+
+    # ==========================================================================
+    # TAB 7: FanDuel Props
+    # ==========================================================================
+    with builder_tabs[6]:
+        st.subheader("FanDuel Player Props")
+        st.caption("View all FanDuel player prop lines alongside our projections — verify API data is populated")
+
+        # Date selector — default to DFS projection date if available
+        props_default_date = date.today()
+        if st.session_state.dfs_projection_date:
+            try:
+                props_default_date = datetime.strptime(
+                    st.session_state.dfs_projection_date, "%Y-%m-%d"
+                ).date()
+            except (ValueError, TypeError):
+                pass
+
+        props_date = st.date_input(
+            "Game Date",
+            value=props_default_date,
+            key="fanduel_props_date"
+        )
+
+        # Ensure schema is up to date (idempotent — only adds missing columns)
+        odds_api.create_odds_tables(dfs_conn)
+        pt.upgrade_predictions_table_for_fanduel(dfs_conn)
+        odds_api.upgrade_predictions_for_fanduel(dfs_conn)
+
+        # --- Fetch Button (reuses FanDuel Compare pattern) ---
+        api_key = odds_api.get_api_key()
+
+        if api_key:
+            should_fetch, reason = odds_api.should_fetch_odds(dfs_conn, props_date)
+            already_fetched = "Already fetched" in reason
+            force_refetch = False
+
+            if already_fetched:
+                st.caption(f"ℹ️ {reason}")
+                force_refetch = st.checkbox(
+                    "🔄 Force refetch (update lines after injury news)",
+                    help="Refetch after injury news or lineup changes. Uses additional API quota.",
+                    key="props_force_refetch"
+                )
+
+            if should_fetch or force_refetch:
+                button_label = "🔄 Refetch FanDuel Lines" if force_refetch else "🔄 Fetch FanDuel Lines"
+                if st.button(button_label, type="primary", key="props_fetch_btn"):
+                    with st.spinner("Fetching all player props from The Odds API..."):
+                        result = odds_api.fetch_fanduel_lines_for_date(
+                            dfs_conn, props_date, force=force_refetch
+                        )
+                        if result['success']:
+                            extended_count = result.get('extended_stats_found', 0)
+                            st.success(
+                                f"✅ Fetched lines for {result['players_matched']} players "
+                                f"({extended_count} with extended stats) "
+                                f"using {result['api_requests_used']} API requests"
+                            )
+                            st.rerun()
+                        else:
+                            st.error(f"Fetch failed: {result.get('error', 'Unknown error')}")
+            elif not already_fetched:
+                st.caption(f"ℹ️ {reason}")
+        else:
+            st.warning(
+                "**API key not configured.** Add `[theoddsapi]` section to `.streamlit/secrets.toml`:\n\n"
+                "```toml\n[theoddsapi]\nAPI_KEY = \"your-api-key-here\"\n```"
+            )
+
+        st.divider()
+
+        # --- Query predictions with FanDuel props ---
+        # Try LEFT JOIN to dfs_slate_projections for our per-stat projections
+        props_df = None
+        has_proj_stats = False
+
+        try:
+            props_query = """
+                SELECT
+                    p.player_name,
+                    p.team_name,
+                    p.opponent_name,
+                    p.projected_ppg,
+                    p.fanduel_ou,
+                    p.fanduel_reb_ou,
+                    p.fanduel_ast_ou,
+                    p.fanduel_3pm_ou,
+                    p.fanduel_stl_ou,
+                    p.fanduel_blk_ou,
+                    p.fanduel_pra_ou,
+                    p.vegas_implied_fpts,
+                    p.fanduel_fetched_at,
+                    d.proj_rebounds,
+                    d.proj_assists,
+                    d.proj_fg3m,
+                    d.proj_steals,
+                    d.proj_blocks,
+                    d.proj_fpts
+                FROM predictions p
+                LEFT JOIN dfs_slate_projections d
+                    ON p.player_id = d.player_id
+                    AND d.slate_date = p.game_date
+                WHERE p.game_date = ?
+                ORDER BY p.projected_ppg DESC
+            """
+            props_df = pd.read_sql_query(props_query, dfs_conn, params=[str(props_date)])
+            has_proj_stats = 'proj_rebounds' in props_df.columns
+        except Exception:
+            pass
+
+        # Fallback: query predictions alone if join failed
+        if props_df is None or props_df.empty:
+            try:
+                fallback_query = """
+                    SELECT
+                        player_name,
+                        team_name,
+                        opponent_name,
+                        projected_ppg,
+                        fanduel_ou,
+                        fanduel_reb_ou,
+                        fanduel_ast_ou,
+                        fanduel_3pm_ou,
+                        fanduel_stl_ou,
+                        fanduel_blk_ou,
+                        fanduel_pra_ou,
+                        vegas_implied_fpts,
+                        fanduel_fetched_at
+                    FROM predictions
+                    WHERE game_date = ?
+                    ORDER BY projected_ppg DESC
+                """
+                props_df = pd.read_sql_query(fallback_query, dfs_conn, params=[str(props_date)])
+                has_proj_stats = False
+            except Exception as e:
+                props_df = pd.DataFrame()
+                st.warning(f"Could not query predictions: {e}")
+
+        if props_df.empty:
+            st.info(
+                f"No predictions found for {props_date}. "
+                "Generate predictions in the **Today's Games** tab first."
+            )
+        else:
+            # --- Coverage metrics ---
+            prop_cols = [
+                'fanduel_ou', 'fanduel_reb_ou', 'fanduel_ast_ou',
+                'fanduel_3pm_ou', 'fanduel_stl_ou', 'fanduel_blk_ou',
+                'fanduel_pra_ou'
+            ]
+            # Ensure all prop columns exist (handle missing columns gracefully)
+            for col in prop_cols:
+                if col not in props_df.columns:
+                    props_df[col] = None
+
+            props_df['prop_count'] = props_df[prop_cols].notna().sum(axis=1)
+
+            total_players = len(props_df)
+            with_any_props = int(props_df['fanduel_ou'].notna().sum())
+
+            # Metrics row
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Total Players", total_players)
+            m2.metric("With Props", with_any_props)
+
+            if with_any_props > 0:
+                avg_coverage = props_df[props_df['prop_count'] > 0]['prop_count'].mean()
+                m3.metric("Avg Stats/Player", f"{avg_coverage:.1f}/7")
+            else:
+                m3.metric("Avg Stats/Player", "0/7")
+
+            monthly_usage = odds_api.get_monthly_api_usage(dfs_conn)
+            m4.metric("API Usage", f"{monthly_usage}/500")
+
+            st.divider()
+
+            # Filter toggle
+            show_all = st.toggle(
+                "Show all players (including those without props)",
+                value=False,
+                key="props_show_all"
+            )
+
+            if not show_all:
+                display_props_df = props_df[props_df['fanduel_ou'].notna()].copy()
+            else:
+                display_props_df = props_df.copy()
+
+            if display_props_df.empty:
+                st.info(
+                    "No FanDuel props found for this date. "
+                    "Click **Fetch FanDuel Lines** above to get latest odds."
+                )
+            else:
+                # Build display table
+                table_data = []
+                for _, row in display_props_df.iterrows():
+                    entry = {
+                        'Player': row['player_name'],
+                        'Team': row['team_name'],
+                        'Opp': row['opponent_name'],
+                        'PTS O/U': row.get('fanduel_ou'),
+                        'Proj PTS': row.get('projected_ppg'),
+                        'REB O/U': row.get('fanduel_reb_ou'),
+                        'AST O/U': row.get('fanduel_ast_ou'),
+                        '3PM O/U': row.get('fanduel_3pm_ou'),
+                        'STL O/U': row.get('fanduel_stl_ou'),
+                        'BLK O/U': row.get('fanduel_blk_ou'),
+                        'PRA O/U': row.get('fanduel_pra_ou'),
+                        'Vegas FPTS': row.get('vegas_implied_fpts'),
+                        'Coverage': f"{int(row['prop_count'])}/7",
+                    }
+
+                    # Add our per-stat projections if available from JOIN
+                    if has_proj_stats:
+                        entry['Proj REB'] = row.get('proj_rebounds')
+                        entry['Proj AST'] = row.get('proj_assists')
+                        entry['Proj 3PM'] = row.get('proj_fg3m')
+                        entry['Proj STL'] = row.get('proj_steals')
+                        entry['Proj BLK'] = row.get('proj_blocks')
+                        entry['Proj FPTS'] = row.get('proj_fpts')
+
+                    table_data.append(entry)
+
+                table_df = pd.DataFrame(table_data)
+
+                # Format numeric columns — display NaN as "—"
+                numeric_cols = [
+                    'PTS O/U', 'Proj PTS', 'REB O/U', 'AST O/U', '3PM O/U',
+                    'STL O/U', 'BLK O/U', 'PRA O/U', 'Vegas FPTS',
+                ]
+                if has_proj_stats:
+                    numeric_cols += ['Proj REB', 'Proj AST', 'Proj 3PM', 'Proj STL', 'Proj BLK', 'Proj FPTS']
+
+                for col in numeric_cols:
+                    if col in table_df.columns:
+                        table_df[col] = table_df[col].apply(
+                            lambda x: f"{x:.1f}" if pd.notna(x) else "\u2014"
+                        )
+
+                st.dataframe(
+                    table_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    height=600
+                )
+
+                # Legend
+                st.caption(
+                    "**Coverage** = how many of 7 stat props are populated (PTS / REB / AST / 3PM / STL / BLK / PRA). "
+                    "Stars typically have 7/7; role players may have fewer. "
+                    "**\u2014** = no line available from FanDuel."
+                )
+
+                # Export button
+                csv_data = display_props_df.to_csv(index=False)
+                st.download_button(
+                    label="📥 Export Props to CSV",
+                    data=csv_data,
+                    file_name=f"fanduel_props_{props_date}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    key="props_export_btn"
+                )
 
 st.divider()
 st.caption(
