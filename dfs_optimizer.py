@@ -533,6 +533,7 @@ class DFSPlayer:
     is_excluded: bool = False    # Never include in lineups
     is_injured: bool = False     # Player is OUT/DOUBTFUL - auto-excluded
     injury_status: str = ""      # Injury status (OUT, DOUBTFUL, etc.)
+    is_fallback: bool = False    # Using DK avg instead of our projection (unmatched player)
 
     # DraftKings data
     dk_id: str = ""
@@ -1154,6 +1155,21 @@ def generate_player_projections(
     Returns:
         DFSPlayer with projections populated
     """
+    # Handle fallback players (not in our database) - use DK average as projection
+    if player.is_fallback:
+        dk_avg = player.dk_avg_pts
+        if dk_avg > 0:
+            player.proj_fpts = dk_avg
+            player.proj_floor = dk_avg * 0.5   # Wider range for uncertainty
+            player.proj_ceiling = dk_avg * 1.8
+            player.fpts_per_dollar = (dk_avg / player.salary * 1000) if player.salary > 0 else 0
+            # Rough stat estimates (for display purposes only)
+            player.proj_points = dk_avg * 0.45   # ~45% of FPTS from points
+            player.proj_rebounds = dk_avg * 0.10
+            player.proj_assists = dk_avg * 0.08
+            player.ownership_proj = 5.0  # Assume low ownership for unknowns
+        return player
+
     # Load historical stats
     logs = load_player_historical_stats(conn, player.player_id, season, season_type)
 
@@ -1510,14 +1526,19 @@ def parse_dk_csv(
             team_lookup=team_to_players
         )
 
+        is_fallback = False
         if player_id is None:
+            # Player not in our database - use fallback projection from DK average
             unmatched.append(name)
-            continue
-
-        matched_names.append((name, name_to_id.get(normalize_name(name), {}).get('original_name', 'Unknown')))
+            # Generate a unique negative ID for unmatched players (hash of name)
+            player_id = -abs(hash(name)) % 1000000
+            is_fallback = True
+        else:
+            matched_names.append((name, name_to_id.get(normalize_name(name), {}).get('original_name', 'Unknown')))
 
         # Check if player is injured (from our API injury list)
-        is_injured = player_id in injured_player_ids
+        # Fallback players can't be checked against injury list (no player_id match)
+        is_injured = player_id in injured_player_ids if not is_fallback else False
         injury_status = ""
         if is_injured and player_id in injured_player_info:
             # Extract status from "Name (STATUS)" format
@@ -1546,7 +1567,8 @@ def parse_dk_csv(
             dk_id=str(row.get('id', '')),
             dk_avg_pts=dk_avg_pts if dk_avg_pts >= 0 else 0.0,
             is_injured=is_injured,
-            injury_status=injury_status.upper() if injury_status else ""
+            injury_status=injury_status.upper() if injury_status else "",
+            is_fallback=is_fallback
         )
 
         players.append(player)
@@ -1554,11 +1576,14 @@ def parse_dk_csv(
     # Count injured players (from API + DK-detected)
     injured_players = [p for p in players if p.is_injured]
     dk_detected_out = [p for p in players if 'DK' in p.injury_status]
+    fallback_players = [p for p in players if p.is_fallback]
 
     metadata = {
         'total_players': len(df),
-        'matched_players': len(players),
-        'unmatched_players': unmatched,
+        'matched_players': len(players) - len(fallback_players),
+        'fallback_players': [(p.name, p.team, p.dk_avg_pts) for p in fallback_players],
+        'fallback_count': len(fallback_players),
+        'unmatched_players': unmatched,  # Keep for backwards compatibility
         'unique_games': len(set(p.game_id for p in players)),
         'salary_range': (
             min(p.salary for p in players) if players else 0,

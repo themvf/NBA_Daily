@@ -12850,13 +12850,16 @@ if selected_page == "DFS Lineup Builder":
                         low, high = metadata['salary_range']
                         st.metric("Salary Range", f"${low:,} - ${high:,}")
 
-                    if metadata['unmatched_players']:
-                        with st.expander(f"⚠️ {len(metadata['unmatched_players'])} Unmatched Players"):
-                            st.write("These players couldn't be matched to the database:")
-                            for name in metadata['unmatched_players'][:20]:
-                                st.caption(f"• {name}")
-                            if len(metadata['unmatched_players']) > 20:
-                                st.caption(f"...and {len(metadata['unmatched_players']) - 20} more")
+                    # Show fallback players (using DK avg instead of our projection)
+                    if metadata.get('fallback_players'):
+                        fallback_count = metadata.get('fallback_count', 0)
+                        with st.expander(f"📊 {fallback_count} Fallback Players (using DK average)", expanded=False):
+                            st.write("These players aren't in our database - using DraftKings average as projection:")
+                            for name, team, dk_avg in metadata['fallback_players'][:20]:
+                                st.caption(f"• {name} ({team}) — DK Avg: {dk_avg:.1f} FPTS")
+                            if len(metadata['fallback_players']) > 20:
+                                st.caption(f"...and {len(metadata['fallback_players']) - 20} more")
+                            st.info("💡 Fallback players are typically two-way players, recent call-ups, or name mismatches.")
 
                     # Show injured players that will be auto-excluded
                     if metadata.get('injured_players'):
