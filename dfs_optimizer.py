@@ -60,6 +60,16 @@ try:
 except ImportError:
     CORRELATION_MODEL_AVAILABLE = False
 
+# Import injury impact analytics for teammate injury stat boosts
+try:
+    from injury_impact_analytics import (
+        get_injury_stat_boosts,
+        InjuryStatBoost,
+    )
+    INJURY_IMPACT_AVAILABLE = True
+except ImportError:
+    INJURY_IMPACT_AVAILABLE = False
+
 
 # =============================================================================
 # Injury Filtering
@@ -1308,6 +1318,47 @@ def generate_player_projections(
         )
         adjusted = raw * rest_multiplier * pace_adjustment
         setattr(player, f'proj_{stat}', max(0.0, adjusted))
+
+    # --- Step 9b: Apply injury stat boosts from injured teammates ---
+    if INJURY_IMPACT_AVAILABLE and teammate_injury_map:
+        try:
+            # Get player's team_id
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT team_id FROM players WHERE player_id = ?",
+                (player.player_id,)
+            )
+            result = cursor.fetchone()
+            if result:
+                team_id = result[0]
+                injured_ids = teammate_injury_map.get(team_id, [])
+                if injured_ids:
+                    # Get stat boosts from injured teammates
+                    injury_boost = get_injury_stat_boosts(
+                        conn,
+                        player.player_id,
+                        player.name,
+                        injured_ids,
+                        season=season,
+                        season_type=season_type,
+                        min_games_apart=3
+                    )
+
+                    # Apply boosts (scaled by confidence)
+                    if injury_boost.confidence > 0:
+                        scale = injury_boost.confidence
+                        player.proj_points += injury_boost.pts_boost * scale
+                        player.proj_rebounds += injury_boost.reb_boost * scale
+                        player.proj_assists += injury_boost.ast_boost * scale
+                        player.proj_steals += injury_boost.stl_boost * scale
+                        player.proj_blocks += injury_boost.blk_boost * scale
+                        player.proj_fg3m += injury_boost.fg3m_boost * scale
+
+                        # Add indicator if significant boost
+                        if injury_boost.to_fpts_boost() >= 2.0:
+                            analytics_used.append("💉")  # Injury boost indicator
+        except Exception:
+            pass  # Don't fail projection if injury boost fails
 
     # Direct FPTS from individual stat projections (replaces ratio approach)
     player.proj_fpts = calculate_dk_fantasy_points(

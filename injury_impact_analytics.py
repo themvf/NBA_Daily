@@ -64,20 +64,35 @@ class TeammateImpact:
     avg_pts_with: float
     avg_usg_with: float
     avg_minutes_with: float
+    avg_reb_with: float = 0.0
+    avg_ast_with: float = 0.0
+    avg_stl_with: float = 0.0
+    avg_blk_with: float = 0.0
+    avg_fg3m_with: float = 0.0
 
     # With key player absent
-    avg_pts_without: float
-    avg_usg_without: float
-    avg_minutes_without: float
+    avg_pts_without: float = 0.0
+    avg_usg_without: float = 0.0
+    avg_minutes_without: float = 0.0
+    avg_reb_without: float = 0.0
+    avg_ast_without: float = 0.0
+    avg_stl_without: float = 0.0
+    avg_blk_without: float = 0.0
+    avg_fg3m_without: float = 0.0
 
-    # Deltas
-    pts_delta: float
-    usg_delta: float
-    minutes_delta: float
+    # Deltas (positive = teammate does BETTER when key player is OUT)
+    pts_delta: float = 0.0
+    usg_delta: float = 0.0
+    minutes_delta: float = 0.0
+    reb_delta: float = 0.0      # Rebounds increase when rebounder is out
+    ast_delta: float = 0.0      # Assists increase when playmaker is out
+    stl_delta: float = 0.0      # Steals redistribution
+    blk_delta: float = 0.0      # Blocks redistribution
+    fg3m_delta: float = 0.0     # 3-pointers (volume opportunity)
 
     # Sample sizes
-    games_together: int
-    games_apart: int
+    games_together: int = 0
+    games_apart: int = 0
 
 
 @dataclass
@@ -248,6 +263,59 @@ def calculate_team_impact(
     )
 
 
+def _get_available_stat_columns(conn: sqlite3.Connection) -> set:
+    """Get which stat columns are available in the player_game_logs table."""
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA table_info(player_game_logs)")
+    existing = {row[1] for row in cursor.fetchall()}
+    return existing
+
+
+def _build_teammate_query(game_ids: tuple, existing_columns: set) -> str:
+    """
+    Build a dynamic query based on available columns.
+    Only queries columns that exist in the database.
+    """
+    # Base columns that should always exist
+    select_parts = [
+        "player_id",
+        "player_name",
+        "AVG(points) as avg_pts",
+        "AVG(CAST(usg_pct AS REAL)) as avg_usg",
+        "AVG(CAST(minutes AS REAL)) as avg_minutes",
+    ]
+
+    # Optional stat columns
+    optional_stats = [
+        ('rebounds', 'avg_reb'),
+        ('assists', 'avg_ast'),
+        ('steals', 'avg_stl'),
+        ('blocks', 'avg_blk'),
+        ('fg3m', 'avg_fg3m'),
+    ]
+
+    for col, alias in optional_stats:
+        if col in existing_columns:
+            select_parts.append(f"AVG(COALESCE({col}, 0)) as {alias}")
+        else:
+            select_parts.append(f"0.0 as {alias}")
+
+    select_parts.append("COUNT(*) as game_count")
+
+    return f"""
+        SELECT {', '.join(select_parts)}
+        FROM player_game_logs
+        WHERE team_id = ?
+          AND season = ?
+          AND season_type = ?
+          AND player_id != ?
+          AND game_id IN ({','.join('?' * len(game_ids))})
+          AND CAST(minutes AS REAL) > 0
+        GROUP BY player_id, player_name
+        HAVING COUNT(*) >= ?
+    """
+
+
 def calculate_teammate_redistribution(
     conn: sqlite3.Connection,
     player_id: int,
@@ -263,28 +331,15 @@ def calculate_teammate_redistribution(
     if games_with.empty or games_without.empty:
         return []
 
-    # Get the team ID
-    team_id = games_with.iloc[0]['team_id']
+    # Get which columns exist in the database
+    existing_columns = _get_available_stat_columns(conn)
+
+    # Get the team ID (convert to native int for SQL compatibility)
+    team_id = int(games_with.iloc[0]['team_id'])
 
     # Get all teammate game logs for games WITH the key player
     with_game_ids = tuple(games_with['game_id'].values)
-
-    query_with = f"""
-        SELECT player_id, player_name,
-               AVG(points) as avg_pts,
-               AVG(CAST(usg_pct AS REAL)) as avg_usg,
-               AVG(CAST(minutes AS REAL)) as avg_minutes,
-               COUNT(*) as game_count
-        FROM player_game_logs
-        WHERE team_id = ?
-          AND season = ?
-          AND season_type = ?
-          AND player_id != ?
-          AND game_id IN ({','.join('?' * len(with_game_ids))})
-          AND CAST(minutes AS REAL) > 0
-        GROUP BY player_id, player_name
-        HAVING COUNT(*) >= ?
-    """
+    query_with = _build_teammate_query(with_game_ids, existing_columns)
 
     teammates_with = pd.read_sql_query(
         query_with,
@@ -295,23 +350,7 @@ def calculate_teammate_redistribution(
     # Get all teammate game logs for games WITHOUT the key player
     if not games_without.empty:
         without_game_ids = tuple(games_without['game_id'].values)
-
-        query_without = f"""
-            SELECT player_id, player_name,
-                   AVG(points) as avg_pts,
-                   AVG(CAST(usg_pct AS REAL)) as avg_usg,
-                   AVG(CAST(minutes AS REAL)) as avg_minutes,
-                   COUNT(*) as game_count
-            FROM player_game_logs
-            WHERE team_id = ?
-              AND season = ?
-              AND season_type = ?
-              AND player_id != ?
-              AND game_id IN ({','.join('?' * len(without_game_ids))})
-              AND CAST(minutes AS REAL) > 0
-            GROUP BY player_id, player_name
-            HAVING COUNT(*) >= ?
-        """
+        query_without = _build_teammate_query(without_game_ids, existing_columns)
 
         teammates_without = pd.read_sql_query(
             query_without,
@@ -333,20 +372,41 @@ def calculate_teammate_redistribution(
         )
 
         for _, row in merged.iterrows():
+            # Helper function for safe numeric extraction
+            def safe_float(val, default=0.0):
+                return float(val) if pd.notna(val) else default
+
             impact = TeammateImpact(
                 teammate_name=row['player_name_with'],
                 teammate_id=row['player_id'],
-                avg_pts_with=row['avg_pts_with'],
-                avg_usg_with=row['avg_usg_with'] if pd.notna(row['avg_usg_with']) else 0.0,
-                avg_minutes_with=row['avg_minutes_with'] if pd.notna(row['avg_minutes_with']) else 0.0,
-                avg_pts_without=row['avg_pts_without'],
-                avg_usg_without=row['avg_usg_without'] if pd.notna(row['avg_usg_without']) else 0.0,
-                avg_minutes_without=row['avg_minutes_without'] if pd.notna(row['avg_minutes_without']) else 0.0,
-                pts_delta=row['avg_pts_without'] - row['avg_pts_with'],
-                usg_delta=(row['avg_usg_without'] if pd.notna(row['avg_usg_without']) else 0.0) -
-                         (row['avg_usg_with'] if pd.notna(row['avg_usg_with']) else 0.0),
-                minutes_delta=(row['avg_minutes_without'] if pd.notna(row['avg_minutes_without']) else 0.0) -
-                             (row['avg_minutes_with'] if pd.notna(row['avg_minutes_with']) else 0.0),
+                # With key player present
+                avg_pts_with=safe_float(row['avg_pts_with']),
+                avg_usg_with=safe_float(row['avg_usg_with']),
+                avg_minutes_with=safe_float(row['avg_minutes_with']),
+                avg_reb_with=safe_float(row.get('avg_reb_with', 0)),
+                avg_ast_with=safe_float(row.get('avg_ast_with', 0)),
+                avg_stl_with=safe_float(row.get('avg_stl_with', 0)),
+                avg_blk_with=safe_float(row.get('avg_blk_with', 0)),
+                avg_fg3m_with=safe_float(row.get('avg_fg3m_with', 0)),
+                # With key player absent
+                avg_pts_without=safe_float(row['avg_pts_without']),
+                avg_usg_without=safe_float(row['avg_usg_without']),
+                avg_minutes_without=safe_float(row['avg_minutes_without']),
+                avg_reb_without=safe_float(row.get('avg_reb_without', 0)),
+                avg_ast_without=safe_float(row.get('avg_ast_without', 0)),
+                avg_stl_without=safe_float(row.get('avg_stl_without', 0)),
+                avg_blk_without=safe_float(row.get('avg_blk_without', 0)),
+                avg_fg3m_without=safe_float(row.get('avg_fg3m_without', 0)),
+                # Deltas (positive = teammate does better when key player OUT)
+                pts_delta=safe_float(row['avg_pts_without']) - safe_float(row['avg_pts_with']),
+                usg_delta=safe_float(row['avg_usg_without']) - safe_float(row['avg_usg_with']),
+                minutes_delta=safe_float(row['avg_minutes_without']) - safe_float(row['avg_minutes_with']),
+                reb_delta=safe_float(row.get('avg_reb_without', 0)) - safe_float(row.get('avg_reb_with', 0)),
+                ast_delta=safe_float(row.get('avg_ast_without', 0)) - safe_float(row.get('avg_ast_with', 0)),
+                stl_delta=safe_float(row.get('avg_stl_without', 0)) - safe_float(row.get('avg_stl_with', 0)),
+                blk_delta=safe_float(row.get('avg_blk_without', 0)) - safe_float(row.get('avg_blk_with', 0)),
+                fg3m_delta=safe_float(row.get('avg_fg3m_without', 0)) - safe_float(row.get('avg_fg3m_with', 0)),
+                # Sample sizes
                 games_together=int(row['game_count_with']),
                 games_apart=int(row['game_count_without']),
             )
@@ -465,3 +525,353 @@ def get_significant_players(
         conn,
         params=[season, season_type, min_games, min_avg_points]
     )
+
+
+# =============================================================================
+# STAT ADJUSTMENT FUNCTIONS - Apply injury impacts to projections
+# =============================================================================
+
+@dataclass
+class InjuryStatBoost:
+    """
+    Stat boosts for a player when specific teammates are out.
+
+    All values are ADDITIVE deltas to apply to projections.
+    Example: pts_boost = +3.2 means add 3.2 to projected points.
+    """
+
+    player_id: int
+    player_name: str
+
+    # Total stat boosts from all injured teammates
+    pts_boost: float = 0.0
+    reb_boost: float = 0.0
+    ast_boost: float = 0.0
+    stl_boost: float = 0.0
+    blk_boost: float = 0.0
+    fg3m_boost: float = 0.0
+    minutes_boost: float = 0.0
+    usg_boost: float = 0.0
+
+    # Tracking
+    injured_teammates: List[str] = None
+    confidence: float = 0.0  # Based on sample size
+    total_games_data: int = 0
+
+    def __post_init__(self):
+        if self.injured_teammates is None:
+            self.injured_teammates = []
+
+    def to_fpts_boost(self) -> float:
+        """
+        Convert stat boosts to estimated FanDuel fantasy points boost.
+
+        FanDuel scoring:
+        - Points: 1 FPTS each
+        - Rebounds: 1.2 FPTS each
+        - Assists: 1.5 FPTS each
+        - Steals: 3 FPTS each
+        - Blocks: 3 FPTS each
+        - 3PM: Bonus already in points
+        """
+        return (
+            self.pts_boost * 1.0 +
+            self.reb_boost * 1.2 +
+            self.ast_boost * 1.5 +
+            self.stl_boost * 3.0 +
+            self.blk_boost * 3.0
+        )
+
+
+def get_injury_stat_boosts(
+    conn: sqlite3.Connection,
+    player_id: int,
+    player_name: str,
+    injured_player_ids: List[int],
+    season: str = "2025-26",
+    season_type: str = "Regular Season",
+    min_games_apart: int = 3,
+) -> InjuryStatBoost:
+    """
+    Calculate stat boosts for a player when specific teammates are injured/out.
+
+    This aggregates the historical stat deltas across all injured teammates
+    to provide a total projection boost.
+
+    Args:
+        conn: Database connection
+        player_id: The player receiving the boost
+        player_name: Player's name for display
+        injured_player_ids: List of player_ids who are OUT
+        season: NBA season
+        season_type: Regular Season or Playoffs
+        min_games_apart: Minimum sample size for reliability
+
+    Returns:
+        InjuryStatBoost with total additive adjustments
+    """
+    boost = InjuryStatBoost(
+        player_id=player_id,
+        player_name=player_name,
+    )
+
+    if not injured_player_ids:
+        return boost
+
+    # For each injured teammate, get the redistribution data
+    total_games = 0
+    injured_names = []
+
+    for injured_id in injured_player_ids:
+        impacts = calculate_teammate_redistribution(
+            conn, injured_id, season, season_type, min_games=min_games_apart
+        )
+
+        # Find this player in the impacts
+        for impact in impacts:
+            if impact.teammate_id == player_id:
+                # Add this injured player's impact
+                boost.pts_boost += impact.pts_delta
+                boost.reb_boost += impact.reb_delta
+                boost.ast_boost += impact.ast_delta
+                boost.stl_boost += impact.stl_delta
+                boost.blk_boost += impact.blk_delta
+                boost.fg3m_boost += impact.fg3m_delta
+                boost.minutes_boost += impact.minutes_delta
+                boost.usg_boost += impact.usg_delta
+                total_games += impact.games_apart
+
+                # Get injured player name from query
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT full_name FROM players WHERE player_id = ?",
+                    [injured_id]
+                )
+                result = cursor.fetchone()
+                if result:
+                    injured_names.append(result[0])
+                break
+
+    boost.injured_teammates = injured_names
+    boost.total_games_data = total_games
+
+    # Calculate confidence based on sample size
+    # 10+ games apart = high confidence, 3-5 games = low confidence
+    if total_games >= 10:
+        boost.confidence = 1.0
+    elif total_games >= 5:
+        boost.confidence = 0.7
+    elif total_games >= min_games_apart:
+        boost.confidence = 0.5
+    else:
+        boost.confidence = 0.3
+
+    return boost
+
+
+def get_team_injured_players(
+    conn: sqlite3.Connection,
+    team_id: int,
+    game_date: str,
+    season: str = "2025-26",
+) -> List[Dict]:
+    """
+    Get list of injured/out players for a team on a given date.
+
+    Uses injury_reports table if available, otherwise returns empty list.
+    You can also manually specify injured players.
+
+    Returns:
+        List of dicts with player_id, player_name, injury_status
+    """
+    cursor = conn.cursor()
+
+    # Check if injury_reports table exists
+    cursor.execute("""
+        SELECT name FROM sqlite_master
+        WHERE type='table' AND name='injury_reports'
+    """)
+
+    if not cursor.fetchone():
+        return []
+
+    # Query injury reports for this date and team
+    cursor.execute("""
+        SELECT player_id, player_name, status, injury_type
+        FROM injury_reports
+        WHERE team_id = ?
+          AND date(report_date) = date(?)
+          AND status IN ('Out', 'Doubtful')
+    """, [team_id, game_date])
+
+    injured = []
+    for row in cursor.fetchall():
+        injured.append({
+            'player_id': row[0],
+            'player_name': row[1],
+            'status': row[2],
+            'injury_type': row[3],
+        })
+
+    return injured
+
+
+def apply_injury_boosts_to_projection(
+    base_projection: Dict[str, float],
+    injury_boost: InjuryStatBoost,
+    apply_confidence_scaling: bool = True,
+) -> Dict[str, float]:
+    """
+    Apply injury stat boosts to a base projection.
+
+    Args:
+        base_projection: Dict with keys like 'pts', 'reb', 'ast', 'stl', 'blk', 'fg3m'
+        injury_boost: The calculated InjuryStatBoost
+        apply_confidence_scaling: Scale boosts by confidence level
+
+    Returns:
+        Updated projection dict
+    """
+    scale = injury_boost.confidence if apply_confidence_scaling else 1.0
+
+    adjusted = base_projection.copy()
+
+    # Apply scaled boosts
+    if 'pts' in adjusted:
+        adjusted['pts'] = adjusted['pts'] + (injury_boost.pts_boost * scale)
+    if 'reb' in adjusted:
+        adjusted['reb'] = adjusted['reb'] + (injury_boost.reb_boost * scale)
+    if 'ast' in adjusted:
+        adjusted['ast'] = adjusted['ast'] + (injury_boost.ast_boost * scale)
+    if 'stl' in adjusted:
+        adjusted['stl'] = adjusted['stl'] + (injury_boost.stl_boost * scale)
+    if 'blk' in adjusted:
+        adjusted['blk'] = adjusted['blk'] + (injury_boost.blk_boost * scale)
+    if 'fg3m' in adjusted:
+        adjusted['fg3m'] = adjusted['fg3m'] + (injury_boost.fg3m_boost * scale)
+    if 'minutes' in adjusted:
+        adjusted['minutes'] = adjusted['minutes'] + (injury_boost.minutes_boost * scale)
+
+    return adjusted
+
+
+def get_slate_injury_boosts(
+    conn: sqlite3.Connection,
+    game_date: str,
+    player_ids: Optional[List[int]] = None,
+    injured_player_ids: Optional[Dict[int, List[int]]] = None,
+    season: str = "2025-26",
+    season_type: str = "Regular Season",
+) -> Dict[int, InjuryStatBoost]:
+    """
+    Calculate injury boosts for all players on a slate.
+
+    This is the main entry point for integrating injury impacts into the
+    prediction pipeline.
+
+    Args:
+        conn: Database connection
+        game_date: Game date (YYYY-MM-DD)
+        player_ids: Optional list of specific player IDs to process
+        injured_player_ids: Optional dict mapping team_id -> [injured_player_ids]
+                           If not provided, will query injury_reports table
+        season: NBA season
+        season_type: Season type
+
+    Returns:
+        Dict mapping player_id -> InjuryStatBoost
+    """
+    cursor = conn.cursor()
+    boosts = {}
+
+    # Get all players in predictions for this date if not specified
+    if player_ids is None:
+        cursor.execute("""
+            SELECT DISTINCT player_id, player_name, team_id
+            FROM predictions
+            WHERE date(game_date) = date(?)
+        """, [game_date])
+        players = cursor.fetchall()
+    else:
+        # Get player info for specified IDs
+        if not player_ids:
+            return boosts
+        placeholders = ','.join('?' * len(player_ids))
+        cursor.execute(f"""
+            SELECT player_id, player_name, team_id
+            FROM predictions
+            WHERE player_id IN ({placeholders})
+              AND date(game_date) = date(?)
+        """, player_ids + [game_date])
+        players = cursor.fetchall()
+
+    # Get injured players by team if not provided
+    if injured_player_ids is None:
+        injured_player_ids = {}
+        # Get unique team IDs
+        team_ids = set(p[2] for p in players)
+        for team_id in team_ids:
+            injured = get_team_injured_players(conn, team_id, game_date, season)
+            if injured:
+                injured_player_ids[team_id] = [i['player_id'] for i in injured]
+
+    # Calculate boosts for each player
+    for player_id, player_name, team_id in players:
+        team_injured = injured_player_ids.get(team_id, [])
+
+        if team_injured:
+            boost = get_injury_stat_boosts(
+                conn,
+                player_id,
+                player_name,
+                team_injured,
+                season,
+                season_type,
+            )
+            if boost.to_fpts_boost() != 0:
+                boosts[player_id] = boost
+
+    return boosts
+
+
+def format_injury_boost_summary(boost: InjuryStatBoost) -> str:
+    """
+    Format an InjuryStatBoost for display in UI.
+
+    Returns a string like:
+    "+3.2 PTS, +1.5 REB, +0.8 AST (Ja Morant out) [High confidence]"
+    """
+    parts = []
+
+    if abs(boost.pts_boost) >= 0.5:
+        parts.append(f"{boost.pts_boost:+.1f} PTS")
+    if abs(boost.reb_boost) >= 0.5:
+        parts.append(f"{boost.reb_boost:+.1f} REB")
+    if abs(boost.ast_boost) >= 0.5:
+        parts.append(f"{boost.ast_boost:+.1f} AST")
+    if abs(boost.stl_boost) >= 0.2:
+        parts.append(f"{boost.stl_boost:+.1f} STL")
+    if abs(boost.blk_boost) >= 0.2:
+        parts.append(f"{boost.blk_boost:+.1f} BLK")
+
+    if not parts:
+        return ""
+
+    stat_str = ", ".join(parts)
+
+    # Add injured players
+    if boost.injured_teammates:
+        injured_str = ", ".join(boost.injured_teammates[:2])  # Max 2 names
+        if len(boost.injured_teammates) > 2:
+            injured_str += f" +{len(boost.injured_teammates) - 2}"
+        stat_str += f" ({injured_str} out)"
+
+    # Add confidence indicator
+    if boost.confidence >= 0.8:
+        stat_str += " [High]"
+    elif boost.confidence >= 0.5:
+        stat_str += " [Med]"
+    else:
+        stat_str += " [Low]"
+
+    return stat_str
