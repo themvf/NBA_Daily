@@ -1381,3 +1381,243 @@ def get_shark_strategy_profile(
         'favorite_players': list(fav_df.itertuples(index=False, name=None)),
         'lineup_history': history,
     }
+
+
+# =============================================================================
+# Top Finisher Analysis (Reverse Engineering Winning Lineups)
+# =============================================================================
+
+def analyze_top_finishers(
+    conn: sqlite3.Connection,
+    slate_date: str,
+    top_n: int = 10
+) -> Dict:
+    """
+    Analyze the top N finishing lineups to understand winning strategies.
+
+    Returns insights on:
+    - Salary distribution by position
+    - Stacking patterns (team/game stacks)
+    - Ownership levels of selected players
+    - Contrarian vs chalk plays
+    - Game environment preferences
+
+    Args:
+        conn: SQLite connection
+        slate_date: Date string (YYYY-MM-DD)
+        top_n: Number of top finishers to analyze (default 10)
+
+    Returns:
+        Dict with comprehensive analysis
+    """
+    results = {
+        'slate_date': slate_date,
+        'top_n': top_n,
+        'lineups': [],
+        'salary_by_position': {},
+        'player_frequency': {},
+        'team_stacks': [],
+        'ownership_analysis': {},
+        'game_totals': {},
+        'insights': [],
+        'errors': []
+    }
+
+    # Get top N lineups
+    top_lineups = pd.read_sql_query("""
+        SELECT rank, points, username, total_salary,
+               pg, sg, sf, pf, c, g, f, util
+        FROM dfs_contest_entries
+        WHERE slate_date = ? AND rank IS NOT NULL
+        ORDER BY rank ASC
+        LIMIT ?
+    """, conn, params=[slate_date, top_n])
+
+    if top_lineups.empty:
+        results['errors'].append("No contest data found for this slate")
+        return results
+
+    # Get player info from projections (salary, team, ownership)
+    player_info = pd.read_sql_query("""
+        SELECT player_name, team, salary, actual_ownership, actual_fpts, opponent
+        FROM dfs_slate_projections
+        WHERE slate_date = ?
+    """, conn, params=[slate_date])
+
+    # Create lookup by normalized name
+    player_lookup = {}
+    for _, row in player_info.iterrows():
+        norm_name = _normalize_name(row['player_name'])
+        player_lookup[norm_name] = {
+            'name': row['player_name'],
+            'team': row['team'],
+            'salary': row['salary'],
+            'ownership': row['actual_ownership'],
+            'fpts': row['actual_fpts'],
+            'opponent': row['opponent']
+        }
+
+    # Position slots
+    positions = ['pg', 'sg', 'sf', 'pf', 'c', 'g', 'f', 'util']
+    position_labels = ['PG', 'SG', 'SF', 'PF', 'C', 'G', 'F', 'UTIL']
+
+    # Initialize salary tracking
+    salary_by_pos = {pos: [] for pos in position_labels}
+    player_counts = {}
+    all_teams_in_lineups = []
+    ownership_levels = []
+
+    # Analyze each lineup
+    for _, lineup in top_lineups.iterrows():
+        lineup_data = {
+            'rank': int(lineup['rank']),
+            'points': float(lineup['points']),
+            'username': lineup['username'],
+            'salary': lineup['total_salary'],
+            'players': [],
+            'teams': [],
+            'stacks': []
+        }
+
+        team_counts = {}
+
+        for pos, label in zip(positions, position_labels):
+            player_name = lineup[pos]
+            if not player_name or pd.isna(player_name):
+                continue
+
+            norm_name = _normalize_name(player_name)
+            info = player_lookup.get(norm_name, {})
+
+            player_data = {
+                'position': label,
+                'name': player_name,
+                'team': info.get('team', '?'),
+                'salary': info.get('salary', 0),
+                'ownership': info.get('ownership'),
+                'fpts': info.get('fpts'),
+                'opponent': info.get('opponent', '?')
+            }
+            lineup_data['players'].append(player_data)
+
+            # Track salary by position
+            if info.get('salary'):
+                salary_by_pos[label].append(info['salary'])
+
+            # Track player frequency
+            player_counts[player_name] = player_counts.get(player_name, 0) + 1
+
+            # Track team stacks
+            team = info.get('team', '?')
+            if team != '?':
+                team_counts[team] = team_counts.get(team, 0) + 1
+                lineup_data['teams'].append(team)
+
+            # Track ownership
+            if info.get('ownership') is not None:
+                ownership_levels.append(info['ownership'])
+
+        # Identify stacks (2+ players from same team)
+        for team, count in team_counts.items():
+            if count >= 2:
+                lineup_data['stacks'].append({'team': team, 'count': count})
+
+        all_teams_in_lineups.extend(lineup_data['teams'])
+        results['lineups'].append(lineup_data)
+
+    # Aggregate salary by position
+    for pos, salaries in salary_by_pos.items():
+        if salaries:
+            results['salary_by_position'][pos] = {
+                'avg': round(np.mean(salaries)),
+                'min': min(salaries),
+                'max': max(salaries),
+                'count': len(salaries)
+            }
+
+    # Player frequency (most rostered in top lineups)
+    results['player_frequency'] = sorted(
+        [{'player': k, 'count': v, 'pct': round(100 * v / top_n, 1)}
+         for k, v in player_counts.items()],
+        key=lambda x: x['count'],
+        reverse=True
+    )[:15]  # Top 15 most used
+
+    # Stacking analysis
+    stack_counts = {}
+    for lineup in results['lineups']:
+        for stack in lineup.get('stacks', []):
+            key = f"{stack['team']} ({stack['count']})"
+            stack_counts[key] = stack_counts.get(key, 0) + 1
+
+    results['team_stacks'] = sorted(
+        [{'stack': k, 'lineups': v} for k, v in stack_counts.items()],
+        key=lambda x: x['lineups'],
+        reverse=True
+    )
+
+    # Ownership analysis
+    if ownership_levels:
+        low_own = [o for o in ownership_levels if o < 10]
+        mid_own = [o for o in ownership_levels if 10 <= o < 25]
+        high_own = [o for o in ownership_levels if o >= 25]
+
+        results['ownership_analysis'] = {
+            'avg_ownership': round(np.mean(ownership_levels), 1),
+            'low_ownership_plays': len(low_own),
+            'mid_ownership_plays': len(mid_own),
+            'high_ownership_plays': len(high_own),
+            'contrarian_pct': round(100 * len(low_own) / len(ownership_levels), 1) if ownership_levels else 0
+        }
+
+    # Generate insights
+    insights = []
+
+    # Salary insight
+    if results['salary_by_position']:
+        high_spend = max(results['salary_by_position'].items(), key=lambda x: x[1]['avg'])
+        low_spend = min(results['salary_by_position'].items(), key=lambda x: x[1]['avg'])
+        insights.append(f"💰 Highest spend at {high_spend[0]} (avg ${high_spend[1]['avg']:,}), lowest at {low_spend[0]} (avg ${low_spend[1]['avg']:,})")
+
+    # Stacking insight
+    if results['team_stacks']:
+        top_stack = results['team_stacks'][0]
+        insights.append(f"🔗 Most common stack: {top_stack['stack']} in {top_stack['lineups']}/{top_n} lineups")
+
+    # Ownership insight
+    if results['ownership_analysis']:
+        own = results['ownership_analysis']
+        if own['contrarian_pct'] >= 30:
+            insights.append(f"🎯 Contrarian builds: {own['contrarian_pct']:.0f}% of plays under 10% owned")
+        else:
+            insights.append(f"📊 Chalk-heavy builds: only {own['contrarian_pct']:.0f}% contrarian plays")
+
+    # Must-have player insight
+    if results['player_frequency']:
+        must_have = [p for p in results['player_frequency'] if p['pct'] >= 70]
+        if must_have:
+            names = ', '.join([p['player'].split()[-1] for p in must_have[:3]])
+            insights.append(f"⭐ Must-have players: {names} (70%+ of top lineups)")
+
+    results['insights'] = insights
+
+    return results
+
+
+def get_game_totals_for_slate(conn: sqlite3.Connection, slate_date: str) -> Dict[str, float]:
+    """Get Vegas game totals for a slate date (for game environment analysis)."""
+    try:
+        totals = pd.read_sql_query("""
+            SELECT home_team, away_team, game_total
+            FROM game_odds
+            WHERE game_date = ? AND game_total IS NOT NULL
+        """, conn, params=[slate_date])
+
+        result = {}
+        for _, row in totals.iterrows():
+            game_key = f"{row['away_team']}@{row['home_team']}"
+            result[row['home_team']] = row['game_total']
+            result[row['away_team']] = row['game_total']
+        return result
+    except Exception:
+        return {}

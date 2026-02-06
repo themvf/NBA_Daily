@@ -14107,6 +14107,7 @@ if selected_page == "DFS Lineup Builder":
                 get_shark_users,
                 get_shark_player_exposure,
                 get_shark_strategy_profile,
+                analyze_top_finishers,
             )
             import plotly.express as px
 
@@ -14261,6 +14262,132 @@ if selected_page == "DFS Lineup Builder":
                                     st.dataframe(hist_df, use_container_width=True, hide_index=True)
                         else:
                             st.info("No data found for this user.")
+
+                # --- Top Finisher Analysis ---
+                st.divider()
+                st.subheader("🏆 Top Finisher Analysis")
+                st.caption("Reverse-engineer winning lineups: salary allocation, stacking patterns, and player selection")
+
+                # Select slate to analyze
+                slate_dates = contest_history['slate_date'].tolist() if not contest_history.empty else []
+                if slate_dates:
+                    tf_col1, tf_col2 = st.columns([2, 1])
+                    with tf_col1:
+                        selected_slate = st.selectbox(
+                            "Select slate to analyze",
+                            slate_dates,
+                            key="top_finisher_slate"
+                        )
+                    with tf_col2:
+                        top_n = st.slider("Analyze top N lineups", 5, 50, 10, key="top_finisher_n")
+
+                    if st.button("🔍 Analyze Top Finishers", type="primary"):
+                        with st.spinner("Analyzing winning lineups..."):
+                            analysis = analyze_top_finishers(dfs_conn, selected_slate, top_n)
+
+                        if analysis.get('errors'):
+                            st.warning(f"⚠️ {analysis['errors'][0]}")
+                        else:
+                            # Display insights
+                            if analysis.get('insights'):
+                                st.success("**Key Insights:**")
+                                for insight in analysis['insights']:
+                                    st.markdown(f"• {insight}")
+
+                            # Metrics row
+                            tf_m1, tf_m2, tf_m3, tf_m4 = st.columns(4)
+                            winner_pts = analysis['lineups'][0]['points'] if analysis['lineups'] else 0
+                            tf_m1.metric("Winner Score", f"{winner_pts:.1f}")
+
+                            own_analysis = analysis.get('ownership_analysis', {})
+                            tf_m2.metric("Avg Ownership", f"{own_analysis.get('avg_ownership', 0):.1f}%")
+                            tf_m3.metric("Contrarian Plays", f"{own_analysis.get('contrarian_pct', 0):.0f}%",
+                                        help="% of plays under 10% owned")
+
+                            stack_count = len([l for l in analysis['lineups'] if l.get('stacks')])
+                            tf_m4.metric("Lineups w/ Stacks", f"{stack_count}/{top_n}")
+
+                            # Two column layout
+                            tf_left, tf_right = st.columns(2)
+
+                            with tf_left:
+                                # Salary by position chart
+                                if analysis.get('salary_by_position'):
+                                    st.markdown("**💰 Salary Allocation by Position**")
+                                    sal_data = []
+                                    for pos, stats in analysis['salary_by_position'].items():
+                                        sal_data.append({
+                                            'Position': pos,
+                                            'Avg Salary': stats['avg'],
+                                            'Min': stats['min'],
+                                            'Max': stats['max']
+                                        })
+                                    sal_df = pd.DataFrame(sal_data)
+
+                                    fig_sal = px.bar(
+                                        sal_df,
+                                        x='Position', y='Avg Salary',
+                                        title='Average Salary by Position',
+                                        color='Avg Salary',
+                                        color_continuous_scale='Greens',
+                                        text='Avg Salary'
+                                    )
+                                    fig_sal.update_traces(texttemplate='$%{text:,.0f}', textposition='outside')
+                                    fig_sal.update_layout(height=350, showlegend=False)
+                                    st.plotly_chart(fig_sal, use_container_width=True)
+
+                                # Team stacks
+                                if analysis.get('team_stacks'):
+                                    st.markdown("**🔗 Stacking Patterns**")
+                                    stack_df = pd.DataFrame(analysis['team_stacks'][:10])
+                                    stack_df.columns = ['Stack', 'Lineups']
+                                    st.dataframe(stack_df, use_container_width=True, hide_index=True)
+
+                            with tf_right:
+                                # Most rostered players
+                                if analysis.get('player_frequency'):
+                                    st.markdown("**⭐ Most Rostered Players**")
+                                    freq_df = pd.DataFrame(analysis['player_frequency'][:12])
+                                    freq_df.columns = ['Player', 'Count', '% of Top']
+
+                                    fig_freq = px.bar(
+                                        freq_df,
+                                        x='Player', y='% of Top',
+                                        title=f'Player Frequency in Top {top_n}',
+                                        color='% of Top',
+                                        color_continuous_scale='Blues',
+                                        text='Count'
+                                    )
+                                    fig_freq.update_traces(textposition='outside')
+                                    fig_freq.update_layout(height=350, showlegend=False, xaxis_tickangle=-45)
+                                    st.plotly_chart(fig_freq, use_container_width=True)
+
+                            # Individual lineup breakdown
+                            with st.expander("📋 Individual Lineup Details"):
+                                for i, lineup in enumerate(analysis['lineups'][:10]):
+                                    st.markdown(f"**#{lineup['rank']} — {lineup['points']:.1f} pts** ({lineup['username']})")
+
+                                    # Build player table
+                                    player_rows = []
+                                    for p in lineup['players']:
+                                        own_str = f"{p['ownership']:.1f}%" if p.get('ownership') else "—"
+                                        player_rows.append({
+                                            'Pos': p['position'],
+                                            'Player': p['name'],
+                                            'Team': p['team'],
+                                            'Salary': f"${p['salary']:,}" if p.get('salary') else "—",
+                                            'Own%': own_str,
+                                            'FPTS': f"{p['fpts']:.1f}" if p.get('fpts') else "—"
+                                        })
+                                    lineup_df = pd.DataFrame(player_rows)
+                                    st.dataframe(lineup_df, use_container_width=True, hide_index=True)
+
+                                    if lineup.get('stacks'):
+                                        stacks_str = ', '.join([f"{s['team']} x{s['count']}" for s in lineup['stacks']])
+                                        st.caption(f"🔗 Stacks: {stacks_str}")
+                                    st.markdown("---")
+                else:
+                    st.info("Import contest CSVs first to analyze top finishers.")
 
         except Exception as e:
             st.error(f"❌ Error loading opponent analysis: {e}")
