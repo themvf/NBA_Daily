@@ -13758,16 +13758,28 @@ if selected_page == "DFS Lineup Builder":
                 if not summary_df.empty:
                     st.subheader("📋 Slate Results Summary")
 
+                    # Get contest winner scores for each slate
+                    winner_df = pd.read_sql_query(
+                        """SELECT slate_date, MAX(top_score) as winner_score
+                           FROM dfs_contest_meta
+                           GROUP BY slate_date""",
+                        dfs_conn
+                    )
+                    if not winner_df.empty:
+                        summary_df = summary_df.merge(winner_df, on='slate_date', how='left')
+                    else:
+                        summary_df['winner_score'] = None
+
                     # Include ownership columns if they exist
                     summary_cols = [
                         'slate_date', 'num_players', 'num_lineups',
                         'proj_mae', 'proj_correlation', 'proj_within_range_pct',
-                        'best_lineup_actual_fpts', 'optimal_lineup_fpts', 'lineup_efficiency_pct'
+                        'best_lineup_actual_fpts', 'winner_score', 'optimal_lineup_fpts', 'lineup_efficiency_pct'
                     ]
                     col_names = [
                         'Date', 'Players', 'Lineups',
                         'Proj MAE', 'Correlation', 'In Range %',
-                        'Best Lineup', 'Optimal', 'Efficiency %'
+                        'Best Lineup', '🏆 Winner', 'Optimal', 'Efficiency %'
                     ]
                     if 'ownership_mae' in summary_df.columns:
                         summary_cols.extend(['ownership_mae', 'ownership_correlation'])
