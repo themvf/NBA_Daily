@@ -12734,6 +12734,70 @@ if selected_page == "Model Review":
         st.success("✅ No major issues detected! Model is performing well.")
 
 
+def _enrich_players_with_vegas_signals(conn, players, game_date):
+    """
+    Query vegas_implied_fpts from predictions table and compute edge
+    vs our DFS optimizer projections for each player.
+
+    Returns: Dict[player_id -> {vegas_fpts, edge_pct, signal, suggest_exposure}]
+    """
+    try:
+        cursor = conn.execute("""
+            SELECT player_name, vegas_implied_fpts, dfs_salary
+            FROM predictions
+            WHERE game_date = ? AND vegas_implied_fpts IS NOT NULL
+        """, [game_date])
+        rows = cursor.fetchall()
+    except Exception:
+        return {}
+
+    if not rows:
+        return {}
+
+    # Build lookup: lowercase player_name -> (vegas_fpts, salary)
+    vegas_lookup = {}
+    for row in rows:
+        pname = row[0].strip().lower() if row[0] else ""
+        vfpts = row[1]
+        sal = row[2] or 0
+        if pname and vfpts:
+            vegas_lookup[pname] = (vfpts, sal)
+
+    signals = {}
+    for p in players:
+        player_key = p.name.strip().lower()
+        if player_key not in vegas_lookup:
+            continue
+
+        vegas_fpts, _ = vegas_lookup[player_key]
+        proj_fpts = p.proj_fpts
+
+        if proj_fpts < 1.0:
+            continue  # Skip very low projections to avoid extreme edge %
+
+        edge_pct = ((vegas_fpts - proj_fpts) / proj_fpts) * 100
+
+        # Determine signal
+        signal = None
+        suggest_exposure = False
+        if edge_pct >= 10 and p.salary < 7000:
+            signal = "BOOST"
+            suggest_exposure = True
+        elif edge_pct <= -15:
+            signal = "FADE"
+        elif abs(edge_pct) >= 5:
+            signal = "WATCH"
+
+        signals[p.player_id] = {
+            'vegas_fpts': round(vegas_fpts, 1),
+            'edge_pct': round(edge_pct, 1),
+            'signal': signal,
+            'suggest_exposure': suggest_exposure,
+        }
+
+    return signals
+
+
 # DFS Lineup Builder tab ---------------------------------------------------
 if selected_page == "DFS Lineup Builder":
     st.title("🏀 DFS Lineup Builder")
@@ -12752,6 +12816,8 @@ if selected_page == "DFS Lineup Builder":
         st.session_state.dfs_all_games = []
     if 'dfs_exposure_targets' not in st.session_state:
         st.session_state.dfs_exposure_targets = {}
+    if 'dfs_vegas_signals' not in st.session_state:
+        st.session_state.dfs_vegas_signals = {}
     if 'dfs_projection_date' not in st.session_state:
         st.session_state.dfs_projection_date = None
 
@@ -13022,6 +13088,20 @@ if selected_page == "DFS Lineup Builder":
                         st.session_state.dfs_upload_metadata = metadata
                         st.session_state.dfs_projection_date = str(projection_date) if projection_date else None
 
+                        # Enrich with Vegas signals if props exist
+                        try:
+                            vegas_signals = _enrich_players_with_vegas_signals(
+                                dfs_conn, projected_players,
+                                str(projection_date) if projection_date else str(date.today())
+                            )
+                            st.session_state.dfs_vegas_signals = vegas_signals
+                            if vegas_signals:
+                                boost_count = sum(1 for s in vegas_signals.values() if s['signal'] == 'BOOST')
+                                if boost_count:
+                                    st.info(f"🎰 Found {boost_count} Vegas BOOST candidate(s) — see Player Pool tab")
+                        except Exception:
+                            st.session_state.dfs_vegas_signals = {}
+
                         # Show projection summary
                         b2b_count = sum(1 for p in projected_players if getattr(p, 'days_rest', None) == 1)
                         rested_count = sum(1 for p in projected_players if (getattr(p, 'days_rest', None) or 0) >= 3)
@@ -13112,9 +13192,13 @@ if selected_page == "DFS Lineup Builder":
             filtered = [p for p in filtered if salary_range[0] <= p.salary <= salary_range[1]]
 
             # Sort options
+            vegas_sigs = st.session_state.get('dfs_vegas_signals', {})
+            sort_options = ["Projected FPTS", "Salary", "Value (FPTS/$)", "Ceiling"]
+            if vegas_sigs:
+                sort_options.append("Vegas Edge")
             sort_by = st.selectbox(
                 "Sort by",
-                ["Projected FPTS", "Salary", "Value (FPTS/$)", "Ceiling"],
+                sort_options,
                 index=0
             )
 
@@ -13124,6 +13208,8 @@ if selected_page == "DFS Lineup Builder":
                 filtered.sort(key=lambda p: p.salary, reverse=True)
             elif sort_by == "Value (FPTS/$)":
                 filtered.sort(key=lambda p: p.fpts_per_dollar, reverse=True)
+            elif sort_by == "Vegas Edge":
+                filtered.sort(key=lambda p: vegas_sigs.get(p.player_id, {}).get('edge_pct', 0), reverse=True)
             else:
                 filtered.sort(key=lambda p: p.proj_ceiling, reverse=True)
 
@@ -13161,7 +13247,12 @@ if selected_page == "DFS Lineup Builder":
                 elif days_rest:
                     rest_indicator = f"{days_rest}d"
 
-                player_data.append({
+                # Vegas signal columns
+                v_sig = vegas_sigs.get(p.player_id, {})
+                v_fpts = v_sig.get('vegas_fpts')
+                v_edge = v_sig.get('edge_pct')
+
+                row = {
                     'Status': status,
                     'Name': p.name,
                     'Team': p.team,
@@ -13169,13 +13260,19 @@ if selected_page == "DFS Lineup Builder":
                     'Pos': '/'.join(p.positions),
                     'Salary': f"${p.salary:,}",
                     'Proj FPTS': f"{p.proj_fpts:.1f}",
+                }
+                if vegas_sigs:
+                    row['Vegas'] = f"{v_fpts:.1f}" if v_fpts is not None else "—"
+                    row['Edge'] = f"{v_edge:+.1f}%" if v_edge is not None else "—"
+                row.update({
                     'Floor': f"{p.proj_floor:.1f}",
                     'Ceiling': f"{p.proj_ceiling:.1f}",
                     'Value': f"{p.fpts_per_dollar:.2f}",
                     'Rest': rest_indicator,
                     'Own%': f"{p.ownership_proj:.1f}%",
-                    '📊': analytics,  # Analytics indicators
+                    '📊': analytics,
                 })
+                player_data.append(row)
 
             df = pd.DataFrame(player_data)
             st.dataframe(df, use_container_width=True, hide_index=True)
@@ -13184,6 +13281,71 @@ if selected_page == "DFS Lineup Builder":
             injured_count = len([p for p in filtered if getattr(p, 'is_injured', False)])
             if injured_count > 0:
                 st.warning(f"🏥 {injured_count} injured player(s) shown above will be auto-excluded from lineups")
+
+            # --- Vegas Edge Suggestions ---
+            boost_players = []
+            if vegas_sigs:
+                for p in players:
+                    sig = vegas_sigs.get(p.player_id, {})
+                    if sig.get('signal') == 'BOOST' and not getattr(p, 'is_locked', False) and not getattr(p, 'is_excluded', False) and not getattr(p, 'is_injured', False):
+                        boost_players.append((p, sig))
+
+            with st.expander("🎰 Vegas Edge Suggestions", expanded=bool(boost_players)):
+                if not vegas_sigs:
+                    st.caption("No Vegas prop data available. Fetch FanDuel props first, then refresh.")
+                elif not boost_players:
+                    st.caption("No BOOST candidates found (edge ≥ +10% at salary < $7K).")
+                else:
+                    # Summary metrics
+                    avg_edge = sum(s['edge_pct'] for _, s in boost_players) / len(boost_players)
+                    total_upside = sum(s['vegas_fpts'] - p.proj_fpts for p, s in boost_players)
+                    st.markdown(f"**{len(boost_players)}** BOOST candidate(s) | Avg edge: **{avg_edge:+.1f}%** | Total FPTS upside: **{total_upside:+.1f}**")
+
+                    # BOOST candidates table
+                    boost_data = []
+                    for p, sig in sorted(boost_players, key=lambda x: x[1]['edge_pct'], reverse=True):
+                        boost_data.append({
+                            'Name': p.name,
+                            'Team': p.team,
+                            'Pos': '/'.join(p.positions),
+                            'Salary': f"${p.salary:,}",
+                            'Proj FPTS': f"{p.proj_fpts:.1f}",
+                            'Vegas FPTS': f"{sig['vegas_fpts']:.1f}",
+                            'Edge': f"{sig['edge_pct']:+.1f}%",
+                        })
+                    st.dataframe(pd.DataFrame(boost_data), use_container_width=True, hide_index=True)
+
+                    # Apply button
+                    btn_col1, btn_col2 = st.columns(2)
+                    with btn_col1:
+                        if st.button("🚀 Apply Vegas Boost Suggestions", help="Add BOOST players to exposure targets at 25%"):
+                            current_targets = dict(st.session_state.dfs_exposure_targets)
+                            added = 0
+                            for p, _ in boost_players:
+                                if p.player_id not in current_targets:
+                                    current_targets[p.player_id] = 0.25
+                                    added += 1
+                            st.session_state.dfs_exposure_targets = current_targets
+                            if added:
+                                st.success(f"Added {added} BOOST player(s) to exposure targets at 25%")
+                            else:
+                                st.info("All BOOST players already have exposure targets set.")
+                            st.rerun()
+
+                    with btn_col2:
+                        if st.button("🔄 Recalculate Signals", help="Recompute edge signals from cached props data"):
+                            game_dt = st.session_state.get('dfs_projection_date') or str(date.today())
+                            refreshed = _enrich_players_with_vegas_signals(dfs_conn, players, game_dt)
+                            st.session_state.dfs_vegas_signals = refreshed
+                            if refreshed:
+                                rc = sum(1 for s in refreshed.values() if s['signal'] == 'BOOST')
+                                st.success(f"Refreshed — {rc} BOOST candidate(s) found")
+                            else:
+                                st.warning("No Vegas prop data found for this game date.")
+                            st.rerun()
+
+                    st.caption("Players where Vegas implied FPTS exceeds our projection by ≥10% at salary < $7K. "
+                               "These are value plays where the market sees upside our model may underweight.")
 
             # Export player pool button
             export_col1, export_col2 = st.columns([1, 3])

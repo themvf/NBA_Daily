@@ -1613,12 +1613,12 @@ def detect_stat_mispricings(
         stat_mispricings = []
 
         stat_checks = [
-            ('points', data.get('projected_ppg'), data.get('fanduel_ou'), 1.0),
-            ('rebounds', data.get('proj_rebounds'), data.get('fanduel_reb_ou'), 1.2),
-            ('assists', data.get('proj_assists'), data.get('fanduel_ast_ou'), 1.5),
-            ('3pm', data.get('proj_fg3m'), data.get('fanduel_3pm_ou'), 0.5),
-            ('steals', data.get('proj_steals'), data.get('fanduel_stl_ou'), 3.0),
-            ('blocks', data.get('proj_blocks'), data.get('fanduel_blk_ou'), 3.0),
+            ('points', data.get('projected_ppg'), data.get('fanduel_ou'), DFS_WEIGHTS["points"]),
+            ('rebounds', data.get('proj_rebounds'), data.get('fanduel_reb_ou'), DFS_WEIGHTS["rebounds"]),
+            ('assists', data.get('proj_assists'), data.get('fanduel_ast_ou'), DFS_WEIGHTS["assists"]),
+            ('3pm', data.get('proj_fg3m'), data.get('fanduel_3pm_ou'), DFS_WEIGHTS["threes"]),
+            ('steals', data.get('proj_steals'), data.get('fanduel_stl_ou'), DFS_WEIGHTS["steals"]),
+            ('blocks', data.get('proj_blocks'), data.get('fanduel_blk_ou'), DFS_WEIGHTS["blocks"]),
         ]
 
         for stat_name, our_val, vegas_val, fpts_weight in stat_checks:
