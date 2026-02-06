@@ -13614,7 +13614,13 @@ if selected_page == "DFS Lineup Builder":
                                 (sd,)
                             ).fetchone()[0]
 
-                            # Count matching game logs
+                            # Count game logs for this date (regardless of player match)
+                            logs_for_date = dfs_conn.execute(
+                                "SELECT COUNT(*) FROM player_game_logs WHERE game_date = ?",
+                                (sd,)
+                            ).fetchone()[0]
+
+                            # Count matching game logs (player_id AND date match)
                             game_data_count = dfs_conn.execute(
                                 """SELECT COUNT(*) FROM dfs_slate_projections p
                                    JOIN player_game_logs g ON p.player_id = g.player_id AND p.slate_date = g.game_date
@@ -13623,7 +13629,22 @@ if selected_page == "DFS Lineup Builder":
                             ).fetchone()[0]
 
                             status_icon = "✅" if game_data_count >= 3 else "⏳"
-                            st.caption(f"{status_icon} **{sd}**: {proj_count} projected players, {game_data_count} with game data")
+                            st.caption(f"{status_icon} **{sd}**: {proj_count} projected, {logs_for_date} game logs exist, {game_data_count} matched")
+
+                            # Show mismatch diagnostic if logs exist but don't match
+                            if logs_for_date > 0 and game_data_count == 0:
+                                st.warning(f"⚠️ **ID Mismatch detected for {sd}!** Game logs exist but player_ids don't match projections.")
+                                # Sample IDs for debugging
+                                sample_proj = dfs_conn.execute(
+                                    "SELECT player_id, player_name FROM dfs_slate_projections WHERE slate_date = ? LIMIT 3",
+                                    (sd,)
+                                ).fetchall()
+                                sample_log = dfs_conn.execute(
+                                    "SELECT player_id, player_name FROM player_game_logs WHERE game_date = ? LIMIT 3",
+                                    (sd,)
+                                ).fetchall()
+                                st.code(f"Projection IDs: {sample_proj}\nGame Log IDs: {sample_log}")
+
                             if game_data_count < 3:
                                 any_missing = True
 
