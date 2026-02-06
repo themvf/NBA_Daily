@@ -278,11 +278,13 @@ def update_slate_actuals(conn: sqlite3.Connection, slate_date: str) -> Tuple[int
     select_cols = ', '.join(safe_cols)
 
     for (player_id,) in proj_rows:
+        # Use LIKE for date matching since player_game_logs stores timestamps
+        # like "2026-02-04T00:00:00" but slate_date is just "2026-02-04"
         row = cursor.execute(f"""
             SELECT {select_cols}
             FROM player_game_logs
-            WHERE player_id = ? AND game_date = ?
-        """, (player_id, slate_date)).fetchone()
+            WHERE player_id = ? AND game_date LIKE ?
+        """, (player_id, f"{slate_date}%")).fetchone()
 
         if row is None:
             # Player didn't play or no data yet

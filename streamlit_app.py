@@ -13614,16 +13614,17 @@ if selected_page == "DFS Lineup Builder":
                                 (sd,)
                             ).fetchone()[0]
 
-                            # Count game logs for this date (regardless of player match)
+                            # Count game logs for this date (use LIKE since game_date is timestamp format)
                             logs_for_date = dfs_conn.execute(
-                                "SELECT COUNT(*) FROM player_game_logs WHERE game_date = ?",
-                                (sd,)
+                                "SELECT COUNT(*) FROM player_game_logs WHERE game_date LIKE ?",
+                                (f"{sd}%",)
                             ).fetchone()[0]
 
                             # Count matching game logs (player_id AND date match)
+                            # Use LIKE for date since player_game_logs stores "2026-02-04T00:00:00" format
                             game_data_count = dfs_conn.execute(
                                 """SELECT COUNT(*) FROM dfs_slate_projections p
-                                   JOIN player_game_logs g ON p.player_id = g.player_id AND p.slate_date = g.game_date
+                                   JOIN player_game_logs g ON p.player_id = g.player_id AND g.game_date LIKE (p.slate_date || '%')
                                    WHERE p.slate_date = ?""",
                                 (sd,)
                             ).fetchone()[0]
