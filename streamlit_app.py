@@ -12818,6 +12818,8 @@ if selected_page == "DFS Lineup Builder":
         st.session_state.dfs_exposure_targets = {}
     if 'dfs_vegas_signals' not in st.session_state:
         st.session_state.dfs_vegas_signals = {}
+    if 'dfs_vegas_blend_active' not in st.session_state:
+        st.session_state.dfs_vegas_blend_active = False
     if 'dfs_projection_date' not in st.session_state:
         st.session_state.dfs_projection_date = None
 
@@ -13191,8 +13193,59 @@ if selected_page == "DFS Lineup Builder":
                 filtered = [p for p in filtered if any(pos in p.positions for pos in selected_positions)]
             filtered = [p for p in filtered if salary_range[0] <= p.salary <= salary_range[1]]
 
-            # Sort options
+            # Vegas blending
             vegas_sigs = st.session_state.get('dfs_vegas_signals', {})
+
+            if vegas_sigs:
+                blend_col1, blend_col2 = st.columns([1, 2])
+                with blend_col1:
+                    blend_vegas = st.toggle(
+                        "Blend Model + Vegas",
+                        value=st.session_state.dfs_vegas_blend_active,
+                        help="Average our model FPTS with Vegas implied FPTS. Blended projections feed directly into lineup optimization."
+                    )
+                with blend_col2:
+                    if blend_vegas:
+                        blend_weight = st.slider(
+                            "Vegas weight",
+                            min_value=10, max_value=90, value=50, step=10,
+                            format="%d%%",
+                            help="50% = equal weight. Higher = trust Vegas more.",
+                            key="vegas_blend_weight"
+                        ) / 100
+                    else:
+                        blend_weight = 0.5
+
+                # Store original proj_fpts on first access so we can always revert
+                for p in players:
+                    if not hasattr(p, '_model_proj_fpts'):
+                        p._model_proj_fpts = p.proj_fpts
+                        p._model_fpts_per_dollar = p.fpts_per_dollar
+
+                vegas_players_blended = 0
+                if blend_vegas:
+                    model_weight = 1.0 - blend_weight
+                    for p in players:
+                        sig = vegas_sigs.get(p.player_id)
+                        if sig and sig.get('vegas_fpts') is not None:
+                            p.proj_fpts = round(p._model_proj_fpts * model_weight + sig['vegas_fpts'] * blend_weight, 1)
+                            p.fpts_per_dollar = round((p.proj_fpts / p.salary) * 1000, 3) if p.salary > 0 else 0
+                            vegas_players_blended += 1
+                        else:
+                            p.proj_fpts = p._model_proj_fpts
+                            p.fpts_per_dollar = p._model_fpts_per_dollar
+                    st.session_state.dfs_vegas_blend_active = True
+                    st.caption(f"🎰 Blended projections active — {vegas_players_blended} players adjusted ({int(blend_weight*100)}% Vegas / {int((1-blend_weight)*100)}% Model). Lineups will use these projections.")
+                else:
+                    if st.session_state.dfs_vegas_blend_active:
+                        # Restore original model projections
+                        for p in players:
+                            if hasattr(p, '_model_proj_fpts'):
+                                p.proj_fpts = p._model_proj_fpts
+                                p.fpts_per_dollar = p._model_fpts_per_dollar
+                        st.session_state.dfs_vegas_blend_active = False
+
+            # Sort options
             sort_options = ["Projected FPTS", "Salary", "Value (FPTS/$)", "Ceiling"]
             if vegas_sigs:
                 sort_options.append("Vegas Edge")
@@ -13252,6 +13305,9 @@ if selected_page == "DFS Lineup Builder":
                 v_fpts = v_sig.get('vegas_fpts')
                 v_edge = v_sig.get('edge_pct')
 
+                is_blended = st.session_state.get('dfs_vegas_blend_active', False)
+                model_fpts = getattr(p, '_model_proj_fpts', p.proj_fpts)
+
                 row = {
                     'Status': status,
                     'Name': p.name,
@@ -13259,11 +13315,18 @@ if selected_page == "DFS Lineup Builder":
                     'Opp': p.opponent,
                     'Pos': '/'.join(p.positions),
                     'Salary': f"${p.salary:,}",
-                    'Proj FPTS': f"{p.proj_fpts:.1f}",
                 }
-                if vegas_sigs:
-                    row['Vegas'] = f"{v_fpts:.1f}" if v_fpts is not None else "—"
+                if is_blended and vegas_sigs:
+                    row['Model'] = f"{model_fpts:.1f}"
+                    row['Vegas FPTS'] = f"{v_fpts:.1f}" if v_fpts is not None else "—"
+                    row['Blended'] = f"{p.proj_fpts:.1f}"
                     row['Edge'] = f"{v_edge:+.1f}%" if v_edge is not None else "—"
+                elif vegas_sigs:
+                    row['Proj FPTS'] = f"{p.proj_fpts:.1f}"
+                    row['Vegas FPTS'] = f"{v_fpts:.1f}" if v_fpts is not None else "—"
+                    row['Edge'] = f"{v_edge:+.1f}%" if v_edge is not None else "—"
+                else:
+                    row['Proj FPTS'] = f"{p.proj_fpts:.1f}"
                 row.update({
                     'Floor': f"{p.proj_floor:.1f}",
                     'Ceiling': f"{p.proj_ceiling:.1f}",
