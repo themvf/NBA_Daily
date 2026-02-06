@@ -105,7 +105,7 @@ def create_dfs_tracking_tables(conn: sqlite3.Connection) -> None:
         );
     """)
 
-    # Migration-safe column additions (won't fail if columns already exist)
+    # Migration-safe column additions (check first, then add if missing)
     migrations = [
         ("dfs_slate_projections", "ownership_proj", "REAL"),
         ("dfs_slate_projections", "actual_ownership", "REAL"),
@@ -113,10 +113,13 @@ def create_dfs_tracking_tables(conn: sqlite3.Connection) -> None:
         ("dfs_slate_results", "ownership_correlation", "REAL"),
     ]
     for table, col, col_type in migrations:
-        try:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
-        except sqlite3.OperationalError:
-            pass  # Column already exists
+        # Check if column exists first to avoid ALTER TABLE errors
+        existing_cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if col not in existing_cols:
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+            except Exception:
+                pass  # Column might have been added concurrently
 
     # --- Opponent tracking tables ---
     conn.executescript("""
