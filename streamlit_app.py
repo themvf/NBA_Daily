@@ -13882,11 +13882,37 @@ if selected_page == "DFS Lineup Builder":
                             slate_result_df = summary_df[summary_df['slate_date'] == detail_date]
                             if not slate_result_df.empty:
                                 slate_result = slate_result_df.iloc[0]
+
+                                # Row 1: Projection accuracy metrics
                                 m1, m2, m3, m4 = st.columns(4)
                                 m1.metric("Proj MAE", f"{slate_result['proj_mae']:.1f}" if pd.notna(slate_result['proj_mae']) else "—")
                                 m2.metric("Correlation", f"{slate_result['proj_correlation']:.3f}" if pd.notna(slate_result['proj_correlation']) else "—")
                                 m3.metric("In Range %", f"{slate_result['proj_within_range_pct']:.1f}%" if pd.notna(slate_result['proj_within_range_pct']) else "—")
                                 m4.metric("Efficiency %", f"{slate_result['lineup_efficiency_pct']:.1f}%" if pd.notna(slate_result['lineup_efficiency_pct']) else "—")
+
+                                # Row 2: Lineup performance vs contest winner
+                                # Get contest winner's score from dfs_contest_meta
+                                winner_row = dfs_conn.execute(
+                                    "SELECT top_score FROM dfs_contest_meta WHERE slate_date = ? ORDER BY import_date DESC LIMIT 1",
+                                    (detail_date,)
+                                ).fetchone()
+                                winner_score = winner_row[0] if winner_row and winner_row[0] else None
+
+                                best_lineup = slate_result.get('best_lineup_actual_fpts')
+                                optimal = slate_result.get('optimal_lineup_fpts')
+
+                                l1, l2, l3, l4 = st.columns(4)
+                                l1.metric("Our Best Lineup", f"{best_lineup:.1f}" if pd.notna(best_lineup) else "—")
+                                l2.metric("🏆 Contest Winner", f"{winner_score:.1f}" if winner_score else "—", help="Upload contest CSV to see winner's score")
+
+                                if winner_score and pd.notna(best_lineup):
+                                    gap = winner_score - best_lineup
+                                    gap_pct = (best_lineup / winner_score * 100) if winner_score > 0 else 0
+                                    l3.metric("Gap to Winner", f"{gap:+.1f}", delta=f"{gap_pct:.0f}% of winner", delta_color="inverse")
+                                else:
+                                    l3.metric("Gap to Winner", "—")
+
+                                l4.metric("Optimal Possible", f"{optimal:.1f}" if pd.notna(optimal) else "—", help="Best lineup with perfect hindsight")
 
                             # --- Ownership Analysis ---
                             has_ownership = (
