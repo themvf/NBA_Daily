@@ -13680,6 +13680,31 @@ if selected_page == "DFS Lineup Builder":
                 # Display each lineup
                 st.subheader("Lineup Details")
 
+                # Pre-fetch Vegas prop lines for all players in lineups
+                vegas_props_lookup = {}
+                try:
+                    game_dt = st.session_state.get('dfs_projection_date') or str(date.today())
+                    props_cursor = dfs_conn.execute("""
+                        SELECT player_name,
+                               fanduel_ou, fanduel_reb_ou, fanduel_ast_ou,
+                               fanduel_3pm_ou, fanduel_stl_ou, fanduel_blk_ou,
+                               vegas_implied_fpts
+                        FROM predictions
+                        WHERE game_date = ?
+                    """, [game_dt])
+                    for row in props_cursor.fetchall():
+                        pname = row[0].strip().lower() if row[0] else ""
+                        if pname:
+                            vegas_props_lookup[pname] = {
+                                'pts': row[1], 'reb': row[2], 'ast': row[3],
+                                '3pm': row[4], 'stl': row[5], 'blk': row[6],
+                                'vegas_fpts': row[7],
+                            }
+                except Exception:
+                    pass
+
+                vegas_sigs = st.session_state.get('dfs_vegas_signals', {})
+
                 # Pagination
                 lineups_per_page = 10
                 total_pages = (len(lineups) + lineups_per_page - 1) // lineups_per_page
@@ -13695,22 +13720,56 @@ if selected_page == "DFS Lineup Builder":
                         f"Salary: ${lineup.total_salary:,} | Ceiling: {lineup.total_ceiling:.1f}",
                         expanded=(i == start_idx)
                     ):
-                        # Show lineup table
+                        # Show lineup table with Vegas props
                         lineup_data = []
                         for slot in dfs.ROSTER_SLOTS:
                             player = lineup.players.get(slot)
                             if player:
-                                lineup_data.append({
+                                props = vegas_props_lookup.get(player.name.strip().lower(), {})
+                                sig = vegas_sigs.get(player.player_id, {})
+                                signal_label = sig.get('signal', '')
+
+                                # Build boost indicator
+                                boost = ""
+                                if signal_label == "BOOST":
+                                    boost = "BOOST"
+                                elif "💉" in getattr(player, 'analytics_used', ''):
+                                    boost = "INJ+"
+
+                                v_fpts = props.get('vegas_fpts')
+                                row_data = {
                                     'Slot': slot,
                                     'Player': player.name,
                                     'Team': player.team,
                                     'Salary': f"${player.salary:,}",
                                     'Proj': f"{player.proj_fpts:.1f}",
-                                    'Ceiling': f"{player.proj_ceiling:.1f}"
-                                })
+                                    'Ceiling': f"{player.proj_ceiling:.1f}",
+                                    'Own%': f"{player.ownership_proj:.1f}%",
+                                    'Vegas': f"{v_fpts:.1f}" if v_fpts is not None else "—",
+                                }
+
+                                # Add individual stat props if any exist
+                                has_props = any(props.get(k) is not None for k in ['pts', 'reb', 'ast', '3pm', 'stl', 'blk'])
+                                if has_props:
+                                    for key, label in [('pts', 'PTS'), ('reb', 'REB'), ('ast', 'AST'),
+                                                       ('3pm', '3PM'), ('stl', 'STL'), ('blk', 'BLK')]:
+                                        val = props.get(key)
+                                        row_data[label] = f"{val:.1f}" if val is not None else "—"
+
+                                if boost:
+                                    row_data['Boost'] = boost
+
+                                lineup_data.append(row_data)
+
+                        df_lineup = pd.DataFrame(lineup_data)
+                        # Drop columns that are entirely empty dashes
+                        for col in ['PTS', 'REB', 'AST', '3PM', 'STL', 'BLK', 'Boost']:
+                            if col in df_lineup.columns:
+                                if (df_lineup[col] == "—").all() or (df_lineup[col] == "").all():
+                                    df_lineup.drop(columns=[col], inplace=True)
 
                         st.dataframe(
-                            pd.DataFrame(lineup_data),
+                            df_lineup,
                             use_container_width=True,
                             hide_index=True
                         )
