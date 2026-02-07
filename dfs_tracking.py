@@ -1439,7 +1439,8 @@ def analyze_top_finishers(
 
     # Get player info from projections (salary, team, ownership)
     player_info = pd.read_sql_query("""
-        SELECT player_name, team, salary, actual_ownership, actual_fpts, opponent
+        SELECT player_name, team, salary, actual_ownership, actual_fpts, opponent,
+               proj_fpts, ownership_proj
         FROM dfs_slate_projections
         WHERE slate_date = ?
     """, conn, params=[slate_date])
@@ -1455,7 +1456,9 @@ def analyze_top_finishers(
             'salary': row['salary'],
             'ownership': row['actual_ownership'],
             'fpts': row['actual_fpts'],
-            'opponent': row['opponent']
+            'opponent': row['opponent'],
+            'proj_fpts': row.get('proj_fpts'),
+            'proj_ownership': row.get('ownership_proj'),
         }
 
         norm_name = _normalize_name(row['player_name'])
@@ -1537,7 +1540,9 @@ def analyze_top_finishers(
                 'salary': info.get('salary', 0),
                 'ownership': info.get('ownership'),
                 'fpts': info.get('fpts'),
-                'opponent': info.get('opponent', '?')
+                'opponent': info.get('opponent', '?'),
+                'proj_fpts': info.get('proj_fpts'),
+                'proj_ownership': info.get('proj_ownership'),
             }
             lineup_data['players'].append(player_data)
 

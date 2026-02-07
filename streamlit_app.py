@@ -14656,13 +14656,18 @@ if selected_page == "DFS Lineup Builder":
                                     player_rows = []
                                     for p in lineup['players']:
                                         own_str = f"{p['ownership']:.1f}%" if p.get('ownership') else "—"
+                                        proj_own_str = f"{p['proj_ownership']:.1f}%" if p.get('proj_ownership') else "—"
+                                        proj_fpts_str = f"{p['proj_fpts']:.1f}" if p.get('proj_fpts') else "—"
+                                        actual_fpts_str = f"{p['fpts']:.1f}" if p.get('fpts') else "—"
                                         player_rows.append({
                                             'Pos': p['position'],
                                             'Player': p['name'],
                                             'Team': p['team'],
                                             'Salary': f"${p['salary']:,}" if p.get('salary') else "—",
+                                            'Proj Own%': proj_own_str,
                                             'Own%': own_str,
-                                            'FPTS': f"{p['fpts']:.1f}" if p.get('fpts') else "—"
+                                            'Proj FPTS': proj_fpts_str,
+                                            'FPTS': actual_fpts_str,
                                         })
                                     lineup_df = pd.DataFrame(player_rows)
                                     st.dataframe(lineup_df, use_container_width=True, hide_index=True)
