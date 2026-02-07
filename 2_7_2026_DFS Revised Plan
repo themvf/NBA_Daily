@@ -1,0 +1,102 @@
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Plan: Calibrate DFS Projections & Ownership Model
+
+ Context
+
+ We ran a calibration analysis against 3 recent contest slates (2026-02-04, 02-05, 02-06, 312 players) and found two
+ critical issues:
+
+ 1. Projection bias by salary tier: Stars over-projected by 1.6 FPTS, punts under-projected by 2.1 FPTS
+ 2. Ownership model is flat and inaccurate: Projects most players at 8-22%, but reality ranges from 1% to 67%.
+ Correlation only 0.329. Chalk players (>20% actual) projected at 15.6% vs 34% actual; contrarian (<5% actual)
+ projected at 11.3% vs 1.5% actual.
+
+ Goal: Fix both issues so today's lineup upload benefits from calibrated projections and more realistic ownership
+ estimates.
+
+ File to Modify
+
+ C:\Docs\_AI Python Projects\NBA_Daily\dfs_optimizer.py — 3 targeted changes (~70 lines changed/added)
+
+ Changes
+
+ Change 1: Salary-Tier Projection Calibration
+
+ Location: Insert between line 1384 (after proj_fpts is calculated) and line 1386 (before floor/ceiling)
+
+ Apply multiplicative bias corrections derived from the calibration data:
+ ┌───────────────────┬────────────────────┬────────────┬───────────────────────────┐
+ │       Tier        │     Bias Found     │ Correction │ Effect on ~avg projection │
+ ├───────────────────┼────────────────────┼────────────┼───────────────────────────┤
+ │ Stars ($8K+)      │ -1.60 (over-proj)  │ *= 0.96    │ 43 -> 41.3                │
+ ├───────────────────┼────────────────────┼────────────┼───────────────────────────┤
+ │ Mid ($6K-$7.9K)   │ +0.64 (negligible) │ no change  │ —                         │
+ ├───────────────────┼────────────────────┼────────────┼───────────────────────────┤
+ │ Value ($4K-$5.9K) │ +0.98 (under-proj) │ *= 1.05    │ 20.6 -> 21.6              │
+ ├───────────────────┼────────────────────┼────────────┼───────────────────────────┤
+ │ Punt (<$4K)       │ +2.09 (under-proj) │ *= 1.20    │ 10.2 -> 12.2              │
+ └───────────────────┴────────────────────┴────────────┴───────────────────────────┘
+ This runs BEFORE floor/ceiling so the fallback path (proj_fpts * 0.6 / * 1.5) uses corrected values. The
+ quantile-based path is unaffected (uses historical logs directly).
+
+ Change 2: Rewrite _estimate_ownership() (lines 890-924)
+
+ Replace the current linear formula with a nonlinear power-law model:
+
+ Current problems:
+ - raw_score * 3.0 produces flat 8-22% range
+ - Salary mult of 1.2 for punts is backwards (punts should default LOW)
+ - No injury-replacement awareness
+
+ New design:
+ - Same inputs (value_score, dk_visibility) but combined with tier-specific weighting (stars driven by name
+ recognition, punts driven by value)
+ - Power-law sharpening (exponent 2.0): normalizes combined signal to [0,1], squares it. High signals stay high, low
+ signals collapse toward zero
+ - Calibrated tier parameters: base + sharpened * (ceiling - base)
+   - Stars ($9K+): base 8%, ceiling 55%, visibility-heavy (0.65 weight)
+   - Mid ($7K-$9K): base 3%, ceiling 30%, balanced (0.55)
+   - Value ($5K-$7K): base 1.5%, ceiling 32%, value-heavy (0.40)
+   - Punt (<$5K): base 0.5%, ceiling 35%, mostly value (0.30)
+ - Injury boost: 2.25x multiplier when player has "💉" in analytics_used (significant injury-replacement usage)
+ - Clamped to [0.5%, 55%]
+
+ Verification against calibration targets:
+ ┌───────────────────────────────────┬───────────┬───────────┬───────────────┐
+ │            Player Type            │ Old Model │ New Model │ Actual Target │
+ ├───────────────────────────────────┼───────────┼───────────┼───────────────┤
+ │ Chalk star ($9.5K, dk_avg=50)     │ ~19.5%    │ ~28%      │ 34%           │
+ ├───────────────────────────────────┼───────────┼───────────┼───────────────┤
+ │ Contrarian punt ($3.5K, dk_avg=8) │ ~9.7%     │ ~2.6%     │ 1.5-2.7%      │
+ ├───────────────────────────────────┼───────────┼───────────┼───────────────┤
+ │ Value injury replacement ($5.2K)  │ ~13.9%    │ ~19.6%    │ 20-50%        │
+ ├───────────────────────────────────┼───────────┼───────────┼───────────────┤
+ │ Mid-tier regular ($7K, dk_avg=30) │ ~15%      │ ~8%       │ 8.4%          │
+ └───────────────────────────────────┴───────────┴───────────┴───────────────┘
+ Change 3: Update Call Site (line 1411)
+
+ Pass injury boost flag to the rewritten function:
+ player.ownership_proj = _estimate_ownership(
+     player, has_injury_boost=("💉" in player.analytics_used)
+ )
+
+ By line 1411, analytics_used is already set (line 1404). The "💉" indicator is only added when
+ injury_boost.to_fpts_boost() >= 2.0 (line 1374-1375).
+
+ What Does NOT Change
+
+ - Floor/ceiling quantile path (lines 1387-1389): Uses historical logs, unaffected
+ - Fallback players (line 1159-1171): Return early with hardcoded 5% ownership, unaffected
+ - Simple projection path (line 1110): Has its own ownership formula, doesn't call _estimate_ownership()
+ - Leverage score (lines 1414-1416): Automatically improves from better ownership inputs
+ - No other files modified
+
+ Verification
+
+ 1. Run Streamlit app, upload today's DK CSV, generate projections
+ 2. Check Player Pool table:
+   - Star projections should be ~4% lower than before
+   - Punt projections should be ~20% higher (better value identification)
+   - Ownership column should show wider spread: some players 25%+, many punts at 1-3%
+ 3. Generate lineups — should see more punt/value plays selected (higher proj_fpts) and better leverage scores
+ 4. Commit and push to Git for Streamlit Cloud
