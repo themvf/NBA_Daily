@@ -13624,22 +13624,33 @@ if selected_page == "DFS Lineup Builder":
             # Always try to load game env from database (odds may have been fetched after projections)
             game_env = st.session_state.get('dfs_game_env', {})
             proj_date_str = st.session_state.get('dfs_projection_date') or str(date.today())
-            if not game_env:
+
+            def _load_game_env_from_db(conn, date_str):
+                """Load game environment data from game_odds table."""
+                env_map = {}
                 try:
-                    env_cursor = dfs_conn.execute("""
+                    # Check if game_odds table exists
+                    tbl = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='game_odds'").fetchone()
+                    if not tbl:
+                        return env_map
+                    cursor = conn.execute("""
                         SELECT game_id, home_team, away_team, spread, total, stack_score
                         FROM game_odds WHERE date(game_date) = date(?)
-                    """, [proj_date_str])
-                    for row in env_cursor.fetchall():
-                        game_env[row[0]] = {
-                            'home': row[1], 'away': row[2],
-                            'spread': row[3], 'total': row[4],
-                            'stack_score': row[5] if row[5] is not None else 0.5
+                    """, [date_str])
+                    for row in cursor.fetchall():
+                        env_map[row['game_id']] = {
+                            'home': row['home_team'], 'away': row['away_team'],
+                            'spread': row['spread'], 'total': row['total'],
+                            'stack_score': row['stack_score'] if row['stack_score'] is not None else 0.5
                         }
-                    if game_env:
-                        st.session_state.dfs_game_env = game_env
                 except Exception:
                     pass
+                return env_map
+
+            if not game_env:
+                game_env = _load_game_env_from_db(dfs_conn, proj_date_str)
+                if game_env:
+                    st.session_state.dfs_game_env = game_env
 
             # Build game list from player pool (DK game_ids)
             dk_games = {}  # dk_game_id -> {teams, players}
@@ -13683,19 +13694,27 @@ if selected_page == "DFS Lineup Builder":
                         fetch_date = datetime.strptime(proj_date_str, "%Y-%m-%d").date() if proj_date_str else date.today()
                     except (ValueError, TypeError):
                         fetch_date = date.today()
+
+                    # First, try loading from DB (odds may already exist)
+                    refreshed = _load_game_env_from_db(dfs_conn, proj_date_str)
+                    if refreshed:
+                        st.session_state.dfs_game_env = refreshed
+                        st.rerun()
+
+                    # No DB data — fetch from API
                     with st.spinner("Fetching odds from The Odds API..."):
                         try:
-                            result = odds_api.fetch_fanduel_lines_for_date(dfs_conn, fetch_date, force=False)
+                            result = odds_api.fetch_fanduel_lines_for_date(dfs_conn, fetch_date, force=True)
                             if result.get('success'):
                                 stored = result.get('game_odds_stored', 0)
                                 st.success(f"Fetched odds for {result.get('events_fetched', 0)} games ({stored} game environments stored)")
-                                # Reload game env from database
-                                st.session_state.dfs_game_env = {}
-                                st.rerun()
                             else:
-                                st.error(f"Fetch failed: {result.get('error', 'Unknown error')}")
+                                st.warning(f"API fetch issue: {result.get('error', 'Unknown')}")
                         except Exception as e:
-                            st.error(f"Error fetching odds: {e}")
+                            st.warning(f"API fetch error: {e}")
+                        # Reload from DB regardless (API may have partially succeeded)
+                        st.session_state.dfs_game_env = _load_game_env_from_db(dfs_conn, proj_date_str)
+                        st.rerun()
 
                 if game_env_matched and not manual_stacking:
                     # --- Odds-driven stacking mode ---
