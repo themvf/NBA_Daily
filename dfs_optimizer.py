@@ -887,39 +887,70 @@ STAT_OPP_ADJUSTMENT_MAP = {
 }
 
 
-def _estimate_ownership(player) -> float:
-    """Estimate ownership % using salary, value, and DK visibility factors.
+def _estimate_ownership(player, has_injury_boost: bool = False) -> float:
+    """Estimate ownership % using nonlinear model calibrated to actual DFS data.
 
-    Key drivers of DFS ownership:
-    1. Value (FPTS/$) — optimizers push everyone toward high-value plays
-    2. DK AvgPointsPerGame — visible on the DK player card, influences casual players
-    3. Salary tier — stars are always popular; cheap value plays enable them
+    Calibrated against 312 players across 3 slates (2026-02-04 to 02-06).
+    Uses power-law sharpening to separate chalk (30%+) from contrarian (<3%).
+
+    Key drivers:
+    1. Value (FPTS/$) -- optimizers push toward high-value plays
+    2. DK AvgPointsPerGame -- visible on DK player card, influences casual players
+    3. Salary tier -- determines base ownership and scaling ceiling
+    4. Injury boost -- players absorbing injured teammates' usage draw higher ownership
     """
     if player.salary <= 0 or player.proj_fpts <= 0:
-        return 1.0
+        return 0.5
 
-    # Factor 1: Value score (0-10 range, normalized)
-    value_score = min(10, player.fpts_per_dollar)
+    # --- Factor 1: Value score (0-10 range) ---
+    value_score = min(10.0, player.fpts_per_dollar)
 
-    # Factor 2: DK visibility (AvgPointsPerGame normalized to 0-10)
+    # --- Factor 2: DK visibility (0-10 range) ---
     dk_avg = getattr(player, 'dk_avg_pts', 0.0) or 0.0
-    dk_visibility = min(10, dk_avg / 7) if dk_avg > 0 else value_score * 0.7
+    dk_visibility = min(10.0, dk_avg / 7.0) if dk_avg > 0 else value_score * 0.7
 
-    # Factor 3: Salary tier multiplier
+    # --- Factor 3: Salary-tier parameters ---
+    # Calibrated from actual contest ownership data:
+    #   Stars:  high base (always rostered), visibility-driven
+    #   Mid:    moderate base, balanced drivers
+    #   Value:  low base, value-driven, can spike on obvious plays
+    #   Punt:   very low base, almost entirely value-driven
     if player.salary >= 9000:
-        salary_mult = 1.3   # Stars are always popular
+        tier_base = 8.0
+        tier_ceiling = 55.0
+        vis_weight = 0.65  # Stars: name recognition dominates
     elif player.salary >= 7000:
-        salary_mult = 1.0   # Mid-high tier
+        tier_base = 3.0
+        tier_ceiling = 30.0
+        vis_weight = 0.55
     elif player.salary >= 5000:
-        salary_mult = 1.1   # Mid-range value plays
+        tier_base = 1.5
+        tier_ceiling = 32.0
+        vis_weight = 0.40  # Value: optimizer value matters more
     else:
-        salary_mult = 1.2   # Cheap plays enable expensive stars
+        tier_base = 0.5
+        tier_ceiling = 35.0
+        vis_weight = 0.30  # Punt: almost entirely value-driven
 
-    # Combine: weighted average with salary multiplier
-    raw_score = (value_score * 0.5 + dk_visibility * 0.5) * salary_mult
+    # --- Combine factors with tier-specific weighting ---
+    val_weight = 1.0 - vis_weight
+    raw_signal = value_score * val_weight + dk_visibility * vis_weight
 
-    # Scale to realistic ownership range (1-50%)
-    ownership = min(50.0, max(1.0, raw_score * 3.0))
+    # --- Power-law sharpening (exponent 2.0) ---
+    # High signals stay high, low signals collapse toward zero
+    # This creates the chalk vs contrarian separation missing from the old linear model
+    normalized = raw_signal / 10.0
+    sharpened = normalized ** 2.0
+
+    # --- Scale to ownership range ---
+    ownership = tier_base + sharpened * (tier_ceiling - tier_base)
+
+    # --- Injury boost: players absorbing injured teammate usage ---
+    if has_injury_boost:
+        ownership *= 2.25
+
+    # --- Clamp to realistic range ---
+    ownership = min(55.0, max(0.5, ownership))
 
     return round(ownership, 1)
 
@@ -1383,6 +1414,21 @@ def generate_player_projections(
         player.proj_fg3m
     )
 
+    # --- Calibration: Salary-tier bias correction ---
+    # Based on 312-player analysis across 3 contest slates (2026-02-04 to 02-06):
+    #   Stars ($8K+):    bias -1.60 (over-projecting) -> scale down 4%
+    #   Mid ($6K-7.9K):  bias +0.64 (negligible)      -> no change
+    #   Value ($4K-5.9K): bias +0.98 (under-proj)     -> scale up 5%
+    #   Punt (<$4K):     bias +2.09 (under-proj)       -> scale up 20%
+    if player.salary >= 8000:
+        player.proj_fpts *= 0.96
+    elif player.salary >= 6000:
+        pass  # Mid-tier bias is negligible
+    elif player.salary >= 4000:
+        player.proj_fpts *= 1.05
+    else:
+        player.proj_fpts *= 1.20
+
     # Floor/ceiling from actual DK FPTS distribution (preserves stat correlations)
     if len(logs) >= 3:
         base_floor = logs['dk_fpts'].quantile(0.10) * rest_multiplier
@@ -1407,8 +1453,10 @@ def generate_player_projections(
     if player.salary > 0:
         player.fpts_per_dollar = (player.proj_fpts / player.salary) * 1000
 
-    # Estimate ownership using multi-factor model
-    player.ownership_proj = _estimate_ownership(player)
+    # Estimate ownership using calibrated nonlinear model
+    player.ownership_proj = _estimate_ownership(
+        player, has_injury_boost=("💉" in player.analytics_used)
+    )
 
     # Leverage score: projection + amplified upside, relative to ownership
     if player.ownership_proj > 0:
