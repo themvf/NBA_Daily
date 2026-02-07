@@ -12881,6 +12881,10 @@ if selected_page == "DFS Lineup Builder":
         st.session_state.dfs_vegas_blend_active = False
     if 'dfs_projection_date' not in st.session_state:
         st.session_state.dfs_projection_date = None
+    if 'dfs_game_env' not in st.session_state:
+        st.session_state.dfs_game_env = {}
+    if 'dfs_stack_config' not in st.session_state:
+        st.session_state.dfs_stack_config = {}
 
     # Get database connection
     dfs_conn = get_connection(str(db_path))
@@ -12906,6 +12910,11 @@ if selected_page == "DFS Lineup Builder":
             value=1000,
             step=100,
             help="Maximum unused salary allowed per lineup. Lower values force fuller salary usage. $0 = must use exactly $50,000."
+        )
+        filter_no_minutes = st.checkbox(
+            "Exclude players with no recent minutes",
+            value=True,
+            help="Filter out players who haven't played recently or average < 5 minutes"
         )
 
         st.divider()
@@ -13162,6 +13171,39 @@ if selected_page == "DFS Lineup Builder":
                                     st.info(f"🎰 Found {boost_count} Vegas BOOST candidate(s) — see Player Pool tab")
                         except Exception:
                             st.session_state.dfs_vegas_signals = {}
+
+                        # Enrich with game environment correlation data
+                        try:
+                            game_date_for_enrich = str(projection_date) if projection_date else str(date.today())
+                            projected_players = dfs.enrich_players_with_correlation_model(
+                                projected_players, dfs_conn, game_date_for_enrich
+                            )
+                            projected_players = dfs.apply_correlation_ceiling_boost(projected_players)
+
+                            # Build game environment lookup for stack UI
+                            game_env_map = {}
+                            try:
+                                env_cursor = dfs_conn.execute("""
+                                    SELECT game_id, home_team, away_team, spread, total, stack_score
+                                    FROM game_odds
+                                    WHERE date(game_date) = date(?)
+                                """, [game_date_for_enrich])
+                                for row in env_cursor.fetchall():
+                                    game_env_map[row[0]] = {
+                                        'home': row[1], 'away': row[2],
+                                        'spread': row[3], 'total': row[4],
+                                        'stack_score': row[5] or 0.5
+                                    }
+                            except Exception:
+                                pass
+                            st.session_state.dfs_game_env = game_env_map
+                        except Exception:
+                            st.session_state.dfs_game_env = {}
+
+                        # Count minutes-validated players
+                        no_minutes = sum(1 for p in projected_players if not p.minutes_validated)
+                        if no_minutes:
+                            st.warning(f"⚠️ {no_minutes} player(s) flagged with no recent minutes")
 
                         # Show projection summary
                         b2b_count = sum(1 for p in projected_players if getattr(p, 'days_rest', None) == 1)
@@ -13578,6 +13620,86 @@ if selected_page == "DFS Lineup Builder":
         else:
             players = st.session_state.dfs_player_pool
 
+            # --- Game Stack Selection ---
+            game_env = st.session_state.get('dfs_game_env', {})
+
+            # Build game list from player pool (DK game_ids)
+            dk_games = {}  # dk_game_id -> {teams, players}
+            for p in players:
+                if p.game_id not in dk_games:
+                    dk_games[p.game_id] = {'teams': set(), 'players': []}
+                dk_games[p.game_id]['teams'].add(p.team)
+                dk_games[p.game_id]['players'].append(p)
+
+            # Match DK game_ids to game_odds entries by team names
+            game_env_matched = {}  # dk_game_id -> env data
+            for dk_gid, ginfo in dk_games.items():
+                dk_teams = ginfo['teams']
+                for env_gid, env in game_env.items():
+                    env_teams = {env.get('home', ''), env.get('away', '')}
+                    if dk_teams & env_teams:  # At least one team matches
+                        game_env_matched[dk_gid] = env
+                        break
+
+            with st.expander("🏀 Game Stacks", expanded=bool(game_env_matched)):
+                if not game_env_matched:
+                    st.caption("No game environment data available. Fetch Vegas odds first for spread/total data.")
+                    st.caption("Lineups will generate without forced stacking.")
+                else:
+                    st.caption("Configure stacking for each game. Primary = 3-4 players with bring-back. Mini = 2-player pair.")
+                    stack_options = ["Auto", "Primary Stack (3-4)", "Mini Stack (2)", "No Stack"]
+
+                    stack_config = {}
+                    # Sort games by stack_score descending
+                    sorted_games = sorted(
+                        game_env_matched.items(),
+                        key=lambda x: x[1].get('stack_score', 0), reverse=True
+                    )
+
+                    for dk_gid, env in sorted_games:
+                        teams = sorted(dk_games[dk_gid]['teams'])
+                        matchup = " vs ".join(teams) if len(teams) >= 2 else teams[0] if teams else dk_gid
+                        spread = env.get('spread', 0) or 0
+                        total = env.get('total', 0) or 0
+                        ss = env.get('stack_score', 0.5)
+
+                        # Default selection based on stack_score
+                        if ss >= 0.75:
+                            default_idx = 0  # Auto (will resolve to primary)
+                        elif ss >= 0.50:
+                            default_idx = 0  # Auto (will resolve to mini)
+                        else:
+                            default_idx = 3  # No Stack
+
+                        col_game, col_sel = st.columns([3, 2])
+                        with col_game:
+                            score_bar = "🟢" if ss >= 0.75 else "🟡" if ss >= 0.50 else "🔴"
+                            st.markdown(f"**{matchup}** — Spread: {spread:+.1f} | Total: {total:.0f} | Stack: {score_bar} {ss:.2f}")
+                        with col_sel:
+                            choice = st.selectbox(
+                                "Stack", stack_options, index=default_idx,
+                                key=f"stack_{dk_gid}", label_visibility="collapsed"
+                            )
+
+                        type_map = {"Auto": "auto", "Primary Stack (3-4)": "primary",
+                                    "Mini Stack (2)": "mini", "No Stack": "none"}
+                        stack_config[dk_gid] = {
+                            'type': type_map[choice],
+                            'teams': list(dk_games[dk_gid]['teams']),
+                            'stack_score': ss,
+                        }
+
+                    st.session_state.dfs_stack_config = stack_config
+
+                    active_stacks = sum(1 for c in stack_config.values() if c['type'] != 'none')
+                    if active_stacks:
+                        st.caption(f"🎯 {active_stacks} game(s) configured for stacking")
+
+            # Also show games without env data (no stack controls, just info)
+            no_env_games = [gid for gid in dk_games if gid not in game_env_matched]
+            if no_env_games and game_env_matched:
+                st.caption(f"ℹ️ {len(no_env_games)} game(s) without odds data — no stacking available")
+
             col1, col2 = st.columns([2, 1])
             with col1:
                 if st.button("🚀 Generate Lineups", type="primary", use_container_width=True):
@@ -13594,6 +13716,14 @@ if selected_page == "DFS Lineup Builder":
                     if salary_filtered_count > 0:
                         st.info(f"💰 Filtered out {salary_filtered_count} players below ${min_salary:,} salary")
 
+                    # Apply minutes validation filter
+                    if filter_no_minutes:
+                        before_count = len(filtered_players)
+                        filtered_players = [p for p in filtered_players if p.minutes_validated]
+                        mins_filtered = before_count - len(filtered_players)
+                        if mins_filtered > 0:
+                            st.info(f"⏱️ Filtered out {mins_filtered} players with no recent minutes")
+
                     # Calculate minimum salary floor from max remaining
                     min_salary_floor = dfs.SALARY_CAP - max_remaining_salary
 
@@ -13605,7 +13735,8 @@ if selected_page == "DFS Lineup Builder":
                             progress_callback=update_progress,
                             excluded_games=st.session_state.dfs_excluded_games,
                             exposure_targets=st.session_state.dfs_exposure_targets,
-                            min_salary_floor=min_salary_floor
+                            min_salary_floor=min_salary_floor,
+                            stack_config=st.session_state.get('dfs_stack_config') or None
                         )
 
                     progress_bar.empty()

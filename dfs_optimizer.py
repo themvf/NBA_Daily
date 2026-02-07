@@ -563,6 +563,10 @@ class DFSPlayer:
     stack_score: float = 0.0      # Game stacking quality (0-1)
     is_star: bool = False         # Season avg >= 25 PPG
 
+    # Minutes validation
+    recent_minutes_avg: float = 0.0  # Last 5 games avg minutes
+    minutes_validated: bool = True    # False if player fails minutes check
+
     def calculate_projections(self) -> None:
         """Calculate derived projection values."""
         self.proj_fpts = calculate_dk_fantasy_points(
@@ -1205,10 +1209,36 @@ def generate_player_projections(
     logs = load_player_historical_stats(conn, player.player_id, season, season_type)
 
     if logs.empty:
+        player.minutes_validated = False
         return player
 
     # Calculate DK fantasy points for each game
     logs['dk_fpts'] = logs.apply(calculate_dk_fpts_from_row, axis=1)
+
+    # --- Minutes validation ---
+    # Check recent playing time to filter out DNP-risk players
+    if 'minutes' in logs.columns:
+        try:
+            min_vals = pd.to_numeric(logs['minutes'].head(10), errors='coerce').fillna(0)
+            recent_5_min = min_vals.head(5)
+            player.recent_minutes_avg = round(float(recent_5_min.mean()), 1)
+
+            games_with_minutes = (min_vals > 0).sum()
+            if games_with_minutes == 0:
+                player.minutes_validated = False
+            elif player.recent_minutes_avg < 5.0:
+                player.minutes_validated = False
+            # Check recency: if most recent game is older than 21 days
+            if 'game_date' in logs.columns and len(logs) > 0:
+                from datetime import datetime, timedelta
+                try:
+                    last_game = pd.to_datetime(logs['game_date'].iloc[0])
+                    if (datetime.now() - last_game).days > 21:
+                        player.minutes_validated = False
+                except Exception:
+                    pass
+        except Exception:
+            pass  # Don't fail projection on minutes check
 
     # If sophisticated prediction modules unavailable, use simple model
     if not SOPHISTICATED_PREDICTIONS or defense_map is None:
@@ -1853,6 +1883,140 @@ def rank_players_by_gpp_value(
 # Lineup Optimizer
 # =============================================================================
 
+def _select_stack_players(
+    available: List[DFSPlayer],
+    stack_config: Dict[str, Dict],
+    used_ids: Set[int],
+    strategy: str
+) -> List[DFSPlayer]:
+    """
+    Select players to force into a lineup based on game stacking configuration.
+
+    Supports three stack types:
+    - Primary (3-4 players): 2-3 from primary team + 1 bring-back from opponent
+    - Mini (2 players): Correlated pair from same game
+    - Auto: Chooses primary/mini based on stack_score
+
+    Returns list of DFSPlayer objects to pre-place in the lineup.
+    """
+    selected = []
+
+    def get_score(p: DFSPlayer) -> float:
+        if strategy == "ceiling":
+            return p.proj_ceiling
+        elif strategy == "value":
+            return p.fpts_per_dollar
+        elif strategy == "leverage":
+            return p.leverage_score
+        return p.proj_fpts
+
+    def weighted_pick(candidates: List[DFSPlayer], n: int = 1) -> List[DFSPlayer]:
+        """Pick n players from candidates using weighted random selection."""
+        if not candidates or n <= 0:
+            return []
+        n = min(n, len(candidates))
+        scores = [max(0.1, get_score(p)) for p in candidates]
+        picks = []
+        remaining = list(zip(candidates, scores))
+        for _ in range(n):
+            if not remaining:
+                break
+            players_left, weights_left = zip(*remaining)
+            total = sum(weights_left)
+            weights_norm = [w / total for w in weights_left]
+            chosen = random.choices(list(players_left), weights=weights_norm, k=1)[0]
+            picks.append(chosen)
+            remaining = [(p, w) for p, w in remaining if p.player_id != chosen.player_id]
+        return picks
+
+    for game_id, config in stack_config.items():
+        stack_type = config.get('type', 'none')
+        if stack_type == 'none':
+            continue
+
+        teams = config.get('teams', [])
+        stack_score = config.get('stack_score', 0.5)
+
+        # Resolve "auto" to primary or mini based on stack_score
+        if stack_type == 'auto':
+            if stack_score >= 0.75:
+                stack_type = 'primary'
+            elif stack_score >= 0.50:
+                stack_type = 'mini'
+            else:
+                continue  # Low stack score, skip
+
+        # Find available players in this game (not already used/selected)
+        selected_ids = {p.player_id for p in selected}
+        game_players = [
+            p for p in available
+            if p.game_id == game_id
+            and p.player_id not in used_ids
+            and p.player_id not in selected_ids
+            and p.proj_fpts > 0
+        ]
+
+        if len(game_players) < 2:
+            continue
+
+        # Group by team
+        by_team: Dict[str, List[DFSPlayer]] = {}
+        for p in game_players:
+            by_team.setdefault(p.team, []).append(p)
+
+        team_names = list(by_team.keys())
+        if not team_names:
+            continue
+
+        if stack_type == 'primary':
+            # Primary stack: 2-3 from one team + 1 bring-back
+            # Pick the team with more/better options as primary
+            if len(team_names) >= 2:
+                team_scores = {}
+                for t in team_names:
+                    team_scores[t] = sum(get_score(p) for p in by_team[t])
+                # Weighted random: prefer higher-scoring team but allow variety
+                t_names = list(team_scores.keys())
+                t_weights = [max(1.0, s) for s in team_scores.values()]
+                primary_team = random.choices(t_names, weights=t_weights, k=1)[0]
+                opp_team = [t for t in team_names if t != primary_team][0]
+            else:
+                primary_team = team_names[0]
+                opp_team = None
+
+            # Pick 2-3 from primary team (60% chance of 3, 40% chance of 2)
+            n_primary = 3 if random.random() < 0.6 else 2
+            primary_picks = weighted_pick(by_team[primary_team], n_primary)
+            selected.extend(primary_picks)
+
+            # Pick 1 bring-back from opponent (prefer stars/high ceiling)
+            if opp_team and by_team.get(opp_team):
+                bringback = weighted_pick(by_team[opp_team], 1)
+                selected.extend(bringback)
+
+        elif stack_type == 'mini':
+            # Mini stack: 2 correlated players
+            if len(team_names) >= 2:
+                # 70% same-team pair, 30% opposing stars
+                if random.random() < 0.70:
+                    # Same-team: pick the team with best options
+                    best_team = max(team_names, key=lambda t: sum(get_score(p) for p in by_team[t]))
+                    picks = weighted_pick(by_team[best_team], 2)
+                    selected.extend(picks)
+                else:
+                    # Opposing stars: 1 from each team
+                    for t in team_names[:2]:
+                        if by_team.get(t):
+                            picks = weighted_pick(by_team[t], 1)
+                            selected.extend(picks)
+            else:
+                # Only one team available, pick 2 from them
+                picks = weighted_pick(game_players, 2)
+                selected.extend(picks)
+
+    return selected
+
+
 def optimize_lineup_randomized(
     player_pool: List[DFSPlayer],
     strategy: str = "projection",
@@ -1862,7 +2026,8 @@ def optimize_lineup_randomized(
     current_exposures: Optional[Dict[int, int]] = None,
     num_lineups_total: int = 1,
     randomization_factor: float = 0.3,
-    min_salary_floor: int = 0
+    min_salary_floor: int = 0,
+    stack_config: Optional[Dict[str, Dict]] = None
 ) -> Optional[DFSLineup]:
     """
     Build an optimized lineup with controlled randomization for diversity.
@@ -1938,6 +2103,18 @@ def optimize_lineup_randomized(
                 lineup.players[slot] = player
                 used_player_ids.add(player.player_id)
                 break
+
+    # Add game stack players (after locked, before random fill)
+    if stack_config:
+        stack_players = _select_stack_players(available, stack_config, used_player_ids, strategy)
+        for player in stack_players:
+            if player.player_id in used_player_ids:
+                continue
+            for slot in ROSTER_SLOTS:
+                if slot not in lineup.players and player.can_fill_slot(slot):
+                    lineup.players[slot] = player
+                    used_player_ids.add(player.player_id)
+                    break
 
     # Fill remaining slots with weighted random selection
     for slot in ROSTER_SLOTS:
@@ -2048,7 +2225,8 @@ def generate_diversified_lineups(
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     excluded_games: Optional[Set[str]] = None,
     exposure_targets: Optional[Dict[int, float]] = None,
-    min_salary_floor: int = 0
+    min_salary_floor: int = 0,
+    stack_config: Optional[Dict[str, Dict]] = None
 ) -> List[DFSLineup]:
     """
     Generate diversified GPP tournament lineups using randomized optimization.
@@ -2163,6 +2341,28 @@ def generate_diversified_lineups(
                     if random.random() < lock_prob:
                         attempt_locked.append(info['player'])
 
+            # Determine stack config for this strategy
+            # Ceiling lineups: full stacking (maximize correlation upside)
+            # Projection lineups: downgrade primary->mini for balance
+            # Leverage lineups: 50% chance of no stacking (contrarian)
+            # Value lineups: use as configured
+            # Balanced (high-rand projection): randomize stack types
+            attempt_stack = stack_config
+            if stack_config and strategy == 'leverage':
+                if random.random() < 0.5:
+                    attempt_stack = None  # Contrarian: no forced stacking
+            elif stack_config and strategy == 'projection' and rand_factor >= 0.5:
+                # Balanced bucket: randomize between full/mini/none
+                r = random.random()
+                if r < 0.33:
+                    attempt_stack = None
+                elif r < 0.66:
+                    # Downgrade primaries to minis
+                    attempt_stack = {
+                        gid: {**cfg, 'type': 'mini' if cfg.get('type') == 'primary' else cfg.get('type')}
+                        for gid, cfg in stack_config.items()
+                    }
+
             lineup = optimize_lineup_randomized(
                 player_pool=filtered_pool,
                 strategy=strategy,
@@ -2171,7 +2371,8 @@ def generate_diversified_lineups(
                 current_exposures=exposures,
                 num_lineups_total=num_lineups,
                 randomization_factor=rand_factor,
-                min_salary_floor=min_salary_floor
+                min_salary_floor=min_salary_floor,
+                stack_config=attempt_stack
             )
 
             if lineup and lineup.is_valid:
