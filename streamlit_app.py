@@ -12881,8 +12881,6 @@ if selected_page == "DFS Lineup Builder":
         st.session_state.dfs_vegas_blend_active = False
     if 'dfs_projection_date' not in st.session_state:
         st.session_state.dfs_projection_date = None
-    if 'dfs_game_env' not in st.session_state:
-        st.session_state.dfs_game_env = {}
     if 'dfs_stack_config' not in st.session_state:
         st.session_state.dfs_stack_config = {}
 
@@ -13179,26 +13177,8 @@ if selected_page == "DFS Lineup Builder":
                                 projected_players, dfs_conn, game_date_for_enrich
                             )
                             projected_players = dfs.apply_correlation_ceiling_boost(projected_players)
-
-                            # Build game environment lookup for stack UI
-                            game_env_map = {}
-                            try:
-                                env_cursor = dfs_conn.execute("""
-                                    SELECT game_id, home_team, away_team, spread, total, stack_score
-                                    FROM game_odds
-                                    WHERE date(game_date) = date(?)
-                                """, [game_date_for_enrich])
-                                for row in env_cursor.fetchall():
-                                    game_env_map[row[0]] = {
-                                        'home': row[1], 'away': row[2],
-                                        'spread': row[3], 'total': row[4],
-                                        'stack_score': row[5] or 0.5
-                                    }
-                            except Exception:
-                                pass
-                            st.session_state.dfs_game_env = game_env_map
                         except Exception:
-                            st.session_state.dfs_game_env = {}
+                            pass
 
                         # Count minutes-validated players
                         no_minutes = sum(1 for p in projected_players if not p.minutes_validated)
@@ -13621,54 +13601,34 @@ if selected_page == "DFS Lineup Builder":
             players = st.session_state.dfs_player_pool
 
             # --- Game Stack Selection ---
-            # Always try to load game env from database (odds may have been fetched after projections)
-            game_env = st.session_state.get('dfs_game_env', {})
+            # Build game list directly from the player pool (always available)
             proj_date_str = st.session_state.get('dfs_projection_date') or str(date.today())
+            dk_games = {}  # dk_game_id -> {teams, players, stack_score}
+            for p in players:
+                if p.game_id not in dk_games:
+                    dk_games[p.game_id] = {'teams': set(), 'players': [], 'stack_scores': []}
+                dk_games[p.game_id]['teams'].add(p.team)
+                dk_games[p.game_id]['players'].append(p)
+                if getattr(p, 'stack_score', 0) > 0:
+                    dk_games[p.game_id]['stack_scores'].append(p.stack_score)
 
-            def _load_game_env_from_db(conn, date_str):
-                """Load game environment data from game_odds table."""
-                env_map = {}
-                try:
-                    # Check if game_odds table exists
-                    tbl = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='game_odds'").fetchone()
-                    if not tbl:
-                        return env_map
-                    cursor = conn.execute("""
-                        SELECT game_id, home_team, away_team, spread, total, stack_score
+            # Try to enrich with spread/total from game_odds table
+            game_odds_lookup = {}  # team_set -> {spread, total, stack_score}
+            try:
+                tbl = dfs_conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='game_odds'").fetchone()
+                if tbl:
+                    cursor = dfs_conn.execute("""
+                        SELECT home_team, away_team, spread, total, stack_score
                         FROM game_odds WHERE date(game_date) = date(?)
-                    """, [date_str])
+                    """, [proj_date_str])
                     for row in cursor.fetchall():
-                        env_map[row['game_id']] = {
-                            'home': row['home_team'], 'away': row['away_team'],
+                        key = frozenset([row['home_team'], row['away_team']])
+                        game_odds_lookup[key] = {
                             'spread': row['spread'], 'total': row['total'],
                             'stack_score': row['stack_score'] if row['stack_score'] is not None else 0.5
                         }
-                except Exception:
-                    pass
-                return env_map
-
-            if not game_env:
-                game_env = _load_game_env_from_db(dfs_conn, proj_date_str)
-                if game_env:
-                    st.session_state.dfs_game_env = game_env
-
-            # Build game list from player pool (DK game_ids)
-            dk_games = {}  # dk_game_id -> {teams, players}
-            for p in players:
-                if p.game_id not in dk_games:
-                    dk_games[p.game_id] = {'teams': set(), 'players': []}
-                dk_games[p.game_id]['teams'].add(p.team)
-                dk_games[p.game_id]['players'].append(p)
-
-            # Match DK game_ids to game_odds entries by team names
-            game_env_matched = {}  # dk_game_id -> env data
-            for dk_gid, ginfo in dk_games.items():
-                dk_teams = ginfo['teams']
-                for env_gid, env in game_env.items():
-                    env_teams = {env.get('home', ''), env.get('away', '')}
-                    if dk_teams & env_teams:  # At least one team matches
-                        game_env_matched[dk_gid] = env
-                        break
+            except Exception:
+                pass
 
             with st.expander("🏀 Game Stacks", expanded=True):
                 stack_options = ["Auto", "Primary Stack (3-4)", "Mini Stack (2)", "No Stack"]
@@ -13676,135 +13636,99 @@ if selected_page == "DFS Lineup Builder":
                             "Mini Stack (2)": "mini", "No Stack": "none"}
                 stack_config = {}
 
-                # Header row: Fetch Odds button + Manual Stacking toggle
-                hdr_col1, hdr_col2, hdr_col3 = st.columns([2, 2, 1])
-                with hdr_col1:
+                # Fetch Odds button
+                fetch_col, _ = st.columns([2, 3])
+                with fetch_col:
                     fetch_odds_clicked = st.button("🔄 Fetch/Refresh Odds", key="stack_fetch_odds")
-                with hdr_col2:
-                    manual_stacking = st.toggle(
-                        "Manual Stacking",
-                        value=not bool(game_env_matched),
-                        help="Configure stacks for all games even without Vegas odds data",
-                        key="manual_stack_toggle"
-                    )
 
-                # Handle Fetch Odds button
                 if fetch_odds_clicked:
                     try:
                         fetch_date = datetime.strptime(proj_date_str, "%Y-%m-%d").date() if proj_date_str else date.today()
                     except (ValueError, TypeError):
                         fetch_date = date.today()
-
-                    # First, try loading from DB (odds may already exist)
-                    refreshed = _load_game_env_from_db(dfs_conn, proj_date_str)
-                    if refreshed:
-                        st.session_state.dfs_game_env = refreshed
-                        st.rerun()
-
-                    # No DB data — fetch from API
                     with st.spinner("Fetching odds from The Odds API..."):
                         try:
                             result = odds_api.fetch_fanduel_lines_for_date(dfs_conn, fetch_date, force=True)
                             if result.get('success'):
-                                stored = result.get('game_odds_stored', 0)
-                                st.success(f"Fetched odds for {result.get('events_fetched', 0)} games ({stored} game environments stored)")
+                                st.success(f"Fetched odds for {result.get('events_fetched', 0)} games")
                             else:
-                                st.warning(f"API fetch issue: {result.get('error', 'Unknown')}")
+                                st.warning(f"API: {result.get('error', 'Unknown')}")
                         except Exception as e:
-                            st.warning(f"API fetch error: {e}")
-                        # Reload from DB regardless (API may have partially succeeded)
-                        st.session_state.dfs_game_env = _load_game_env_from_db(dfs_conn, proj_date_str)
+                            st.warning(f"Fetch error: {e}")
                         st.rerun()
 
-                if game_env_matched and not manual_stacking:
-                    # --- Odds-driven stacking mode ---
-                    st.caption("Configure stacking per game. Primary = 3-4 players with bring-back. Mini = 2-player pair.")
+                st.caption("Configure stacking per game. Primary = 3-4 players with bring-back. Mini = 2-player pair.")
 
-                    sorted_games = sorted(
-                        game_env_matched.items(),
-                        key=lambda x: x[1].get('stack_score', 0), reverse=True
-                    )
+                # Sort games: highest stack_score first
+                def _game_sort_key(item):
+                    gid, ginfo = item
+                    # Use player-derived stack_score, or odds lookup, or 0
+                    scores = ginfo['stack_scores']
+                    if scores:
+                        return max(scores)
+                    team_key = frozenset(ginfo['teams'])
+                    odds = game_odds_lookup.get(team_key)
+                    if odds:
+                        return odds.get('stack_score', 0)
+                    return 0
 
-                    for dk_gid, env in sorted_games:
-                        teams = sorted(dk_games[dk_gid]['teams'])
-                        matchup = " vs ".join(teams) if len(teams) >= 2 else teams[0] if teams else dk_gid
-                        spread = env.get('spread', 0) or 0
-                        total = env.get('total', 0) or 0
-                        ss = env.get('stack_score', 0.5)
+                has_any_odds = bool(game_odds_lookup)
+                sorted_games = sorted(dk_games.items(), key=_game_sort_key, reverse=True)
 
-                        if ss >= 0.75:
-                            default_idx = 0  # Auto
-                        elif ss >= 0.50:
-                            default_idx = 0  # Auto
-                        else:
-                            default_idx = 3  # No Stack
+                for dk_gid, ginfo in sorted_games:
+                    teams = sorted(ginfo['teams'])
+                    matchup = " vs ".join(teams) if len(teams) >= 2 else teams[0] if teams else dk_gid
+                    player_count = len(ginfo['players'])
 
-                        col_game, col_sel = st.columns([3, 2])
-                        with col_game:
-                            score_bar = "🟢" if ss >= 0.75 else "🟡" if ss >= 0.50 else "🔴"
-                            st.markdown(f"**{matchup}** — Spread: {spread:+.1f} | Total: {total:.0f} | Stack: {score_bar} {ss:.2f}")
-                        with col_sel:
-                            choice = st.selectbox(
-                                "Stack", stack_options, index=default_idx,
-                                key=f"stack_{dk_gid}", label_visibility="collapsed"
-                            )
+                    # Get stack_score: prefer player-enriched, then odds lookup
+                    scores = ginfo['stack_scores']
+                    team_key = frozenset(ginfo['teams'])
+                    odds_data = game_odds_lookup.get(team_key)
 
-                        stack_config[dk_gid] = {
-                            'type': type_map[choice],
-                            'teams': list(dk_games[dk_gid]['teams']),
-                            'stack_score': ss,
-                        }
-
-                    # Games without odds data — show as info only
-                    no_env_games = [gid for gid in dk_games if gid not in game_env_matched]
-                    if no_env_games:
-                        st.caption(f"ℹ️ {len(no_env_games)} game(s) without odds data — use Manual Stacking to configure")
-
-                else:
-                    # --- Manual stacking mode (or no odds data) ---
-                    if not game_env_matched:
-                        st.caption("No odds data loaded. Use Fetch Odds above, or configure stacks manually below.")
+                    if scores:
+                        ss = max(scores)
+                    elif odds_data:
+                        ss = odds_data.get('stack_score', 0.5)
                     else:
-                        st.caption("Manual mode: configure stacking for all games. Primary = 3-4 with bring-back. Mini = 2-player pair.")
+                        ss = 0.5  # neutral default
 
-                    # Show all games from the DK player pool
-                    sorted_dk = sorted(dk_games.items(), key=lambda x: sorted(x[1]['teams']))
-                    for dk_gid, ginfo in sorted_dk:
-                        teams = sorted(ginfo['teams'])
-                        matchup = " vs ".join(teams) if len(teams) >= 2 else teams[0] if teams else dk_gid
-                        player_count = len(ginfo['players'])
+                    spread = odds_data.get('spread', 0) if odds_data else None
+                    total = odds_data.get('total', 0) if odds_data else None
 
-                        # Check if we have odds data for this game
-                        env = game_env_matched.get(dk_gid)
+                    # Default selection based on stack_score
+                    if ss >= 0.75:
+                        default_idx = 0  # Auto (-> primary)
+                    elif ss >= 0.50:
+                        default_idx = 0  # Auto (-> mini)
+                    else:
+                        default_idx = 3  # No Stack
 
-                        col_game, col_sel = st.columns([3, 2])
-                        with col_game:
-                            if env:
-                                spread = env.get('spread', 0) or 0
-                                total = env.get('total', 0) or 0
-                                ss = env.get('stack_score', 0.5)
-                                score_bar = "🟢" if ss >= 0.75 else "🟡" if ss >= 0.50 else "🔴"
-                                st.markdown(f"**{matchup}** — Spread: {spread:+.1f} | Total: {total:.0f} | Stack: {score_bar} {ss:.2f}")
-                            else:
-                                st.markdown(f"**{matchup}** — {player_count} players")
-                        with col_sel:
-                            choice = st.selectbox(
-                                "Stack", stack_options, index=3,  # Default No Stack in manual mode
-                                key=f"stack_{dk_gid}", label_visibility="collapsed"
-                            )
+                    col_game, col_sel = st.columns([3, 2])
+                    with col_game:
+                        score_bar = "🟢" if ss >= 0.75 else "🟡" if ss >= 0.50 else "🔴"
+                        if spread is not None and total is not None:
+                            st.markdown(f"**{matchup}** — Spread: {spread:+.1f} | Total: {total:.0f} | {score_bar} {ss:.2f}")
+                        else:
+                            st.markdown(f"**{matchup}** — {player_count} players | {score_bar} {ss:.2f}")
+                    with col_sel:
+                        choice = st.selectbox(
+                            "Stack", stack_options, index=default_idx,
+                            key=f"stack_{dk_gid}", label_visibility="collapsed"
+                        )
 
-                        ss_val = env.get('stack_score', 0.5) if env else 0.5
-                        stack_config[dk_gid] = {
-                            'type': type_map[choice],
-                            'teams': list(ginfo['teams']),
-                            'stack_score': ss_val,
-                        }
+                    stack_config[dk_gid] = {
+                        'type': type_map[choice],
+                        'teams': list(ginfo['teams']),
+                        'stack_score': ss,
+                    }
 
                 # Save config and show summary
                 st.session_state.dfs_stack_config = stack_config
                 active_stacks = sum(1 for c in stack_config.values() if c['type'] != 'none')
                 if active_stacks:
                     st.caption(f"🎯 {active_stacks} game(s) configured for stacking")
+                if not has_any_odds:
+                    st.caption("Odds data not loaded — use Fetch/Refresh Odds for spread & total info")
 
             col1, col2 = st.columns([2, 1])
             with col1:
