@@ -1437,12 +1437,15 @@ def analyze_top_finishers(
         results['errors'].append("No contest data found for this slate")
         return results
 
-    # Get player info from projections (salary, team, ownership)
+    # Get player info from projections (salary, team, ownership, vegas)
     player_info = pd.read_sql_query("""
-        SELECT player_name, team, salary, actual_ownership, actual_fpts, opponent,
-               proj_fpts, ownership_proj
-        FROM dfs_slate_projections
-        WHERE slate_date = ?
+        SELECT s.player_name, s.team, s.salary, s.actual_ownership, s.actual_fpts,
+               s.opponent, s.proj_fpts, s.ownership_proj,
+               p.vegas_implied_fpts
+        FROM dfs_slate_projections s
+        LEFT JOIN predictions p
+            ON s.player_id = p.player_id AND p.game_date = s.slate_date
+        WHERE s.slate_date = ?
     """, conn, params=[slate_date])
 
     # Create multiple lookups for flexible name matching
@@ -1459,6 +1462,7 @@ def analyze_top_finishers(
             'opponent': row['opponent'],
             'proj_fpts': row.get('proj_fpts'),
             'proj_ownership': row.get('ownership_proj'),
+            'vegas_fpts': row.get('vegas_implied_fpts'),
         }
 
         norm_name = _normalize_name(row['player_name'])
@@ -1543,6 +1547,7 @@ def analyze_top_finishers(
                 'opponent': info.get('opponent', '?'),
                 'proj_fpts': info.get('proj_fpts'),
                 'proj_ownership': info.get('proj_ownership'),
+                'vegas_fpts': info.get('vegas_fpts'),
             }
             lineup_data['players'].append(player_data)
 

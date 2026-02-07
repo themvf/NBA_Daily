@@ -14658,6 +14658,7 @@ if selected_page == "DFS Lineup Builder":
                                         own_str = f"{p['ownership']:.1f}%" if p.get('ownership') else "—"
                                         proj_own_str = f"{p['proj_ownership']:.1f}%" if p.get('proj_ownership') else "—"
                                         proj_fpts_str = f"{p['proj_fpts']:.1f}" if p.get('proj_fpts') else "—"
+                                        vegas_fpts_str = f"{p['vegas_fpts']:.1f}" if p.get('vegas_fpts') else "—"
                                         actual_fpts_str = f"{p['fpts']:.1f}" if p.get('fpts') else "—"
                                         player_rows.append({
                                             'Pos': p['position'],
@@ -14667,6 +14668,7 @@ if selected_page == "DFS Lineup Builder":
                                             'Proj Own%': proj_own_str,
                                             'Own%': own_str,
                                             'Proj FPTS': proj_fpts_str,
+                                            'Vegas FPTS': vegas_fpts_str,
                                             'FPTS': actual_fpts_str,
                                         })
                                     lineup_df = pd.DataFrame(player_rows)
