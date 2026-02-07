@@ -1238,7 +1238,7 @@ def generate_player_projections(
                 except Exception:
                     pass
         except Exception:
-            pass  # Don't fail projection on minutes check
+            player.minutes_validated = False  # Mark invalid if check fails
 
     # If sophisticated prediction modules unavailable, use simple model
     if not SOPHISTICATED_PREDICTIONS or defense_map is None:

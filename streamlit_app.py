@@ -13724,6 +13724,10 @@ if selected_page == "DFS Lineup Builder":
                         if mins_filtered > 0:
                             st.info(f"⏱️ Filtered out {mins_filtered} players with no recent minutes")
 
+                    if len(filtered_players) < 15:
+                        st.error(f"Only {len(filtered_players)} players remain after filtering — need at least 15 to build lineups. Try disabling the minutes filter or lowering the salary minimum.")
+                        st.stop()
+
                     # Calculate minimum salary floor from max remaining
                     min_salary_floor = dfs.SALARY_CAP - max_remaining_salary
 
