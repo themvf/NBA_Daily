@@ -13641,21 +13641,30 @@ if selected_page == "DFS Lineup Builder":
                 with fetch_col:
                     fetch_odds_clicked = st.button("🔄 Fetch/Refresh Odds", key="stack_fetch_odds")
 
+                # Show fetch result from previous click (stored before rerun)
+                if 'stack_fetch_result' in st.session_state:
+                    msg = st.session_state.pop('stack_fetch_result')
+                    if msg.startswith('OK:'):
+                        st.success(msg[3:])
+                    else:
+                        st.error(msg)
+
                 if fetch_odds_clicked:
                     try:
                         fetch_date = datetime.strptime(proj_date_str, "%Y-%m-%d").date() if proj_date_str else date.today()
                     except (ValueError, TypeError):
                         fetch_date = date.today()
-                    with st.spinner("Fetching odds from The Odds API..."):
+                    with st.spinner(f"Fetching odds for {fetch_date} from The Odds API..."):
                         try:
                             result = odds_api.fetch_fanduel_lines_for_date(dfs_conn, fetch_date, force=True)
                             if result.get('success'):
-                                st.success(f"Fetched odds for {result.get('events_fetched', 0)} games")
+                                stored = result.get('game_odds_stored', 0)
+                                st.session_state.stack_fetch_result = f"OK:Fetched odds for {result.get('events_fetched', 0)} games ({stored} game environments stored)"
                             else:
-                                st.warning(f"API: {result.get('error', 'Unknown')}")
+                                st.session_state.stack_fetch_result = f"Fetch failed: {result.get('error', 'Unknown error')}"
                         except Exception as e:
-                            st.warning(f"Fetch error: {e}")
-                        st.rerun()
+                            st.session_state.stack_fetch_result = f"Fetch error: {e}"
+                    st.rerun()
 
                 st.caption("Configure stacking per game. Primary = 3-4 players with bring-back. Mini = 2-player pair.")
 
