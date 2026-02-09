@@ -255,17 +255,19 @@ def get_nba_events(api_key: str) -> Tuple[List[Dict], int]:
     return response.json(), 1
 
 
-def get_game_odds_bulk(api_key: str) -> Tuple[List[Dict], int]:
+def get_game_odds_bulk(api_key: str, game_date: date = None) -> Tuple[List[Dict], int]:
     """
-    Fetch game-level odds (spreads, totals) for all NBA games.
+    Fetch game-level odds (spreads, totals) for NBA games.
 
-    This is a BULK endpoint - 1 request returns all games with odds.
-    Much more efficient than per-event fetching.
+    This is a BULK endpoint - 1 request returns games with odds.
+    When game_date is provided, filters to that date using API parameters.
 
     Returns:
         (games_with_odds_list, requests_used)
         Each game contains: home_team, away_team, commence_time, bookmakers with spreads/totals
     """
+    from zoneinfo import ZoneInfo
+
     url = f"{BASE_URL}/sports/{SPORT}/odds"
     params = {
         "apiKey": api_key,
@@ -273,6 +275,14 @@ def get_game_odds_bulk(api_key: str) -> Tuple[List[Dict], int]:
         "markets": "spreads,totals",
         "oddsFormat": "american",
     }
+
+    # Filter by date at the API level (much more reliable than local filtering)
+    if game_date:
+        eastern = ZoneInfo("America/New_York")
+        start_et = datetime.combine(game_date, datetime.min.time()).replace(tzinfo=eastern)
+        end_et = start_et + timedelta(days=1)
+        params["commenceTimeFrom"] = start_et.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ")
+        params["commenceTimeTo"] = end_et.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     response = requests.get(url, params=params, timeout=30)
     response.raise_for_status()
@@ -311,7 +321,7 @@ def extract_game_odds_from_response(games_data: List[Dict], target_date: str) ->
     extracted = []
 
     for game in games_data:
-        # Check date (convert UTC to Eastern)
+        # Check date (convert UTC to Eastern) — if API pre-filtered, be lenient
         commence_str = game.get("commence_time", "")
         if commence_str:
             try:
@@ -320,8 +330,8 @@ def extract_game_odds_from_response(games_data: List[Dict], target_date: str) ->
                 game_date = eastern_dt.strftime("%Y-%m-%d")
                 if game_date != target_date:
                     continue
-            except ValueError:
-                continue
+            except (ValueError, TypeError):
+                pass  # If date parsing fails, still try to extract odds
 
         home_team = game.get("home_team", "")
         away_team = game.get("away_team", "")
@@ -931,7 +941,7 @@ def fetch_fanduel_lines_for_date(
         # Step 1.5: ALSO fetch game-level odds (spreads/totals) for Tournament Strategy
         # This is a BULK endpoint - 1 request returns ALL games, very efficient!
         try:
-            games_data, req_count = get_game_odds_bulk(api_key)
+            games_data, req_count = get_game_odds_bulk(api_key, game_date=game_date)
             total_requests += req_count
 
             # Extract and store game odds for the target date
