@@ -1740,31 +1740,50 @@ def enrich_players_with_correlation_model(
         return players
 
     # Get game environment data for enhanced correlation
-    game_environments = {}
+    game_environments = {}  # game_odds game_id -> env data
+    team_env_lookup = {}    # frozenset({team1, team2}) -> env data (for DK game_id matching)
     if conn and game_date:
         try:
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT game_id, ot_probability, stack_score, total
+                SELECT game_id, home_team, away_team, ot_probability, stack_score, total
                 FROM game_odds
                 WHERE date(game_date) = date(?)
             """, (game_date,))
 
             for row in cursor.fetchall():
-                gid, ot_prob, stack, total = row
-                game_environments[gid] = {
-                    'ot_probability': ot_prob or 0.06,
-                    'stack_score': stack or 0.5,
-                    'total': total or 228
+                gid = row[0]
+                env = {
+                    'ot_probability': row[3] or 0.06,
+                    'stack_score': row[4] or 0.5,
+                    'total': row[5] or 228
                 }
+                game_environments[gid] = env
+                # Also key by team pair for matching DK game_ids
+                if row[1] and row[2]:
+                    team_env_lookup[frozenset([row[1], row[2]])] = env
         except Exception:
             pass
+
+    # Remap game_environments from game_odds game_ids to DK game_ids
+    # game_odds uses "2026-02-07_DAL_SAS", DK uses "DAL_SAS_0700PM"
+    # Match via team_env_lookup (keyed by frozenset of team abbreviations)
+    dk_game_environments = {}
+    if team_env_lookup:
+        # Build team set for each DK game_id from slate_info
+        dk_game_teams: Dict[str, Set[str]] = {}
+        for si in slate_info:
+            dk_game_teams.setdefault(si.game_id, set()).add(si.team)
+        for dk_gid, teams in dk_game_teams.items():
+            key = frozenset(teams)
+            if key in team_env_lookup:
+                dk_game_environments[dk_gid] = team_env_lookup[key]
 
     # Run correlated simulation
     try:
         config = CorrelationConfig(n_simulations=n_simulations, random_seed=42)
         model = PlayerCorrelationModel(config)
-        results = model.run_correlated_simulation(slate_info, game_environments)
+        results = model.run_correlated_simulation(slate_info, dk_game_environments)
 
         # Build lookup by player_id
         results_dict = {r.player_id: r for r in results}
@@ -1779,9 +1798,10 @@ def enrich_players_with_correlation_model(
                 p.support_score = r.support_score
                 p.sigma = r.sigma_used
 
-                # Update stack score from game environment
-                if p.game_id in game_environments:
-                    p.stack_score = game_environments[p.game_id].get('stack_score', 0.5)
+                # Update stack score from game environment (match by team pair)
+                team_key = frozenset([p.team, p.opponent]) if p.opponent else None
+                if team_key and team_key in team_env_lookup:
+                    p.stack_score = team_env_lookup[team_key].get('stack_score', 0.5)
 
                 # Mark as star
                 p.is_star = p.proj_points >= 25
