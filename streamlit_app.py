@@ -13648,6 +13648,11 @@ if selected_page == "DFS Lineup Builder":
                         st.success(msg[3:])
                     else:
                         st.error(msg)
+                    # Show debug diagnostics if available
+                    if 'stack_fetch_debug' in st.session_state:
+                        debug_info = st.session_state.pop('stack_fetch_debug')
+                        with st.expander("🔍 Fetch Diagnostics", expanded=True):
+                            st.json(debug_info)
 
                 if fetch_odds_clicked:
                     try:
@@ -13657,9 +13662,16 @@ if selected_page == "DFS Lineup Builder":
                     with st.spinner(f"Fetching odds for {fetch_date} from The Odds API..."):
                         try:
                             result = odds_api.fetch_fanduel_lines_for_date(dfs_conn, fetch_date, force=True)
+                            # Store debug info for display
+                            if result.get('odds_debug'):
+                                st.session_state.stack_fetch_debug = result['odds_debug']
                             if result.get('success'):
                                 stored = result.get('game_odds_stored', 0)
-                                st.session_state.stack_fetch_result = f"OK:Fetched odds for {result.get('events_fetched', 0)} games ({stored} game environments stored)"
+                                matched = result.get('players_matched', 0)
+                                st.session_state.stack_fetch_result = (
+                                    f"OK:Fetched odds for {result.get('events_fetched', 0)} games "
+                                    f"({stored} game environments, {matched} players matched)"
+                                )
                             else:
                                 st.session_state.stack_fetch_result = f"Fetch failed: {result.get('error', 'Unknown error')}"
                         except Exception as e:

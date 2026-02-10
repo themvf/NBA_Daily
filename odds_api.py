@@ -944,16 +944,53 @@ def fetch_fanduel_lines_for_date(
             games_data, req_count = get_game_odds_bulk(api_key, game_date=game_date)
             total_requests += req_count
 
+            # Diagnostic: log what the API returned
+            odds_debug = {
+                "bulk_games_returned": len(games_data) if games_data else 0,
+                "target_date": game_date_str,
+            }
+            if games_data:
+                # Sample first game's structure for debugging
+                sample = games_data[0]
+                odds_debug["sample_commence"] = sample.get("commence_time", "N/A")
+                odds_debug["sample_home"] = sample.get("home_team", "N/A")
+                odds_debug["sample_bookmakers"] = len(sample.get("bookmakers", []))
+                # Check all commence times
+                from zoneinfo import ZoneInfo as _ZI
+                _eastern = _ZI("America/New_York")
+                _dates_seen = set()
+                for g in games_data:
+                    ct = g.get("commence_time", "")
+                    if ct:
+                        try:
+                            _utc = datetime.fromisoformat(ct.replace("Z", "+00:00"))
+                            _et = _utc.astimezone(_eastern)
+                            _dates_seen.add(_et.strftime("%Y-%m-%d"))
+                        except Exception:
+                            _dates_seen.add(f"parse_err:{ct}")
+                odds_debug["eastern_dates_in_response"] = sorted(_dates_seen)
+
             # Extract and store game odds for the target date
             game_odds_list = extract_game_odds_from_response(games_data, game_date_str)
+            odds_debug["extracted_count"] = len(game_odds_list)
+            if game_odds_list:
+                odds_debug["sample_extracted"] = {
+                    "game_id": game_odds_list[0].get("game_id"),
+                    "spread": game_odds_list[0].get("spread"),
+                    "total": game_odds_list[0].get("total"),
+                }
+
             games_stored = store_game_odds_from_api(conn, game_odds_list)
             result["game_odds_stored"] = games_stored
-            print(f"[odds_api] Stored {games_stored} game odds for Tournament Strategy reuse")
+            result["odds_debug"] = odds_debug
+            print(f"[odds_api] Stored {games_stored} game odds | debug: {odds_debug}")
 
         except Exception as e:
             # Non-fatal: player props are still useful even if game odds fail
-            print(f"[odds_api] Warning: Failed to fetch game odds: {e}")
+            import traceback
             result["game_odds_stored"] = 0
+            result["odds_debug"] = {"error": str(e), "traceback": traceback.format_exc()}
+            print(f"[odds_api] Warning: Failed to fetch game odds: {e}")
 
         # Step 2: Fetch player props for each event
         all_player_lines = {}
