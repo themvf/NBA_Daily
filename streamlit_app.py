@@ -15285,9 +15285,13 @@ if selected_page == "DFS Lineup Builder":
                 # Get avg ownership from past slates
                 try:
                     own_query = """
-                        SELECT player_id, AVG(ownership_proj) as avg_own_proj
+                        SELECT player_id,
+                            COALESCE(
+                                AVG(CASE WHEN actual_ownership > 0 THEN actual_ownership END),
+                                AVG(CASE WHEN ownership_proj > 0 THEN ownership_proj END)
+                            ) as avg_own_proj
                         FROM dfs_slate_projections
-                        WHERE slate_date >= date('now', '-14 days')
+                        WHERE slate_date >= date('now', '-21 days')
                         GROUP BY player_id
                     """
                     own_df = pd.read_sql_query(own_query, dfs_conn)

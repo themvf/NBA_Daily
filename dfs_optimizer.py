@@ -964,6 +964,50 @@ def _estimate_ownership(player, has_injury_boost: bool = False) -> float:
     return round(ownership, 1)
 
 
+def _get_historical_ownership(conn: sqlite3.Connection, player_id: int, lookback_days: int = 21) -> Optional[float]:
+    """Get average ownership from past slates for a player.
+
+    Prefers actual_ownership (from parsed contest results) when available.
+    Falls back to ownership_proj from prior projections.
+    Returns None if no historical data exists (will fall back to model estimate).
+
+    Note: SQLite date('now') uses UTC, which may be ~1 day ahead of Eastern.
+    This slightly widens the lookback window, which is acceptable.
+    """
+    try:
+        # First try actual ownership from contest results (most accurate)
+        row = conn.execute("""
+            SELECT AVG(actual_ownership) as avg_actual, COUNT(*) as n
+            FROM dfs_slate_projections
+            WHERE player_id = ?
+              AND slate_date >= date('now', ? || ' days')
+              AND actual_ownership IS NOT NULL
+              AND actual_ownership > 0
+        """, (player_id, f"-{lookback_days}")).fetchone()
+
+        if row and row[1] >= 1 and row[0] is not None:
+            return round(row[0], 1)
+
+        # Fall back to projected ownership from prior slates (less accurate but better than model)
+        row = conn.execute("""
+            SELECT AVG(ownership_proj) as avg_proj, COUNT(*) as n
+            FROM dfs_slate_projections
+            WHERE player_id = ?
+              AND slate_date >= date('now', ? || ' days')
+              AND ownership_proj IS NOT NULL
+              AND ownership_proj > 0
+        """, (player_id, f"-{lookback_days}")).fetchone()
+
+        if row and row[1] >= 1 and row[0] is not None:
+            return round(row[0], 1)
+
+    except Exception as e:
+        import logging
+        logging.warning(f"Historical ownership query failed for player {player_id}: {e}")
+
+    return None
+
+
 def _project_stat_multi_factor(
     stat_name: str,
     logs: pd.DataFrame,
@@ -1146,8 +1190,11 @@ def _generate_simple_projections(
     player.calculate_projections()
 
     if player.salary > 0:
-        value_score = player.fpts_per_dollar
-        player.ownership_proj = min(30.0, max(1.0, value_score * 3))
+        hist_own = _get_historical_ownership(conn, player.player_id)
+        if hist_own is not None:
+            player.ownership_proj = hist_own
+        else:
+            player.ownership_proj = _estimate_ownership(player)
 
     return player
 
@@ -1207,7 +1254,8 @@ def generate_player_projections(
             player.proj_points = dk_avg * 0.45   # ~45% of FPTS from points
             player.proj_rebounds = dk_avg * 0.10
             player.proj_assists = dk_avg * 0.08
-            player.ownership_proj = 5.0  # Assume low ownership for unknowns
+            hist_own = _get_historical_ownership(conn, player.player_id)
+            player.ownership_proj = hist_own if hist_own is not None else 5.0
         return player
 
     # Load historical stats
@@ -1525,10 +1573,14 @@ def generate_player_projections(
     if player.salary > 0:
         player.fpts_per_dollar = (player.proj_fpts / player.salary) * 1000
 
-    # Estimate ownership using calibrated nonlinear model
-    player.ownership_proj = _estimate_ownership(
-        player, has_injury_boost=("💉" in player.analytics_used)
-    )
+    # Ownership: use historical average from past slates, fall back to model estimate
+    hist_own = _get_historical_ownership(conn, player.player_id)
+    if hist_own is not None:
+        player.ownership_proj = hist_own
+    else:
+        player.ownership_proj = _estimate_ownership(
+            player, has_injury_boost=("💉" in player.analytics_used)
+        )
 
     # Leverage score: projection + amplified upside, relative to ownership
     if player.ownership_proj > 0:
