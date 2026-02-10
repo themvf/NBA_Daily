@@ -14644,6 +14644,13 @@ if selected_page == "DFS Lineup Builder":
 
             _create_tables(dfs_conn)
 
+            # Ensure player_roles table exists for role-based analysis
+            try:
+                from depth_chart import ensure_player_roles_table
+                ensure_player_roles_table(dfs_conn)
+            except Exception:
+                pass
+
             # --- Contest Import Summary ---
             contest_history = get_opponent_contest_history(dfs_conn)
 
@@ -14920,8 +14927,8 @@ if selected_page == "DFS Lineup Builder":
                                                 'Role': f"{role_icons.get(role, '')} {role}",
                                                 'Players': stats['count'],
                                                 '% of Slots': f"{stats['pct_of_lineups']:.0f}%",
-                                                'Avg FPTS': f"{stats['avg_fpts']:.1f}" if stats.get('avg_fpts') else "—",
-                                                'Avg Salary': f"${stats['avg_salary']:,}" if stats.get('avg_salary') else "—",
+                                                'Avg FPTS': f"{stats['avg_fpts']:.1f}" if stats.get('avg_fpts') is not None else "—",
+                                                'Avg Salary': f"${stats['avg_salary']:,}" if stats.get('avg_salary') is not None else "—",
                                             })
                                     if role_rows:
                                         st.dataframe(pd.DataFrame(role_rows), use_container_width=True, hide_index=True)
@@ -14947,7 +14954,7 @@ if selected_page == "DFS Lineup Builder":
                                             own_role_rows.append({
                                                 'Role': f"{role_icons.get(role, '')} {role}",
                                                 'Avg Own%': stats['avg_ownership'],
-                                                'Avg FPTS': stats.get('avg_fpts', 0) or 0,
+                                                'Avg FPTS': stats['avg_fpts'] if stats.get('avg_fpts') is not None else 0,
                                                 'Count': stats['count'],
                                             })
                                     if own_role_rows:
