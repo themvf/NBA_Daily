@@ -13426,6 +13426,66 @@ if selected_page == "DFS Lineup Builder":
             if injured_count > 0:
                 st.warning(f"🏥 {injured_count} injured player(s) shown above will be auto-excluded from lineups")
 
+            # --- Player Scouting Table ---
+            with st.expander("🔬 Player Scouting", expanded=False):
+                scout_data = []
+                for p in filtered:
+                    if getattr(p, 'is_injured', False):
+                        continue
+                    role = getattr(p, 'role_tier', '') or '—'
+                    avg7 = getattr(p, 'avg_fpts_last7', 0)
+                    variance = getattr(p, 'fpts_variance', 0)
+                    own = getattr(p, 'ownership_proj', 0)
+
+                    scout_data.append({
+                        'Player': p.name,
+                        'Team': p.team,
+                        'Pos': '/'.join(p.positions),
+                        'Role': role,
+                        'Salary': p.salary,
+                        'Avg FPTS (7G)': avg7,
+                        'Variance': variance,
+                        'Own%': round(own, 1),
+                    })
+
+                if scout_data:
+                    scout_df = pd.DataFrame(scout_data)
+                    # Sort by avg FPTS descending
+                    scout_df = scout_df.sort_values('Avg FPTS (7G)', ascending=False).reset_index(drop=True)
+
+                    # Color-code the Role column for quick scanning
+                    role_colors = {'STAR': '🌟', 'STARTER': '🟢', 'ROTATION': '🟡', 'BENCH': '⚪'}
+                    scout_df['Role'] = scout_df['Role'].apply(
+                        lambda r: f"{role_colors.get(r, '')} {r}" if r != '—' else r
+                    )
+
+                    # Summary by role
+                    role_counts = {}
+                    for row in scout_data:
+                        r = row['Role']
+                        if r and r != '—':
+                            role_counts[r] = role_counts.get(r, 0) + 1
+                    if role_counts:
+                        role_summary = " | ".join(
+                            f"{role_colors.get(r, '')} {r}: {c}"
+                            for r, c in sorted(role_counts.items(), key=lambda x: ['STAR', 'STARTER', 'ROTATION', 'BENCH'].index(x[0]) if x[0] in ['STAR', 'STARTER', 'ROTATION', 'BENCH'] else 99)
+                        )
+                        st.caption(role_summary)
+
+                    st.dataframe(
+                        scout_df,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            'Salary': st.column_config.NumberColumn(format="$%d"),
+                            'Avg FPTS (7G)': st.column_config.NumberColumn(format="%.1f"),
+                            'Variance': st.column_config.NumberColumn(format="%.1f"),
+                            'Own%': st.column_config.NumberColumn(format="%.1f%%"),
+                        }
+                    )
+                else:
+                    st.info("No scouting data available. Generate projections first.")
+
             # --- Vegas Edge Suggestions ---
             boost_players = []
             if vegas_sigs:

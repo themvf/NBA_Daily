@@ -567,6 +567,11 @@ class DFSPlayer:
     recent_minutes_avg: float = 0.0  # Last 5 games avg minutes
     minutes_validated: bool = True    # False if player fails minutes check
 
+    # Research / scouting fields
+    role_tier: str = ""              # STAR, STARTER, ROTATION, BENCH
+    avg_fpts_last7: float = 0.0     # Average DK FPTS over last 7 games
+    fpts_variance: float = 0.0      # Std dev of recent DK FPTS
+
     def calculate_projections(self) -> None:
         """Calculate derived projection values."""
         self.proj_fpts = calculate_dk_fantasy_points(
@@ -1239,6 +1244,23 @@ def generate_player_projections(
                     pass
         except Exception:
             player.minutes_validated = False  # Mark invalid if check fails
+
+    # --- Recent FPTS stats (for scouting table) ---
+    try:
+        recent_7 = logs['dk_fpts'].head(7)
+        player.avg_fpts_last7 = round(float(recent_7.mean()), 1) if len(recent_7) > 0 else 0.0
+        player.fpts_variance = round(float(recent_7.std()), 1) if len(recent_7) > 1 else 0.0
+    except Exception:
+        pass
+
+    # --- Role tier classification ---
+    try:
+        avg_min = pd.to_numeric(logs['minutes'], errors='coerce').mean()
+        avg_ppg = logs['points'].mean() if 'points' in logs.columns else 0
+        from depth_chart import classify_role_tier
+        player.role_tier = classify_role_tier(avg_min, avg_ppg, len(logs))
+    except Exception:
+        player.role_tier = ""
 
     # If sophisticated prediction modules unavailable, use simple model
     if not SOPHISTICATED_PREDICTIONS or defense_map is None:
