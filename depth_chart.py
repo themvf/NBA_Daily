@@ -84,13 +84,14 @@ def classify_role_tier(
     ppg: float,
     games_played: int,
     team_games: int = None,
-    usage_pct: float = None
+    usage_pct: float = None,
+    avg_fpts: float = None,
 ) -> str:
     """
     Classify player into role tier based on statistics.
 
     Classification logic (in order):
-    1. STAR: 30+ minutes AND 18+ PPG (or high usage)
+    1. STAR: 30+ minutes AND 18+ PPG (or high usage, or 40+ DK FPTS)
     2. STARTER: 25+ minutes AND 10+ PPG
     3. ROTATION: 15+ minutes AND plays regularly
     4. BENCH: Everyone else
@@ -101,6 +102,7 @@ def classify_role_tier(
         games_played: Number of games played
         team_games: Total team games (optional, for games% calc)
         usage_pct: Usage percentage (optional)
+        avg_fpts: Average DK fantasy points (optional, catches multi-category stars)
 
     Returns:
         Role tier string: 'STAR', 'STARTER', 'ROTATION', or 'BENCH'
@@ -115,6 +117,10 @@ def classify_role_tier(
 
     # Also STAR if high usage + good minutes (usage-based stars)
     if usage_pct and usage_pct >= star_thresh['min_usage'] and avg_minutes >= 28:
+        return 'STAR'
+
+    # Also STAR if high DK FPTS (multi-category producers like Wembanyama)
+    if avg_fpts and avg_fpts >= 40.0 and avg_minutes >= 28:
         return 'STAR'
 
     # STARTER: Solid minutes + scoring

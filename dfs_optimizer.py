@@ -1258,7 +1258,7 @@ def generate_player_projections(
         avg_min = pd.to_numeric(logs['minutes'], errors='coerce').mean()
         avg_ppg = logs['points'].mean() if 'points' in logs.columns else 0
         from depth_chart import classify_role_tier
-        player.role_tier = classify_role_tier(avg_min, avg_ppg, len(logs))
+        player.role_tier = classify_role_tier(avg_min, avg_ppg, len(logs), avg_fpts=player.avg_fpts_last7)
     except Exception:
         player.role_tier = ""
 
@@ -1481,6 +1481,12 @@ def generate_player_projections(
     else:
         player.proj_fpts *= 1.20
 
+    # --- Recency blend: nudge projection toward recent 7-game average ---
+    # If a player's recent production diverges significantly from the model,
+    # blend in the recent average at 20% weight (captures hot/cold streaks)
+    if player.avg_fpts_last7 > 0 and abs(player.avg_fpts_last7 - player.proj_fpts) > 3.0:
+        player.proj_fpts = round(player.proj_fpts * 0.80 + player.avg_fpts_last7 * 0.20, 1)
+
     # Floor/ceiling from actual DK FPTS distribution (preserves stat correlations)
     if len(logs) >= 3:
         base_floor = logs['dk_fpts'].quantile(0.10) * rest_multiplier
@@ -1488,6 +1494,20 @@ def generate_player_projections(
     else:
         base_floor = player.proj_fpts * 0.6
         base_ceiling = player.proj_fpts * 1.5
+
+    # --- Variance-adjusted ceiling/floor ---
+    # Use actual recent variance to widen/narrow the range
+    if player.fpts_variance > 0 and base_ceiling > base_floor:
+        model_range = base_ceiling - base_floor
+        # High variance (>12): widen ceiling by up to 10%
+        # Low variance (<6): tighten ceiling by up to 5% (more predictable)
+        if player.fpts_variance > 12:
+            variance_boost = min(0.10, (player.fpts_variance - 12) / 40)
+            base_ceiling *= (1.0 + variance_boost)
+        elif player.fpts_variance < 6:
+            variance_tighten = min(0.05, (6 - player.fpts_variance) / 30)
+            base_ceiling *= (1.0 - variance_tighten)
+            base_floor *= (1.0 + variance_tighten * 0.5)  # floor rises slightly
 
     # Apply uncertainty multiplier (calculated in Step 8)
     try:
@@ -1755,7 +1775,7 @@ def enrich_players_with_correlation_model(
             game_id=p.game_id,
             mean_score=p.proj_fpts,
             sigma=max(sigma, 1.0),
-            is_star=p.proj_points >= 25  # Star if 25+ projected points
+            is_star=p.role_tier == 'STAR' or p.proj_points >= 25
         ))
 
     if len(slate_info) < 3:
@@ -1826,7 +1846,7 @@ def enrich_players_with_correlation_model(
                     p.stack_score = team_env_lookup[team_key].get('stack_score', 0.5)
 
                 # Mark as star
-                p.is_star = p.proj_points >= 25
+                p.is_star = p.role_tier == 'STAR' or p.proj_points >= 25
 
     except Exception as e:
         # If simulation fails, continue with basic projections

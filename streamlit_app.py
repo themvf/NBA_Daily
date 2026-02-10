@@ -15299,7 +15299,7 @@ if selected_page == "DFS Lineup Builder":
                 from depth_chart import classify_role_tier
                 scout_df['role_tier'] = scout_df.apply(
                     lambda row: row['role_tier'] if pd.notna(row.get('role_tier')) and row['role_tier']
-                    else classify_role_tier(row['avg_minutes'], row['avg_points'], row['games']),
+                    else classify_role_tier(row['avg_minutes'], row['avg_points'], row['games'], avg_fpts=row.get('avg_fpts')),
                     axis=1
                 )
 
