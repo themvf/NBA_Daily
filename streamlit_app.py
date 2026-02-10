@@ -13056,7 +13056,7 @@ if selected_page == "DFS Lineup Builder":
                     with game_date_col1:
                         projection_date = st.date_input(
                             "Projection Date (for rest day calculations)",
-                            value=date.today(),
+                            value=datetime.now(EASTERN_TZ).date(),
                             help="Select the date of the games to calculate rest days correctly"
                         )
                     with game_date_col2:
@@ -13160,7 +13160,7 @@ if selected_page == "DFS Lineup Builder":
                         try:
                             vegas_signals = _enrich_players_with_vegas_signals(
                                 dfs_conn, projected_players,
-                                str(projection_date) if projection_date else str(date.today())
+                                str(projection_date) if projection_date else str(datetime.now(EASTERN_TZ).date())
                             )
                             st.session_state.dfs_vegas_signals = vegas_signals
                             if vegas_signals:
@@ -13172,7 +13172,7 @@ if selected_page == "DFS Lineup Builder":
 
                         # Enrich with game environment correlation data
                         try:
-                            game_date_for_enrich = str(projection_date) if projection_date else str(date.today())
+                            game_date_for_enrich = str(projection_date) if projection_date else str(datetime.now(EASTERN_TZ).date())
                             projected_players = dfs.enrich_players_with_correlation_model(
                                 projected_players, dfs_conn, game_date_for_enrich
                             )
@@ -13196,7 +13196,7 @@ if selected_page == "DFS Lineup Builder":
 
                         # Save projections to S3 (latest overrides earlier for same day)
                         try:
-                            slate_date = str(projection_date) if projection_date else str(date.today())
+                            slate_date = str(projection_date) if projection_date else str(datetime.now(EASTERN_TZ).date())
                             proj_rows = []
                             for p in projected_players:
                                 if p.is_injured or p.is_excluded:
@@ -13438,7 +13438,7 @@ if selected_page == "DFS Lineup Builder":
                 # Recalculate button — always visible so user can load signals
                 # after fetching props post-projection
                 if st.button("🔄 Load / Recalculate Vegas Signals", help="Query props from database and compute edge signals"):
-                    game_dt = st.session_state.get('dfs_projection_date') or str(date.today())
+                    game_dt = st.session_state.get('dfs_projection_date') or str(datetime.now(EASTERN_TZ).date())
                     refreshed = _enrich_players_with_vegas_signals(dfs_conn, players, game_dt, debug=True)
                     st.session_state.dfs_vegas_signals = refreshed
                     if refreshed:
@@ -13602,7 +13602,7 @@ if selected_page == "DFS Lineup Builder":
 
             # --- Game Stack Selection ---
             # Build game list directly from the player pool (always available)
-            proj_date_str = st.session_state.get('dfs_projection_date') or str(date.today())
+            proj_date_str = st.session_state.get('dfs_projection_date') or str(datetime.now(EASTERN_TZ).date())
             dk_games = {}  # dk_game_id -> {teams, players, stack_score}
             for p in players:
                 if p.game_id not in dk_games:
@@ -13651,9 +13651,9 @@ if selected_page == "DFS Lineup Builder":
 
                 if fetch_odds_clicked:
                     try:
-                        fetch_date = datetime.strptime(proj_date_str, "%Y-%m-%d").date() if proj_date_str else date.today()
+                        fetch_date = datetime.strptime(proj_date_str, "%Y-%m-%d").date() if proj_date_str else datetime.now(EASTERN_TZ).date()
                     except (ValueError, TypeError):
-                        fetch_date = date.today()
+                        fetch_date = datetime.now(EASTERN_TZ).date()
                     with st.spinner(f"Fetching odds for {fetch_date} from The Odds API..."):
                         try:
                             result = odds_api.fetch_fanduel_lines_for_date(dfs_conn, fetch_date, force=True)
@@ -13797,7 +13797,7 @@ if selected_page == "DFS Lineup Builder":
                                 save_slate_projections,
                                 save_slate_lineups
                             )
-                            slate_date = st.session_state.dfs_projection_date or str(date.today())
+                            slate_date = st.session_state.dfs_projection_date or str(datetime.now(EASTERN_TZ).date())
                             create_dfs_tracking_tables(dfs_conn)
                             save_slate_projections(dfs_conn, slate_date, players)
                             save_slate_lineups(dfs_conn, slate_date, lineups)
@@ -13857,7 +13857,7 @@ if selected_page == "DFS Lineup Builder":
                 # Pre-fetch Vegas prop lines for all players in lineups
                 vegas_props_lookup = {}
                 try:
-                    game_dt = st.session_state.get('dfs_projection_date') or str(date.today())
+                    game_dt = st.session_state.get('dfs_projection_date') or str(datetime.now(EASTERN_TZ).date())
                     props_cursor = dfs_conn.execute("""
                         SELECT player_name,
                                fanduel_ou, fanduel_reb_ou, fanduel_ast_ou,
@@ -14927,7 +14927,7 @@ if selected_page == "DFS Lineup Builder":
         st.caption("View all FanDuel player prop lines alongside our projections — verify API data is populated")
 
         # Date selector — default to DFS projection date if available
-        props_default_date = date.today()
+        props_default_date = datetime.now(EASTERN_TZ).date()
         if st.session_state.dfs_projection_date:
             try:
                 props_default_date = datetime.strptime(
