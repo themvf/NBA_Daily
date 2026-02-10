@@ -285,9 +285,13 @@ def extract_game_odds_from_response(games_data: List[Dict], target_date: str) ->
     """
     Extract spread/total from bulk game odds response.
 
+    Extracts ALL games from the API response (no date filtering).
+    Each game's date is derived from its commence_time (UTC → Eastern).
+    The caller or DB query handles date filtering downstream.
+
     Args:
         games_data: Response from get_game_odds_bulk
-        target_date: Date string (YYYY-MM-DD) to filter games
+        target_date: Date string (YYYY-MM-DD) — used as fallback if commence_time missing
 
     Returns:
         List of dicts with: game_id, home_team, away_team, spread, total, etc.
@@ -312,17 +316,16 @@ def extract_game_odds_from_response(games_data: List[Dict], target_date: str) ->
     extracted = []
 
     for game in games_data:
-        # Check date (convert UTC to Eastern) — if API pre-filtered, be lenient
+        # Derive game date from commence_time (UTC → Eastern)
         commence_str = game.get("commence_time", "")
+        game_date_str = target_date  # fallback
         if commence_str:
             try:
                 utc_dt = datetime.fromisoformat(commence_str.replace("Z", "+00:00"))
                 eastern_dt = utc_dt.astimezone(eastern)
-                game_date = eastern_dt.strftime("%Y-%m-%d")
-                if game_date != target_date:
-                    continue
+                game_date_str = eastern_dt.strftime("%Y-%m-%d")
             except (ValueError, TypeError):
-                pass  # If date parsing fails, still try to extract odds
+                pass  # Use target_date as fallback
 
         home_team = game.get("home_team", "")
         away_team = game.get("away_team", "")
@@ -370,11 +373,11 @@ def extract_game_odds_from_response(games_data: List[Dict], target_date: str) ->
         if spread is None or total is None:
             continue
 
-        game_id = f"{target_date}_{away_abbr}_{home_abbr}"
+        game_id = f"{game_date_str}_{away_abbr}_{home_abbr}"
 
         extracted.append({
             "game_id": game_id,
-            "game_date": target_date,
+            "game_date": game_date_str,
             "home_team": home_abbr,
             "away_team": away_abbr,
             "spread": spread,
@@ -961,12 +964,16 @@ def fetch_fanduel_lines_for_date(
                             _dates_seen.add(f"parse_err:{ct}")
                 odds_debug["eastern_dates_in_response"] = sorted(_dates_seen)
 
-            # Extract and store game odds for the target date
+            # Extract all games (no date filtering — match by teams downstream)
             game_odds_list = extract_game_odds_from_response(games_data, game_date_str)
-            odds_debug["extracted_count"] = len(game_odds_list)
+            odds_debug["extracted_total"] = len(game_odds_list)
+            # Count how many match the target date
+            target_date_count = sum(1 for g in game_odds_list if g.get("game_date") == game_date_str)
+            odds_debug["extracted_for_target_date"] = target_date_count
             if game_odds_list:
                 odds_debug["sample_extracted"] = {
                     "game_id": game_odds_list[0].get("game_id"),
+                    "game_date": game_odds_list[0].get("game_date"),
                     "spread": game_odds_list[0].get("spread"),
                     "total": game_odds_list[0].get("total"),
                 }
