@@ -12940,7 +12940,8 @@ if selected_page == "DFS Lineup Builder":
         "📈 Exposure Report",
         "🎯 Model Accuracy",
         "🦈 Opponent Analysis",
-        "🎰 FanDuel Props"
+        "🎰 FanDuel Props",
+        "🔬 Player Scouting"
     ])
 
     # ==========================================================================
@@ -13425,66 +13426,6 @@ if selected_page == "DFS Lineup Builder":
             injured_count = len([p for p in filtered if getattr(p, 'is_injured', False)])
             if injured_count > 0:
                 st.warning(f"🏥 {injured_count} injured player(s) shown above will be auto-excluded from lineups")
-
-            # --- Player Scouting Table ---
-            with st.expander("🔬 Player Scouting", expanded=False):
-                scout_data = []
-                for p in filtered:
-                    if getattr(p, 'is_injured', False):
-                        continue
-                    role = getattr(p, 'role_tier', '') or '—'
-                    avg7 = getattr(p, 'avg_fpts_last7', 0)
-                    variance = getattr(p, 'fpts_variance', 0)
-                    own = getattr(p, 'ownership_proj', 0)
-
-                    scout_data.append({
-                        'Player': p.name,
-                        'Team': p.team,
-                        'Pos': '/'.join(p.positions),
-                        'Role': role,
-                        'Salary': p.salary,
-                        'Avg FPTS (7G)': avg7,
-                        'Variance': variance,
-                        'Own%': round(own, 1),
-                    })
-
-                if scout_data:
-                    scout_df = pd.DataFrame(scout_data)
-                    # Sort by avg FPTS descending
-                    scout_df = scout_df.sort_values('Avg FPTS (7G)', ascending=False).reset_index(drop=True)
-
-                    # Color-code the Role column for quick scanning
-                    role_colors = {'STAR': '🌟', 'STARTER': '🟢', 'ROTATION': '🟡', 'BENCH': '⚪'}
-                    scout_df['Role'] = scout_df['Role'].apply(
-                        lambda r: f"{role_colors.get(r, '')} {r}" if r != '—' else r
-                    )
-
-                    # Summary by role
-                    role_counts = {}
-                    for row in scout_data:
-                        r = row['Role']
-                        if r and r != '—':
-                            role_counts[r] = role_counts.get(r, 0) + 1
-                    if role_counts:
-                        role_summary = " | ".join(
-                            f"{role_colors.get(r, '')} {r}: {c}"
-                            for r, c in sorted(role_counts.items(), key=lambda x: ['STAR', 'STARTER', 'ROTATION', 'BENCH'].index(x[0]) if x[0] in ['STAR', 'STARTER', 'ROTATION', 'BENCH'] else 99)
-                        )
-                        st.caption(role_summary)
-
-                    st.dataframe(
-                        scout_df,
-                        use_container_width=True,
-                        hide_index=True,
-                        column_config={
-                            'Salary': st.column_config.NumberColumn(format="$%d"),
-                            'Avg FPTS (7G)': st.column_config.NumberColumn(format="%.1f"),
-                            'Variance': st.column_config.NumberColumn(format="%.1f"),
-                            'Own%': st.column_config.NumberColumn(format="%.1f%%"),
-                        }
-                    )
-                else:
-                    st.info("No scouting data available. Generate projections first.")
 
             # --- Vegas Edge Suggestions ---
             boost_players = []
@@ -15255,6 +15196,171 @@ if selected_page == "DFS Lineup Builder":
                     use_container_width=True,
                     key="props_export_btn"
                 )
+
+    # ==========================================================================
+    # TAB 8: Player Scouting (database-driven, slate-independent)
+    # ==========================================================================
+    with builder_tabs[7]:
+        st.subheader("Player Scouting")
+        st.caption("League-wide player research — independent of the current DK slate")
+
+        try:
+            # Query recent game logs for all players (last 7 games per player)
+            scout_query = """
+                WITH ranked_games AS (
+                    SELECT
+                        player_id,
+                        player_name,
+                        team_abbreviation,
+                        game_date,
+                        minutes,
+                        points,
+                        rebounds,
+                        assists,
+                        steals,
+                        blocks,
+                        turnovers,
+                        fg3m,
+                        ROW_NUMBER() OVER (PARTITION BY player_id ORDER BY game_date DESC) as game_num
+                    FROM player_game_logs
+                    WHERE season = '2025-26' AND season_type = 'Regular Season'
+                ),
+                recent AS (
+                    SELECT * FROM ranked_games WHERE game_num <= 7
+                ),
+                player_stats AS (
+                    SELECT
+                        player_id,
+                        player_name,
+                        team_abbreviation,
+                        COUNT(*) as games,
+                        AVG(CAST(minutes AS REAL)) as avg_minutes,
+                        AVG(points) as avg_points,
+                        -- DK FPTS = pts*1 + reb*1.25 + ast*1.5 + stl*2 + blk*2 - tov*0.5 + fg3m*0.5
+                        AVG(
+                            points * 1.0 + rebounds * 1.25 + assists * 1.5
+                            + steals * 2.0 + blocks * 2.0 - turnovers * 0.5
+                            + fg3m * 0.5
+                        ) as avg_fpts,
+                        -- Sample standard deviation of FPTS
+                        CASE WHEN COUNT(*) > 1 THEN
+                            -- Manual stddev since SQLite doesn't have it natively
+                            SQRT(
+                                AVG(
+                                    (points * 1.0 + rebounds * 1.25 + assists * 1.5
+                                     + steals * 2.0 + blocks * 2.0 - turnovers * 0.5
+                                     + fg3m * 0.5)
+                                    * (points * 1.0 + rebounds * 1.25 + assists * 1.5
+                                       + steals * 2.0 + blocks * 2.0 - turnovers * 0.5
+                                       + fg3m * 0.5)
+                                )
+                                - AVG(
+                                    points * 1.0 + rebounds * 1.25 + assists * 1.5
+                                    + steals * 2.0 + blocks * 2.0 - turnovers * 0.5
+                                    + fg3m * 0.5
+                                ) * AVG(
+                                    points * 1.0 + rebounds * 1.25 + assists * 1.5
+                                    + steals * 2.0 + blocks * 2.0 - turnovers * 0.5
+                                    + fg3m * 0.5
+                                )
+                            )
+                        ELSE 0 END as fpts_stddev
+                    FROM recent
+                    WHERE CAST(minutes AS REAL) > 0
+                    GROUP BY player_id
+                    HAVING games >= 3
+                )
+                SELECT
+                    ps.*,
+                    pr.role_tier
+                FROM player_stats ps
+                LEFT JOIN player_roles pr ON ps.player_id = pr.player_id AND pr.season = '2025-26'
+                ORDER BY avg_fpts DESC
+            """
+            scout_df = pd.read_sql_query(scout_query, dfs_conn)
+
+            if scout_df.empty:
+                st.info("No recent game data found. Run the data builder to populate player_game_logs.")
+            else:
+                # Get avg ownership from past slates
+                try:
+                    own_query = """
+                        SELECT player_id, AVG(ownership_proj) as avg_own_proj
+                        FROM dfs_slate_projections
+                        WHERE slate_date >= date('now', '-14 days')
+                        GROUP BY player_id
+                    """
+                    own_df = pd.read_sql_query(own_query, dfs_conn)
+                    scout_df = scout_df.merge(own_df, on='player_id', how='left')
+                except Exception:
+                    scout_df['avg_own_proj'] = None
+
+                # Classify role for players without player_roles entry
+                from depth_chart import classify_role_tier
+                scout_df['role_tier'] = scout_df.apply(
+                    lambda row: row['role_tier'] if pd.notna(row.get('role_tier')) and row['role_tier']
+                    else classify_role_tier(row['avg_minutes'], row['avg_points'], row['games']),
+                    axis=1
+                )
+
+                # Filters
+                col_f1, col_f2, col_f3 = st.columns(3)
+                with col_f1:
+                    scout_teams = sorted(scout_df['team_abbreviation'].dropna().unique())
+                    sel_teams = st.multiselect("Filter by Team", scout_teams, default=[], key="scout_team_filter")
+                with col_f2:
+                    role_options = ['STAR', 'STARTER', 'ROTATION', 'BENCH']
+                    sel_roles = st.multiselect("Filter by Role", role_options, default=[], key="scout_role_filter")
+                with col_f3:
+                    min_fpts = st.slider("Min Avg FPTS", 0.0, 60.0, 10.0, step=5.0, key="scout_min_fpts")
+
+                display_df = scout_df.copy()
+                if sel_teams:
+                    display_df = display_df[display_df['team_abbreviation'].isin(sel_teams)]
+                if sel_roles:
+                    display_df = display_df[display_df['role_tier'].isin(sel_roles)]
+                display_df = display_df[display_df['avg_fpts'] >= min_fpts]
+
+                # Role summary
+                role_icons = {'STAR': '🌟', 'STARTER': '🟢', 'ROTATION': '🟡', 'BENCH': '⚪'}
+                role_counts = display_df['role_tier'].value_counts()
+                role_parts = []
+                for r in ['STAR', 'STARTER', 'ROTATION', 'BENCH']:
+                    if r in role_counts.index:
+                        role_parts.append(f"{role_icons.get(r, '')} {r}: {role_counts[r]}")
+                if role_parts:
+                    st.caption(f"{len(display_df)} players | " + " | ".join(role_parts))
+
+                # Format for display
+                display_df['Role'] = display_df['role_tier'].apply(
+                    lambda r: f"{role_icons.get(r, '')} {r}" if r else '—'
+                )
+                display_df['Avg FPTS (7G)'] = display_df['avg_fpts'].round(1)
+                display_df['Variance'] = display_df['fpts_stddev'].round(1)
+                display_df['Avg Own%'] = display_df['avg_own_proj'].round(1)
+
+                show_df = display_df[[
+                    'player_name', 'team_abbreviation', 'Role',
+                    'Avg FPTS (7G)', 'Variance', 'Avg Own%', 'games'
+                ]].rename(columns={
+                    'player_name': 'Player',
+                    'team_abbreviation': 'Team',
+                    'games': 'GP',
+                })
+
+                st.dataframe(
+                    show_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        'Avg FPTS (7G)': st.column_config.NumberColumn(format="%.1f"),
+                        'Variance': st.column_config.NumberColumn(format="%.1f"),
+                        'Avg Own%': st.column_config.NumberColumn(format="%.1f%%"),
+                    }
+                )
+
+        except Exception as e:
+            st.error(f"Failed to load scouting data: {e}")
 
 st.divider()
 st.caption(
