@@ -14875,11 +14875,18 @@ if selected_page == "DFS Lineup Builder":
                                     st.dataframe(stack_df, use_container_width=True, hide_index=True)
 
                             with tf_right:
-                                # Most rostered players
+                                # Most rostered players (with role)
                                 if analysis.get('player_frequency'):
                                     st.markdown("**⭐ Most Rostered Players**")
-                                    freq_df = pd.DataFrame(analysis['player_frequency'][:12])
-                                    freq_df.columns = ['Player', 'Count', '% of Top']
+                                    freq_raw = analysis['player_frequency'][:12]
+                                    role_icons_freq = {'STAR': '🌟', 'STARTER': '🟢', 'ROTATION': '🔄', 'BENCH': '🪑'}
+                                    freq_df = pd.DataFrame([{
+                                        'Player': f.get('player', ''),
+                                        'Role': f"{role_icons_freq.get(f.get('role', ''), '❓')} {f.get('role', '') or '?'}",
+                                        'Count': f.get('count', 0),
+                                        '% of Top': f.get('pct', 0),
+                                        'Own%': f"{f['ownership']:.1f}" if f.get('ownership') is not None else "—",
+                                    } for f in freq_raw])
 
                                     fig_freq = px.bar(
                                         freq_df,
@@ -14892,6 +14899,94 @@ if selected_page == "DFS Lineup Builder":
                                     fig_freq.update_traces(textposition='outside')
                                     fig_freq.update_layout(height=350, showlegend=False, xaxis_tickangle=-45)
                                     st.plotly_chart(fig_freq, use_container_width=True)
+
+                                    # Table with role and ownership
+                                    st.dataframe(freq_df, use_container_width=True, hide_index=True)
+
+                            # Role Composition & Ownership Analysis
+                            role_analysis = analysis.get('role_analysis', {})
+                            if role_analysis:
+                                st.divider()
+                                ra_left, ra_right = st.columns(2)
+
+                                with ra_left:
+                                    st.markdown("**🎭 Role Composition in Winning Lineups**")
+                                    role_icons = {'STAR': '🌟', 'STARTER': '🟢', 'ROTATION': '🔄', 'BENCH': '🪑', 'UNKNOWN': '❓'}
+                                    role_rows = []
+                                    for role in ['STAR', 'STARTER', 'ROTATION', 'BENCH', 'UNKNOWN']:
+                                        stats = role_analysis.get(role)
+                                        if stats:
+                                            role_rows.append({
+                                                'Role': f"{role_icons.get(role, '')} {role}",
+                                                'Players': stats['count'],
+                                                '% of Slots': f"{stats['pct_of_lineups']:.0f}%",
+                                                'Avg FPTS': f"{stats['avg_fpts']:.1f}" if stats.get('avg_fpts') else "—",
+                                                'Avg Salary': f"${stats['avg_salary']:,}" if stats.get('avg_salary') else "—",
+                                            })
+                                    if role_rows:
+                                        st.dataframe(pd.DataFrame(role_rows), use_container_width=True, hide_index=True)
+
+                                    # Role distribution pie chart
+                                    pie_data = [{'Role': r['Role'], 'Count': r['Players']} for r in role_rows if r['Players'] > 0]
+                                    if pie_data:
+                                        fig_pie = px.pie(
+                                            pd.DataFrame(pie_data),
+                                            names='Role', values='Count',
+                                            title='Role Distribution',
+                                            color_discrete_sequence=px.colors.qualitative.Set2,
+                                        )
+                                        fig_pie.update_layout(height=300)
+                                        st.plotly_chart(fig_pie, use_container_width=True)
+
+                                with ra_right:
+                                    st.markdown("**📊 Ownership by Role Tier**")
+                                    own_role_rows = []
+                                    for role in ['STAR', 'STARTER', 'ROTATION', 'BENCH']:
+                                        stats = role_analysis.get(role)
+                                        if stats and stats.get('avg_ownership') is not None:
+                                            own_role_rows.append({
+                                                'Role': f"{role_icons.get(role, '')} {role}",
+                                                'Avg Own%': stats['avg_ownership'],
+                                                'Avg FPTS': stats.get('avg_fpts', 0) or 0,
+                                                'Count': stats['count'],
+                                            })
+                                    if own_role_rows:
+                                        own_df = pd.DataFrame(own_role_rows)
+                                        fig_own_role = px.bar(
+                                            own_df,
+                                            x='Role', y='Avg Own%',
+                                            title='Average Ownership by Role',
+                                            color='Avg FPTS',
+                                            color_continuous_scale='YlOrRd',
+                                            text='Avg Own%',
+                                        )
+                                        fig_own_role.update_traces(texttemplate='%{text:.1f}%', textposition='outside')
+                                        fig_own_role.update_layout(height=350, showlegend=False)
+                                        st.plotly_chart(fig_own_role, use_container_width=True)
+
+                                    # Ownership distribution across all players
+                                    own_an = analysis.get('ownership_analysis', {})
+                                    if own_an:
+                                        st.markdown("**Ownership Breakdown**")
+                                        own_dist = pd.DataFrame([
+                                            {'Tier': 'Chalk (25%+)', 'Plays': own_an.get('high_ownership_plays', 0)},
+                                            {'Tier': 'Mid (10-25%)', 'Plays': own_an.get('mid_ownership_plays', 0)},
+                                            {'Tier': 'Contrarian (<10%)', 'Plays': own_an.get('low_ownership_plays', 0)},
+                                        ])
+                                        fig_own_dist = px.bar(
+                                            own_dist, x='Tier', y='Plays',
+                                            title='Ownership Tier Distribution',
+                                            color='Tier',
+                                            color_discrete_map={
+                                                'Chalk (25%+)': '#e74c3c',
+                                                'Mid (10-25%)': '#f39c12',
+                                                'Contrarian (<10%)': '#27ae60',
+                                            },
+                                            text='Plays',
+                                        )
+                                        fig_own_dist.update_traces(textposition='outside')
+                                        fig_own_dist.update_layout(height=300, showlegend=False)
+                                        st.plotly_chart(fig_own_dist, use_container_width=True)
 
                             # Individual lineup breakdown
                             with st.expander("📋 Individual Lineup Details"):
@@ -14906,15 +15001,16 @@ if selected_page == "DFS Lineup Builder":
                                         proj_fpts_str = f"{p['proj_fpts']:.1f}" if p.get('proj_fpts') else "—"
                                         vegas_fpts_str = f"{p['vegas_fpts']:.1f}" if p.get('vegas_fpts') else "—"
                                         actual_fpts_str = f"{p['fpts']:.1f}" if p.get('fpts') else "—"
+                                        role_icons = {'STAR': '🌟', 'STARTER': '🟢', 'ROTATION': '🔄', 'BENCH': '🪑'}
+                                        role = p.get('role_tier', '') or ''
+                                        role_str = f"{role_icons.get(role, '❓')} {role}" if role else "—"
                                         player_rows.append({
                                             'Pos': p['position'],
                                             'Player': p['name'],
+                                            'Role': role_str,
                                             'Team': p['team'],
                                             'Salary': f"${p['salary']:,}" if p.get('salary') else "—",
-                                            'Proj Own%': proj_own_str,
                                             'Own%': own_str,
-                                            'Proj FPTS': proj_fpts_str,
-                                            'Vegas FPTS': vegas_fpts_str,
                                             'FPTS': actual_fpts_str,
                                         })
                                     lineup_df = pd.DataFrame(player_rows)

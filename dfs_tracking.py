@@ -1418,6 +1418,7 @@ def analyze_top_finishers(
         'player_frequency': {},
         'team_stacks': [],
         'ownership_analysis': {},
+        'role_analysis': {},
         'game_totals': {},
         'insights': [],
         'errors': []
@@ -1437,14 +1438,17 @@ def analyze_top_finishers(
         results['errors'].append("No contest data found for this slate")
         return results
 
-    # Get player info from projections (salary, team, ownership, vegas)
+    # Get player info from projections (salary, team, ownership, vegas, role)
     player_info = pd.read_sql_query("""
         SELECT s.player_name, s.team, s.salary, s.actual_ownership, s.actual_fpts,
                s.opponent, s.proj_fpts, s.ownership_proj,
-               p.vegas_implied_fpts
+               p.vegas_implied_fpts,
+               pr.role_tier
         FROM dfs_slate_projections s
         LEFT JOIN predictions p
             ON s.player_id = p.player_id AND p.game_date = s.slate_date
+        LEFT JOIN player_roles pr
+            ON s.player_id = pr.player_id AND pr.season = '2025-26'
         WHERE s.slate_date = ?
     """, conn, params=[slate_date])
 
@@ -1463,6 +1467,7 @@ def analyze_top_finishers(
             'proj_fpts': row.get('proj_fpts'),
             'proj_ownership': row.get('ownership_proj'),
             'vegas_fpts': row.get('vegas_implied_fpts'),
+            'role_tier': row.get('role_tier', ''),
         }
 
         norm_name = _normalize_name(row['player_name'])
@@ -1509,11 +1514,12 @@ def analyze_top_finishers(
     positions = ['pg', 'sg', 'sf', 'pf', 'c', 'g', 'f', 'util']
     position_labels = ['PG', 'SG', 'SF', 'PF', 'C', 'G', 'F', 'UTIL']
 
-    # Initialize salary tracking
+    # Initialize tracking
     salary_by_pos = {pos: [] for pos in position_labels}
     player_counts = {}
     all_teams_in_lineups = []
     ownership_levels = []
+    role_data = []  # List of {'role': str, 'ownership': float, 'fpts': float, 'salary': int}
 
     # Analyze each lineup
     for _, lineup in top_lineups.iterrows():
@@ -1548,6 +1554,7 @@ def analyze_top_finishers(
                 'proj_fpts': info.get('proj_fpts'),
                 'proj_ownership': info.get('proj_ownership'),
                 'vegas_fpts': info.get('vegas_fpts'),
+                'role_tier': info.get('role_tier', ''),
             }
             lineup_data['players'].append(player_data)
 
@@ -1555,8 +1562,10 @@ def analyze_top_finishers(
             if info.get('salary'):
                 salary_by_pos[label].append(info['salary'])
 
-            # Track player frequency
-            player_counts[player_name] = player_counts.get(player_name, 0) + 1
+            # Track player frequency (with role)
+            if player_name not in player_counts:
+                player_counts[player_name] = {'count': 0, 'role': info.get('role_tier', ''), 'ownership': info.get('ownership')}
+            player_counts[player_name]['count'] += 1
 
             # Track team stacks
             team = info.get('team', '?')
@@ -1567,6 +1576,15 @@ def analyze_top_finishers(
             # Track ownership
             if info.get('ownership') is not None:
                 ownership_levels.append(info['ownership'])
+
+            # Track role tier data for analysis
+            role = info.get('role_tier', '') or 'UNKNOWN'
+            role_entry = {'role': role, 'salary': info.get('salary', 0)}
+            if info.get('ownership') is not None:
+                role_entry['ownership'] = info['ownership']
+            if info.get('fpts') is not None:
+                role_entry['fpts'] = info['fpts']
+            role_data.append(role_entry)
 
         # Identify stacks (2+ players from same team)
         for team, count in team_counts.items():
@@ -1586,9 +1604,10 @@ def analyze_top_finishers(
                 'count': len(salaries)
             }
 
-    # Player frequency (most rostered in top lineups)
+    # Player frequency (most rostered in top lineups) — includes role tier
     results['player_frequency'] = sorted(
-        [{'player': k, 'count': v, 'pct': round(100 * v / top_n, 1)}
+        [{'player': k, 'count': v['count'], 'pct': round(100 * v['count'] / top_n, 1),
+          'role': v.get('role', ''), 'ownership': v.get('ownership')}
          for k, v in player_counts.items()],
         key=lambda x: x['count'],
         reverse=True
@@ -1621,6 +1640,25 @@ def analyze_top_finishers(
             'contrarian_pct': round(100 * len(low_own) / len(ownership_levels), 1) if ownership_levels else 0
         }
 
+    # Role tier analysis
+    if role_data:
+        role_order = ['STAR', 'STARTER', 'ROTATION', 'BENCH', 'UNKNOWN']
+        role_stats = {}
+        for role in role_order:
+            entries = [r for r in role_data if r['role'] == role]
+            if entries:
+                own_vals = [r['ownership'] for r in entries if 'ownership' in r]
+                fpts_vals = [r['fpts'] for r in entries if 'fpts' in r]
+                sal_vals = [r['salary'] for r in entries if r.get('salary')]
+                role_stats[role] = {
+                    'count': len(entries),
+                    'pct_of_lineups': round(100 * len(entries) / (top_n * 8), 1),
+                    'avg_ownership': round(np.mean(own_vals), 1) if own_vals else None,
+                    'avg_fpts': round(np.mean(fpts_vals), 1) if fpts_vals else None,
+                    'avg_salary': round(np.mean(sal_vals)) if sal_vals else None,
+                }
+        results['role_analysis'] = role_stats
+
     # Generate insights
     insights = []
 
@@ -1649,6 +1687,26 @@ def analyze_top_finishers(
         if must_have:
             names = ', '.join([p['player'].split()[-1] for p in must_have[:3]])
             insights.append(f"⭐ Must-have players: {names} (70%+ of top lineups)")
+
+    # Role composition insight
+    if results.get('role_analysis'):
+        ra = results['role_analysis']
+        star_pct = ra.get('STAR', {}).get('pct_of_lineups', 0)
+        rotation_pct = ra.get('ROTATION', {}).get('pct_of_lineups', 0)
+        bench_pct = ra.get('BENCH', {}).get('pct_of_lineups', 0)
+        if star_pct > 0:
+            star_avg = ra['STAR'].get('avg_fpts')
+            star_own = ra['STAR'].get('avg_ownership')
+            parts = [f"STARs = {star_pct:.0f}% of roster spots"]
+            if star_avg:
+                parts.append(f"avg {star_avg:.1f} FPTS")
+            if star_own:
+                parts.append(f"{star_own:.0f}% owned")
+            insights.append(f"🌟 {', '.join(parts)}")
+        if rotation_pct + bench_pct > 20:
+            insights.append(
+                f"🔄 Value plays: ROTATION+BENCH = {rotation_pct + bench_pct:.0f}% of roster spots"
+            )
 
     results['insights'] = insights
 
