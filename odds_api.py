@@ -259,15 +259,14 @@ def get_game_odds_bulk(api_key: str, game_date: date = None) -> Tuple[List[Dict]
     """
     Fetch game-level odds (spreads, totals) for NBA games.
 
-    This is a BULK endpoint - 1 request returns games with odds.
-    When game_date is provided, filters to that date using API parameters.
+    This is a BULK endpoint - 1 request returns all upcoming games with odds.
+    Date filtering is done locally in extract_game_odds_from_response() since
+    the commenceTimeFrom/To API params require a paid subscription tier.
 
     Returns:
         (games_with_odds_list, requests_used)
         Each game contains: home_team, away_team, commence_time, bookmakers with spreads/totals
     """
-    from zoneinfo import ZoneInfo
-
     url = f"{BASE_URL}/sports/{SPORT}/odds"
     params = {
         "apiKey": api_key,
@@ -275,14 +274,6 @@ def get_game_odds_bulk(api_key: str, game_date: date = None) -> Tuple[List[Dict]
         "markets": "spreads,totals",
         "oddsFormat": "american",
     }
-
-    # Filter by date at the API level (much more reliable than local filtering)
-    if game_date:
-        eastern = ZoneInfo("America/New_York")
-        start_et = datetime.combine(game_date, datetime.min.time()).replace(tzinfo=eastern)
-        end_et = start_et + timedelta(days=1)
-        params["commenceTimeFrom"] = start_et.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ")
-        params["commenceTimeTo"] = end_et.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     response = requests.get(url, params=params, timeout=30)
     response.raise_for_status()
@@ -987,10 +978,13 @@ def fetch_fanduel_lines_for_date(
 
         except Exception as e:
             # Non-fatal: player props are still useful even if game odds fail
-            import traceback
+            import traceback, re as _re
             result["game_odds_stored"] = 0
-            result["odds_debug"] = {"error": str(e), "traceback": traceback.format_exc()}
-            print(f"[odds_api] Warning: Failed to fetch game odds: {e}")
+            # Sanitize API key from error messages before exposing to UI
+            err_str = _re.sub(r'apiKey=[a-f0-9]+', 'apiKey=***', str(e))
+            tb_str = _re.sub(r'apiKey=[a-f0-9]+', 'apiKey=***', traceback.format_exc())
+            result["odds_debug"] = {"error": err_str, "traceback": tb_str}
+            print(f"[odds_api] Warning: Failed to fetch game odds: {err_str}")
 
         # Step 2: Fetch player props for each event
         all_player_lines = {}
