@@ -5909,7 +5909,7 @@ if selected_page == "Injury Admin":
                         st.write(f"**Updated:** {row[9]}")
 
                         # Check why it might be filtered
-                        today = date.today().strftime('%Y-%m-%d')
+                        today = datetime.now(EASTERN_TZ).date().strftime('%Y-%m-%d')
                         if row[5]:  # has return date
                             if row[5] < today:
                                 st.error(f"⚠️ FILTERED OUT: Return date ({row[5]}) < today ({today})")
@@ -6140,7 +6140,7 @@ if selected_page == "Injury Admin":
     st.caption("Remove OUT players from existing predictions and recalculate teammate projections")
 
     # Get today's date
-    today = date.today().strftime('%Y-%m-%d')
+    today = datetime.now(EASTERN_TZ).date().strftime('%Y-%m-%d')
 
     try:
         # Get refresh status
@@ -11552,7 +11552,7 @@ if selected_page == "FanDuel Compare":
         with col_date:
             compare_date = st.date_input(
                 "Game Date",
-                value=date.today(),
+                value=datetime.now(EASTERN_TZ).date(),
                 key="fanduel_compare_date"
             )
 
@@ -12969,9 +12969,9 @@ if selected_page == "DFS Lineup Builder":
 
                     # Save raw DK CSV to S3 (preserves salary/player data)
                     _s3_upload_slate_file(
-                        csv_path, str(date.today()),
+                        csv_path, str(datetime.now(EASTERN_TZ).date()),
                         "dk_salaries.csv",
-                        f"☁️ DK CSV saved to S3 for {date.today()}"
+                        f"☁️ DK CSV saved to S3 for {datetime.now(EASTERN_TZ).date()}"
                     )
 
                     st.success(f"✅ Loaded {metadata['matched_players']} players from {metadata['unique_games']} games")
@@ -14193,7 +14193,7 @@ if selected_page == "DFS Lineup Builder":
                         from dfs_optimizer import parse_contest_entries
                         import re as _re
                         _cid_match = _re.search(r'(\d{6,})', contest_file.name)
-                        _contest_id = _cid_match.group(1) if _cid_match else date.today().strftime('%Y%m%d')
+                        _contest_id = _cid_match.group(1) if _cid_match else datetime.now(EASTERN_TZ).date().strftime('%Y%m%d')
                         try:
                             contest_entries = parse_contest_entries(tmp_path, _contest_id)
                             _unique_users = len(set(e['username'] for e in contest_entries))
@@ -14210,7 +14210,7 @@ if selected_page == "DFS Lineup Builder":
                             # Let user pick which slate this belongs to
                             contest_slate_options = all_dates if all_dates else []
                             # Also offer today's date
-                            today_str = date.today().strftime('%Y-%m-%d')
+                            today_str = datetime.now(EASTERN_TZ).date().strftime('%Y-%m-%d')
                             if today_str not in contest_slate_options:
                                 contest_slate_options = [today_str] + contest_slate_options
 
