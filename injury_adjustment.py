@@ -16,6 +16,7 @@ Key features:
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict
 from datetime import date, datetime
+from zoneinfo import ZoneInfo
 import sqlite3
 import pandas as pd
 import json
@@ -620,7 +621,7 @@ def add_to_injury_list(
         injury_id of the created/updated record
     """
     cursor = conn.cursor()
-    today = date.today().strftime('%Y-%m-%d')
+    today = datetime.now(ZoneInfo("America/New_York")).date().strftime('%Y-%m-%d')
 
     # First, check if player already has an injury record
     cursor.execute("SELECT injury_id FROM injury_list WHERE player_id = ?", (player_id,))
@@ -764,7 +765,7 @@ def get_active_injuries(
 
     # Filter by return date if requested
     if check_return_dates:
-        today = date.today().strftime('%Y-%m-%d')
+        today = datetime.now(ZoneInfo("America/New_York")).date().strftime('%Y-%m-%d')
         # Keep players with no return date (indefinite) or return date >= today
         df = df[(df['expected_return_date'].isna()) | (df['expected_return_date'] >= today)]
 

@@ -182,8 +182,8 @@ def get_monthly_api_usage(conn: sqlite3.Connection) -> int:
     """
     cursor = conn.cursor()
 
-    # Get first day of current month
-    today = date.today()
+    # Get first day of current month (use Eastern time for Streamlit Cloud compatibility)
+    today = datetime.now(ZoneInfo("America/New_York")).date()
     first_of_month = today.replace(day=1).strftime("%Y-%m-%d")
 
     cursor.execute("""
@@ -224,7 +224,7 @@ def should_fetch_odds(conn: sqlite3.Connection, game_date: date) -> Tuple[bool, 
         WHERE game_date = ?
         AND fetch_date = ?
         AND error_message IS NULL
-    """, (str(game_date), str(date.today())))
+    """, (str(game_date), str(datetime.now(ZoneInfo("America/New_York")).date())))
 
     if cursor.fetchone()[0] > 0:
         return False, "Already fetched odds for this date today"
@@ -838,7 +838,7 @@ def log_fetch_attempt(
          api_requests_used, remaining_requests, error_message)
         VALUES (?, ?, ?, ?, ?, ?, ?)
     """, (
-        str(date.today()),
+        str(datetime.now(ZoneInfo("America/New_York")).date()),
         str(game_date),
         events_fetched,
         players_matched,
