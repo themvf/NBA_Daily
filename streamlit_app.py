@@ -15034,6 +15034,8 @@ if selected_page == "DFS Lineup Builder":
                                             'Role': role_str,
                                             'Team': p['team'],
                                             'Salary': f"${p['salary']:,}" if p.get('salary') else "—",
+                                            'Proj FPTS': proj_fpts_str,
+                                            'Proj Own%': proj_own_str,
                                             'Own%': own_str,
                                             'FPTS': actual_fpts_str,
                                         })
