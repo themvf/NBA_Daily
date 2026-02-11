@@ -336,6 +336,7 @@ def compute_game_environment(odds: GameOdds) -> GameEnvironment:
     # UPDATED: Backtest shows spread matters more than total for top scorers
     # Prioritize close games where stars stay in late
     # Total is now a secondary factor, not primary
+    # Tiers: tight (≤3.5) > moderate (≤6) > wide (≤10) > blowout (>10)
     stack_score = 0.0
     if spread_tight:
         # Close games are the primary stacking signal
@@ -343,12 +344,22 @@ def compute_game_environment(odds: GameOdds) -> GameEnvironment:
     elif spread_moderate:
         # Moderate spreads still okay, total adds small boost
         stack_score = 0.60 if high_total else 0.50
-    elif very_high_total and not spread_large:
-        # High total but not a blowout - moderate stack value
-        stack_score = 0.45
+    elif not spread_large:
+        # Wide spread (6-10 pts) — total becomes the key differentiator
+        if very_high_total:
+            stack_score = 0.50
+        elif high_total:
+            stack_score = 0.40
+        else:
+            stack_score = 0.30
     else:
-        # Blowouts or low-total neutral games - avoid stacking
-        stack_score = 0.25
+        # Blowouts (10+ pts) — only stack if extreme total drives pace
+        if very_high_total:
+            stack_score = 0.35
+        elif high_total:
+            stack_score = 0.25
+        else:
+            stack_score = 0.15
 
     return GameEnvironment(
         game_id=odds.game_id,
