@@ -24,7 +24,7 @@ BASE_URL = "https://api.the-odds-api.com/v4"
 SPORT = "basketball_nba"
 MARKET = "player_points"  # Legacy single market (for compatibility)
 BOOKMAKER = "fanduel"
-MAX_API_REQUESTS_PER_MONTH = 500
+MAX_API_REQUESTS_PER_MONTH = 20000
 BUDGET_WARNING_THRESHOLD = 0.80  # Warn at 80%
 BUDGET_BLOCK_THRESHOLD = 0.95   # Block at 95%
 FUZZY_MATCH_THRESHOLD = 85      # Minimum similarity score
@@ -177,6 +177,10 @@ def get_monthly_api_usage(conn: sqlite3.Connection) -> int:
     """
     Get total API requests used this month.
 
+    Prefers the actual remaining_requests value from the most recent API
+    response header (x-requests-remaining), which is the ground truth.
+    Falls back to summing local log entries if no API header data exists.
+
     Returns:
         Number of API requests used in current calendar month
     """
@@ -186,6 +190,22 @@ def get_monthly_api_usage(conn: sqlite3.Connection) -> int:
     today = datetime.now(ZoneInfo("America/New_York")).date()
     first_of_month = today.replace(day=1).strftime("%Y-%m-%d")
 
+    # Prefer actual API remaining count (ground truth from x-requests-remaining header)
+    cursor.execute("""
+        SELECT remaining_requests
+        FROM odds_fetch_log
+        WHERE fetch_date >= ?
+        AND remaining_requests IS NOT NULL
+        ORDER BY created_at DESC
+        LIMIT 1
+    """, (first_of_month,))
+
+    row = cursor.fetchone()
+    if row and row[0] is not None:
+        # API says X remaining out of 500 → usage = 500 - X
+        return max(0, MAX_API_REQUESTS_PER_MONTH - row[0])
+
+    # Fallback: sum local log entries
     cursor.execute("""
         SELECT COALESCE(SUM(api_requests_used), 0)
         FROM odds_fetch_log
@@ -217,13 +237,16 @@ def should_fetch_odds(conn: sqlite3.Connection, game_date: date) -> Tuple[bool, 
     if monthly_usage >= MAX_API_REQUESTS_PER_MONTH * BUDGET_BLOCK_THRESHOLD:
         return False, f"API budget nearly exhausted ({monthly_usage}/{MAX_API_REQUESTS_PER_MONTH})"
 
-    # Check if already fetched today for this game date
+    # Check if already successfully fetched today for this game date
+    # Only block if a previous fetch actually matched players (error_message IS NULL
+    # AND players_matched > 0). This allows retries after generating predictions.
     cursor = conn.cursor()
     cursor.execute("""
         SELECT COUNT(*) FROM odds_fetch_log
         WHERE game_date = ?
         AND fetch_date = ?
         AND error_message IS NULL
+        AND players_matched > 0
     """, (str(game_date), str(datetime.now(ZoneInfo("America/New_York")).date())))
 
     if cursor.fetchone()[0] > 0:
@@ -236,12 +259,13 @@ def should_fetch_odds(conn: sqlite3.Connection, game_date: date) -> Tuple[bool, 
     return True, "OK"
 
 
-def get_nba_events(api_key: str) -> Tuple[List[Dict], int]:
+def get_nba_events(api_key: str) -> Tuple[List[Dict], int, Optional[int]]:
     """
     Fetch list of upcoming NBA events from The Odds API.
 
     Returns:
-        (events_list, requests_used)
+        (events_list, requests_used, remaining_requests)
+        remaining_requests comes from the x-requests-remaining API header
     """
     url = f"{BASE_URL}/sports/{SPORT}/events"
     params = {"apiKey": api_key}
@@ -249,13 +273,19 @@ def get_nba_events(api_key: str) -> Tuple[List[Dict], int]:
     response = requests.get(url, params=params, timeout=30)
     response.raise_for_status()
 
-    # Get remaining requests from headers
-    remaining = int(response.headers.get("x-requests-remaining", 0))
+    # Get remaining requests from headers (actual API-side count)
+    remaining = None
+    raw = response.headers.get("x-requests-remaining")
+    if raw is not None:
+        try:
+            remaining = int(raw)
+        except (ValueError, TypeError):
+            pass
 
-    return response.json(), 1
+    return response.json(), 1, remaining
 
 
-def get_game_odds_bulk(api_key: str, game_date: date = None) -> Tuple[List[Dict], int]:
+def get_game_odds_bulk(api_key: str, game_date: date = None) -> Tuple[List[Dict], int, Optional[int]]:
     """
     Fetch game-level odds (spreads, totals) for NBA games.
 
@@ -264,7 +294,7 @@ def get_game_odds_bulk(api_key: str, game_date: date = None) -> Tuple[List[Dict]
     the commenceTimeFrom/To API params require a paid subscription tier.
 
     Returns:
-        (games_with_odds_list, requests_used)
+        (games_with_odds_list, requests_used, remaining_requests)
         Each game contains: home_team, away_team, commence_time, bookmakers with spreads/totals
     """
     url = f"{BASE_URL}/sports/{SPORT}/odds"
@@ -278,7 +308,16 @@ def get_game_odds_bulk(api_key: str, game_date: date = None) -> Tuple[List[Dict]
     response = requests.get(url, params=params, timeout=30)
     response.raise_for_status()
 
-    return response.json(), 1
+    # Get remaining requests from headers (actual API-side count)
+    remaining = None
+    raw = response.headers.get("x-requests-remaining")
+    if raw is not None:
+        try:
+            remaining = int(raw)
+        except (ValueError, TypeError):
+            pass
+
+    return response.json(), 1, remaining
 
 
 def extract_game_odds_from_response(games_data: List[Dict], target_date: str) -> List[Dict]:
@@ -903,8 +942,10 @@ def fetch_fanduel_lines_for_date(
 
     try:
         # Step 1: Get today's events
-        events, req_count = get_nba_events(api_key)
+        events, req_count, api_remaining = get_nba_events(api_key)
         total_requests += req_count
+        if api_remaining is not None:
+            remaining = api_remaining
 
         # Filter to events on the target date (convert UTC to Eastern time)
         game_date_str = game_date.strftime("%Y-%m-%d")
@@ -935,8 +976,10 @@ def fetch_fanduel_lines_for_date(
         # Step 1.5: ALSO fetch game-level odds (spreads/totals) for Tournament Strategy
         # This is a BULK endpoint - 1 request returns ALL games, very efficient!
         try:
-            games_data, req_count = get_game_odds_bulk(api_key, game_date=game_date)
+            games_data, req_count, api_remaining = get_game_odds_bulk(api_key, game_date=game_date)
             total_requests += req_count
+            if api_remaining is not None:
+                remaining = api_remaining
 
             # Diagnostic: log what the API returned
             odds_debug = {
@@ -1054,14 +1097,25 @@ def fetch_fanduel_lines_for_date(
         result["success"] = True
         result["api_requests_used"] = total_requests
 
-        # Log successful fetch
-        log_fetch_attempt(
-            conn, game_date,
-            result["events_fetched"],
-            result["players_matched"],
-            total_requests,
-            remaining
-        )
+        # Log fetch attempt — mark as error if 0 players matched so the
+        # once-per-day guard doesn't block a retry after generating predictions
+        if result["players_matched"] == 0:
+            log_fetch_attempt(
+                conn, game_date,
+                result["events_fetched"],
+                0,
+                total_requests,
+                remaining,
+                error_message="No players matched (predictions may not exist yet)"
+            )
+        else:
+            log_fetch_attempt(
+                conn, game_date,
+                result["events_fetched"],
+                result["players_matched"],
+                total_requests,
+                remaining
+            )
 
         # Auto-backup to S3 after successful fetch (prevents data loss on reboot)
         if result["players_matched"] > 0:

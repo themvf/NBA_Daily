@@ -6476,15 +6476,32 @@ if selected_page == "Admin Panel":
             else:
                 st.info("No fetch history yet. Click 'Fetch FanDuel Lines' on the Vegas Comparison tab.")
 
+        # Reset counter button (for when local tracking drifts from actual API usage)
+        if st.button("🔄 Reset API Usage Counter",
+                      help="Clear the local usage log. Use this if the counter is out of sync with your actual API usage at theoddsapi.com.",
+                      key="reset_api_counter"):
+            try:
+                today_eastern = datetime.now(EASTERN_TZ).date()
+                first_of_month = today_eastern.replace(day=1).strftime("%Y-%m-%d")
+                admin_conn.execute(
+                    "DELETE FROM odds_fetch_log WHERE fetch_date >= ?",
+                    (first_of_month,)
+                )
+                admin_conn.commit()
+                st.success("API usage counter reset. The counter will re-calibrate from the API on next fetch.")
+                st.rerun()
+            except Exception as reset_err:
+                st.error(f"Reset failed: {reset_err}")
+
         # Budget recommendations
         if usage_pct >= 80:
             st.warning(f"""
             ⚠️ **Budget Alert:** You've used {usage_pct:.0f}% of your monthly API budget.
 
             **Options:**
-            - Upgrade your [The Odds API](https://the-odds-api.com/) plan
+            - Check your actual usage at [The Odds API](https://the-odds-api.com/) — local counter may be inflated
+            - Click **Reset API Usage Counter** above if the local count doesn't match the API website
             - Wait until next month (resets on the 1st)
-            - Reduce fetch frequency
             """)
         elif usage_pct >= 50:
             st.info(f"💡 You've used {monthly_usage} requests. Budget resets on the 1st of next month.")
