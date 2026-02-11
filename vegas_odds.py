@@ -343,7 +343,7 @@ def compute_game_environment(odds: GameOdds) -> GameEnvironment:
     elif spread_moderate:
         # Moderate spreads still okay, total adds small boost
         stack_score = 0.60 if high_total else 0.50
-    elif very_high_total and not (spread >= 10):
+    elif very_high_total and not spread_large:
         # High total but not a blowout - moderate stack value
         stack_score = 0.45
     else:
