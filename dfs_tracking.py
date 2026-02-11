@@ -437,15 +437,24 @@ def import_contest_results(
         norm_name = _normalize(player_name)
 
         if norm_name in contest_by_norm:
-            _, own_pct, _ = contest_by_norm[norm_name]
+            _, own_pct, contest_fpts = contest_by_norm[norm_name]
+            # Update ownership; also fill actual_fpts/did_play from contest
+            # CSV when not already populated by update_slate_actuals()
             cursor.execute(
-                "UPDATE dfs_slate_projections SET actual_ownership = ? "
-                "WHERE slate_date = ? AND player_id = ?",
-                (own_pct, slate_date, player_id)
+                """UPDATE dfs_slate_projections
+                   SET actual_ownership = ?,
+                       actual_fpts = COALESCE(actual_fpts, ?),
+                       did_play = CASE WHEN did_play = 1 THEN 1
+                                       WHEN ? > 0 THEN 1 ELSE did_play END
+                   WHERE slate_date = ? AND player_id = ?""",
+                (own_pct, contest_fpts, contest_fpts, slate_date, player_id)
             )
             matched += 1
         else:
             unmatched_players.append(player_name)
+
+    # Recompute lineup actual totals now that actual_fpts may be populated
+    _update_lineup_actuals(conn, slate_date)
 
     conn.commit()
 
