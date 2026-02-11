@@ -1717,16 +1717,215 @@ def get_game_totals_for_slate(conn: sqlite3.Connection, slate_date: str) -> Dict
     """Get Vegas game totals for a slate date (for game environment analysis)."""
     try:
         totals = pd.read_sql_query("""
-            SELECT home_team, away_team, game_total
+            SELECT home_team, away_team, total
             FROM game_odds
-            WHERE game_date = ? AND game_total IS NOT NULL
+            WHERE game_date = ? AND total IS NOT NULL
         """, conn, params=[slate_date])
 
         result = {}
         for _, row in totals.iterrows():
             game_key = f"{row['away_team']}@{row['home_team']}"
-            result[row['home_team']] = row['game_total']
-            result[row['away_team']] = row['game_total']
+            result[row['home_team']] = row['total']
+            result[row['away_team']] = row['total']
         return result
     except Exception:
         return {}
+
+
+# DraftKings → NBA API abbreviation normalization
+DK_TO_NBA_ABBR = {
+    'PHO': 'PHX', 'GS': 'GSW', 'SA': 'SAS', 'NY': 'NYK', 'NO': 'NOP',
+}
+
+
+def _normalize_team_abbr(abbr: str) -> str:
+    """Convert DraftKings team abbreviation to NBA API format."""
+    return DK_TO_NBA_ABBR.get(abbr.upper(), abbr.upper()) if abbr else ''
+
+
+def analyze_game_environment(
+    conn: sqlite3.Connection,
+    slate_date: str,
+    top_lineups_analysis: Dict,
+    top_n: int = 10,
+) -> Dict:
+    """Analyze how game environment (Vegas totals, spreads) correlates with top lineup construction.
+
+    Compares Vegas projections to actual scores and measures whether top-finishing
+    lineups disproportionately target high-total games — a key GPP strategy signal
+    that feeds back into the stack_score algorithm.
+
+    Args:
+        conn: SQLite connection (must have game_odds and team_game_logs tables).
+        slate_date: Date string 'YYYY-MM-DD'.
+        top_lineups_analysis: Output from analyze_top_finishers().
+        top_n: Number of top lineups to analyze.
+
+    Returns:
+        Dict with keys: games, correlation_stats, insights, errors.
+    """
+    result = {
+        'games': [],
+        'correlation_stats': {},
+        'insights': [],
+        'errors': [],
+    }
+
+    try:
+        # --- 1. Get Vegas odds for all games on this slate ---
+        odds_df = pd.read_sql_query("""
+            SELECT home_team, away_team, total, spread, stack_score, pace_score, blowout_risk
+            FROM game_odds
+            WHERE game_date = ? AND total IS NOT NULL
+        """, conn, params=[slate_date])
+
+        if odds_df.empty:
+            result['errors'].append(f"No game odds found for {slate_date}")
+            return result
+
+        # --- 2. Get actual scores from team_game_logs ---
+        actual_scores = {}
+        try:
+            scores_df = pd.read_sql_query("""
+                SELECT team_abbreviation, pts, opp_pts, matchup
+                FROM team_game_logs
+                WHERE date(game_date) = ?
+            """, conn, params=[slate_date])
+
+            for _, row in scores_df.iterrows():
+                team = row['team_abbreviation']
+                actual_scores[team] = {
+                    'pts': row['pts'],
+                    'opp_pts': row['opp_pts'],
+                    'matchup': row['matchup'],
+                }
+        except Exception as e:
+            result['errors'].append(f"Could not fetch actual scores: {e}")
+
+        # --- 3. Count player slots per game from top lineups ---
+        game_player_counts = {}  # "AWAY@HOME" -> count
+        lineups = top_lineups_analysis.get('lineups', [])[:top_n]
+        total_slots = 0
+
+        for lineup in lineups:
+            for p in lineup.get('players', []):
+                team_raw = p.get('team', '')
+                team = _normalize_team_abbr(team_raw)
+                if team:
+                    # Find which game this team belongs to
+                    for _, odds_row in odds_df.iterrows():
+                        if team in (odds_row['home_team'], odds_row['away_team']):
+                            game_key = f"{odds_row['away_team']}@{odds_row['home_team']}"
+                            game_player_counts[game_key] = game_player_counts.get(game_key, 0) + 1
+                            break
+                total_slots += 1
+
+        # --- 4. Build per-game detail ---
+        all_games = []
+        for _, odds_row in odds_df.iterrows():
+            home = odds_row['home_team']
+            away = odds_row['away_team']
+            game_key = f"{away}@{home}"
+            game_label = f"{away} @ {home}"
+
+            # Actual totals from team_game_logs (home team perspective)
+            actual_total = None
+            actual_margin = None
+            home_scores = actual_scores.get(home)
+            if home_scores:
+                actual_total = home_scores['pts'] + home_scores['opp_pts']
+                actual_margin = home_scores['opp_pts'] - home_scores['pts']  # away - home (matches spread sign)
+
+            total_diff = None
+            if actual_total is not None and odds_row['total'] is not None:
+                total_diff = actual_total - odds_row['total']
+
+            players_in_top = game_player_counts.get(game_key, 0)
+            pct_of_slots = (players_in_top / total_slots * 100) if total_slots > 0 else 0.0
+
+            all_games.append({
+                'game_label': game_label,
+                'vegas_total': odds_row['total'],
+                'actual_total': actual_total,
+                'total_diff': total_diff,
+                'spread': odds_row['spread'],
+                'actual_margin': actual_margin,
+                'stack_score': odds_row.get('stack_score'),
+                'pace_score': odds_row.get('pace_score'),
+                'blowout_risk': odds_row.get('blowout_risk'),
+                'top_lineup_players': players_in_top,
+                'pct_of_slots': round(pct_of_slots, 1),
+            })
+
+        result['games'] = sorted(all_games, key=lambda g: g['vegas_total'] or 0, reverse=True)
+
+        # --- 5. Compute correlation stats ---
+        games_with_players = [g for g in all_games if g['top_lineup_players'] > 0]
+        all_totals = [g['vegas_total'] for g in all_games if g['vegas_total'] is not None]
+        avg_total_all = np.mean(all_totals) if all_totals else 0.0
+
+        if games_with_players:
+            weights = [g['top_lineup_players'] for g in games_with_players]
+            totals = [g['vegas_total'] for g in games_with_players]
+            avg_total_used = np.average(totals, weights=weights)
+        else:
+            avg_total_used = 0.0
+
+        total_bias = avg_total_used - avg_total_all
+
+        # Over/under hit rate
+        games_with_results = [g for g in all_games if g['total_diff'] is not None]
+        overs = [g for g in games_with_results if g['total_diff'] > 0]
+        over_hit_rate = (len(overs) / len(games_with_results) * 100) if games_with_results else 0.0
+
+        most_targeted = max(all_games, key=lambda g: g['top_lineup_players'])['game_label'] if all_games else 'N/A'
+
+        # Correlation: Vegas total vs player usage (filter out games with missing totals)
+        correlation = None
+        valid_games = [g for g in all_games if g['vegas_total'] is not None]
+        if len(valid_games) >= 3:
+            totals_arr = np.array([g['vegas_total'] for g in valid_games])
+            usage_arr = np.array([g['top_lineup_players'] for g in valid_games])
+            if np.std(totals_arr) > 0 and np.std(usage_arr) > 0:
+                correlation = float(np.corrcoef(totals_arr, usage_arr)[0, 1])
+
+        result['correlation_stats'] = {
+            'avg_total_used_games': round(avg_total_used, 1),
+            'avg_total_all_games': round(avg_total_all, 1),
+            'total_bias': round(total_bias, 1),
+            'most_targeted_game': most_targeted,
+            'over_hit_rate': round(over_hit_rate, 1),
+            'correlation': correlation,
+            'n_games': len(all_games),
+        }
+
+        # --- 6. Generate insights ---
+        insights = []
+        if total_bias > 0:
+            insights.append(f"Top lineups targeted games ~{total_bias:.1f} pts above slate average total")
+        elif total_bias < 0:
+            insights.append(f"Top lineups targeted games ~{abs(total_bias):.1f} pts below slate average total")
+
+        if over_hit_rate >= 60:
+            insights.append(f"{over_hit_rate:.0f}% of games went OVER the Vegas total")
+        elif over_hit_rate <= 40 and games_with_results:
+            insights.append(f"Only {over_hit_rate:.0f}% of games went OVER — a low-scoring slate")
+
+        if correlation is not None:
+            if correlation > 0.5:
+                insights.append(f"Strong positive correlation ({correlation:.2f}) between Vegas total and player usage")
+            elif correlation > 0.2:
+                insights.append(f"Moderate positive correlation ({correlation:.2f}) between Vegas total and player usage")
+            elif correlation < -0.2:
+                insights.append(f"Negative correlation ({correlation:.2f}) — top lineups avoided high-total games")
+
+        if most_targeted != 'N/A':
+            top_game = max(all_games, key=lambda g: g['top_lineup_players'])
+            insights.append(f"Most targeted game: {most_targeted} ({top_game['top_lineup_players']} player slots)")
+
+        result['insights'] = insights
+
+    except Exception as e:
+        result['errors'].append(f"Game environment analysis error: {e}")
+
+    return result

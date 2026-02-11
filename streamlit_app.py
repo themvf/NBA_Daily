@@ -14656,6 +14656,7 @@ if selected_page == "DFS Lineup Builder":
                 get_shark_player_exposure,
                 get_shark_strategy_profile,
                 analyze_top_finishers,
+                analyze_game_environment,
             )
             import plotly.express as px
 
@@ -15046,6 +15047,160 @@ if selected_page == "DFS Lineup Builder":
                                         stacks_str = ', '.join([f"{s['team']} x{s['count']}" for s in lineup['stacks']])
                                         st.caption(f"🔗 Stacks: {stacks_str}")
                                     st.markdown("---")
+
+                            # --- Game Environment Impact ---
+                            st.divider()
+                            st.subheader("🎯 Game Environment Impact")
+                            st.caption("How Vegas totals and spreads correlate with top lineup player selection")
+
+                            with st.spinner("Analyzing game environment..."):
+                                env_analysis = analyze_game_environment(dfs_conn, selected_slate, analysis, top_n)
+
+                            if env_analysis.get('errors'):
+                                for err in env_analysis['errors']:
+                                    st.warning(f"⚠️ {err}")
+
+                            if env_analysis.get('games'):
+                                # Metrics row
+                                corr_stats = env_analysis.get('correlation_stats', {})
+                                env_m1, env_m2, env_m3 = st.columns(3)
+                                avg_used = corr_stats.get('avg_total_used_games', 0)
+                                total_bias = corr_stats.get('total_bias', 0)
+                                env_m1.metric(
+                                    "Avg Total (Top Games)",
+                                    f"{avg_used:.1f}",
+                                    delta=f"{total_bias:+.1f} vs slate avg" if total_bias else None,
+                                )
+                                env_m2.metric("Over Hit Rate", f"{corr_stats.get('over_hit_rate', 0):.0f}%")
+                                env_m3.metric("Most Targeted", corr_stats.get('most_targeted_game', 'N/A'))
+
+                                # Per-game table
+                                game_rows = []
+                                for g in env_analysis['games']:
+                                    game_rows.append({
+                                        'Game': g['game_label'],
+                                        'Vegas O/U': f"{g['vegas_total']:.1f}" if g['vegas_total'] else "—",
+                                        'Actual Total': f"{g['actual_total']:.0f}" if g['actual_total'] is not None else "—",
+                                        'Over/Under': f"{g['total_diff']:+.1f}" if g['total_diff'] is not None else "—",
+                                        'Spread': f"{g['spread']:+.1f}" if g['spread'] is not None else "—",
+                                        'Actual Margin': f"{g['actual_margin']:+.0f}" if g['actual_margin'] is not None else "—",
+                                        'Stack Score': f"{g['stack_score']:.2f}" if g.get('stack_score') is not None else "—",
+                                        f'Players (Top {top_n})': g['top_lineup_players'],
+                                        '% of Slots': f"{g['pct_of_slots']:.1f}%",
+                                    })
+                                game_env_df = pd.DataFrame(game_rows)
+                                st.dataframe(game_env_df, use_container_width=True, hide_index=True)
+
+                                # Bar chart: player usage by game, colored by Vegas total
+                                chart_data = pd.DataFrame([{
+                                    'Game': g['game_label'],
+                                    'Players in Top Lineups': g['top_lineup_players'],
+                                    'Vegas Total': g['vegas_total'] or 0,
+                                } for g in env_analysis['games']])
+                                chart_data = chart_data.sort_values('Vegas Total', ascending=False)
+
+                                fig_env = px.bar(
+                                    chart_data,
+                                    x='Game', y='Players in Top Lineups',
+                                    color='Vegas Total',
+                                    color_continuous_scale='YlOrRd',
+                                    title=f'Player Slots in Top {top_n} Lineups by Game (ordered by Vegas Total)',
+                                    text='Players in Top Lineups',
+                                )
+                                fig_env.update_traces(textposition='outside')
+                                fig_env.update_layout(height=400, xaxis_tickangle=-45)
+                                st.plotly_chart(fig_env, use_container_width=True)
+
+                                # Insights
+                                if env_analysis.get('insights'):
+                                    st.markdown("**Key Findings:**")
+                                    for ins in env_analysis['insights']:
+                                        st.markdown(f"• {ins}")
+
+                    # --- Cross-Slate Aggregate ---
+                    if len(slate_dates) >= 2:
+                        with st.expander("📊 Cross-Slate Game Environment Aggregate"):
+                            all_env_games = []
+                            agg_errors = []
+                            for s_date in slate_dates:
+                                s_analysis = analyze_top_finishers(dfs_conn, s_date, top_n)
+                                if not s_analysis.get('errors'):
+                                    s_env = analyze_game_environment(dfs_conn, s_date, s_analysis, top_n)
+                                    all_env_games.extend(s_env.get('games', []))
+                                    agg_errors.extend(s_env.get('errors', []))
+
+                            if all_env_games:
+                                # Total bucket breakdown
+                                high_total = [g for g in all_env_games if g['vegas_total'] and g['vegas_total'] >= 230]
+                                med_total = [g for g in all_env_games if g['vegas_total'] and 225 <= g['vegas_total'] < 230]
+                                low_total = [g for g in all_env_games if g['vegas_total'] and g['vegas_total'] < 225]
+
+                                st.markdown("**Vegas Total Buckets**")
+                                bucket_df = pd.DataFrame([
+                                    {
+                                        'Bucket': 'High (230+)',
+                                        'Games': len(high_total),
+                                        'Avg Players in Top Lineups': f"{np.mean([g['top_lineup_players'] for g in high_total]):.1f}" if high_total else "—",
+                                    },
+                                    {
+                                        'Bucket': 'Medium (225-229)',
+                                        'Games': len(med_total),
+                                        'Avg Players in Top Lineups': f"{np.mean([g['top_lineup_players'] for g in med_total]):.1f}" if med_total else "—",
+                                    },
+                                    {
+                                        'Bucket': 'Low (<225)',
+                                        'Games': len(low_total),
+                                        'Avg Players in Top Lineups': f"{np.mean([g['top_lineup_players'] for g in low_total]):.1f}" if low_total else "—",
+                                    },
+                                ])
+                                st.dataframe(bucket_df, use_container_width=True, hide_index=True)
+
+                                # Spread bucket breakdown
+                                tight_spread = [g for g in all_env_games if g['spread'] is not None and abs(g['spread']) <= 3.5]
+                                mod_spread = [g for g in all_env_games if g['spread'] is not None and 3.5 < abs(g['spread']) <= 7]
+                                large_spread = [g for g in all_env_games if g['spread'] is not None and abs(g['spread']) > 7]
+
+                                st.markdown("**Spread Buckets**")
+                                spread_df = pd.DataFrame([
+                                    {
+                                        'Bucket': 'Tight (<=3.5)',
+                                        'Games': len(tight_spread),
+                                        'Avg Players in Top Lineups': f"{np.mean([g['top_lineup_players'] for g in tight_spread]):.1f}" if tight_spread else "—",
+                                    },
+                                    {
+                                        'Bucket': 'Moderate (3.5-7)',
+                                        'Games': len(mod_spread),
+                                        'Avg Players in Top Lineups': f"{np.mean([g['top_lineup_players'] for g in mod_spread]):.1f}" if mod_spread else "—",
+                                    },
+                                    {
+                                        'Bucket': 'Large (7+)',
+                                        'Games': len(large_spread),
+                                        'Avg Players in Top Lineups': f"{np.mean([g['top_lineup_players'] for g in large_spread]):.1f}" if large_spread else "—",
+                                    },
+                                ])
+                                st.dataframe(spread_df, use_container_width=True, hide_index=True)
+
+                                # Correlation coefficient
+                                agg_totals = np.array([g['vegas_total'] or 0 for g in all_env_games])
+                                agg_usage = np.array([g['top_lineup_players'] for g in all_env_games])
+                                if len(all_env_games) >= 3 and np.std(agg_totals) > 0 and np.std(agg_usage) > 0:
+                                    corr = float(np.corrcoef(agg_totals, agg_usage)[0, 1])
+                                    st.metric(
+                                        "Vegas Total vs Player Usage Correlation",
+                                        f"{corr:.3f}",
+                                        help=f"Pearson correlation across {len(all_env_games)} games from {len(slate_dates)} slates"
+                                    )
+                                    if corr > 0.3:
+                                        st.info(f"Positive correlation ({corr:.2f}) confirms top lineups favor high-total games across {len(slate_dates)} slates")
+                                    elif corr < -0.1:
+                                        st.info(f"Negative correlation ({corr:.2f}) — top lineups did NOT favor high-total games across these slates")
+
+                                if agg_errors:
+                                    for err in agg_errors:
+                                        st.caption(f"⚠️ {err}")
+                            else:
+                                st.info("No game environment data available across slates.")
+
                 else:
                     st.info("Import contest CSVs first to analyze top finishers.")
 
