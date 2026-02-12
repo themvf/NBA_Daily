@@ -268,9 +268,9 @@ def generate_predictions_for_date(
             result['summary']['avg_dfs_score'] = dfs_score_sum / player_count
 
         # Step 2.5: Fetch FanDuel odds AFTER predictions are created
-        # Uses force=True because Step 2's INSERT OR REPLACE clobbers any
-        # previously stored odds data, so we must always re-fetch regardless
-        # of what should_fetch_odds() reports from earlier fetches today.
+        # Uses force=True to ensure fresh odds data. Step 2 uses ON CONFLICT
+        # DO UPDATE which preserves existing fanduel_ou, but we still re-fetch
+        # to pick up any newly generated players or updated lines.
         if progress_callback:
             progress_callback(total_games, total_games, "Fetching FanDuel odds...")
 
@@ -279,7 +279,7 @@ def generate_predictions_for_date(
             odds_api.create_odds_tables(data['games_conn'])
             odds_api.upgrade_predictions_for_fanduel(data['games_conn'])
 
-            # Always force=True: INSERT OR REPLACE in Step 2 wiped any prior odds
+            # Always force=True: re-fetch to cover newly added players
             should_fetch, reason = odds_api.should_fetch_odds(data['games_conn'], game_date)
             if should_fetch or "Already fetched" in reason:
                 odds_result = odds_api.fetch_fanduel_lines_for_date(

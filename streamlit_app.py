@@ -3668,6 +3668,9 @@ if selected_page == "Matchup Spotlight":
                         'away_props_sum': 0.0,
                         'home_count': 0,
                         'away_count': 0,
+                        # Track all projections per side to compute top-8 rotation total
+                        'home_all_projections': [],
+                        'away_all_projections': [],
                     }
                     game_players[matchup_key] = {'home': [], 'away': []}
 
@@ -3681,6 +3684,7 @@ if selected_page == "Matchup Spotlight":
 
                 gt[f'{side}_projected_total'] += proj
                 gt[f'{side}_count'] += 1
+                gt[f'{side}_all_projections'].append(proj)
                 if fd_ou is not None:
                     gt[f'{side}_props_sum'] += fd_ou
 
@@ -3699,12 +3703,16 @@ if selected_page == "Matchup Spotlight":
                         reverse=True
                     )
 
-            # Compute bench gap for each game
+            # Compute bench gap and rotation totals for each game
+            ROTATION_SIZE = 8  # Top 8 players ≈ real NBA rotation
             for mk, gt in game_totals_by_game.items():
                 for side in ('home', 'away'):
                     implied = gt[f'{side}_implied']
                     props_sum = gt[f'{side}_props_sum']
                     gt[f'{side}_bench_gap'] = round(implied - props_sum, 1) if implied is not None else None
+                    # Model total uses top-8 rotation (not all 13) for realistic team scores
+                    all_proj = sorted(gt[f'{side}_all_projections'], reverse=True)
+                    gt[f'{side}_rotation_total'] = sum(all_proj[:ROTATION_SIZE]) if all_proj else 0.0
     except Exception as exc:
         st.error(f"❌ **Failed to load matchup spotlight:** {exc}")
         import traceback
@@ -3725,12 +3733,13 @@ if selected_page == "Matchup Spotlight":
 
         if game_totals_by_game:
             st.markdown("### Vegas Gap Analysis")
-            st.caption("Vegas implied scores vs. model projections vs. sum of player props — exposing bench points and edge opportunities")
+            st.caption("Vegas implied scores vs. model projections (top 8 rotation) vs. sum of player props — exposing bench points and edge opportunities")
 
             # Build overview table
             overview_rows = []
             for mk, gt in game_totals_by_game.items():
-                model_total = gt['away_projected_total'] + gt['home_projected_total']
+                # Use top-8 rotation total for realistic team score comparison
+                model_total = gt['away_rotation_total'] + gt['home_rotation_total']
                 # Count players with props in this game
                 home_with_props = sum(1 for p in game_players.get(mk, {}).get('home', []) if p['vegas_pts'] is not None)
                 away_with_props = sum(1 for p in game_players.get(mk, {}).get('away', []) if p['vegas_pts'] is not None)
@@ -3784,20 +3793,20 @@ if selected_page == "Matchup Spotlight":
                     for side, abbr in [('away', away_abbr), ('home', home_abbr)]:
                         team_label = f"{abbr} ({'home' if side == 'home' else 'away'})"
                         implied = gt[f'{side}_implied']
-                        model_proj = gt[f'{side}_projected_total']
+                        rotation_proj = gt.get(f'{side}_rotation_total', 0.0)
                         props_sum = gt[f'{side}_props_sum']
-                        bench_gap = gt[f'{side}_bench_gap']
+                        bench_gap = gt.get(f'{side}_bench_gap')
                         team_comp_rows.append({
                             "Team": team_label,
                             "Vegas Implied": round(implied, 1) if implied is not None else _nan,
-                            "Model Proj": round(model_proj, 1),
+                            "Model Proj (Top 8)": round(rotation_proj, 1) if rotation_proj else _nan,
                             "Props Sum": round(props_sum, 1),
                             "Bench Gap": bench_gap if bench_gap is not None else _nan,
                         })
                     team_comp_df = pd.DataFrame(team_comp_rows)
                     team_cfg = {
                         "Vegas Implied": st.column_config.NumberColumn(format="%.1f"),
-                        "Model Proj": st.column_config.NumberColumn(format="%.1f"),
+                        "Model Proj (Top 8)": st.column_config.NumberColumn(format="%.1f"),
                         "Props Sum": st.column_config.NumberColumn(format="%.1f"),
                         "Bench Gap": st.column_config.NumberColumn(format="%.1f"),
                     }
@@ -3822,12 +3831,12 @@ if selected_page == "Matchup Spotlight":
                                 # Add summary rows
                                 side_implied = gt[f'{side}_implied']
                                 side_props = gt[f'{side}_props_sum']
-                                side_model = gt[f'{side}_projected_total']
+                                side_rotation = gt[f'{side}_rotation_total']
                                 side_gap = gt[f'{side}_bench_gap']
                                 p_rows.append({
-                                    "Player": "-- Sum --",
+                                    "Player": "-- Sum (Top 8) --",
                                     "Vegas Pts": round(side_props, 1) if side_props else 0,
-                                    "Our Proj": round(side_model, 1),
+                                    "Our Proj": round(side_rotation, 1),
                                     "Diff": _nan,
                                 })
                                 if side_implied is not None:
