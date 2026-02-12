@@ -9,3 +9,5 @@ boto3>=1.28.0,<2
 rapidfuzz>=3.0.0
 requests>=2.31.0
 statsmodels>=0.14.0
+fastapi>=0.109
+uvicorn>=0.27
