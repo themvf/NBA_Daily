@@ -42,6 +42,10 @@ from enrichment_monitor import ensure_enrichment_columns
 import dfs_optimizer as dfs
 import odds_api
 import coefficient_calibrator as coeff_cal
+from vegas_odds import TEAM_NAME_TO_ABBR
+
+# Reverse mapping: abbreviation -> full team name
+ABBR_TO_TEAM_NAME = {v: k for k, v in TEAM_NAME_TO_ABBR.items()}
 
 DEFAULT_DB_PATH = Path(__file__).with_name("nba_stats.db")
 DEFAULT_PREDICTIONS_PATH = Path(__file__).with_name("predictions.csv")
@@ -3476,7 +3480,12 @@ if selected_page == "Matchup Spotlight":
                 dfs_grade,
                 opponent_def_rating,
                 opponent_pace,
-                game_date
+                game_date,
+                fanduel_ou,
+                fanduel_reb_ou,
+                fanduel_ast_ou,
+                fanduel_3pm_ou,
+                vegas_implied_fpts
             FROM predictions
             WHERE game_date = ?
             ORDER BY dfs_score DESC
@@ -3485,14 +3494,39 @@ if selected_page == "Matchup Spotlight":
         spotlight_conn = get_connection(str(db_path))
         spotlight_df_raw = run_query(str(db_path), spotlight_query, params=(spotlight_date_str,))
 
+        # Query game_odds for Vegas spreads/totals
+        spotlight_odds_lookup = {}  # frozenset({abbr, abbr}) -> {spread, total, stack_score, home_team, away_team}
+        try:
+            tbl = spotlight_conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='game_odds'"
+            ).fetchone()
+            if tbl:
+                cursor = spotlight_conn.execute("""
+                    SELECT home_team, away_team, spread, total, stack_score
+                    FROM game_odds WHERE date(game_date) = date(?)
+                """, [spotlight_date_str])
+                for row in cursor.fetchall():
+                    key = frozenset([row['home_team'], row['away_team']])
+                    spotlight_odds_lookup[key] = {
+                        'spread': row['spread'],
+                        'total': row['total'],
+                        'stack_score': row['stack_score'] if row['stack_score'] is not None else 0.5,
+                        'home_team': row['home_team'],
+                        'away_team': row['away_team'],
+                    }
+        except Exception:
+            pass
+
         if spotlight_df_raw.empty:
             st.info(f"📊 No predictions found for {spotlight_date_str}. Go to Today's Games tab and generate predictions first.")
         else:
             # Rebuild matchup_spotlight_rows from database
             matchup_spotlight_rows = []
             for _, row in spotlight_df_raw.iterrows():
+                fd_ou = row['fanduel_ou'] if pd.notna(row.get('fanduel_ou')) else None
+                vegas_fpts = row['vegas_implied_fpts'] if pd.notna(row.get('vegas_implied_fpts')) else None
                 matchup_spotlight_rows.append({
-                    "Matchup": f"{row['opponent_name']} at {row['team_name']}",  # Simplified
+                    "Matchup": f"{row['opponent_name']} at {row['team_name']}",
                     "Player": row['player_name'],
                     "Team": row['team_name'],
                     "Opponent": row['opponent_name'],
@@ -3500,6 +3534,8 @@ if selected_page == "Matchup Spotlight":
                     "Pick Grade": row['dfs_grade'],
                     "Season Avg PPG": row['season_avg_ppg'],
                     "Projected PPG": row['projected_ppg'],
+                    "Vegas Pts": fd_ou,
+                    "Vegas FPTS": vegas_fpts,
                     "Proj Floor": row['proj_floor'],
                     "Proj Ceiling": row['proj_ceiling'],
                     "Proj Confidence": row['proj_confidence'],
@@ -3507,89 +3543,238 @@ if selected_page == "Matchup Spotlight":
                     "Last3 Avg PPG": row['last3_avg_ppg'],
                     "Vs This Team": f"{row['vs_opponent_avg']:.1f} ({row['vs_opponent_games']}g)" if row['vs_opponent_avg'] else "N/A",
                     "Opp Def Rating": row['opponent_def_rating'],
-                    "Matchup Score": row['dfs_score'],  # Use DFS score as matchup score
-                    "Composite Score": row['dfs_score'],  # Use DFS score as composite
+                    "Matchup Score": row['dfs_score'],
+                    "Composite Score": row['dfs_score'],
                 })
 
-            # Calculate game totals from predictions
+            # Build game-level data with Vegas gap analysis
             game_totals_by_game = {}
+            game_players = {}  # matchup_key -> {home_players: [], away_players: []}
+
             for _, row in spotlight_df_raw.iterrows():
-                matchup_key = f"{row['opponent_name']} @ {row['team_name']}"
+                team_name = row['team_name']
+                opp_name = row['opponent_name']
+                team_abbr = TEAM_NAME_TO_ABBR.get(team_name, str(team_name)[:3].upper() if team_name else 'UNK')
+                opp_abbr = TEAM_NAME_TO_ABBR.get(opp_name, str(opp_name)[:3].upper() if opp_name else 'UNK')
+
+                # Use frozenset to look up odds (odds keyed by abbreviations)
+                odds_key = frozenset([team_abbr, opp_abbr])
+                odds = spotlight_odds_lookup.get(odds_key)
+
+                # Determine home/away: if odds exist use them, otherwise use prediction layout
+                if odds:
+                    home_abbr = odds['home_team']
+                    away_abbr = odds['away_team']
+                    home_name = ABBR_TO_TEAM_NAME.get(home_abbr, home_abbr)
+                    away_name = ABBR_TO_TEAM_NAME.get(away_abbr, away_abbr)
+                else:
+                    # Fallback: treat team_name as home (prediction layout)
+                    home_name = team_name
+                    away_name = opp_name
+                    home_abbr = team_abbr
+                    away_abbr = opp_abbr
+
+                matchup_key = f"{away_abbr} @ {home_abbr}"
 
                 if matchup_key not in game_totals_by_game:
+                    # Compute Vegas implied team scores
+                    if odds and odds['total'] and odds['spread'] is not None:
+                        total = float(odds['total'])
+                        spread = float(odds['spread'])  # negative = home favorite
+                        home_implied = (total / 2) - (spread / 2)
+                        away_implied = (total / 2) + (spread / 2)
+                    else:
+                        total = None
+                        spread = None
+                        home_implied = None
+                        away_implied = None
+
                     game_totals_by_game[matchup_key] = {
-                        'away_team': row['opponent_name'] if '@' in matchup_key else row['team_name'],
-                        'home_team': row['team_name'] if '@' in matchup_key else row['opponent_name'],
-                        'away_projected_total': 0.0,
+                        'home_team': home_name,
+                        'away_team': away_name,
+                        'home_abbr': home_abbr,
+                        'away_abbr': away_abbr,
+                        'spread': spread,
+                        'total': total,
+                        'stack_score': odds['stack_score'] if odds else None,
+                        'home_implied': home_implied,
+                        'away_implied': away_implied,
                         'home_projected_total': 0.0,
-                        'away_top_5_total': 0.0,
-                        'home_top_5_total': 0.0,
-                        'away_count': 0,
+                        'away_projected_total': 0.0,
+                        'home_props_sum': 0.0,
+                        'away_props_sum': 0.0,
                         'home_count': 0,
+                        'away_count': 0,
                     }
+                    game_players[matchup_key] = {'home': [], 'away': []}
 
-                # Aggregate by team
-                if row['team_name'] == game_totals_by_game[matchup_key]['home_team']:
-                    game_totals_by_game[matchup_key]['home_projected_total'] += row['projected_ppg'] or 0
-                    game_totals_by_game[matchup_key]['home_count'] += 1
-                else:
-                    game_totals_by_game[matchup_key]['away_projected_total'] += row['projected_ppg'] or 0
-                    game_totals_by_game[matchup_key]['away_count'] += 1
+                gt = game_totals_by_game[matchup_key]
+                proj = row['projected_ppg'] or 0
+                fd_ou = row['fanduel_ou'] if pd.notna(row.get('fanduel_ou')) else None
 
-            # Now continue with existing display logic
+                # Identify if player is home or away
+                is_home = (team_abbr == gt['home_abbr'])
+                side = 'home' if is_home else 'away'
+
+                gt[f'{side}_projected_total'] += proj
+                gt[f'{side}_count'] += 1
+                if fd_ou is not None:
+                    gt[f'{side}_props_sum'] += fd_ou
+
+                game_players[matchup_key][side].append({
+                    'player': row['player_name'],
+                    'vegas_pts': fd_ou,
+                    'our_proj': proj,
+                    'diff': round(proj - fd_ou, 1) if fd_ou is not None else None,
+                })
+
+            # Sort players within each side by fanduel_ou desc (no-prop at bottom)
+            for mk in game_players:
+                for side in ('home', 'away'):
+                    game_players[mk][side].sort(
+                        key=lambda p: (p['vegas_pts'] is not None, p['vegas_pts'] or 0),
+                        reverse=True
+                    )
+
+            # Compute bench gap for each game
+            for mk, gt in game_totals_by_game.items():
+                for side in ('home', 'away'):
+                    implied = gt[f'{side}_implied']
+                    props_sum = gt[f'{side}_props_sum']
+                    gt[f'{side}_bench_gap'] = round(implied - props_sum, 1) if implied is not None else None
     except Exception as exc:
         st.error(f"❌ **Failed to load matchup spotlight:** {exc}")
         import traceback
         st.code(traceback.format_exc())
         matchup_spotlight_rows = []
         game_totals_by_game = {}
+        game_players = {}
+        spotlight_odds_lookup = {}
 
     if matchup_spotlight_rows:
-        # NEW: Game Totals Summary Section
+        # Vegas Gap Analysis — Game Overview
+        has_odds = bool(spotlight_odds_lookup)
+        if not has_odds:
+            st.warning("Fetch odds via FanDuel Compare or DFS Builder to enable Vegas analysis.")
+
         if game_totals_by_game:
-            st.markdown("### 🏀 Projected Game Totals")
-            st.caption("Sum of all player projections for each team")
+            st.markdown("### Vegas Gap Analysis")
+            st.caption("Vegas implied scores vs. model projections vs. sum of player props — exposing bench points and edge opportunities")
 
-            totals_data = []
-            for game_id, totals in game_totals_by_game.items():
-                totals_data.append({
-                    "Matchup": f"{totals['away_team']} @ {totals['home_team']}",
-                    "Away Team": totals['away_team'],
-                    "Away Proj": f"{totals['away_projected_total']:.1f}",
-                    "Away Top 5": f"{totals['away_top_5_total']:.1f}",
-                    "Home Team": totals['home_team'],
-                    "Home Proj": f"{totals['home_projected_total']:.1f}",
-                    "Home Top 5": f"{totals['home_top_5_total']:.1f}",
-                    "Game Total": f"{totals['away_projected_total'] + totals['home_projected_total']:.1f}",
-                    "Top 5 Total": f"{totals['away_top_5_total'] + totals['home_top_5_total']:.1f}",
-                })
+            # Build overview table
+            overview_rows = []
+            for mk, gt in game_totals_by_game.items():
+                model_total = gt['away_projected_total'] + gt['home_projected_total']
+                row_data = {
+                    "Matchup": mk,
+                    "Spread": gt['spread'] if gt['spread'] is not None else None,
+                    "Total": gt['total'],
+                    "Stack": gt['stack_score'],
+                    "Model Total": round(model_total, 1),
+                }
+                if has_odds and gt['total'] is not None:
+                    row_data["Vegas Total"] = gt['total']
+                    row_data["Diff (Model-Vegas)"] = round(model_total - gt['total'], 1)
+                overview_rows.append(row_data)
 
-            totals_df = pd.DataFrame(totals_data)
+            overview_df = pd.DataFrame(overview_rows)
+            if not overview_df.empty:
+                col_cfg = {
+                    "Spread": st.column_config.NumberColumn(format="%.1f"),
+                    "Total": st.column_config.NumberColumn(format="%.1f"),
+                    "Stack": st.column_config.NumberColumn(format="%.2f"),
+                    "Model Total": st.column_config.NumberColumn(format="%.1f"),
+                }
+                if "Vegas Total" in overview_df.columns:
+                    col_cfg["Vegas Total"] = st.column_config.NumberColumn(format="%.1f")
+                    col_cfg["Diff (Model-Vegas)"] = st.column_config.NumberColumn(format="%.1f")
+                st.dataframe(overview_df, use_container_width=True, hide_index=True, column_config=col_cfg)
 
-            # Sort by game total descending
-            totals_df_sorted = totals_df.copy()
-            totals_df_sorted['_game_total_numeric'] = totals_df['Game Total'].astype(float)
-            totals_df_sorted = totals_df_sorted.sort_values('_game_total_numeric', ascending=False)
-            totals_df_sorted = totals_df_sorted.drop(columns=['_game_total_numeric'])
+            # Per-game team breakdown
+            for mk, gt in game_totals_by_game.items():
+                away_abbr = gt['away_abbr']
+                home_abbr = gt['home_abbr']
+                spread_str = f"{gt['spread']:+.1f}" if gt['spread'] is not None else "N/A"
+                total_str = f"{gt['total']:.1f}" if gt['total'] is not None else "N/A"
 
-            st.dataframe(totals_df_sorted, use_container_width=True, hide_index=True)
+                # Summary line for the expander header
+                header = f"{mk}   |   Spread: {spread_str}   Total: {total_str}"
 
-            # Summary metrics
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                avg_game_total = sum(t['away_projected_total'] + t['home_projected_total'] for t in game_totals_by_game.values()) / len(game_totals_by_game)
-                st.metric("Avg Game Total", f"{avg_game_total:.1f}")
-            with col2:
-                max_game = max(game_totals_by_game.values(), key=lambda x: x['away_projected_total'] + x['home_projected_total'])
-                max_total = max_game['away_projected_total'] + max_game['home_projected_total']
-                st.metric("Highest Projected", f"{max_total:.1f}", f"{max_game['away_team']} @ {max_game['home_team']}")
-            with col3:
-                min_game = min(game_totals_by_game.values(), key=lambda x: x['away_projected_total'] + x['home_projected_total'])
-                min_total = min_game['away_projected_total'] + min_game['home_projected_total']
-                st.metric("Lowest Projected", f"{min_total:.1f}", f"{min_game['away_team']} @ {min_game['home_team']}")
+                with st.expander(header, expanded=False):
+                    # Team-level comparison row
+                    team_comp_rows = []
+                    for side, abbr in [('away', away_abbr), ('home', home_abbr)]:
+                        team_label = f"{abbr} ({'home' if side == 'home' else 'away'})"
+                        implied = gt[f'{side}_implied']
+                        model_proj = gt[f'{side}_projected_total']
+                        props_sum = gt[f'{side}_props_sum']
+                        bench_gap = gt[f'{side}_bench_gap']
+                        team_comp_rows.append({
+                            "Team": team_label,
+                            "Vegas Implied": round(implied, 1) if implied is not None else None,
+                            "Model Proj": round(model_proj, 1),
+                            "Props Sum": round(props_sum, 1),
+                            "Bench Gap": bench_gap,
+                        })
+                    team_comp_df = pd.DataFrame(team_comp_rows)
+                    team_cfg = {
+                        "Vegas Implied": st.column_config.NumberColumn(format="%.1f"),
+                        "Model Proj": st.column_config.NumberColumn(format="%.1f"),
+                        "Props Sum": st.column_config.NumberColumn(format="%.1f"),
+                        "Bench Gap": st.column_config.NumberColumn(format="%.1f"),
+                    }
+                    st.dataframe(team_comp_df, use_container_width=True, hide_index=True, column_config=team_cfg)
+
+                    # Player-level breakdown (two columns: Away | Home)
+                    col_away, col_home = st.columns(2)
+                    for col_widget, side, abbr in [(col_away, 'away', away_abbr), (col_home, 'home', home_abbr)]:
+                        with col_widget:
+                            st.markdown(f"**{abbr}**")
+                            players = game_players.get(mk, {}).get(side, [])
+                            if players:
+                                p_rows = []
+                                for p in players:
+                                    p_rows.append({
+                                        "Player": p['player'],
+                                        "Vegas Pts": p['vegas_pts'],
+                                        "Our Proj": round(p['our_proj'], 1),
+                                        "Diff": p['diff'],
+                                    })
+                                # Add summary rows
+                                side_implied = gt[f'{side}_implied']
+                                side_props = gt[f'{side}_props_sum']
+                                side_model = gt[f'{side}_projected_total']
+                                side_gap = gt[f'{side}_bench_gap']
+                                p_rows.append({
+                                    "Player": "Sum",
+                                    "Vegas Pts": round(side_props, 1) if side_props else 0,
+                                    "Our Proj": round(side_model, 1),
+                                    "Diff": None,
+                                })
+                                if side_implied is not None:
+                                    p_rows.append({
+                                        "Player": "Vegas Implied",
+                                        "Vegas Pts": round(side_implied, 1),
+                                        "Our Proj": None,
+                                        "Diff": None,
+                                    })
+                                    p_rows.append({
+                                        "Player": "Bench Gap",
+                                        "Vegas Pts": side_gap,
+                                        "Our Proj": None,
+                                        "Diff": None,
+                                    })
+                                p_df = pd.DataFrame(p_rows)
+                                p_cfg = {
+                                    "Vegas Pts": st.column_config.NumberColumn(format="%.1f"),
+                                    "Our Proj": st.column_config.NumberColumn(format="%.1f"),
+                                    "Diff": st.column_config.NumberColumn(format="%+.1f"),
+                                }
+                                st.dataframe(p_df, use_container_width=True, hide_index=True, column_config=p_cfg)
+                            else:
+                                st.caption("No players")
 
             st.divider()
-        # END NEW SECTION
         spotlight_df = pd.DataFrame(matchup_spotlight_rows)
         sort_column = st.selectbox(
             "Sort by",
@@ -3597,6 +3782,8 @@ if selected_page == "Matchup Spotlight":
                 "Matchup Score",
                 "DFS Score",
                 "Projected PPG",
+                "Vegas Pts",
+                "Vegas FPTS",
                 "Season Avg PPG",
                 "Last5 Avg PPG",
                 "Composite Score",
@@ -3606,7 +3793,7 @@ if selected_page == "Matchup Spotlight":
         ascending = st.checkbox("Sort ascending (default descending)", value=False)
         top_n = st.slider("Rows to display", min_value=10, max_value=200, value=50, step=10)
         display_df = (
-            spotlight_df.sort_values(sort_column, ascending=ascending)
+            spotlight_df.sort_values(sort_column, ascending=ascending, na_position='last')
             .head(top_n)
             .reset_index(drop=True)
         )
@@ -3624,7 +3811,16 @@ if selected_page == "Matchup Spotlight":
             display_df["Opp Def Composite"] = display_df["Opp Def Composite"].map(
                 lambda v: format_number(v, 1)
             )
-        st.dataframe(display_df, use_container_width=True)
+        spotlight_col_cfg = {
+            "Vegas Pts": st.column_config.NumberColumn(format="%.1f"),
+            "Vegas FPTS": st.column_config.NumberColumn(format="%.1f"),
+            "Projected PPG": st.column_config.NumberColumn(format="%.1f"),
+            "DFS Score": st.column_config.NumberColumn(format="%.1f"),
+            "Season Avg PPG": st.column_config.NumberColumn(format="%.1f"),
+            "Last5 Avg PPG": st.column_config.NumberColumn(format="%.1f"),
+            "Last3 Avg PPG": st.column_config.NumberColumn(format="%.1f"),
+        }
+        st.dataframe(display_df, use_container_width=True, column_config=spotlight_col_cfg)
         st.subheader("Daily Power Rankings")
         col_points, col_3pm = st.columns(2)
 
@@ -8634,19 +8830,7 @@ if selected_page == "Tournament Strategy":
                                 proj_ppg = safe_get(row, 'projected_ppg', 20)
                                 sigma = (ceiling - floor) / 4 if ceiling > floor else proj_ppg * 0.15
 
-                                # Team name to abbreviation mapping
-                                TEAM_NAME_TO_ABBR = {
-                                    "Atlanta Hawks": "ATL", "Boston Celtics": "BOS", "Brooklyn Nets": "BKN",
-                                    "Charlotte Hornets": "CHA", "Chicago Bulls": "CHI", "Cleveland Cavaliers": "CLE",
-                                    "Dallas Mavericks": "DAL", "Denver Nuggets": "DEN", "Detroit Pistons": "DET",
-                                    "Golden State Warriors": "GSW", "Houston Rockets": "HOU", "Indiana Pacers": "IND",
-                                    "Los Angeles Clippers": "LAC", "Los Angeles Lakers": "LAL", "Memphis Grizzlies": "MEM",
-                                    "Miami Heat": "MIA", "Milwaukee Bucks": "MIL", "Minnesota Timberwolves": "MIN",
-                                    "New Orleans Pelicans": "NOP", "New York Knicks": "NYK", "Oklahoma City Thunder": "OKC",
-                                    "Orlando Magic": "ORL", "Philadelphia 76ers": "PHI", "Phoenix Suns": "PHX",
-                                    "Portland Trail Blazers": "POR", "Sacramento Kings": "SAC", "San Antonio Spurs": "SAS",
-                                    "Toronto Raptors": "TOR", "Utah Jazz": "UTA", "Washington Wizards": "WAS"
-                                }
+                                # Team name to abbreviation mapping (uses module-level import)
 
                                 # Determine game_id from matchup or team
                                 team_raw = safe_get(row, 'team_abbreviation', None)
