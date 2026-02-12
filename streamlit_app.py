@@ -13654,10 +13654,31 @@ if selected_page == "DFS Lineup Builder":
                             "Mini Stack (2)": "mini", "No Stack": "none"}
                 stack_config = {}
 
-                # Fetch Odds button
-                fetch_col, _ = st.columns([2, 3])
+                # Fetch Odds button — check if already fetched to avoid redundant API calls
+                try:
+                    _stack_fetch_date = datetime.strptime(proj_date_str, "%Y-%m-%d").date() if proj_date_str else datetime.now(EASTERN_TZ).date()
+                except (ValueError, TypeError):
+                    _stack_fetch_date = datetime.now(EASTERN_TZ).date()
+
+                _stack_should_fetch, _stack_reason = odds_api.should_fetch_odds(dfs_conn, _stack_fetch_date)
+                _stack_already_fetched = "Already fetched" in _stack_reason
+                _stack_force = False
+
+                fetch_col, status_col = st.columns([2, 3])
                 with fetch_col:
-                    fetch_odds_clicked = st.button("🔄 Fetch/Refresh Odds", key="stack_fetch_odds")
+                    if _stack_already_fetched:
+                        _stack_force = st.checkbox(
+                            "Force refetch", key="stack_force_refetch",
+                            help="Refetch after injury news. Uses additional API quota."
+                        )
+                    if _stack_should_fetch or _stack_force:
+                        _btn_label = "🔄 Refetch Odds" if _stack_force else "🔄 Fetch Odds"
+                        fetch_odds_clicked = st.button(_btn_label, key="stack_fetch_odds")
+                    else:
+                        fetch_odds_clicked = False
+                with status_col:
+                    if _stack_already_fetched and not _stack_force:
+                        st.caption(f"✅ {_stack_reason}")
 
                 # Show fetch result from previous click (stored before rerun)
                 if 'stack_fetch_result' in st.session_state:
@@ -13673,13 +13694,10 @@ if selected_page == "DFS Lineup Builder":
                             st.json(debug_info)
 
                 if fetch_odds_clicked:
-                    try:
-                        fetch_date = datetime.strptime(proj_date_str, "%Y-%m-%d").date() if proj_date_str else datetime.now(EASTERN_TZ).date()
-                    except (ValueError, TypeError):
-                        fetch_date = datetime.now(EASTERN_TZ).date()
+                    fetch_date = _stack_fetch_date
                     with st.spinner(f"Fetching odds for {fetch_date} from The Odds API..."):
                         try:
-                            result = odds_api.fetch_fanduel_lines_for_date(dfs_conn, fetch_date, force=True)
+                            result = odds_api.fetch_fanduel_lines_for_date(dfs_conn, fetch_date, force=_stack_force)
                             # Store debug info for display
                             if result.get('odds_debug'):
                                 st.session_state.stack_fetch_debug = result['odds_debug']
