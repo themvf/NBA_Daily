@@ -870,14 +870,18 @@ def log_prediction(conn: sqlite3.Connection, pred: Prediction) -> int:
     """
     Log a prediction to the database.
 
+    Uses INSERT ... ON CONFLICT DO UPDATE so that re-running predictions
+    updates only the projection columns while preserving Vegas odds data
+    (fanduel_ou, vegas_implied_fpts, etc.) that was written separately.
+
     Returns:
         prediction_id of the inserted/updated record
     """
     cursor = conn.cursor()
 
-    # Use INSERT OR REPLACE to handle re-runs on same day
+    # ON CONFLICT updates only prediction columns, preserving Vegas/FanDuel data
     cursor.execute("""
-        INSERT OR REPLACE INTO predictions (
+        INSERT INTO predictions (
             prediction_date, game_date, player_id, player_name,
             team_id, team_name, opponent_id, opponent_name,
             projected_ppg, proj_confidence, proj_floor, proj_ceiling,
@@ -890,6 +894,34 @@ def log_prediction(conn: sqlite3.Connection, pred: Prediction) -> int:
             opponent_injury_impact_score,
             created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(player_id, game_date) DO UPDATE SET
+            prediction_date = excluded.prediction_date,
+            player_name = excluded.player_name,
+            team_id = excluded.team_id,
+            team_name = excluded.team_name,
+            opponent_id = excluded.opponent_id,
+            opponent_name = excluded.opponent_name,
+            projected_ppg = excluded.projected_ppg,
+            proj_confidence = excluded.proj_confidence,
+            proj_floor = excluded.proj_floor,
+            proj_ceiling = excluded.proj_ceiling,
+            season_avg_ppg = excluded.season_avg_ppg,
+            recent_avg_3 = excluded.recent_avg_3,
+            recent_avg_5 = excluded.recent_avg_5,
+            vs_opponent_avg = excluded.vs_opponent_avg,
+            vs_opponent_games = excluded.vs_opponent_games,
+            analytics_used = excluded.analytics_used,
+            opponent_def_rating = excluded.opponent_def_rating,
+            opponent_pace = excluded.opponent_pace,
+            dfs_score = excluded.dfs_score,
+            dfs_grade = excluded.dfs_grade,
+            opponent_injury_detected = excluded.opponent_injury_detected,
+            opponent_injury_boost_projection = excluded.opponent_injury_boost_projection,
+            opponent_injury_boost_ceiling = excluded.opponent_injury_boost_ceiling,
+            opponent_injured_player_ids = excluded.opponent_injured_player_ids,
+            opponent_injury_impact_score = excluded.opponent_injury_impact_score,
+            last_refreshed_at = CURRENT_TIMESTAMP,
+            refresh_count = COALESCE(predictions.refresh_count, 0) + 1
     """, (
         pred.prediction_date, pred.game_date, pred.player_id, pred.player_name,
         pred.team_id, pred.team_name, pred.opponent_id, pred.opponent_name,
