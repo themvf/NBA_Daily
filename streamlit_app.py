@@ -3453,13 +3453,39 @@ if selected_page == "Matchup Spotlight":
 
     # Load predictions directly from database (self-contained)
     try:
-        # Get selected date
-        spotlight_date = st.date_input(
-            "Select Date",
-            value=default_game_date(),
-            key="spotlight_date_input"
-        )
+        # Get selected date + fetch button
+        spot_col_date, spot_col_fetch = st.columns([2, 1])
+        with spot_col_date:
+            spotlight_date = st.date_input(
+                "Select Date",
+                value=default_game_date(),
+                key="spotlight_date_input"
+            )
         spotlight_date_str = spotlight_date.strftime('%Y-%m-%d')
+
+        # Fetch FanDuel odds button
+        spotlight_conn = get_connection(str(db_path))
+        with spot_col_fetch:
+            st.markdown("<br>", unsafe_allow_html=True)  # Align with date input
+            if st.button("Fetch FanDuel Odds", key="spotlight_fetch_odds"):
+                with st.spinner("Fetching odds from The Odds API..."):
+                    try:
+                        fetch_dt = datetime.strptime(spotlight_date_str, "%Y-%m-%d").date()
+                        result = odds_api.fetch_fanduel_lines_for_date(
+                            spotlight_conn, fetch_dt, force=True
+                        )
+                        if result.get('success'):
+                            matched = result.get('players_matched', 0)
+                            game_stored = result.get('game_odds_stored', 0)
+                            st.success(
+                                f"Fetched lines for {matched} players, "
+                                f"{game_stored} games"
+                            )
+                            st.rerun()
+                        else:
+                            st.error(f"Fetch failed: {result.get('error', 'Unknown')}")
+                    except Exception as fetch_err:
+                        st.error(f"Fetch error: {fetch_err}")
 
         # Query predictions for this date
         spotlight_query = """
@@ -3491,7 +3517,6 @@ if selected_page == "Matchup Spotlight":
             ORDER BY dfs_score DESC
         """
 
-        spotlight_conn = get_connection(str(db_path))
         # Bypass run_query cache — Vegas odds may have been written since last cache fill
         spotlight_df_raw = pd.read_sql_query(spotlight_query, spotlight_conn, params=(spotlight_date_str,))
 
@@ -3655,8 +3680,11 @@ if selected_page == "Matchup Spotlight":
     if matchup_spotlight_rows:
         # Vegas Gap Analysis — Game Overview
         has_odds = bool(spotlight_odds_lookup)
-        if not has_odds:
-            st.warning("Fetch odds via FanDuel Compare or DFS Builder to enable Vegas analysis.")
+        has_player_props = any(r.get('Vegas Pts') is not None for r in matchup_spotlight_rows)
+        if not has_odds and not has_player_props:
+            st.warning("Click **Fetch FanDuel Odds** above to load Vegas spreads, totals, and player props.")
+        elif has_odds and not has_player_props:
+            st.info(f"Game odds loaded ({len(spotlight_odds_lookup)} games) but no player props found. Try clicking **Fetch FanDuel Odds** to refresh.")
 
         if game_totals_by_game:
             st.markdown("### Vegas Gap Analysis")
