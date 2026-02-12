@@ -3731,11 +3731,17 @@ if selected_page == "Matchup Spotlight":
             overview_rows = []
             for mk, gt in game_totals_by_game.items():
                 model_total = gt['away_projected_total'] + gt['home_projected_total']
+                # Count players with props in this game
+                home_with_props = sum(1 for p in game_players.get(mk, {}).get('home', []) if p['vegas_pts'] is not None)
+                away_with_props = sum(1 for p in game_players.get(mk, {}).get('away', []) if p['vegas_pts'] is not None)
+                props_count = home_with_props + away_with_props
+                total_players = gt['home_count'] + gt['away_count']
                 row_data = {
                     "Matchup": mk,
                     "Spread": gt['spread'] if gt['spread'] is not None else None,
                     "Total": gt['total'],
                     "Stack": gt['stack_score'],
+                    "Props": f"{props_count}/{total_players}",
                     "Model Total": round(model_total, 1),
                 }
                 if has_odds and gt['total'] is not None:
@@ -3763,11 +3769,17 @@ if selected_page == "Matchup Spotlight":
                 spread_str = f"{gt['spread']:+.1f}" if gt['spread'] is not None else "N/A"
                 total_str = f"{gt['total']:.1f}" if gt['total'] is not None else "N/A"
 
+                # Count props for header
+                h_props = sum(1 for p in game_players.get(mk, {}).get('home', []) if p['vegas_pts'] is not None)
+                a_props = sum(1 for p in game_players.get(mk, {}).get('away', []) if p['vegas_pts'] is not None)
+                props_tag = f"   Props: {a_props + h_props}" if (a_props + h_props) > 0 else "   No Props"
+
                 # Summary line for the expander header
-                header = f"{mk}   |   Spread: {spread_str}   Total: {total_str}"
+                header = f"{mk}   |   Spread: {spread_str}   Total: {total_str}{props_tag}"
 
                 with st.expander(header, expanded=False):
                     # Team-level comparison row
+                    _nan = float('nan')
                     team_comp_rows = []
                     for side, abbr in [('away', away_abbr), ('home', home_abbr)]:
                         team_label = f"{abbr} ({'home' if side == 'home' else 'away'})"
@@ -3777,10 +3789,10 @@ if selected_page == "Matchup Spotlight":
                         bench_gap = gt[f'{side}_bench_gap']
                         team_comp_rows.append({
                             "Team": team_label,
-                            "Vegas Implied": round(implied, 1) if implied is not None else None,
+                            "Vegas Implied": round(implied, 1) if implied is not None else _nan,
                             "Model Proj": round(model_proj, 1),
                             "Props Sum": round(props_sum, 1),
-                            "Bench Gap": bench_gap,
+                            "Bench Gap": bench_gap if bench_gap is not None else _nan,
                         })
                     team_comp_df = pd.DataFrame(team_comp_rows)
                     team_cfg = {
@@ -3798,13 +3810,14 @@ if selected_page == "Matchup Spotlight":
                             st.markdown(f"**{abbr}**")
                             players = game_players.get(mk, {}).get(side, [])
                             if players:
+                                _nan = float('nan')
                                 p_rows = []
                                 for p in players:
                                     p_rows.append({
                                         "Player": p['player'],
-                                        "Vegas Pts": p['vegas_pts'],
+                                        "Vegas Pts": p['vegas_pts'] if p['vegas_pts'] is not None else _nan,
                                         "Our Proj": round(p['our_proj'], 1),
-                                        "Diff": p['diff'],
+                                        "Diff": p['diff'] if p['diff'] is not None else _nan,
                                     })
                                 # Add summary rows
                                 side_implied = gt[f'{side}_implied']
@@ -3812,23 +3825,23 @@ if selected_page == "Matchup Spotlight":
                                 side_model = gt[f'{side}_projected_total']
                                 side_gap = gt[f'{side}_bench_gap']
                                 p_rows.append({
-                                    "Player": "Sum",
+                                    "Player": "-- Sum --",
                                     "Vegas Pts": round(side_props, 1) if side_props else 0,
                                     "Our Proj": round(side_model, 1),
-                                    "Diff": None,
+                                    "Diff": _nan,
                                 })
                                 if side_implied is not None:
                                     p_rows.append({
-                                        "Player": "Vegas Implied",
+                                        "Player": "-- Vegas Implied --",
                                         "Vegas Pts": round(side_implied, 1),
-                                        "Our Proj": None,
-                                        "Diff": None,
+                                        "Our Proj": _nan,
+                                        "Diff": _nan,
                                     })
                                     p_rows.append({
-                                        "Player": "Bench Gap",
-                                        "Vegas Pts": side_gap,
-                                        "Our Proj": None,
-                                        "Diff": None,
+                                        "Player": "-- Bench Gap --",
+                                        "Vegas Pts": side_gap if side_gap is not None else _nan,
+                                        "Our Proj": _nan,
+                                        "Diff": _nan,
                                     })
                                 p_df = pd.DataFrame(p_rows)
                                 p_cfg = {
