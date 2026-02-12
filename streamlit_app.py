@@ -13413,31 +13413,53 @@ if selected_page == "DFS Lineup Builder":
                     'Team': p.team,
                     'Opp': p.opponent,
                     'Pos': '/'.join(p.positions),
-                    'Salary': f"${p.salary:,}",
+                    'Salary': p.salary,
                 }
                 if is_blended and vegas_sigs:
-                    row['Model'] = f"{model_fpts:.1f}"
-                    row['Vegas FPTS'] = f"{v_fpts:.1f}" if v_fpts is not None else "—"
-                    row['Blended'] = f"{p.proj_fpts:.1f}"
-                    row['Edge'] = f"{v_edge:+.1f}%" if v_edge is not None else "—"
+                    row['Model'] = round(model_fpts, 1)
+                    row['Vegas FPTS'] = round(v_fpts, 1) if v_fpts is not None else None
+                    row['Blended'] = round(p.proj_fpts, 1)
+                    row['Edge'] = round(v_edge, 1) if v_edge is not None else None
                 elif vegas_sigs:
-                    row['Proj FPTS'] = f"{p.proj_fpts:.1f}"
-                    row['Vegas FPTS'] = f"{v_fpts:.1f}" if v_fpts is not None else "—"
-                    row['Edge'] = f"{v_edge:+.1f}%" if v_edge is not None else "—"
+                    row['Proj FPTS'] = round(p.proj_fpts, 1)
+                    row['Vegas FPTS'] = round(v_fpts, 1) if v_fpts is not None else None
+                    row['Edge'] = round(v_edge, 1) if v_edge is not None else None
                 else:
-                    row['Proj FPTS'] = f"{p.proj_fpts:.1f}"
+                    row['Proj FPTS'] = round(p.proj_fpts, 1)
                 row.update({
-                    'Floor': f"{p.proj_floor:.1f}",
-                    'Ceiling': f"{p.proj_ceiling:.1f}",
-                    'Value': f"{p.fpts_per_dollar:.2f}",
+                    'Floor': round(p.proj_floor, 1),
+                    'Ceiling': round(p.proj_ceiling, 1),
+                    'Value': round(p.fpts_per_dollar, 2),
                     'Rest': rest_indicator,
-                    'Own%': f"{p.ownership_proj:.1f}%",
+                    'Own%': round(p.ownership_proj, 1),
                     '📊': analytics,
                 })
                 player_data.append(row)
 
             df = pd.DataFrame(player_data)
-            st.dataframe(df, use_container_width=True, hide_index=True)
+
+            # Use column_config for display formatting while keeping raw
+            # numeric values so interactive column sorting works correctly.
+            col_config = {
+                'Salary': st.column_config.NumberColumn(format="$%d"),
+                'Floor': st.column_config.NumberColumn(format="%.1f"),
+                'Ceiling': st.column_config.NumberColumn(format="%.1f"),
+                'Value': st.column_config.NumberColumn(format="%.2f"),
+                'Own%': st.column_config.NumberColumn(format="%.1f%%"),
+            }
+            # Add formatting for conditional columns
+            if 'Proj FPTS' in df.columns:
+                col_config['Proj FPTS'] = st.column_config.NumberColumn(format="%.1f")
+            if 'Model' in df.columns:
+                col_config['Model'] = st.column_config.NumberColumn(format="%.1f")
+            if 'Blended' in df.columns:
+                col_config['Blended'] = st.column_config.NumberColumn(format="%.1f")
+            if 'Vegas FPTS' in df.columns:
+                col_config['Vegas FPTS'] = st.column_config.NumberColumn(format="%.1f")
+            if 'Edge' in df.columns:
+                col_config['Edge'] = st.column_config.NumberColumn(format="%+.1f%%")
+
+            st.dataframe(df, use_container_width=True, hide_index=True, column_config=col_config)
 
             # Show count of injured players (use getattr for backwards compatibility)
             injured_count = len([p for p in filtered if getattr(p, 'is_injured', False)])
