@@ -3474,18 +3474,55 @@ if selected_page == "Matchup Spotlight":
                         result = odds_api.fetch_fanduel_lines_for_date(
                             spotlight_conn, fetch_dt, force=True
                         )
+                        # Store result in session state so it survives the rerun
+                        st.session_state['spotlight_fetch_result'] = result
                         if result.get('success'):
-                            matched = result.get('players_matched', 0)
-                            game_stored = result.get('game_odds_stored', 0)
-                            st.success(
-                                f"Fetched lines for {matched} players, "
-                                f"{game_stored} games"
-                            )
                             st.rerun()
                         else:
                             st.error(f"Fetch failed: {result.get('error', 'Unknown')}")
                     except Exception as fetch_err:
                         st.error(f"Fetch error: {fetch_err}")
+
+        # Show fetch result from previous click (persists across rerun)
+        if 'spotlight_fetch_result' in st.session_state:
+            fr = st.session_state.pop('spotlight_fetch_result')
+            matched = fr.get('players_matched', 0)
+            game_stored = fr.get('game_odds_stored', 0)
+            events = fr.get('events_fetched', 0)
+            api_used = fr.get('api_requests_used', 0)
+            ext_stats = fr.get('extended_stats_found', 0)
+            if fr.get('success'):
+                st.success(
+                    f"Fetched {events} events, {game_stored} game odds, "
+                    f"{matched} player props ({ext_stats} with extended stats), "
+                    f"{api_used} API requests used"
+                )
+            if matched == 0 and fr.get('success'):
+                st.warning(
+                    "0 player props matched. This means the FanDuel API returned player "
+                    "names that could not be matched to predictions, OR the UPDATE failed "
+                    "due to a player_id/game_date mismatch."
+                )
+            # Show debug info if available
+            if fr.get('odds_debug'):
+                with st.expander("Fetch Diagnostics", expanded=matched == 0):
+                    st.json(fr['odds_debug'])
+
+        # Quick data status indicator
+        try:
+            ou_check = spotlight_conn.execute(
+                "SELECT COUNT(*) as total, SUM(CASE WHEN fanduel_ou IS NOT NULL THEN 1 ELSE 0 END) as with_ou "
+                "FROM predictions WHERE game_date = ?", [spotlight_date_str]
+            ).fetchone()
+            if ou_check:
+                total_preds = ou_check['total'] or 0
+                with_ou = ou_check['with_ou'] or 0
+                if total_preds > 0 and with_ou == 0:
+                    st.caption(f"{total_preds} predictions, 0 with FanDuel props -- click Fetch FanDuel Odds")
+                elif total_preds > 0:
+                    st.caption(f"{total_preds} predictions, {with_ou} with FanDuel props")
+        except Exception:
+            pass
 
         # Query predictions for this date
         spotlight_query = """
