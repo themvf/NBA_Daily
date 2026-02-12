@@ -138,7 +138,7 @@ def generate_predictions_for_date(
     This function:
     1. Loads all required data (games, leaders, defense stats, etc.)
     2. Fetches current injury data
-    3. Iterates through games → teams → top 5 players
+    3. Iterates through games → teams → top 13 players
     4. Calculates projections and saves to database
     5. Reports progress via callback
 
@@ -525,12 +525,13 @@ def _generate_predictions_for_game(
     st_app: Any
 ) -> Tuple[int, int, List[Dict[str, float]]]:
     """
-    Generate predictions for a single game (both teams, top 8 players each).
+    Generate predictions for a single game (both teams, top 13 players each).
 
-    IMPORTANT: We increased from top 5 to top 8 because:
+    IMPORTANT: We increased from top 8 to top 13 because:
+    - Matches DraftKings full rotation depth (10-13 players per team)
+    - Vegas Gap Analysis needs all rotation players to compute accurate bench gaps
     - A 6th man or bench player can absolutely be a top-3 scorer on a slate
     - Winner-take-all tournaments need broader coverage
-    - Only predicting top 5 means we "miss" by construction
 
     Args:
         matchup: Game row from games_df
@@ -561,9 +562,9 @@ def _generate_predictions_for_game(
     away_id = int(away_id)
     home_id = int(home_id)
 
-    # INCREASED: top 8 players per team (was 5)
-    # This ensures we don't miss potential top-3 scorers
-    PLAYERS_PER_TEAM = 8
+    # INCREASED: top 13 players per team (was 8, originally 5)
+    # Matches DraftKings rotation depth for accurate Vegas gap analysis
+    PLAYERS_PER_TEAM = 13
 
     # Pre-compute team categorizations ONCE per game (not per player!)
     # This avoids expensive repeated DB queries
