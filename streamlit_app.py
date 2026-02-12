@@ -3492,7 +3492,8 @@ if selected_page == "Matchup Spotlight":
         """
 
         spotlight_conn = get_connection(str(db_path))
-        spotlight_df_raw = run_query(str(db_path), spotlight_query, params=(spotlight_date_str,))
+        # Bypass run_query cache — Vegas odds may have been written since last cache fill
+        spotlight_df_raw = pd.read_sql_query(spotlight_query, spotlight_conn, params=(spotlight_date_str,))
 
         # Query game_odds for Vegas spreads/totals
         spotlight_odds_lookup = {}  # frozenset({abbr, abbr}) -> {spread, total, stack_score, home_team, away_team}
