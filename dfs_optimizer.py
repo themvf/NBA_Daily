@@ -964,8 +964,13 @@ def _estimate_ownership(player, has_injury_boost: bool = False) -> float:
     return round(ownership, 1)
 
 
-def _get_historical_ownership(conn: sqlite3.Connection, player_id: int, lookback_days: int = 21) -> Optional[float]:
-    """Get average ownership from past slates for a player.
+def _get_historical_ownership(conn: sqlite3.Connection, player_id: int,
+                              today_num_games: int = None, lookback_days: int = 21) -> Optional[float]:
+    """Get average ownership from past slates for a player, normalized by slate size.
+
+    When today_num_games is provided, each historical ownership value is adjusted
+    for the difference in slate size using: adjusted = own * (slate_games / today_games) ^ 0.4
+    This accounts for ownership concentrating on smaller slates and spreading on larger ones.
 
     Prefers actual_ownership (from parsed contest results) when available.
     Falls back to ownership_proj from prior projections.
@@ -976,30 +981,60 @@ def _get_historical_ownership(conn: sqlite3.Connection, player_id: int, lookback
     """
     try:
         # First try actual ownership from contest results (most accurate)
-        row = conn.execute("""
-            SELECT AVG(actual_ownership) as avg_actual, COUNT(*) as n
-            FROM dfs_slate_projections
-            WHERE player_id = ?
-              AND slate_date >= date('now', ? || ' days')
-              AND actual_ownership IS NOT NULL
-              AND actual_ownership > 0
-        """, (player_id, f"-{lookback_days}")).fetchone()
+        rows = conn.execute("""
+            WITH slate_sizes AS (
+                SELECT slate_date, COUNT(DISTINCT team) / 2.0 as slate_games
+                FROM dfs_slate_projections
+                WHERE slate_date >= date('now', ? || ' days')
+                GROUP BY slate_date
+            )
+            SELECT p.actual_ownership, s.slate_games
+            FROM dfs_slate_projections p
+            JOIN slate_sizes s ON s.slate_date = p.slate_date
+            WHERE p.player_id = ?
+              AND p.slate_date >= date('now', ? || ' days')
+              AND p.actual_ownership IS NOT NULL
+              AND p.actual_ownership > 0
+        """, (f"-{lookback_days}", player_id, f"-{lookback_days}")).fetchall()
 
-        if row and row[1] >= 1 and row[0] is not None:
-            return round(row[0], 1)
+        if rows:
+            if today_num_games and today_num_games > 0:
+                adjusted = [
+                    own * (sg / today_num_games) ** 0.4 if sg and sg > 0 else own
+                    for own, sg in rows
+                ]
+                if adjusted:
+                    return round(sum(adjusted) / len(adjusted), 1)
+            else:
+                return round(sum(own for own, _ in rows) / len(rows), 1)
 
         # Fall back to projected ownership from prior slates (less accurate but better than model)
-        row = conn.execute("""
-            SELECT AVG(ownership_proj) as avg_proj, COUNT(*) as n
-            FROM dfs_slate_projections
-            WHERE player_id = ?
-              AND slate_date >= date('now', ? || ' days')
-              AND ownership_proj IS NOT NULL
-              AND ownership_proj > 0
-        """, (player_id, f"-{lookback_days}")).fetchone()
+        rows = conn.execute("""
+            WITH slate_sizes AS (
+                SELECT slate_date, COUNT(DISTINCT team) / 2.0 as slate_games
+                FROM dfs_slate_projections
+                WHERE slate_date >= date('now', ? || ' days')
+                GROUP BY slate_date
+            )
+            SELECT p.ownership_proj, s.slate_games
+            FROM dfs_slate_projections p
+            JOIN slate_sizes s ON s.slate_date = p.slate_date
+            WHERE p.player_id = ?
+              AND p.slate_date >= date('now', ? || ' days')
+              AND p.ownership_proj IS NOT NULL
+              AND p.ownership_proj > 0
+        """, (f"-{lookback_days}", player_id, f"-{lookback_days}")).fetchall()
 
-        if row and row[1] >= 1 and row[0] is not None:
-            return round(row[0], 1)
+        if rows:
+            if today_num_games and today_num_games > 0:
+                adjusted = [
+                    own * (sg / today_num_games) ** 0.4 if sg and sg > 0 else own
+                    for own, sg in rows
+                ]
+                if adjusted:
+                    return round(sum(adjusted) / len(adjusted), 1)
+            else:
+                return round(sum(own for own, _ in rows) / len(rows), 1)
 
     except Exception as e:
         import logging
@@ -1107,7 +1142,8 @@ def _generate_simple_projections(
     conn: sqlite3.Connection,
     player: DFSPlayer,
     logs: pd.DataFrame,
-    season: str = "2025-26"
+    season: str = "2025-26",
+    num_games: int = None
 ) -> DFSPlayer:
     """
     Simple projection model (fallback when sophisticated modules unavailable).
@@ -1190,7 +1226,7 @@ def _generate_simple_projections(
     player.calculate_projections()
 
     if player.salary > 0:
-        hist_own = _get_historical_ownership(conn, player.player_id)
+        hist_own = _get_historical_ownership(conn, player.player_id, today_num_games=num_games)
         if hist_own is not None:
             player.ownership_proj = hist_own
         else:
@@ -1213,6 +1249,7 @@ def generate_player_projections(
     league_avg_ppm: float = 0.462,
     injury_status_map: Dict = None,
     teammate_injury_map: Dict = None,
+    num_games: int = None,
 ) -> DFSPlayer:
     """
     Generate projections for a player using sophisticated prediction model.
@@ -1254,7 +1291,7 @@ def generate_player_projections(
             player.proj_points = dk_avg * 0.45   # ~45% of FPTS from points
             player.proj_rebounds = dk_avg * 0.10
             player.proj_assists = dk_avg * 0.08
-            hist_own = _get_historical_ownership(conn, player.player_id)
+            hist_own = _get_historical_ownership(conn, player.player_id, today_num_games=num_games)
             player.ownership_proj = hist_own if hist_own is not None else 5.0
         return player
 
@@ -1312,7 +1349,7 @@ def generate_player_projections(
 
     # If sophisticated prediction modules unavailable, use simple model
     if not SOPHISTICATED_PREDICTIONS or defense_map is None:
-        return _generate_simple_projections(conn, player, logs, season)
+        return _generate_simple_projections(conn, player, logs, season, num_games=num_games)
 
     # =========================================================================
     # SOPHISTICATED PROJECTION MODEL
@@ -1574,7 +1611,7 @@ def generate_player_projections(
         player.fpts_per_dollar = (player.proj_fpts / player.salary) * 1000
 
     # Ownership: use historical average from past slates, fall back to model estimate
-    hist_own = _get_historical_ownership(conn, player.player_id)
+    hist_own = _get_historical_ownership(conn, player.player_id, today_num_games=num_games)
     if hist_own is not None:
         player.ownership_proj = hist_own
     else:

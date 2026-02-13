@@ -13436,6 +13436,7 @@ if selected_page == "DFS Lineup Builder":
                                 league_avg_ppm=league_avg_ppm,
                                 injury_status_map=injury_status_map,
                                 teammate_injury_map=teammate_injury_map,
+                                num_games=metadata.get('unique_games'),
                             )
                             projected_players.append(player)
 
