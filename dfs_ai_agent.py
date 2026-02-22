@@ -453,16 +453,35 @@ def run_projection_review(
 
     client = OpenAI(api_key=api_key)
     try:
-        completion = client.chat.completions.create(
-            model=model,
-            temperature=0.15,
-            max_tokens=1600,
-            response_format={"type": "json_object"},
-            messages=[
+        request_kwargs = {
+            "model": model,
+            "temperature": 0.15,
+            "response_format": {"type": "json_object"},
+            "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": json.dumps(user_payload, separators=(",", ":"))},
             ],
-        )
+        }
+        try:
+            # gpt-5 family expects max_completion_tokens.
+            completion = client.chat.completions.create(
+                **request_kwargs,
+                max_completion_tokens=1600,
+            )
+        except Exception as exc:
+            msg = str(exc).lower()
+            if (
+                "max_completion_tokens" in msg
+                and ("unsupported" in msg or "unknown parameter" in msg)
+            ):
+                # Backward-compatibility fallback for older model behavior.
+                completion = client.chat.completions.create(
+                    **request_kwargs,
+                    max_tokens=1600,
+                )
+            else:
+                raise
+
         content = completion.choices[0].message.content or "{}"
         parsed = _safe_json_loads(content)
     except Exception as exc:
