@@ -455,13 +455,15 @@ def run_projection_review(
     try:
         request_kwargs = {
             "model": model,
-            "temperature": 0.15,
             "response_format": {"type": "json_object"},
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": json.dumps(user_payload, separators=(",", ":"))},
             ],
         }
+        # gpt-5 currently supports only default temperature behavior.
+        if not str(model).lower().startswith("gpt-5"):
+            request_kwargs["temperature"] = 0.15
         try:
             # gpt-5 family expects max_completion_tokens.
             completion = client.chat.completions.create(
