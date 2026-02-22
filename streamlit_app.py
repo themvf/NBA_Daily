@@ -6,6 +6,7 @@ Version: 2025-11-26 (CSV Export Feature)
 from __future__ import annotations
 
 import os
+import json
 import sqlite3
 import tempfile
 from datetime import date, datetime, timezone, timedelta
@@ -141,15 +142,15 @@ def generate_predictions_ui(pred_date: date, db_path: Path, builder_config: Dict
                     for err in sim_errors:
                         st.warning(err)
 
-            # Trigger S3 backup if configured
+            # Trigger cloud backup if configured
             try:
                 storage = s3_storage.S3PredictionStorage()
                 if storage.is_connected():
                     backup_success, backup_message = storage.upload_database(db_path)
                     if backup_success:
-                        st.sidebar.info("☁️ Backed up to S3")
+                        st.sidebar.info(f"☁️ {backup_message}")
             except Exception:
-                pass  # Silent fail for S3
+                pass  # Silent fail for cloud backup
 
         if result['predictions_failed'] > 0:
             st.sidebar.warning(f"⚠️ {result['predictions_failed']} predictions failed")
@@ -476,23 +477,23 @@ def persist_uploaded_file(file, suffix: str) -> Path:
 
 
 def _s3_backup_db(db_path: Path, toast: bool = True) -> None:
-    """Best-effort S3 database backup after key DFS operations."""
+    """Best-effort cloud database backup after key DFS operations."""
     try:
         from s3_storage import S3PredictionStorage
         s3 = S3PredictionStorage()
         if s3.is_connected():
             success, msg = s3.upload_database(db_path)
             if success and toast:
-                st.toast("☁️ Database backed up to S3")
+                st.toast(f"☁️ {msg}")
     except Exception:
         pass
 
 
 def _s3_upload_slate_file(local_path: Path, slate_date: str,
                           filename: str, toast_msg: str = None) -> None:
-    """Best-effort upload of a DFS slate artifact to S3."""
+    """Best-effort upload of a DFS slate artifact to configured cloud storage."""
     try:
-        # Validate inputs to prevent malformed S3 keys
+        # Validate inputs to prevent malformed object keys.
         if not slate_date or '/' in slate_date or '..' in slate_date:
             return
         if not filename or '/' in filename or '..' in filename:
@@ -13333,11 +13334,11 @@ if selected_page == "DFS Lineup Builder":
                 try:
                     players, metadata = dfs.parse_dk_csv(csv_path, dfs_conn)
 
-                    # Save raw DK CSV to S3 (preserves salary/player data)
+                    # Save raw DK CSV to cloud storage (preserves salary/player data).
                     _s3_upload_slate_file(
                         csv_path, str(datetime.now(EASTERN_TZ).date()),
                         "dk_salaries.csv",
-                        f"☁️ DK CSV saved to S3 for {datetime.now(EASTERN_TZ).date()}"
+                        f"☁️ DK CSV saved to cloud storage for {datetime.now(EASTERN_TZ).date()}"
                     )
 
                     st.success(f"✅ Loaded {metadata['matched_players']} players from {metadata['unique_games']} games")
@@ -13563,7 +13564,7 @@ if selected_page == "DFS Lineup Builder":
                             st.info(f"📊 Rest analysis: **{b2b_count}** players on B2B (-8%), **{rested_count}** well-rested (+5%)")
                         st.info("Switch to the **Player Pool** tab to review and adjust projections.")
 
-                        # Save projections to S3 (latest overrides earlier for same day)
+                        # Save projections to cloud storage (latest overrides earlier for same day).
                         try:
                             slate_date = str(projection_date) if projection_date else str(datetime.now(EASTERN_TZ).date())
                             proj_rows = []
@@ -13591,7 +13592,7 @@ if selected_page == "DFS Lineup Builder":
                                 _s3_upload_slate_file(
                                     tmp_path, slate_date,
                                     "projections.csv",
-                                    f"☁️ Projections saved to S3 for {slate_date}"
+                                    f"☁️ Projections saved to cloud storage for {slate_date}"
                                 )
                                 try:
                                     tmp_path.unlink()
@@ -13600,7 +13601,7 @@ if selected_page == "DFS Lineup Builder":
                             # Also backup DB (projections are now in tracking tables too)
                             _s3_backup_db(db_path, toast=False)
                         except Exception:
-                            pass  # Best-effort S3 save
+                            pass  # Best-effort cloud save
 
                 except Exception as e:
                     st.error(f"❌ Error parsing CSV: {str(e)}")
@@ -13998,6 +13999,29 @@ if selected_page == "DFS Lineup Builder":
                         )
                     st.session_state.dfs_ai_review = review_result
                     st.session_state.dfs_ai_last_model = selected_ai_model
+
+                    # Persist AI review artifact to cloud storage by slate date.
+                    try:
+                        with tempfile.NamedTemporaryFile(
+                            mode="w",
+                            suffix=".json",
+                            delete=False,
+                            encoding="utf-8",
+                        ) as tmp:
+                            json.dump(review_result, tmp, indent=2, default=str)
+                            tmp_path = Path(tmp.name)
+                        _s3_upload_slate_file(
+                            tmp_path,
+                            projection_date_for_ai,
+                            "ai_review.json",
+                        )
+                        try:
+                            tmp_path.unlink()
+                        except OSError:
+                            pass
+                    except Exception:
+                        pass
+
                     if review_result.get("status") == "ok":
                         rec_count = len(review_result.get("recommendations", []))
                         st.success(f"AI review complete: {rec_count} recommendation(s).")
@@ -14042,6 +14066,37 @@ if selected_page == "DFS Lineup Builder":
                     st.session_state.dfs_ai_adjustments = ai_adjustments
                     if target_updates > 0:
                         st.session_state.dfs_exposure_targets = merged_targets
+
+                    # Persist applied AI adjustments artifact to cloud storage.
+                    try:
+                        projection_date_for_ai = (
+                            st.session_state.get('dfs_projection_date') or str(datetime.now(EASTERN_TZ).date())
+                        )
+                        payload = {
+                            "applied_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                            "model": (st.session_state.get("dfs_ai_review") or {}).get("model"),
+                            "adjustments": ai_adjustments,
+                            "exposure_targets": st.session_state.get("dfs_exposure_targets", {}),
+                        }
+                        with tempfile.NamedTemporaryFile(
+                            mode="w",
+                            suffix=".json",
+                            delete=False,
+                            encoding="utf-8",
+                        ) as tmp:
+                            json.dump(payload, tmp, indent=2, default=str)
+                            tmp_path = Path(tmp.name)
+                        _s3_upload_slate_file(
+                            tmp_path,
+                            projection_date_for_ai,
+                            "ai_adjustments.json",
+                        )
+                        try:
+                            tmp_path.unlink()
+                        except OSError:
+                            pass
+                    except Exception:
+                        pass
 
                     st.success(
                         f"Applied AI adjustments to {len(ai_adjustments)} players."
@@ -15300,29 +15355,33 @@ if selected_page == "DFS Lineup Builder":
                 else:
                     st.info("No slate results computed yet. Click 'Update Actuals' to compute accuracy metrics.")
 
-            # --- S3 Slate Archive ---
+            # --- Cloud Slate Archive ---
             st.divider()
-            with st.expander("☁️ S3 Slate Archive"):
+            with st.expander("☁️ Cloud Slate Archive"):
                 try:
                     from s3_storage import S3PredictionStorage
-                    s3_arch = S3PredictionStorage()
-                    if s3_arch.is_connected():
-                        slate_files = s3_arch.list_files("dfs_slates/")
+                    cloud_arch = S3PredictionStorage()
+                    if cloud_arch.is_connected():
+                        backend_label = cloud_arch.get_backend()
+                        slate_files = cloud_arch.list_files("dfs_slates/")
                         if slate_files:
-                            s3_dates = sorted(set(
+                            slate_dates = sorted(set(
                                 key.split('/')[1] for key in slate_files
                                 if len(key.split('/')) >= 3
                             ), reverse=True)
-                            st.write(f"**{len(s3_dates)} slate(s) archived in S3:**")
-                            for d in s3_dates:
+                            st.write(f"**{len(slate_dates)} slate(s) archived in {backend_label}:**")
+                            for d in slate_dates:
                                 files = [k.split('/')[-1] for k in slate_files if f"/{d}/" in k]
                                 st.write(f"• **{d}**: {', '.join(files)}")
                         else:
-                            st.info("No slates archived in S3 yet. Upload a DK CSV and generate projections to start archiving.")
+                            st.info(
+                                f"No slates archived in {backend_label} yet. "
+                                "Upload a DK CSV and generate projections to start archiving."
+                            )
                     else:
-                        st.info("S3 not configured. Slate data is stored locally only.")
+                        st.info("Cloud storage not configured. Slate data is stored locally only.")
                 except Exception:
-                    st.info("Could not connect to S3.")
+                    st.info("Could not connect to cloud storage.")
 
         except Exception as e:
             st.error(f"❌ Error loading model accuracy: {e}")

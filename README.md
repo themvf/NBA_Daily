@@ -209,3 +209,27 @@ API_KEY = "YOUR_OPENAI_API_KEY"
 ```
 
 You can also set `OPENAI_API_KEY` as an environment variable for local runs.
+
+## Cloud Persistence (GCS)
+
+The app now supports Google Cloud Storage as the primary cloud backend for
+persistence (with S3 fallback only when GCS is not configured).
+
+Add this to Streamlit Cloud secrets:
+
+```toml
+[gcs]
+bucket_name = "YOUR_GCS_BUCKET"
+project = "YOUR_GCP_PROJECT_ID"
+service_account_json = """{ ... full service account json ... }"""
+```
+
+When `[gcs]` is present, the DFS app writes to GCS:
+
+- `predictions/nba_stats.db` (database backup)
+- `dfs_slates/<date>/dk_salaries.csv`
+- `dfs_slates/<date>/projections.csv`
+- `dfs_slates/<date>/ai_review.json`
+- `dfs_slates/<date>/ai_adjustments.json`
+
+See `STREAMLIT_CLOUD_SETUP.md` for full setup steps.
