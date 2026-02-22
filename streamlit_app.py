@@ -14060,6 +14060,41 @@ if selected_page == "DFS Lineup Builder":
                         st.error(review.get("error", "AI review failed."))
                     else:
                         st.markdown(f"**Summary:** {review.get('summary', 'No summary provided.')}")
+                        review_notes = review.get("review_notes", {}) or {}
+                        review_snapshot = review.get("review_snapshot", {}) or {}
+
+                        if review_snapshot:
+                            own_buckets = review_snapshot.get("ownership_buckets", {}) or {}
+                            reviewed_data_lines = [
+                                f"Players reviewed: {review_snapshot.get('players_reviewed', 0)}",
+                                f"Salary range reviewed: ${review_snapshot.get('salary_min', 0)} to ${review_snapshot.get('salary_max', 0)}",
+                                f"Average projection / ownership: {review_snapshot.get('avg_proj_fpts', 0):.1f} FPTS / {review_snapshot.get('avg_ownership_proj', 0):.1f}%",
+                                (
+                                    "Ownership buckets (low/mid/high): "
+                                    f"{own_buckets.get('low_under_10', 0)}/"
+                                    f"{own_buckets.get('mid_10_to_25', 0)}/"
+                                    f"{own_buckets.get('high_25_plus', 0)}"
+                                ),
+                                f"Positive Vegas edges (>=+5%): {review_snapshot.get('positive_vegas_edges_5_plus', 0)}",
+                                f"Rising-form players: {review_snapshot.get('rising_form_players', 0)}",
+                            ]
+                            st.markdown("**What The Agent Reviewed:**")
+                            st.text("\n".join(reviewed_data_lines))
+
+                        if review_notes:
+                            what_reviewed = review_notes.get("what_was_reviewed", []) or []
+                            decision_logic = review_notes.get("decision_logic", []) or []
+                            no_rec_reason = str(review_notes.get("no_recommendation_reason", "")).strip()
+
+                            if what_reviewed:
+                                st.markdown("**Review Scope Notes:**")
+                                for line in what_reviewed:
+                                    st.caption(f"- {line}")
+
+                            if decision_logic:
+                                st.markdown("**Why It Made Recommendations:**")
+                                for line in decision_logic:
+                                    st.caption(f"- {line}")
 
                         recommendations = review.get("recommendations", []) or []
                         boost_like = sum(
@@ -14101,6 +14136,17 @@ if selected_page == "DFS Lineup Builder":
                                     "Target Own%": st.column_config.NumberColumn(format="%.1f%%"),
                                 },
                             )
+                        elif review_notes and str(review_notes.get("no_recommendation_reason", "")).strip():
+                            st.info(f"No recommendations reason: {review_notes.get('no_recommendation_reason')}")
+
+                        if recommendations:
+                            st.markdown("**Recommendation Rationale (Text):**")
+                            for rec in recommendations[:12]:
+                                player_name = rec.get("name", "")
+                                action = str(rec.get("action", "")).upper()
+                                delta = float(rec.get("projection_delta_fpts", 0.0) or 0.0)
+                                why = str(rec.get("rationale", "")).strip()
+                                st.caption(f"- {player_name} [{action}, {delta:+.2f} FPTS]: {why}")
 
                         lineup_notes = review.get("lineup_strategy", []) or []
                         if lineup_notes:

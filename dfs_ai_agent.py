@@ -280,6 +280,89 @@ def build_player_context(
     return context_rows
 
 
+def _build_review_snapshot(context_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Build a compact, deterministic summary of what the agent reviewed."""
+    if not context_rows:
+        return {}
+
+    df = pd.DataFrame(context_rows)
+    if df.empty:
+        return {}
+
+    def _num(col: str) -> pd.Series:
+        return pd.to_numeric(df.get(col), errors="coerce").fillna(0.0)
+
+    proj = _num("proj_fpts")
+    own = _num("ownership_proj")
+    salary = _num("salary")
+    trend = _num("fpts_trend_3v10")
+    mins = _num("recent_avg_minutes_10")
+    vegas_edge = pd.to_numeric(df.get("vegas_edge_pct"), errors="coerce")
+
+    low_own = int((own < 10).sum())
+    mid_own = int(((own >= 10) & (own < 25)).sum())
+    high_own = int((own >= 25).sum())
+    vegas_edge_count = int((vegas_edge >= 5).fillna(False).sum())
+    rising_form_count = int((trend >= 2).sum())
+    minutes_risk_count = int((mins < 20).sum())
+
+    return {
+        "players_reviewed": int(len(df)),
+        "avg_proj_fpts": round(float(proj.mean()), 2),
+        "avg_ownership_proj": round(float(own.mean()), 2),
+        "salary_min": int(salary.min()) if len(salary) else 0,
+        "salary_max": int(salary.max()) if len(salary) else 0,
+        "ownership_buckets": {
+            "low_under_10": low_own,
+            "mid_10_to_25": mid_own,
+            "high_25_plus": high_own,
+        },
+        "positive_vegas_edges_5_plus": vegas_edge_count,
+        "rising_form_players": rising_form_count,
+        "minutes_risk_players_under_20": minutes_risk_count,
+    }
+
+
+def _default_review_notes(
+    review_snapshot: Mapping[str, Any],
+    recommendations: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Fallback notes when the model does not return rich narrative fields."""
+    total = int(review_snapshot.get("players_reviewed", 0) or 0)
+    avg_proj = float(review_snapshot.get("avg_proj_fpts", 0.0) or 0.0)
+    avg_own = float(review_snapshot.get("avg_ownership_proj", 0.0) or 0.0)
+    own_buckets = review_snapshot.get("ownership_buckets", {}) or {}
+    low_own = int(own_buckets.get("low_under_10", 0) or 0)
+    vegas_edges = int(review_snapshot.get("positive_vegas_edges_5_plus", 0) or 0)
+    rising = int(review_snapshot.get("rising_form_players", 0) or 0)
+    mins_risk = int(review_snapshot.get("minutes_risk_players_under_20", 0) or 0)
+
+    notes = {
+        "what_was_reviewed": [
+            f"Evaluated {total} candidate players from the current slate pool.",
+            f"Compared projected FPTS and ownership (avg {avg_proj:.1f} FPTS, {avg_own:.1f}% ownership).",
+            f"Segmented ownership buckets including {low_own} low-owned players under 10%.",
+            "Used recent form context (last-10 and trend from last-3 vs last-10 games).",
+            "Included historical ownership bias and optional Vegas edge signals where available.",
+        ],
+        "decision_logic": [
+            "Boost/Core candidates prioritize upside, improving recent form, and manageable ownership.",
+            "Fade candidates prioritize fragile projections, negative trend, or weak leverage vs ownership.",
+            f"Current slate context: {vegas_edges} players with >=+5% Vegas edge and {rising} rising-form players.",
+            f"Minutes risk was considered for {mins_risk} players averaging under 20 recent minutes.",
+        ],
+        "no_recommendation_reason": "",
+    }
+
+    if not recommendations:
+        notes["no_recommendation_reason"] = (
+            "No players crossed the action thresholds after balancing projection edge, ownership leverage, "
+            "recent form trend, and minutes/role risk."
+        )
+
+    return notes
+
+
 def _strip_code_fences(text: str) -> str:
     cleaned = text.strip()
     if cleaned.startswith("```"):
@@ -374,6 +457,41 @@ def _coerce_recommendations(
     return list(deduped.values())
 
 
+def _coerce_review_notes(
+    raw_notes: Any,
+    review_snapshot: Mapping[str, Any],
+    recommendations: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    fallback = _default_review_notes(review_snapshot, recommendations)
+    if not isinstance(raw_notes, dict):
+        return fallback
+
+    what_raw = raw_notes.get("what_was_reviewed", [])
+    logic_raw = raw_notes.get("decision_logic", [])
+
+    if not isinstance(what_raw, list):
+        what_raw = []
+    if not isinstance(logic_raw, list):
+        logic_raw = []
+
+    what = [str(x).strip()[:220] for x in what_raw if str(x).strip()][:8]
+    logic = [str(x).strip()[:220] for x in logic_raw if str(x).strip()][:8]
+    no_reason = str(raw_notes.get("no_recommendation_reason", "")).strip()[:400]
+
+    if not what:
+        what = fallback["what_was_reviewed"]
+    if not logic:
+        logic = fallback["decision_logic"]
+    if not recommendations and not no_reason:
+        no_reason = fallback["no_recommendation_reason"]
+
+    return {
+        "what_was_reviewed": what,
+        "decision_logic": logic,
+        "no_recommendation_reason": no_reason,
+    }
+
+
 def run_projection_review(
     conn: sqlite3.Connection,
     players: Iterable[Any],
@@ -392,6 +510,8 @@ def run_projection_review(
         - status: "ok" | "error"
         - summary: short model summary
         - lineup_strategy: list[str]
+        - review_notes: narrative explanation of what was reviewed and why
+        - review_snapshot: deterministic aggregate input context
         - recommendations: list[dict]
         - model: model name used
         - candidate_count: number of players sent to model
@@ -423,6 +543,7 @@ def run_projection_review(
         lookback_days=lookback_days,
         max_players=max_players,
     )
+    review_snapshot = _build_review_snapshot(context_rows)
     if len(context_rows) < 10:
         return {
             "status": "error",
@@ -440,7 +561,9 @@ def run_projection_review(
     user_payload = {
         "slate_date": projection_date,
         "task": (
-            "Return JSON with keys: summary, lineup_strategy, recommendations. "
+            "Return JSON with keys: summary, lineup_strategy, review_notes, recommendations. "
+            "review_notes must include: what_was_reviewed (3-8 bullets), "
+            "decision_logic (3-8 bullets), no_recommendation_reason (string, required if recommendations is empty). "
             "recommendations must be an array with 6-16 entries. "
             "Each entry: player_id (int), name (string), action (core|boost|watch|fade), "
             "confidence (0-1), projection_delta_fpts (-6 to 6), "
@@ -448,6 +571,7 @@ def run_projection_review(
             "For fades use non-positive deltas. For core/boost use positive deltas. "
             "Prioritize low-owned upside where supported by data."
         ),
+        "review_snapshot": review_snapshot,
         "players": context_rows,
     }
 
@@ -505,6 +629,11 @@ def run_projection_review(
             key=lambda x: (abs(x["projection_delta_fpts"]), x["confidence"]),
             reverse=True,
         )
+    review_notes = _coerce_review_notes(
+        parsed.get("review_notes"),
+        review_snapshot=review_snapshot,
+        recommendations=recommendations,
+    )
 
     lineup_strategy = parsed.get("lineup_strategy", [])
     if not isinstance(lineup_strategy, list):
@@ -519,6 +648,8 @@ def run_projection_review(
         "status": "ok",
         "summary": summary,
         "lineup_strategy": lineup_strategy,
+        "review_notes": review_notes,
+        "review_snapshot": review_snapshot,
         "recommendations": recommendations,
         "model": model,
         "candidate_count": len(context_rows),
