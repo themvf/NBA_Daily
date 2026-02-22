@@ -13921,14 +13921,20 @@ if selected_page == "DFS Lineup Builder":
                         "to Streamlit secrets to enable AI projection review."
                     )
 
-                model_options = ["gpt-4.1-mini", "gpt-4o-mini", "gpt-4.1"]
+                model_options = [
+                    "gpt-5-mini",
+                    "gpt-5",
+                    "gpt-4.1-mini",
+                    "gpt-4.1",
+                    "gpt-4o-mini",
+                ]
                 default_model = st.session_state.get('dfs_ai_last_model', dfs_ai.DEFAULT_MODEL)
                 default_model_index = model_options.index(default_model) if default_model in model_options else 0
                 selected_ai_model = st.selectbox(
                     "Model",
                     model_options,
                     index=default_model_index,
-                    help="Lower-cost options: gpt-4.1-mini or gpt-4o-mini."
+                    help="Lower-cost options: gpt-5-mini, gpt-4.1-mini, or gpt-4o-mini."
                 )
 
                 lookback_days = st.slider(
