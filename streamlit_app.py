@@ -5,6 +5,7 @@ Version: 2025-11-26 (CSV Export Feature)
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import tempfile
 from datetime import date, datetime, timezone, timedelta
@@ -40,6 +41,7 @@ import backtest_portfolio
 import preset_ab_test
 from enrichment_monitor import ensure_enrichment_columns
 import dfs_optimizer as dfs
+import dfs_ai_agent as dfs_ai
 import odds_api
 import coefficient_calibrator as coeff_cal
 from vegas_odds import TEAM_NAME_TO_ABBR
@@ -13146,6 +13148,74 @@ def _enrich_players_with_vegas_signals(conn, players, game_date, debug=False):
     return signals
 
 
+def _get_openai_api_key() -> Optional[str]:
+    """Read OpenAI API key from Streamlit secrets first, then env var."""
+    key = ""
+
+    try:
+        openai_block = st.secrets.get("openai", {})
+        if openai_block:
+            key = (
+                str(openai_block.get("API_KEY", "")).strip()
+                or str(openai_block.get("api_key", "")).strip()
+            )
+    except Exception:
+        pass
+
+    if not key:
+        try:
+            key = str(st.secrets.get("OPENAI_API_KEY", "")).strip()
+        except Exception:
+            pass
+
+    if not key:
+        key = str(os.getenv("OPENAI_API_KEY", "")).strip()
+
+    return key or None
+
+
+def _apply_ai_adjustments_to_players(players: list[Any]) -> tuple[int, float]:
+    """
+    Apply stored AI deltas to current slate projections.
+
+    Deltas are always applied from `_pre_ai_proj_fpts` so reruns do not compound.
+    Returns `(players_adjusted, total_delta_fpts)`.
+    """
+    adjustments = st.session_state.get("dfs_ai_adjustments", {}) or {}
+    if not adjustments:
+        for p in players:
+            p.ai_adjustment_delta = 0.0
+            p.ai_adjustment_action = ""
+            p.ai_adjustment_reason = ""
+        return 0, 0.0
+
+    adjusted_count = 0
+    total_delta = 0.0
+    for p in players:
+        p.ai_adjustment_delta = 0.0
+        p.ai_adjustment_action = ""
+        p.ai_adjustment_reason = ""
+
+        rec = adjustments.get(p.player_id) or adjustments.get(str(p.player_id))
+        if not rec:
+            continue
+
+        delta = float(rec.get("delta_fpts", 0.0) or 0.0)
+        if abs(delta) < 0.05:
+            continue
+
+        base_proj = float(getattr(p, "_pre_ai_proj_fpts", p.proj_fpts))
+        p.proj_fpts = round(max(0.0, base_proj + delta), 1)
+        p.fpts_per_dollar = round((p.proj_fpts / p.salary) * 1000, 3) if p.salary > 0 else 0.0
+        p.ai_adjustment_delta = round(delta, 2)
+        p.ai_adjustment_action = str(rec.get("action", "")).upper()
+        p.ai_adjustment_reason = str(rec.get("reason", "")).strip()
+        adjusted_count += 1
+        total_delta += delta
+
+    return adjusted_count, total_delta
+
+
 # DFS Lineup Builder tab ---------------------------------------------------
 if selected_page == "DFS Lineup Builder":
     st.title("🏀 DFS Lineup Builder")
@@ -13172,6 +13242,12 @@ if selected_page == "DFS Lineup Builder":
         st.session_state.dfs_projection_date = None
     if 'dfs_stack_config' not in st.session_state:
         st.session_state.dfs_stack_config = {}
+    if 'dfs_ai_review' not in st.session_state:
+        st.session_state.dfs_ai_review = {}
+    if 'dfs_ai_adjustments' not in st.session_state:
+        st.session_state.dfs_ai_adjustments = {}
+    if 'dfs_ai_last_model' not in st.session_state:
+        st.session_state.dfs_ai_last_model = dfs_ai.DEFAULT_MODEL
 
     # Get database connection
     dfs_conn = get_connection(str(db_path))
@@ -13446,6 +13522,8 @@ if selected_page == "DFS Lineup Builder":
                         st.session_state.dfs_player_pool = projected_players
                         st.session_state.dfs_upload_metadata = metadata
                         st.session_state.dfs_projection_date = str(projection_date) if projection_date else None
+                        st.session_state.dfs_ai_review = {}
+                        st.session_state.dfs_ai_adjustments = {}
 
                         # Enrich with Vegas signals if props exist
                         try:
@@ -13540,6 +13618,18 @@ if selected_page == "DFS Lineup Builder":
         else:
             players = st.session_state.dfs_player_pool
 
+            # Always rebuild from model baseline each rerun so blend/AI deltas
+            # are deterministic and never compound accidentally.
+            for p in players:
+                if not hasattr(p, '_model_proj_fpts'):
+                    p._model_proj_fpts = p.proj_fpts
+                    p._model_fpts_per_dollar = p.fpts_per_dollar
+                p.proj_fpts = p._model_proj_fpts
+                p.fpts_per_dollar = p._model_fpts_per_dollar
+                p.ai_adjustment_delta = 0.0
+                p.ai_adjustment_action = ""
+                p.ai_adjustment_reason = ""
+
             # Filters
             col1, col2, col3 = st.columns(3)
             with col1:
@@ -13617,10 +13707,24 @@ if selected_page == "DFS Lineup Builder":
                                 p.fpts_per_dollar = p._model_fpts_per_dollar
                         st.session_state.dfs_vegas_blend_active = False
 
+            # Snapshot current projection state so AI deltas always apply from
+            # this pre-AI baseline (model-only or model+vegas blend).
+            for p in players:
+                p._pre_ai_proj_fpts = p.proj_fpts
+
+            ai_adjusted_players, ai_total_delta = _apply_ai_adjustments_to_players(players)
+            if ai_adjusted_players > 0:
+                st.caption(
+                    f"AI adjustments active - {ai_adjusted_players} players, "
+                    f"total projection shift {ai_total_delta:+.1f} FPTS."
+                )
+
             # Sort options
             sort_options = ["Projected FPTS", "Salary", "Value (FPTS/$)", "Ceiling"]
             if vegas_sigs:
                 sort_options.append("Vegas Edge")
+            if ai_adjusted_players > 0:
+                sort_options.append("AI Delta")
             sort_by = st.selectbox(
                 "Sort by",
                 sort_options,
@@ -13635,6 +13739,8 @@ if selected_page == "DFS Lineup Builder":
                 filtered.sort(key=lambda p: p.fpts_per_dollar, reverse=True)
             elif sort_by == "Vegas Edge":
                 filtered.sort(key=lambda p: vegas_sigs.get(p.player_id, {}).get('edge_pct', 0), reverse=True)
+            elif sort_by == "AI Delta":
+                filtered.sort(key=lambda p: abs(getattr(p, 'ai_adjustment_delta', 0.0)), reverse=True)
             else:
                 filtered.sort(key=lambda p: p.proj_ceiling, reverse=True)
 
@@ -13699,6 +13805,9 @@ if selected_page == "DFS Lineup Builder":
                     row['Edge'] = round(v_edge, 1) if v_edge is not None else None
                 else:
                     row['Proj FPTS'] = round(p.proj_fpts, 1)
+                if ai_adjusted_players > 0:
+                    row['AI Delta'] = round(getattr(p, 'ai_adjustment_delta', 0.0), 2)
+                    row['AI'] = getattr(p, 'ai_adjustment_action', '')
                 row.update({
                     'Floor': round(p.proj_floor, 1),
                     'Ceiling': round(p.proj_ceiling, 1),
@@ -13731,6 +13840,8 @@ if selected_page == "DFS Lineup Builder":
                 col_config['Vegas FPTS'] = st.column_config.NumberColumn(format="%.1f")
             if 'Edge' in df.columns:
                 col_config['Edge'] = st.column_config.NumberColumn(format="%+.1f%%")
+            if 'AI Delta' in df.columns:
+                col_config['AI Delta'] = st.column_config.NumberColumn(format="%+.2f")
 
             st.dataframe(df, use_container_width=True, hide_index=True, column_config=col_config)
 
@@ -13801,6 +13912,201 @@ if selected_page == "DFS Lineup Builder":
                     st.caption("Players where Vegas implied FPTS exceeds our projection by ≥10% at salary < $7K. "
                                "These are value plays where the market sees upside our model may underweight.")
 
+            # --- OpenAI Projection Review Agent ---
+            with st.expander("OpenAI Projection Review Agent", expanded=False):
+                openai_key = _get_openai_api_key()
+                if not openai_key:
+                    st.info(
+                        "OpenAI API key not found. Add `OPENAI_API_KEY` (or `[openai].API_KEY`) "
+                        "to Streamlit secrets to enable AI projection review."
+                    )
+
+                model_options = ["gpt-4.1-mini", "gpt-4o-mini", "gpt-4.1"]
+                default_model = st.session_state.get('dfs_ai_last_model', dfs_ai.DEFAULT_MODEL)
+                default_model_index = model_options.index(default_model) if default_model in model_options else 0
+                selected_ai_model = st.selectbox(
+                    "Model",
+                    model_options,
+                    index=default_model_index,
+                    help="Lower-cost options: gpt-4.1-mini or gpt-4o-mini."
+                )
+
+                lookback_days = st.slider(
+                    "Ownership lookback (days)",
+                    min_value=30,
+                    max_value=240,
+                    value=120,
+                    step=15,
+                    key="dfs_ai_lookback_days",
+                    help="Historical ownership window used for context in the agent review."
+                )
+                max_players_for_ai = st.slider(
+                    "Players sent to AI",
+                    min_value=30,
+                    max_value=100,
+                    value=75,
+                    step=5,
+                    key="dfs_ai_max_players",
+                    help="Higher values include more of the pool but increase token usage."
+                )
+
+                run_col, apply_col, clear_col = st.columns(3)
+                with run_col:
+                    run_ai_review = st.button(
+                        "Run AI Review",
+                        type="primary",
+                        use_container_width=True,
+                        disabled=not bool(openai_key),
+                        key="dfs_ai_run_btn",
+                    )
+                with apply_col:
+                    review_ready = bool((st.session_state.get("dfs_ai_review") or {}).get("recommendations"))
+                    apply_ai_review = st.button(
+                        "Apply AI Changes",
+                        use_container_width=True,
+                        disabled=not review_ready,
+                        key="dfs_ai_apply_btn",
+                    )
+                with clear_col:
+                    clear_ai_adjustments = st.button(
+                        "Clear AI Changes",
+                        use_container_width=True,
+                        disabled=not bool(st.session_state.get("dfs_ai_adjustments")),
+                        key="dfs_ai_clear_btn",
+                    )
+
+                if run_ai_review:
+                    projection_date_for_ai = (
+                        st.session_state.get('dfs_projection_date') or str(datetime.now(EASTERN_TZ).date())
+                    )
+                    with st.spinner("Running OpenAI projection review..."):
+                        review_result = dfs_ai.run_projection_review(
+                            conn=dfs_conn,
+                            players=players,
+                            api_key=openai_key or "",
+                            model=selected_ai_model,
+                            vegas_signals=vegas_sigs,
+                            projection_date=projection_date_for_ai,
+                            lookback_days=int(lookback_days),
+                            max_players=int(max_players_for_ai),
+                        )
+                    st.session_state.dfs_ai_review = review_result
+                    st.session_state.dfs_ai_last_model = selected_ai_model
+                    if review_result.get("status") == "ok":
+                        rec_count = len(review_result.get("recommendations", []))
+                        st.success(f"AI review complete: {rec_count} recommendation(s).")
+                    else:
+                        st.error(review_result.get("error", "AI review failed."))
+
+                if apply_ai_review:
+                    review_payload = st.session_state.get("dfs_ai_review", {}) or {}
+                    recs = review_payload.get("recommendations", []) or []
+
+                    ai_adjustments = {}
+                    merged_targets = dict(st.session_state.get("dfs_exposure_targets", {}))
+                    target_updates = 0
+                    for rec in recs:
+                        pid = int(rec.get("player_id", 0) or 0)
+                        if pid <= 0:
+                            continue
+
+                        delta_fpts = float(rec.get("projection_delta_fpts", 0.0) or 0.0)
+                        action = str(rec.get("action", "")).lower()
+                        reason = str(rec.get("rationale", "")).strip()
+                        confidence = float(rec.get("confidence", 0.0) or 0.0)
+
+                        if abs(delta_fpts) >= 0.1:
+                            ai_adjustments[pid] = {
+                                "delta_fpts": round(delta_fpts, 2),
+                                "action": action,
+                                "reason": reason,
+                                "confidence": round(confidence, 2),
+                            }
+
+                        target_pct = rec.get("target_exposure_pct")
+                        if target_pct is not None and action in {"core", "boost", "watch"}:
+                            try:
+                                target_frac = max(0.0, min(0.95, float(target_pct) / 100.0))
+                                if target_frac > merged_targets.get(pid, 0.0):
+                                    merged_targets[pid] = target_frac
+                                    target_updates += 1
+                            except (TypeError, ValueError):
+                                pass
+
+                    st.session_state.dfs_ai_adjustments = ai_adjustments
+                    if target_updates > 0:
+                        st.session_state.dfs_exposure_targets = merged_targets
+
+                    st.success(
+                        f"Applied AI adjustments to {len(ai_adjustments)} players."
+                        + (f" Updated {target_updates} exposure target(s)." if target_updates else "")
+                    )
+                    st.rerun()
+
+                if clear_ai_adjustments:
+                    st.session_state.dfs_ai_adjustments = {}
+                    st.success("Cleared AI projection adjustments.")
+                    st.rerun()
+
+                review = st.session_state.get("dfs_ai_review", {}) or {}
+                if review:
+                    if review.get("status") != "ok":
+                        st.error(review.get("error", "AI review failed."))
+                    else:
+                        st.markdown(f"**Summary:** {review.get('summary', 'No summary provided.')}")
+
+                        recommendations = review.get("recommendations", []) or []
+                        boost_like = sum(
+                            1 for r in recommendations if str(r.get("action", "")).lower() in {"core", "boost"}
+                        )
+                        fades = sum(1 for r in recommendations if str(r.get("action", "")).lower() == "fade")
+                        m1, m2, m3, m4 = st.columns(4)
+                        with m1:
+                            st.metric("Recommendations", len(recommendations))
+                        with m2:
+                            st.metric("Boost/Core", boost_like)
+                        with m3:
+                            st.metric("Fades", fades)
+                        with m4:
+                            st.metric("Model", review.get("model", "-"))
+
+                        if recommendations:
+                            review_rows = []
+                            for rec in recommendations:
+                                review_rows.append(
+                                    {
+                                        "Player": rec.get("name", ""),
+                                        "Team": rec.get("team", ""),
+                                        "Action": str(rec.get("action", "")).upper(),
+                                        "Conf": rec.get("confidence", 0.0),
+                                        "Delta FPTS": rec.get("projection_delta_fpts", 0.0),
+                                        "Target Own%": rec.get("target_exposure_pct", None),
+                                        "Reason": rec.get("rationale", ""),
+                                    }
+                                )
+                            review_df = pd.DataFrame(review_rows)
+                            st.dataframe(
+                                review_df,
+                                use_container_width=True,
+                                hide_index=True,
+                                column_config={
+                                    "Conf": st.column_config.NumberColumn(format="%.2f"),
+                                    "Delta FPTS": st.column_config.NumberColumn(format="%+.2f"),
+                                    "Target Own%": st.column_config.NumberColumn(format="%.1f%%"),
+                                },
+                            )
+
+                        lineup_notes = review.get("lineup_strategy", []) or []
+                        if lineup_notes:
+                            st.caption("Lineup strategy notes:")
+                            for note in lineup_notes[:5]:
+                                st.caption(f"- {note}")
+
+                        st.caption(
+                            f"Reviewed {review.get('candidate_count', 0)} players | "
+                            f"Run time: {review.get('timestamp_utc', 'n/a')}"
+                        )
+
             # Export player pool button
             export_col1, export_col2 = st.columns([1, 3])
             with export_col1:
@@ -13823,6 +14129,8 @@ if selected_page == "DFS Lineup Builder":
                         'Rest_Mult': round(getattr(p, 'rest_multiplier', 1.0), 3),
                         'Uncertainty': round(getattr(p, 'uncertainty_multiplier', 1.0), 3),
                         'Analytics': getattr(p, 'analytics_used', ''),
+                        'AI_Delta_FPTS': round(getattr(p, 'ai_adjustment_delta', 0.0), 2),
+                        'AI_Action': getattr(p, 'ai_adjustment_action', ''),
                         'Game': p.game_id,
                     })
                 export_pool_df = pd.DataFrame(export_data)
@@ -13878,9 +14186,15 @@ if selected_page == "DFS Lineup Builder":
                 and not getattr(p, 'is_injured', False)
             ]
 
+            existing_targets = dict(st.session_state.get("dfs_exposure_targets", {}))
+            default_target_names = [
+                p.name for p in players
+                if p.name in available_for_targets and p.player_id in existing_targets
+            ]
             target_names = st.multiselect(
                 "Select players for custom exposure",
                 available_for_targets,
+                default=default_target_names,
                 help="Pick players and set how often they should appear in lineups"
             )
 
@@ -13890,10 +14204,12 @@ if selected_page == "DFS Lineup Builder":
                 for i, name in enumerate(target_names):
                     player_obj = next((p for p in players if p.name == name), None)
                     if player_obj:
+                        default_pct = int(round(existing_targets.get(player_obj.player_id, 0.25) * 100))
+                        default_pct = max(5, min(95, default_pct))
                         with cols[i % 3]:
                             pct = st.number_input(
                                 f"{name}", min_value=5, max_value=95,
-                                value=25, step=5,
+                                value=default_pct, step=5,
                                 key=f"exp_target_{player_obj.player_id}"
                             )
                             exposure_targets[player_obj.player_id] = pct / 100
@@ -13912,6 +14228,13 @@ if selected_page == "DFS Lineup Builder":
             st.info("📤 Upload a DraftKings CSV and generate projections first.")
         else:
             players = st.session_state.dfs_player_pool
+            ai_adjustments = st.session_state.get("dfs_ai_adjustments", {}) or {}
+            if ai_adjustments:
+                total_ai_delta = sum(float(v.get("delta_fpts", 0.0) or 0.0) for v in ai_adjustments.values())
+                st.info(
+                    f"AI adjustments are active for {len(ai_adjustments)} players "
+                    f"({total_ai_delta:+.1f} total FPTS shift). Generated lineups use these projections."
+                )
 
             # --- Game Stack Selection ---
             # Build game list directly from the player pool (always available)

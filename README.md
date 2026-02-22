@@ -185,3 +185,27 @@ ORDER BY s.win_pct DESC;
 ```
 
 You can open the database with any SQLite browser or use the CLI: `sqlite3 nba_stats.db`.
+
+## OpenAI DFS Projection Review Agent
+
+The DFS Lineup Builder now includes an OpenAI-based projection review agent in the
+`Player Pool` tab (`OpenAI Projection Review Agent` expander). It reviews the current
+slate using:
+
+- Current projection + ownership from the player pool
+- Recent game-log form from `player_game_logs`
+- Historical ownership tracking from `dfs_slate_projections`
+- Optional Vegas edge signals already loaded in the app
+
+The agent returns structured recommendations (boost/core/watch/fade), projection deltas,
+and optional target exposure percentages. Clicking `Apply AI Changes` pushes those
+adjustments into the active player pool and lineup generation flow.
+
+To enable it in Streamlit Cloud, add an OpenAI key in app secrets:
+
+```toml
+[openai]
+API_KEY = "YOUR_OPENAI_API_KEY"
+```
+
+You can also set `OPENAI_API_KEY` as an environment variable for local runs.
