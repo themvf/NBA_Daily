@@ -630,6 +630,12 @@ LINEUP_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
         "label": "Standard v1",
         "description": "Balanced baseline blend of projection, ceiling, value, and leverage.",
         "aggressive_ceiling_stack": False,
+        "overlap_cap": 6,
+        "low_own_inject_prob": 0.12,
+        "low_own_max_own_pct": 10.0,
+        "low_own_min_projection": 22.0,
+        "standout_lock_prob": 0.10,
+        "standout_min_ceiling_gap": 7.0,
         "strategy_mix": [
             ("projection", 0.25, 0.20),
             ("ceiling", 0.30, 0.25),
@@ -642,6 +648,12 @@ LINEUP_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
         "label": "Spike v1 (Legacy)",
         "description": "Legacy spike profile with stronger upside and leverage tilt.",
         "aggressive_ceiling_stack": True,
+        "overlap_cap": 5,
+        "low_own_inject_prob": 0.30,
+        "low_own_max_own_pct": 12.0,
+        "low_own_min_projection": 20.0,
+        "standout_lock_prob": 0.25,
+        "standout_min_ceiling_gap": 8.0,
         "strategy_mix": [
             ("ceiling", 0.24, 0.45),
             ("leverage", 0.30, 0.25),
@@ -653,6 +665,12 @@ LINEUP_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
         "label": "Spike v2 (Tail)",
         "description": "Tail-seeking profile emphasizing ceiling outcomes and contrarian leverage.",
         "aggressive_ceiling_stack": True,
+        "overlap_cap": 4,
+        "low_own_inject_prob": 0.42,
+        "low_own_max_own_pct": 14.0,
+        "low_own_min_projection": 18.0,
+        "standout_lock_prob": 0.35,
+        "standout_min_ceiling_gap": 9.5,
         "strategy_mix": [
             ("ceiling", 0.20, 0.55),
             ("leverage", 0.28, 0.25),
@@ -663,6 +681,12 @@ LINEUP_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
         "label": "Cluster v1 (Experimental)",
         "description": "High-diversity exploratory profile with wider randomization.",
         "aggressive_ceiling_stack": False,
+        "overlap_cap": 5,
+        "low_own_inject_prob": 0.25,
+        "low_own_max_own_pct": 12.0,
+        "low_own_min_projection": 20.0,
+        "standout_lock_prob": 0.20,
+        "standout_min_ceiling_gap": 7.5,
         "strategy_mix": [
             ("ceiling", 0.34, 0.30),
             ("leverage", 0.48, 0.20),
@@ -674,6 +698,12 @@ LINEUP_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
         "label": "Standout v1 (Missed-Capture)",
         "description": "Ceiling-first profile for capturing overlooked breakout outcomes.",
         "aggressive_ceiling_stack": True,
+        "overlap_cap": 4,
+        "low_own_inject_prob": 0.45,
+        "low_own_max_own_pct": 15.0,
+        "low_own_min_projection": 18.0,
+        "standout_lock_prob": 0.55,
+        "standout_min_ceiling_gap": 9.0,
         "strategy_mix": [
             ("ceiling", 0.18, 0.60),
             ("leverage", 0.26, 0.20),
@@ -2523,6 +2553,66 @@ def generate_diversified_lineups(
     for pid, info in target_player_map.items():
         max_exp[pid] = max(max_player_exposure, info['target'])
 
+    profile_cfg = LINEUP_MODEL_PROFILES.get(model_key, {}) if model_key else {}
+    overlap_cap = int(profile_cfg.get("overlap_cap", 8) or 8)
+    low_own_inject_prob = float(profile_cfg.get("low_own_inject_prob", 0.0) or 0.0)
+    low_own_max_own_pct = float(profile_cfg.get("low_own_max_own_pct", 12.0) or 12.0)
+    low_own_min_projection = float(profile_cfg.get("low_own_min_projection", 20.0) or 20.0)
+    standout_lock_prob = float(profile_cfg.get("standout_lock_prob", 0.0) or 0.0)
+    standout_min_ceiling_gap = float(profile_cfg.get("standout_min_ceiling_gap", 8.0) or 8.0)
+
+    lineup_player_sets: List[Set[int]] = []
+
+    def _can_use_for_lock(player: DFSPlayer) -> bool:
+        max_pct = float(max_exp.get(player.player_id, max_player_exposure))
+        max_lineups_for_player = int(num_lineups * max_pct)
+        return exposures.get(player.player_id, 0) < max_lineups_for_player
+
+    def _add_lock_candidate(attempt_locked: List[DFSPlayer], candidate: DFSPlayer) -> None:
+        if candidate.player_id not in {p.player_id for p in attempt_locked}:
+            attempt_locked.append(candidate)
+
+    def _overlap_allowed(lineup_key: Tuple[int, ...]) -> bool:
+        if overlap_cap >= 8:
+            return True
+        candidate_set = set(lineup_key)
+        for existing in lineup_player_sets:
+            if len(candidate_set & existing) > overlap_cap:
+                return False
+        return True
+
+    low_own_candidates = [
+        p for p in filtered_pool
+        if (
+            p.player_id not in locked_ids
+            and not p.is_excluded
+            and not p.is_injured
+            and float(getattr(p, "ownership_proj", 0.0) or 0.0) <= low_own_max_own_pct
+            and float(getattr(p, "proj_fpts", 0.0) or 0.0) >= low_own_min_projection
+        )
+    ]
+    low_own_candidates = sorted(
+        low_own_candidates,
+        key=lambda p: (
+            float(getattr(p, "leverage_score", 0.0) or 0.0),
+            float(getattr(p, "proj_ceiling", 0.0) or 0.0),
+        ),
+        reverse=True,
+    )
+
+    standout_scored: List[Tuple[DFSPlayer, float]] = []
+    for p in filtered_pool:
+        if p.player_id in locked_ids or p.is_excluded or p.is_injured:
+            continue
+        ceiling_gap = float(getattr(p, "proj_ceiling", 0.0) or 0.0) - float(getattr(p, "proj_fpts", 0.0) or 0.0)
+        if ceiling_gap < standout_min_ceiling_gap:
+            continue
+        ownership = max(1.0, float(getattr(p, "ownership_proj", 0.0) or 0.0))
+        standout_score = (ceiling_gap ** 1.15) * (1.0 + max(0.0, 15.0 - ownership) / 18.0)
+        standout_scored.append((p, standout_score))
+    standout_scored.sort(key=lambda x: x[1], reverse=True)
+    standout_scored = standout_scored[:40]
+
     # Strategy configuration: (strategy, randomization_factor, target_count_pct)
     strategies = strategy_mix or [
         ("projection", 0.25, 0.20),  # core projection-optimal
@@ -2561,8 +2651,19 @@ def generate_diversified_lineups(
     max_total_attempts = num_lineups * 50  # Allow many more attempts
     total_attempts = 0
 
-    for strategy, rand_factor, pct in strategies:
-        target_count = int(num_lineups * pct)
+    raw_targets = [num_lineups * pct for _, _, pct in strategies]
+    target_counts = [int(t) for t in raw_targets]
+    remainder = num_lineups - sum(target_counts)
+    if remainder > 0:
+        order = sorted(
+            range(len(strategies)),
+            key=lambda idx: raw_targets[idx] - target_counts[idx],
+            reverse=True,
+        )
+        for idx in order[:remainder]:
+            target_counts[idx] += 1
+
+    for (strategy, rand_factor, pct), target_count in zip(strategies, target_counts):
         strategy_generated = 0
         strategy_attempts = 0
         max_strategy_attempts = target_count * 20  # More attempts per strategy
@@ -2594,7 +2695,43 @@ def generate_diversified_lineups(
                     # Catch-up probability: adjusts to converge on target
                     lock_prob = min(1.0, needed / remaining_lineups)
                     if random.random() < lock_prob:
-                        attempt_locked.append(info['player'])
+                        _add_lock_candidate(attempt_locked, info['player'])
+
+            # Profile: inject low-owned upside candidates at controlled frequency.
+            if low_own_candidates and random.random() < low_own_inject_prob:
+                available_low_own = [
+                    p for p in low_own_candidates
+                    if _can_use_for_lock(p)
+                    and p.player_id not in {lp.player_id for lp in attempt_locked}
+                ]
+                if available_low_own:
+                    weighted_pool = available_low_own[:20]
+                    weights = [
+                        max(
+                            0.05,
+                            float(getattr(p, "leverage_score", 0.0) or 0.0) +
+                            (float(getattr(p, "proj_ceiling", 0.0) or 0.0) * 0.02),
+                        )
+                        for p in weighted_pool
+                    ]
+                    lock_choice = random.choices(weighted_pool, weights=weights, k=1)[0]
+                    _add_lock_candidate(attempt_locked, lock_choice)
+
+            # Profile: force occasional standout missed-capture candidates.
+            if standout_scored and random.random() < standout_lock_prob:
+                available_standout = [
+                    (p, score) for p, score in standout_scored
+                    if _can_use_for_lock(p)
+                    and p.player_id not in {lp.player_id for lp in attempt_locked}
+                ]
+                if available_standout:
+                    weighted_pool = available_standout[:15]
+                    lock_choice = random.choices(
+                        [p for p, _ in weighted_pool],
+                        weights=[score for _, score in weighted_pool],
+                        k=1,
+                    )[0]
+                    _add_lock_candidate(attempt_locked, lock_choice)
 
             # Determine stack config for this strategy
             # Ceiling lineups: full stacking (maximize correlation upside)
@@ -2603,21 +2740,67 @@ def generate_diversified_lineups(
             # Value lineups: use as configured
             # Balanced (high-rand projection): randomize stack types
             attempt_stack = stack_config
-            if stack_config and strategy == 'leverage':
-                # In aggressive ceiling-stack mode, keep leverage stacks active.
-                if not aggressive_ceiling_stack and random.random() < 0.5:
-                    attempt_stack = None  # Contrarian: no forced stacking
-            elif stack_config and strategy == 'projection' and rand_factor >= 0.5:
-                # Balanced bucket: randomize between full/mini/none
-                r = random.random()
-                if r < 0.33:
-                    attempt_stack = None
-                elif r < 0.66:
-                    # Downgrade primaries to minis
+            stack_locked_by_profile = False
+            ranked_stacks = []
+            if stack_config:
+                active_stack_items = [
+                    (gid, cfg)
+                    for gid, cfg in stack_config.items()
+                    if str((cfg or {}).get("type", "none")).lower() != "none"
+                ]
+                ranked_stacks = sorted(
+                    active_stack_items,
+                    key=lambda item: float((item[1] or {}).get("stack_score", 0.0) or 0.0),
+                    reverse=True,
+                )
+
+            # Profile-specific stack scripts.
+            if ranked_stacks and model_key == "spike_v2_tail" and strategy in {"ceiling", "leverage"}:
+                attempt_stack = {}
+                gid, cfg = ranked_stacks[0]
+                attempt_stack[gid] = {**cfg, "type": "primary"}
+                if len(ranked_stacks) > 1 and random.random() < 0.55:
+                    gid2, cfg2 = ranked_stacks[1]
+                    attempt_stack[gid2] = {**cfg2, "type": "mini"}
+                stack_locked_by_profile = True
+            elif ranked_stacks and model_key == "cluster_v1_experimental":
+                cluster_roll = random.random()
+                if cluster_roll < 0.34:
+                    gid, cfg = ranked_stacks[0]
+                    attempt_stack = {gid: {**cfg, "type": "primary"}}
+                elif cluster_roll < 0.67:
                     attempt_stack = {
-                        gid: {**cfg, 'type': 'mini' if cfg.get('type') == 'primary' else cfg.get('type')}
-                        for gid, cfg in stack_config.items()
+                        gid: {**cfg, "type": "mini"}
+                        for gid, cfg in ranked_stacks[:2]
                     }
+                else:
+                    if random.random() < 0.40:
+                        attempt_stack = None
+                    else:
+                        tail_games = ranked_stacks[-2:] if len(ranked_stacks) > 1 else ranked_stacks
+                        attempt_stack = {gid: {**cfg, "type": "mini"} for gid, cfg in tail_games}
+                stack_locked_by_profile = True
+            elif ranked_stacks and model_key == "standout_v1_capture" and strategy in {"ceiling", "leverage"}:
+                gid, cfg = ranked_stacks[0]
+                attempt_stack = {gid: {**cfg, "type": "primary"}}
+                stack_locked_by_profile = True
+
+            if not stack_locked_by_profile:
+                if stack_config and strategy == 'leverage':
+                    # In aggressive ceiling-stack mode, keep leverage stacks active.
+                    if not aggressive_ceiling_stack and random.random() < 0.5:
+                        attempt_stack = None  # Contrarian: no forced stacking
+                elif stack_config and strategy == 'projection' and rand_factor >= 0.5:
+                    # Balanced bucket: randomize between full/mini/none
+                    r = random.random()
+                    if r < 0.33:
+                        attempt_stack = None
+                    elif r < 0.66:
+                        # Downgrade primaries to minis
+                        attempt_stack = {
+                            gid: {**cfg, 'type': 'mini' if cfg.get('type') == 'primary' else cfg.get('type')}
+                            for gid, cfg in stack_config.items()
+                        }
 
             lineup = optimize_lineup_randomized(
                 player_pool=filtered_pool,
@@ -2635,12 +2818,13 @@ def generate_diversified_lineups(
                 # Check lineup uniqueness
                 lineup_key = tuple(sorted(p.player_id for p in lineup.players.values()))
 
-                if lineup_key not in existing_lineup_keys:
+                if lineup_key not in existing_lineup_keys and _overlap_allowed(lineup_key):
                     lineup.model_key = model_key
                     lineup.model_label = model_label
                     lineup.generation_strategy = strategy
                     lineups.append(lineup)
                     existing_lineup_keys.add(lineup_key)
+                    lineup_player_sets.append(set(lineup_key))
                     strategy_generated += 1
                     total_generated += 1
 
