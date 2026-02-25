@@ -13149,47 +13149,6 @@ def _enrich_players_with_vegas_signals(conn, players, game_date, debug=False):
     return signals
 
 
-def _should_keep_low_minutes_player_via_vegas(
-    player: Any,
-    vegas_signals: dict[int, dict[str, Any]],
-) -> tuple[bool, str]:
-    """
-    Determine whether a minutes-filtered player should be kept via Vegas override.
-
-    This protects likely returning players (for example, stars coming back from
-    injury) from being auto-removed only because recent minutes are sparse.
-    """
-    if getattr(player, "is_injured", False):
-        return False, ""
-
-    signal = (vegas_signals or {}).get(getattr(player, "player_id", 0), {}) or {}
-    if not signal:
-        return False, ""
-
-    try:
-        vegas_fpts = float(signal.get("vegas_fpts", 0.0) or 0.0)
-        edge_pct = float(signal.get("edge_pct", 0.0) or 0.0)
-    except (TypeError, ValueError):
-        return False, ""
-
-    signal_tag = str(signal.get("signal", "") or "").upper()
-    salary = int(getattr(player, "salary", 0) or 0)
-
-    # Existing BOOST logic already flags strong positive market edges.
-    if signal_tag == "BOOST":
-        return True, f"BOOST {edge_pct:+.1f}% edge"
-
-    # Returning-star safety valve: high salary + high Vegas implied output.
-    if salary >= 8000 and vegas_fpts >= 30.0:
-        return True, f"high Vegas implied {vegas_fpts:.1f} FPTS"
-
-    # General positive Vegas edge override.
-    if vegas_fpts >= 24.0 and edge_pct >= 7.5:
-        return True, f"Vegas edge {edge_pct:+.1f}%"
-
-    return False, ""
-
-
 def _get_openai_api_key() -> Optional[str]:
     """Read OpenAI API key from Streamlit secrets first, then env var."""
     key = ""
@@ -13299,7 +13258,21 @@ if selected_page == "DFS Lineup Builder":
         st.subheader("⚙️ Builder Settings")
         num_lineups = st.slider("Number of lineups", 1, 100, 20, step=1)
         model_profiles = dfs.get_lineup_model_profiles()
-        model_keys = list(model_profiles.keys())
+
+        # Ensure expected model catalog is always present in UI order.
+        expected_model_labels = {
+            "standard_v1": "Standard v1",
+            "spike_v1_legacy": "Spike v1 (Legacy)",
+            "spike_v2_tail": "Spike v2 (Tail)",
+            "cluster_v1_experimental": "Cluster v1 (Experimental)",
+            "standout_v1_capture": "Standout v1 (Missed-Capture)",
+        }
+        for key, label in expected_model_labels.items():
+            if key not in model_profiles:
+                model_profiles[key] = {"label": label}
+
+        extra_model_keys = [k for k in model_profiles.keys() if k not in expected_model_labels]
+        model_keys = list(expected_model_labels.keys()) + sorted(extra_model_keys)
 
         run_mode = st.selectbox(
             "Run Mode",
@@ -13324,6 +13297,10 @@ if selected_page == "DFS Lineup Builder":
                 help="Choose the lineup-generation profile for this run.",
             )
             st.session_state.dfs_lineup_model_key = selected_model_key
+            st.caption(
+                "Available models: "
+                + ", ".join(model_profiles[k].get("label", k) for k in model_keys)
+            )
         else:
             selected_model_key = default_model_key
             st.caption(
@@ -13369,13 +13346,9 @@ if selected_page == "DFS Lineup Builder":
             step=100,
             help="Maximum unused salary allowed per lineup. Lower values force fuller salary usage. $0 = must use exactly $50,000."
         )
-        filter_no_minutes = st.checkbox(
-            "Exclude players with no recent minutes",
-            value=True,
-            help=(
-                "Filter out players who haven't played recently or average < 5 minutes. "
-                "Vegas override can still keep strong market-projected return candidates."
-            )
+        st.caption(
+            "Minutes auto-filter is disabled. Lineup creation now lets projections speak for themselves "
+            "(injured/excluded players are still removed)."
         )
 
         st.divider()
@@ -14625,41 +14598,8 @@ if selected_page == "DFS Lineup Builder":
                     if salary_filtered_count > 0:
                         st.info(f"💰 Filtered out {salary_filtered_count} players below ${min_salary:,} salary")
 
-                    # Apply minutes validation filter
-                    if filter_no_minutes:
-                        before_count = len(filtered_players)
-                        vegas_sigs_for_filter = st.session_state.get('dfs_vegas_signals', {}) or {}
-                        vegas_override_kept: list[tuple[Any, str]] = []
-                        post_minutes_filter = []
-
-                        for p in filtered_players:
-                            if getattr(p, 'minutes_validated', True):
-                                post_minutes_filter.append(p)
-                                continue
-
-                            keep_via_vegas, keep_reason = _should_keep_low_minutes_player_via_vegas(
-                                p, vegas_sigs_for_filter
-                            )
-                            if keep_via_vegas:
-                                post_minutes_filter.append(p)
-                                vegas_override_kept.append((p, keep_reason))
-
-                        filtered_players = post_minutes_filter
-                        mins_filtered = before_count - len(filtered_players)
-                        if mins_filtered > 0:
-                            st.info(f"⏱️ Filtered out {mins_filtered} players with no recent minutes")
-                        if vegas_override_kept:
-                            override_preview = ", ".join(
-                                f"{p.name} ({reason})"
-                                for p, reason in vegas_override_kept[:4]
-                            )
-                            overflow = len(vegas_override_kept) - 4
-                            if overflow > 0:
-                                override_preview = f"{override_preview} +{overflow} more"
-                            st.info(
-                                f"Vegas minutes override kept {len(vegas_override_kept)} player(s): "
-                                f"{override_preview}"
-                            )
+                    # Minutes-based exclusion is intentionally disabled.
+                    # We allow projections (plus injury exclusions) to drive candidate selection.
 
                     if len(filtered_players) < 15:
                         st.error(f"Only {len(filtered_players)} players remain after filtering — need at least 15 to build lineups. Try disabling the minutes filter or lowering the salary minimum.")
