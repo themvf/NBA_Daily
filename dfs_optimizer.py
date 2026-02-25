@@ -24,7 +24,7 @@ import unicodedata
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -623,6 +623,71 @@ LEAGUE_AVG_TEAM_REB = 44.0
 LEAGUE_AVG_TEAM_AST = 25.5
 LEAGUE_AVG_TEAM_FG3M = 12.5
 
+# Lineup model profiles used by the DFS builder UI.
+# strategy_mix tuples are (strategy, randomization_factor, target_pct).
+LINEUP_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
+    "standard_v1": {
+        "label": "Standard v1",
+        "description": "Balanced baseline blend of projection, ceiling, value, and leverage.",
+        "aggressive_ceiling_stack": False,
+        "strategy_mix": [
+            ("projection", 0.25, 0.20),
+            ("ceiling", 0.30, 0.25),
+            ("value", 0.25, 0.15),
+            ("leverage", 0.35, 0.15),
+            ("projection", 0.60, 0.25),
+        ],
+    },
+    "spike_v1_legacy": {
+        "label": "Spike v1 (Legacy)",
+        "description": "Legacy spike profile with stronger upside and leverage tilt.",
+        "aggressive_ceiling_stack": True,
+        "strategy_mix": [
+            ("ceiling", 0.24, 0.45),
+            ("leverage", 0.30, 0.25),
+            ("projection", 0.35, 0.15),
+            ("projection", 0.68, 0.15),
+        ],
+    },
+    "spike_v2_tail": {
+        "label": "Spike v2 (Tail)",
+        "description": "Tail-seeking profile emphasizing ceiling outcomes and contrarian leverage.",
+        "aggressive_ceiling_stack": True,
+        "strategy_mix": [
+            ("ceiling", 0.20, 0.55),
+            ("leverage", 0.28, 0.25),
+            ("projection", 0.48, 0.20),
+        ],
+    },
+    "cluster_v1_experimental": {
+        "label": "Cluster v1 (Experimental)",
+        "description": "High-diversity exploratory profile with wider randomization.",
+        "aggressive_ceiling_stack": False,
+        "strategy_mix": [
+            ("ceiling", 0.34, 0.30),
+            ("leverage", 0.48, 0.20),
+            ("value", 0.42, 0.15),
+            ("projection", 0.70, 0.35),
+        ],
+    },
+    "standout_v1_capture": {
+        "label": "Standout v1 (Missed-Capture)",
+        "description": "Ceiling-first profile for capturing overlooked breakout outcomes.",
+        "aggressive_ceiling_stack": True,
+        "strategy_mix": [
+            ("ceiling", 0.18, 0.60),
+            ("leverage", 0.26, 0.20),
+            ("projection", 0.42, 0.10),
+            ("projection", 0.78, 0.10),
+        ],
+    },
+}
+
+
+def get_lineup_model_profiles() -> Dict[str, Dict[str, Any]]:
+    """Return lineup model profile metadata for UI and engine wiring."""
+    return LINEUP_MODEL_PROFILES
+
 
 # =============================================================================
 # Lineup Data Class
@@ -632,6 +697,9 @@ LEAGUE_AVG_TEAM_FG3M = 12.5
 class DFSLineup:
     """Represents a complete 8-player DFS lineup."""
     players: Dict[str, DFSPlayer] = field(default_factory=dict)  # slot -> player
+    model_key: str = ""
+    model_label: str = ""
+    generation_strategy: str = ""
 
     @property
     def total_salary(self) -> int:
@@ -2377,7 +2445,12 @@ def generate_diversified_lineups(
     excluded_games: Optional[Set[str]] = None,
     exposure_targets: Optional[Dict[int, float]] = None,
     min_salary_floor: int = 0,
-    stack_config: Optional[Dict[str, Dict]] = None
+    stack_config: Optional[Dict[str, Dict]] = None,
+    strategy_mix: Optional[List[Tuple[str, float, float]]] = None,
+    ceiling_focus_pct: int = 0,
+    aggressive_ceiling_stack: bool = False,
+    model_key: str = "",
+    model_label: str = "",
 ) -> List[DFSLineup]:
     """
     Generate diversified GPP tournament lineups using randomized optimization.
@@ -2399,6 +2472,12 @@ def generate_diversified_lineups(
         min_salary_floor: Minimum total salary required per lineup (e.g., 49000).
                           Lineups using less salary will be rejected.
                           Set to SALARY_CAP - max_remaining (e.g., 50000 - 1000 = 49000).
+        strategy_mix: Optional list of (strategy, randomization_factor, target_pct)
+                      tuples overriding the default generation mix.
+        ceiling_focus_pct: 0-100 dial that shifts allocation toward ceiling/leverage.
+        aggressive_ceiling_stack: If True, keep stacking active for ceiling/leverage.
+        model_key: Optional model/profile key annotation on generated lineups.
+        model_label: Optional display label annotation on generated lineups.
 
     Returns:
         List of valid DFSLineup objects
@@ -2445,13 +2524,38 @@ def generate_diversified_lineups(
         max_exp[pid] = max(max_player_exposure, info['target'])
 
     # Strategy configuration: (strategy, randomization_factor, target_count_pct)
-    strategies = [
-        ('projection', 0.25, 0.20),  # 20% — core projection-optimal
-        ('ceiling', 0.30, 0.25),     # 25% — upside-focused
-        ('value', 0.25, 0.15),       # 15% — value-focused
-        ('leverage', 0.35, 0.15),    # 15% — low-own/high-ceiling contrarian
-        ('projection', 0.60, 0.25),  # 25% — balanced high-randomization
+    strategies = strategy_mix or [
+        ("projection", 0.25, 0.20),  # core projection-optimal
+        ("ceiling", 0.30, 0.25),     # upside-focused
+        ("value", 0.25, 0.15),       # value-focused
+        ("leverage", 0.35, 0.15),    # low-own/high-ceiling contrarian
+        ("projection", 0.60, 0.25),  # balanced high-randomization
     ]
+
+    # Ceiling focus dial shifts weight from projection/value into ceiling/leverage.
+    # This keeps model profiles flexible while allowing a slate-level upside push.
+    focus = max(0.0, min(1.0, float(ceiling_focus_pct) / 100.0))
+    if focus > 0:
+        adjusted = []
+        for strategy, rand_factor, pct in strategies:
+            if strategy == "ceiling":
+                multiplier = 1.0 + (1.25 * focus)
+            elif strategy == "leverage":
+                multiplier = 1.0 + (0.65 * focus)
+            elif strategy == "projection":
+                multiplier = max(0.15, 1.0 - (0.50 * focus))
+            elif strategy == "value":
+                multiplier = max(0.10, 1.0 - (0.45 * focus))
+            else:
+                multiplier = 1.0
+            adjusted.append((strategy, rand_factor, max(0.0, pct * multiplier)))
+        strategies = adjusted
+
+    total_pct = sum(max(0.0, pct) for _, _, pct in strategies)
+    if total_pct <= 0:
+        strategies = [("projection", 0.50, 1.0)]
+    else:
+        strategies = [(s, r, max(0.0, p) / total_pct) for s, r, p in strategies]
 
     total_generated = 0
     max_total_attempts = num_lineups * 50  # Allow many more attempts
@@ -2500,7 +2604,8 @@ def generate_diversified_lineups(
             # Balanced (high-rand projection): randomize stack types
             attempt_stack = stack_config
             if stack_config and strategy == 'leverage':
-                if random.random() < 0.5:
+                # In aggressive ceiling-stack mode, keep leverage stacks active.
+                if not aggressive_ceiling_stack and random.random() < 0.5:
                     attempt_stack = None  # Contrarian: no forced stacking
             elif stack_config and strategy == 'projection' and rand_factor >= 0.5:
                 # Balanced bucket: randomize between full/mini/none
@@ -2531,6 +2636,9 @@ def generate_diversified_lineups(
                 lineup_key = tuple(sorted(p.player_id for p in lineup.players.values()))
 
                 if lineup_key not in existing_lineup_keys:
+                    lineup.model_key = model_key
+                    lineup.model_label = model_label
+                    lineup.generation_strategy = strategy
                     lineups.append(lineup)
                     existing_lineup_keys.add(lineup_key)
                     strategy_generated += 1

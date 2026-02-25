@@ -13298,6 +13298,59 @@ if selected_page == "DFS Lineup Builder":
     with st.sidebar:
         st.subheader("⚙️ Builder Settings")
         num_lineups = st.slider("Number of lineups", 1, 100, 20, step=1)
+        model_profiles = dfs.get_lineup_model_profiles()
+        model_keys = list(model_profiles.keys())
+
+        run_mode = st.selectbox(
+            "Run Mode",
+            options=["Single Version", "All Versions"],
+            index=0,
+            help=(
+                "Single Version builds one model profile. "
+                "All Versions runs all model profiles for a broader portfolio."
+            ),
+        )
+
+        default_model_key = st.session_state.get("dfs_lineup_model_key", "standout_v1_capture")
+        if default_model_key not in model_keys:
+            default_model_key = model_keys[0]
+
+        if run_mode == "Single Version":
+            selected_model_key = st.selectbox(
+                "Lineup Model",
+                options=model_keys,
+                index=model_keys.index(default_model_key),
+                format_func=lambda key: model_profiles[key]["label"],
+                help="Choose the lineup-generation profile for this run.",
+            )
+            st.session_state.dfs_lineup_model_key = selected_model_key
+        else:
+            selected_model_key = default_model_key
+            st.caption(
+                "All Versions enabled: standard_v1, spike_v1_legacy, "
+                "spike_v2_tail, cluster_v1_experimental, standout_v1_capture"
+            )
+
+        ceiling_focus_pct = st.slider(
+            "Ceiling Focus %",
+            min_value=0,
+            max_value=100,
+            value=70,
+            step=5,
+            help=(
+                "Pushes lineup generation toward ceiling and leverage at the "
+                "expense of pure median projection."
+            ),
+        )
+        aggressive_ceiling_stacks = st.checkbox(
+            "Aggressive Ceiling Stack Bias",
+            value=True,
+            help=(
+                "Keeps stacking active in ceiling/leverage builds to maximize "
+                "correlated upside."
+            ),
+        )
+
         max_exposure = st.slider("Max player exposure %", 20, 60, 40, step=5) / 100
         min_salary = st.slider(
             "Min player salary",
@@ -14616,16 +14669,65 @@ if selected_page == "DFS Lineup Builder":
                     min_salary_floor = dfs.SALARY_CAP - max_remaining_salary
 
                     with st.spinner("Optimizing lineups..."):
-                        lineups = dfs.generate_diversified_lineups(
-                            player_pool=filtered_players,
-                            num_lineups=num_lineups,
-                            max_player_exposure=max_exposure,
-                            progress_callback=update_progress,
-                            excluded_games=st.session_state.dfs_excluded_games,
-                            exposure_targets=st.session_state.dfs_exposure_targets,
-                            min_salary_floor=min_salary_floor,
-                            stack_config=st.session_state.get('dfs_stack_config') or None
-                        )
+                        if run_mode == "All Versions":
+                            model_run_keys = [
+                                "standard_v1",
+                                "spike_v1_legacy",
+                                "spike_v2_tail",
+                                "cluster_v1_experimental",
+                                "standout_v1_capture",
+                            ]
+                        else:
+                            model_run_keys = [selected_model_key]
+
+                        total_target = num_lineups * len(model_run_keys)
+                        lineups = []
+                        existing_lineup_keys = set()
+                        model_lineup_counts = {}
+                        completed_target = 0
+
+                        for model_key in model_run_keys:
+                            profile = model_profiles.get(model_key, {}) or {}
+                            profile_label = str(profile.get("label", model_key))
+                            profile_strategy_mix = profile.get("strategy_mix")
+                            profile_stack_bias = bool(profile.get("aggressive_ceiling_stack", False))
+
+                            def update_model_progress(current, total, message,
+                                                      _offset=completed_target, _label=profile_label):
+                                update_progress(
+                                    _offset + current,
+                                    total_target,
+                                    f"{_label}: {message}",
+                                )
+
+                            model_lineups = dfs.generate_diversified_lineups(
+                                player_pool=filtered_players,
+                                num_lineups=num_lineups,
+                                max_player_exposure=max_exposure,
+                                progress_callback=update_model_progress,
+                                excluded_games=st.session_state.dfs_excluded_games,
+                                exposure_targets=st.session_state.dfs_exposure_targets,
+                                min_salary_floor=min_salary_floor,
+                                stack_config=st.session_state.get('dfs_stack_config') or None,
+                                strategy_mix=profile_strategy_mix,
+                                ceiling_focus_pct=int(ceiling_focus_pct),
+                                aggressive_ceiling_stack=(aggressive_ceiling_stacks or profile_stack_bias),
+                                model_key=model_key,
+                                model_label=profile_label,
+                            )
+                            completed_target += num_lineups
+
+                            kept_for_model = 0
+                            for lineup in model_lineups:
+                                lineup.model_key = model_key
+                                lineup.model_label = profile_label
+                                lineup_key = tuple(sorted(p.player_id for p in lineup.players.values()))
+                                if lineup_key in existing_lineup_keys:
+                                    continue
+                                existing_lineup_keys.add(lineup_key)
+                                lineups.append(lineup)
+                                kept_for_model += 1
+                            model_lineup_counts[model_key] = kept_for_model
 
                     progress_bar.empty()
                     status_text.empty()
@@ -14634,6 +14736,15 @@ if selected_page == "DFS Lineup Builder":
 
                     if lineups:
                         st.success(f"✅ Generated {len(lineups)} valid lineups!")
+                        if run_mode == "All Versions":
+                            breakdown = []
+                            for model_key in model_run_keys:
+                                label = model_profiles.get(model_key, {}).get("label", model_key)
+                                breakdown.append(f"{label}: {model_lineup_counts.get(model_key, 0)}")
+                            st.caption("All Versions breakdown — " + " | ".join(breakdown))
+                        else:
+                            active_model_label = model_profiles.get(selected_model_key, {}).get("label", selected_model_key)
+                            st.caption(f"Model used: {active_model_label} | Ceiling focus: {ceiling_focus_pct}%")
 
                         # Auto-save slate projections + lineups for tracking
                         try:
@@ -14696,6 +14807,17 @@ if selected_page == "DFS Lineup Builder":
                 with col4:
                     st.metric("Avg Ceiling", f"{avg_ceiling:.1f}")
 
+                model_counts = {}
+                for lineup in lineups:
+                    key = getattr(lineup, "model_key", "") or "standard_v1"
+                    model_counts[key] = model_counts.get(key, 0) + 1
+                if model_counts:
+                    model_parts = []
+                    for key, count in sorted(model_counts.items(), key=lambda x: x[1], reverse=True):
+                        label = model_profiles.get(key, {}).get("label", key)
+                        model_parts.append(f"{label}: {count}")
+                    st.caption("Lineup model mix — " + " | ".join(model_parts))
+
                 # Display each lineup
                 st.subheader("Lineup Details")
 
@@ -14734,8 +14856,9 @@ if selected_page == "DFS Lineup Builder":
 
                 for i in range(start_idx, end_idx):
                     lineup = lineups[i]
+                    lineup_model = getattr(lineup, "model_label", "") or getattr(lineup, "model_key", "") or "Standard"
                     with st.expander(
-                        f"Lineup #{i+1} | Proj: {lineup.total_proj_fpts:.1f} | "
+                        f"Lineup #{i+1} [{lineup_model}] | Proj: {lineup.total_proj_fpts:.1f} | "
                         f"Salary: ${lineup.total_salary:,} | Ceiling: {lineup.total_ceiling:.1f}",
                         expanded=(i == start_idx)
                     ):
