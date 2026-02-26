@@ -16412,6 +16412,11 @@ if selected_page == "DFS Lineup Builder":
                                 "exposure_comparison_top_field_only": _df_records_safe(exp_comp_top_field_df),
                                 "missed_core": _df_records_safe(pm_payload.get("missed_core_df")),
                                 "missed_standouts": _df_records_safe(pm_payload.get("missed_standouts_df")),
+                                "ownership_polarity": _df_records_safe(pm_payload.get("ownership_polarity_df")),
+                                "overexposed_duds": _df_records_safe(pm_payload.get("overexposed_duds_df")),
+                                "value_tier_misses": _df_records_safe(pm_payload.get("value_tier_misses_df")),
+                                "combo_capture_misses": _df_records_safe(pm_payload.get("combo_capture_misses_df")),
+                                "team_concentration_mismatch": _df_records_safe(pm_payload.get("team_concentration_mismatch_df")),
                                 "improvements": _df_records_safe(pm_payload.get("improvements_df")),
                             },
                         }
@@ -16465,6 +16470,13 @@ if selected_page == "DFS Lineup Builder":
                             pm_m7.metric("Our Lineups", int(pm_metrics.get('our_lineups') or 0))
                             pm_m8.metric("Missed Core Plays", int(pm_metrics.get('missed_core_count') or 0))
                             pm_m9.metric("Missed Standouts", int(pm_metrics.get('missed_standout_count') or 0))
+
+                            pm_m10, pm_m11, pm_m12, pm_m13, pm_m14 = st.columns(5)
+                            pm_m10.metric("Own Polarity Misses", int(pm_metrics.get('ownership_polarity_count') or 0))
+                            pm_m11.metric("Overexposed Duds", int(pm_metrics.get('overexposed_dud_count') or 0))
+                            pm_m12.metric("4k-5k Misses", int(pm_metrics.get('value_tier_miss_count') or 0))
+                            pm_m13.metric("Combo Misses (Raw)", int(pm_metrics.get('combo_capture_miss_count') or 0))
+                            pm_m14.metric("Team Mismatch", int(pm_metrics.get('team_concentration_mismatch_count') or 0))
 
                             top_scorer_name = str(pm_metrics.get('top_scorer_name') or "").strip()
                             top_scorer_actual = pm_metrics.get('top_scorer_actual')
@@ -16591,6 +16603,169 @@ if selected_page == "DFS Lineup Builder":
                                 for c in ['Actual FPTS', 'Proj FPTS', 'Actual-Proj']:
                                     standout_view[c] = standout_view[c].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "—")
                                 st.dataframe(standout_view, use_container_width=True, hide_index=True)
+
+                            ownership_polarity_df = pm_payload.get('ownership_polarity_df')
+                            if isinstance(ownership_polarity_df, pd.DataFrame) and not ownership_polarity_df.empty:
+                                st.markdown("**Ownership Polarity Misses**")
+                                own_view = ownership_polarity_df[
+                                    [
+                                        'display_name',
+                                        'field_exposure_pct',
+                                        'our_exposure_pct',
+                                        'actual_ownership',
+                                        'ownership_proj',
+                                        'ownership_error_pp',
+                                        'polarity',
+                                    ]
+                                ].copy()
+                                own_view.columns = [
+                                    'Player',
+                                    'Field Exp %',
+                                    'Our Exp %',
+                                    'Actual Own%',
+                                    'Proj Own%',
+                                    'Own Error (pp)',
+                                    'Type',
+                                ]
+                                for c in ['Field Exp %', 'Our Exp %', 'Actual Own%', 'Proj Own%']:
+                                    own_view[c] = own_view[c].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "â€”")
+                                own_view['Own Error (pp)'] = own_view['Own Error (pp)'].apply(
+                                    lambda x: f"{x:+.1f}" if pd.notna(x) else "â€”"
+                                )
+                                st.dataframe(own_view.head(25), use_container_width=True, hide_index=True)
+
+                            overexposed_duds_df = pm_payload.get('overexposed_duds_df')
+                            if isinstance(overexposed_duds_df, pd.DataFrame) and not overexposed_duds_df.empty:
+                                st.markdown("**Overexposed Dud Watchlist**")
+                                dud_view = overexposed_duds_df[
+                                    [
+                                        'display_name',
+                                        'our_exposure_pct',
+                                        'field_exposure_pct',
+                                        'our_minus_field_pct',
+                                        'actual_fpts',
+                                        'proj_fpts',
+                                        'actual_minus_proj',
+                                    ]
+                                ].copy()
+                                dud_view.columns = [
+                                    'Player',
+                                    'Our Exp %',
+                                    'Field Exp %',
+                                    'Our-Field (pp)',
+                                    'Actual FPTS',
+                                    'Proj FPTS',
+                                    'Actual-Proj',
+                                ]
+                                for c in ['Our Exp %', 'Field Exp %']:
+                                    dud_view[c] = dud_view[c].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "â€”")
+                                dud_view['Our-Field (pp)'] = dud_view['Our-Field (pp)'].apply(
+                                    lambda x: f"{x:+.1f}" if pd.notna(x) else "â€”"
+                                )
+                                for c in ['Actual FPTS', 'Proj FPTS', 'Actual-Proj']:
+                                    dud_view[c] = dud_view[c].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "â€”")
+                                st.dataframe(dud_view.head(25), use_container_width=True, hide_index=True)
+
+                            value_tier_misses_df = pm_payload.get('value_tier_misses_df')
+                            if isinstance(value_tier_misses_df, pd.DataFrame) and not value_tier_misses_df.empty:
+                                st.markdown("**Value-Tier Miss Tracker ($4k-$5k)**")
+                                value_view = value_tier_misses_df[
+                                    [
+                                        'display_name',
+                                        'salary',
+                                        'field_exposure_pct',
+                                        'our_exposure_pct',
+                                        'actual_fpts',
+                                        'proj_fpts',
+                                        'actual_minus_proj',
+                                        'miss_tags',
+                                    ]
+                                ].copy()
+                                value_view.columns = [
+                                    'Player',
+                                    'Salary',
+                                    'Field Exp %',
+                                    'Our Exp %',
+                                    'Actual FPTS',
+                                    'Proj FPTS',
+                                    'Actual-Proj',
+                                    'Miss Tags',
+                                ]
+                                value_view['Salary'] = value_view['Salary'].apply(
+                                    lambda x: f"${int(x):,}" if pd.notna(x) else "â€”"
+                                )
+                                for c in ['Field Exp %', 'Our Exp %']:
+                                    value_view[c] = value_view[c].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "â€”")
+                                for c in ['Actual FPTS', 'Proj FPTS', 'Actual-Proj']:
+                                    value_view[c] = value_view[c].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "â€”")
+                                st.dataframe(value_view.head(25), use_container_width=True, hide_index=True)
+
+                            combo_capture_misses_df = pm_payload.get('combo_capture_misses_df')
+                            if isinstance(combo_capture_misses_df, pd.DataFrame) and not combo_capture_misses_df.empty:
+                                st.markdown("**Pair/Triple Combo Capture Misses**")
+                                combo_view = combo_capture_misses_df[
+                                    [
+                                        'combo_size',
+                                        'combo_players',
+                                        'field_combo_pct',
+                                        'our_combo_pct',
+                                        'combo_gap_pct',
+                                        'combo_actual_fpts_sum',
+                                    ]
+                                ].copy()
+                                combo_view.columns = [
+                                    'Combo Size',
+                                    'Players',
+                                    'Field Combo %',
+                                    'Our Combo %',
+                                    'Gap (Field-Our)',
+                                    'Combo Actual FPTS Sum',
+                                ]
+                                for c in ['Field Combo %', 'Our Combo %', 'Gap (Field-Our)']:
+                                    combo_view[c] = combo_view[c].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "â€”")
+                                combo_view['Combo Actual FPTS Sum'] = combo_view['Combo Actual FPTS Sum'].apply(
+                                    lambda x: f"{x:.1f}" if pd.notna(x) else "â€”"
+                                )
+                                st.dataframe(combo_view.head(20), use_container_width=True, hide_index=True)
+                                raw_combo_count = int(pm_metrics.get('combo_capture_miss_count') or 0)
+                                exported_combo_rows = int(
+                                    pm_metrics.get('combo_capture_rows_exported') or len(combo_capture_misses_df)
+                                )
+                                if raw_combo_count > exported_combo_rows:
+                                    shown_rows = int(min(20, len(combo_capture_misses_df)))
+                                    st.caption(
+                                        f"Showing top {shown_rows} combos (export includes top {exported_combo_rows}; "
+                                        f"{raw_combo_count} raw misses detected)."
+                                    )
+
+                            team_conc_df = pm_payload.get('team_concentration_mismatch_df')
+                            if isinstance(team_conc_df, pd.DataFrame) and not team_conc_df.empty:
+                                st.markdown("**Team Concentration Mismatch**")
+                                team_view = team_conc_df[
+                                    [
+                                        'team',
+                                        'field_team_slot_pct',
+                                        'our_team_slot_pct',
+                                        'slot_gap_pct',
+                                        'field_team_lineup_pct',
+                                        'our_team_lineup_pct',
+                                        'lineup_gap_pct',
+                                    ]
+                                ].copy()
+                                team_view.columns = [
+                                    'Team',
+                                    'Field Slot Share',
+                                    'Our Slot Share',
+                                    'Slot Share Gap',
+                                    'Field Lineup Share',
+                                    'Our Lineup Share',
+                                    'Lineup Share Gap',
+                                ]
+                                for c in ['Field Slot Share', 'Our Slot Share', 'Field Lineup Share', 'Our Lineup Share']:
+                                    team_view[c] = team_view[c].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "â€”")
+                                for c in ['Slot Share Gap', 'Lineup Share Gap']:
+                                    team_view[c] = team_view[c].apply(lambda x: f"{x:+.1f}pp" if pd.notna(x) else "â€”")
+                                st.dataframe(team_view.head(20), use_container_width=True, hide_index=True)
 
                             rw_left, rw_right = st.columns(2)
                             with rw_left:

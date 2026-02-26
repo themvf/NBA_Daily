@@ -13,6 +13,8 @@ Tables:
 
 import sqlite3
 import unicodedata
+from collections import Counter
+from itertools import combinations
 import numpy as np
 import pandas as pd
 from datetime import datetime
@@ -1531,6 +1533,11 @@ def build_tournament_postmortem(
         'exposure_comparison_df': pd.DataFrame(),
         'missed_core_df': pd.DataFrame(),
         'missed_standouts_df': pd.DataFrame(),
+        'ownership_polarity_df': pd.DataFrame(),
+        'overexposed_duds_df': pd.DataFrame(),
+        'value_tier_misses_df': pd.DataFrame(),
+        'combo_capture_misses_df': pd.DataFrame(),
+        'team_concentration_mismatch_df': pd.DataFrame(),
         'improvements_df': pd.DataFrame(),
         'right_notes': [],
         'wrong_notes': [],
@@ -1555,8 +1562,11 @@ def build_tournament_postmortem(
             return result
 
         field_lineups = int(len(top_entries_df))
+        top_entries_df = top_entries_df.reset_index(drop=True).copy()
+        top_entries_df['field_lineup_num'] = np.arange(1, field_lineups + 1)
         pos_cols = ['pg', 'sg', 'sf', 'pf', 'c', 'g', 'f', 'util']
-        field_long = top_entries_df[pos_cols].melt(
+        field_long = top_entries_df[['field_lineup_num'] + pos_cols].melt(
+            id_vars=['field_lineup_num'],
             var_name='slot',
             value_name='player',
         )
@@ -1566,6 +1576,11 @@ def build_tournament_postmortem(
             result['errors'].append("Contest standings have no parsed lineup player names.")
             return result
         field_long['name_key'] = field_long['player'].map(_normalize_name)
+        field_lineup_name_sets = (
+            field_long.groupby('field_lineup_num')['name_key']
+            .apply(lambda s: {x for x in s.tolist() if x})
+            .tolist()
+        )
 
         field_exposure_df = (
             field_long.groupby('name_key', as_index=False)
@@ -1630,6 +1645,7 @@ def build_tournament_postmortem(
                 our_lineups_df[name_col] = our_lineups_df[col].apply(_map_player_name)
 
         our_exposure_df = pd.DataFrame(columns=['name_key', 'our_slots', 'our_player', 'our_exposure_pct'])
+        our_long = pd.DataFrame(columns=['lineup_num', 'slot', 'player', 'name_key'])
         lineup_name_sets: List[set] = []
         if our_lineups > 0 and our_name_cols:
             our_long = our_lineups_df[['lineup_num'] + our_name_cols].melt(
@@ -1740,6 +1756,237 @@ def build_tournament_postmortem(
             ascending=[False, False],
         )
 
+        # 4b) Additional postmortem diagnostics
+        for num_col in ['salary', 'proj_fpts', 'actual_fpts', 'actual_minus_proj', 'ownership_proj', 'actual_ownership']:
+            exposure_df[num_col] = pd.to_numeric(exposure_df.get(num_col), errors='coerce')
+            top_field_players_df[num_col] = pd.to_numeric(top_field_players_df.get(num_col), errors='coerce')
+
+        ownership_polarity_df = top_field_players_df.dropna(subset=['actual_ownership', 'ownership_proj']).copy()
+        if not ownership_polarity_df.empty:
+            ownership_polarity_df['ownership_error_pp'] = (
+                ownership_polarity_df['actual_ownership'] - ownership_polarity_df['ownership_proj']
+            )
+            ownership_polarity_df['ownership_error_abs'] = ownership_polarity_df['ownership_error_pp'].abs()
+            ownership_polarity_df['polarity'] = np.where(
+                ownership_polarity_df['ownership_error_pp'] >= 8.0,
+                'Underprojected Chalk',
+                np.where(
+                    ownership_polarity_df['ownership_error_pp'] <= -8.0,
+                    'Overprojected Chalk',
+                    'Neutral',
+                ),
+            )
+            ownership_polarity_df = ownership_polarity_df[
+                ownership_polarity_df['ownership_error_abs'] >= 8.0
+            ].copy().sort_values(
+                ['ownership_error_abs', 'field_exposure_pct'],
+                ascending=[False, False],
+            )
+
+        overexposed_duds_df = exposure_df.copy()
+        if not overexposed_duds_df.empty:
+            overexposed_duds_df['our_minus_field_pct'] = (
+                overexposed_duds_df['our_exposure_pct'] - overexposed_duds_df['field_exposure_pct']
+            )
+            overexposed_duds_df = overexposed_duds_df[
+                (overexposed_duds_df['our_exposure_pct'] >= 10.0)
+                & (overexposed_duds_df['our_minus_field_pct'] >= 8.0)
+                & (pd.to_numeric(overexposed_duds_df['actual_minus_proj'], errors='coerce') <= -6.0)
+            ].copy().sort_values(
+                ['our_minus_field_pct', 'actual_minus_proj'],
+                ascending=[False, True],
+            )
+
+        value_tier_misses_df = top_field_players_df[
+            (pd.to_numeric(top_field_players_df['salary'], errors='coerce') >= 4000)
+            & (pd.to_numeric(top_field_players_df['salary'], errors='coerce') <= 5000)
+            & (top_field_players_df['field_exposure_pct'] >= 10.0)
+        ].copy()
+        if not value_tier_misses_df.empty:
+            def _value_tier_tag(row: pd.Series) -> str:
+                tags: List[str] = []
+                if pd.to_numeric(row.get('our_exposure_pct'), errors='coerce') < pd.to_numeric(row.get('field_exposure_pct'), errors='coerce'):
+                    tags.append('underexposed')
+                if pd.to_numeric(row.get('actual_minus_proj'), errors='coerce') >= standout_min_error:
+                    tags.append('standout')
+                if pd.to_numeric(row.get('field_exposure_pct'), errors='coerce') >= core_field_exposure_pct:
+                    tags.append('core-field')
+                return ', '.join(tags)
+
+            value_tier_misses_df['miss_tags'] = value_tier_misses_df.apply(_value_tier_tag, axis=1)
+            value_tier_misses_df = value_tier_misses_df[
+                value_tier_misses_df['miss_tags'].astype(str).str.len() > 0
+            ].copy().sort_values(
+                ['field_exposure_pct', 'actual_minus_proj'],
+                ascending=[False, False],
+            )
+
+        combo_rows: List[Dict[str, Any]] = []
+        if field_lineup_name_sets:
+            eligible_combo_keys = set(
+                top_field_players_df[
+                    pd.to_numeric(top_field_players_df['field_exposure_pct'], errors='coerce') >= 20.0
+                ]['name_key'].dropna().astype(str).tolist()
+            )
+            combo_counts = {2: Counter(), 3: Counter()}
+            for lineup_keys in field_lineup_name_sets:
+                clean_keys = sorted([k for k in lineup_keys if k and k in eligible_combo_keys])
+                for combo_size in (2, 3):
+                    if len(clean_keys) >= combo_size:
+                        for combo in combinations(clean_keys, combo_size):
+                            combo_counts[combo_size][combo] += 1
+
+            name_lookup: Dict[str, str] = {}
+            actual_lookup: Dict[str, Any] = {}
+            for _, row in exposure_df[['name_key', 'display_name', 'actual_fpts']].iterrows():
+                key = str(row.get('name_key') or '').strip()
+                if not key:
+                    continue
+                if key not in name_lookup:
+                    name_lookup[key] = str(row.get('display_name') or key)
+                if key not in actual_lookup:
+                    actual_lookup[key] = row.get('actual_fpts')
+
+            min_pair_count = max(2, int(np.ceil(field_lineups * 0.30)))
+            min_triple_count = max(2, int(np.ceil(field_lineups * 0.20)))
+            min_combo_gap_pct = 10.0
+
+            for combo_size, counter in combo_counts.items():
+                min_count = min_pair_count if combo_size == 2 else min_triple_count
+                for combo_keys, field_count in counter.items():
+                    if field_count < min_count:
+                        continue
+
+                    field_combo_pct = 100.0 * float(field_count) / float(max(1, field_lineups))
+                    if our_lineups > 0 and lineup_name_sets:
+                        our_count = int(sum(1 for s in lineup_name_sets if set(combo_keys).issubset(s)))
+                        our_combo_pct = 100.0 * float(our_count) / float(max(1, our_lineups))
+                    else:
+                        our_count = 0
+                        our_combo_pct = 0.0
+                    combo_gap_pct = field_combo_pct - our_combo_pct
+                    if combo_gap_pct < min_combo_gap_pct:
+                        continue
+
+                    combo_players = [name_lookup.get(k, k) for k in combo_keys]
+                    actual_vals = [pd.to_numeric(actual_lookup.get(k), errors='coerce') for k in combo_keys]
+                    actual_vals = [v for v in actual_vals if pd.notna(v)]
+                    combo_actual_sum = float(np.sum(actual_vals)) if actual_vals else None
+
+                    combo_rows.append({
+                        'combo_size': int(combo_size),
+                        'combo_players': ' + '.join(combo_players),
+                        'field_combo_count': int(field_count),
+                        'field_combo_pct': float(field_combo_pct),
+                        'our_combo_count': int(our_count),
+                        'our_combo_pct': float(our_combo_pct),
+                        'combo_gap_pct': float(combo_gap_pct),
+                        'combo_actual_fpts_sum': combo_actual_sum,
+                    })
+
+        combo_capture_misses_df = pd.DataFrame(combo_rows)
+        combo_capture_miss_raw_count = 0
+        if not combo_capture_misses_df.empty:
+            combo_capture_miss_raw_count = int(len(combo_capture_misses_df))
+            combo_capture_misses_df = combo_capture_misses_df.sort_values(
+                ['combo_gap_pct', 'field_combo_pct', 'combo_size', 'combo_actual_fpts_sum'],
+                ascending=[False, False, False, False],
+            ).head(60)
+
+        team_lookup_df = perf_agg[['name_key', 'team']].dropna(subset=['name_key']).copy()
+        if not team_lookup_df.empty:
+            team_lookup_df['team'] = team_lookup_df['team'].astype(str).str.strip()
+            team_lookup_df = team_lookup_df[
+                team_lookup_df['team'].ne('')
+                & team_lookup_df['team'].ne('nan')
+                & team_lookup_df['team'].ne('?')
+            ]
+
+        team_concentration_mismatch_df = pd.DataFrame()
+        if not team_lookup_df.empty and not field_long.empty:
+            field_team_slots = field_long[['field_lineup_num', 'name_key']].merge(
+                team_lookup_df,
+                on='name_key',
+                how='left',
+            ).dropna(subset=['team'])
+            field_team_agg = pd.DataFrame(columns=['team', 'field_team_slots', 'field_team_lineups'])
+            if not field_team_slots.empty:
+                field_team_agg = field_team_slots.groupby('team', as_index=False).agg(
+                    field_team_slots=('name_key', 'size'),
+                    field_team_lineups=('field_lineup_num', 'nunique'),
+                )
+                field_team_agg['field_team_slot_pct'] = (
+                    100.0 * field_team_agg['field_team_slots'] / float(max(1, field_lineups * 8))
+                )
+                field_team_agg['field_team_lineup_pct'] = (
+                    100.0 * field_team_agg['field_team_lineups'] / float(max(1, field_lineups))
+                )
+
+            our_team_agg = pd.DataFrame(columns=['team', 'our_team_slots', 'our_team_lineups'])
+            if our_lineups > 0 and not our_long.empty:
+                our_team_slots = our_long[['lineup_num', 'name_key']].merge(
+                    team_lookup_df,
+                    on='name_key',
+                    how='left',
+                ).dropna(subset=['team'])
+                if not our_team_slots.empty:
+                    our_team_agg = our_team_slots.groupby('team', as_index=False).agg(
+                        our_team_slots=('name_key', 'size'),
+                        our_team_lineups=('lineup_num', 'nunique'),
+                    )
+                    our_team_agg['our_team_slot_pct'] = (
+                        100.0 * our_team_agg['our_team_slots'] / float(max(1, our_lineups * 8))
+                    )
+                    our_team_agg['our_team_lineup_pct'] = (
+                        100.0 * our_team_agg['our_team_lineups'] / float(max(1, our_lineups))
+                    )
+
+            team_conc_df = field_team_agg.merge(
+                our_team_agg,
+                on='team',
+                how='outer',
+            )
+            for c in [
+                'field_team_slots', 'field_team_lineups', 'field_team_slot_pct', 'field_team_lineup_pct',
+                'our_team_slots', 'our_team_lineups', 'our_team_slot_pct', 'our_team_lineup_pct',
+            ]:
+                team_conc_df[c] = pd.to_numeric(team_conc_df.get(c), errors='coerce').fillna(0.0)
+
+            team_conc_df['slot_gap_pct'] = team_conc_df['field_team_slot_pct'] - team_conc_df['our_team_slot_pct']
+            team_conc_df['lineup_gap_pct'] = (
+                team_conc_df['field_team_lineup_pct'] - team_conc_df['our_team_lineup_pct']
+            )
+            team_conc_df['abs_slot_gap_pct'] = team_conc_df['slot_gap_pct'].abs()
+            team_concentration_mismatch_df = team_conc_df[
+                (team_conc_df['abs_slot_gap_pct'] >= 5.0)
+                | (team_conc_df['lineup_gap_pct'].abs() >= 20.0)
+            ].copy().sort_values(
+                ['abs_slot_gap_pct', 'field_team_slot_pct'],
+                ascending=[False, False],
+            )
+
+        ownership_polarity_count = int(len(ownership_polarity_df))
+        underprojected_chalk_count = int(
+            ((ownership_polarity_df.get('ownership_error_pp') >= 8.0).sum())
+            if not ownership_polarity_df.empty
+            else 0
+        )
+        overprojected_chalk_count = int(
+            ((ownership_polarity_df.get('ownership_error_pp') <= -8.0).sum())
+            if not ownership_polarity_df.empty
+            else 0
+        )
+        overexposed_dud_count = int(len(overexposed_duds_df))
+        value_tier_miss_count = int(len(value_tier_misses_df))
+        combo_capture_miss_count = int(combo_capture_miss_raw_count)
+        combo_capture_rows_exported = int(len(combo_capture_misses_df))
+        team_concentration_mismatch_count = int(len(team_concentration_mismatch_df))
+        largest_team_slot_gap = None
+        largest_team_slot_gap_team = ""
+        if not team_concentration_mismatch_df.empty:
+            largest_team_slot_gap = float(team_concentration_mismatch_df.iloc[0].get('slot_gap_pct'))
+            largest_team_slot_gap_team = str(team_concentration_mismatch_df.iloc[0].get('team') or '')
+
         # 5) Score and accuracy metrics
         winner_row = conn.execute(
             """
@@ -1848,6 +2095,16 @@ def build_tournament_postmortem(
             'ownership_rank_corr': ownership_rank_corr,
             'missed_core_count': int(len(missed_core_df)),
             'missed_standout_count': int(len(missed_standouts_df)),
+            'ownership_polarity_count': ownership_polarity_count,
+            'underprojected_chalk_count': underprojected_chalk_count,
+            'overprojected_chalk_count': overprojected_chalk_count,
+            'overexposed_dud_count': overexposed_dud_count,
+            'value_tier_miss_count': value_tier_miss_count,
+            'combo_capture_miss_count': combo_capture_miss_count,
+            'combo_capture_rows_exported': combo_capture_rows_exported,
+            'team_concentration_mismatch_count': team_concentration_mismatch_count,
+            'largest_team_slot_gap': largest_team_slot_gap,
+            'largest_team_slot_gap_team': largest_team_slot_gap_team,
             'top_scorer_name': top_scorer_name,
             'top_scorer_actual': float(top_scorer_actual) if pd.notna(top_scorer_actual) else None,
             'top_scorer_in_our_lineups': top_scorer_in_our,
@@ -1907,6 +2164,37 @@ def build_tournament_postmortem(
                 right_notes.append("At least one lineup contained all top-3 actual scorers.")
             elif top3_all_in_single is False:
                 wrong_notes.append("No lineup captured all top-3 actual scorers together.")
+
+        if ownership_polarity_count > 0:
+            wrong_notes.append(
+                f"Ownership polarity misses: {ownership_polarity_count} high-signal players were materially misestimated."
+            )
+
+        if overexposed_dud_count > 0:
+            wrong_notes.append(
+                f"Overexposed dud watchlist triggered on {overexposed_dud_count} players (high our exposure + underperformance)."
+            )
+
+        if value_tier_miss_count > 0:
+            wrong_notes.append(
+                f"Value-tier miss tracker flagged {value_tier_miss_count} players in the $4k-$5k range."
+            )
+
+        if combo_capture_miss_count > 0:
+            top_combo = str(combo_capture_misses_df.iloc[0].get('combo_players') or '')
+            top_combo_gap = pd.to_numeric(combo_capture_misses_df.iloc[0].get('combo_gap_pct'), errors='coerce')
+            if top_combo and pd.notna(top_combo_gap):
+                wrong_notes.append(
+                    f"Combo capture miss: `{top_combo}` field-minus-our gap was {float(top_combo_gap):.1f}pp."
+                )
+
+        if team_concentration_mismatch_count > 0 and largest_team_slot_gap_team:
+            if largest_team_slot_gap is not None and pd.notna(largest_team_slot_gap):
+                wrong_notes.append(
+                    f"Team concentration mismatch led by {largest_team_slot_gap_team} ({float(largest_team_slot_gap):+.1f}pp slot-share gap)."
+                )
+            else:
+                wrong_notes.append("Team concentration mismatch detected between field and our builds.")
 
         result['right_notes'] = right_notes
         result['wrong_notes'] = wrong_notes
@@ -1974,6 +2262,80 @@ def build_tournament_postmortem(
                 'next_slate_change': 'Strengthen standout rules for volatile upside profiles and stack contexts.',
                 'success_metric': 'Improve coverage of high actual-minus-projection players.',
             })
+            priority += 1
+
+        if ownership_polarity_count > 0:
+            top_own = str(ownership_polarity_df.iloc[0].get('display_name') or '')
+            own_err = pd.to_numeric(ownership_polarity_df.iloc[0].get('ownership_error_pp'), errors='coerce')
+            improvement_rows.append({
+                'priority': priority,
+                'area': 'Ownership Polarity Calibration',
+                'why': (
+                    f"polarity_misses={ownership_polarity_count} (top: {top_own}, error={own_err:+.1f}pp)"
+                    if pd.notna(own_err)
+                    else f"polarity_misses={ownership_polarity_count}"
+                ),
+                'next_slate_change': 'Add bidirectional ownership guardrails for underprojected/overprojected chalk.',
+                'success_metric': 'Lower ownership polarity misses and improve ownership rank alignment.',
+            })
+            priority += 1
+
+        if overexposed_dud_count > 0:
+            top_dud = str(overexposed_duds_df.iloc[0].get('display_name') or '')
+            over_gap = pd.to_numeric(overexposed_duds_df.iloc[0].get('our_minus_field_pct'), errors='coerce')
+            improvement_rows.append({
+                'priority': priority,
+                'area': 'Overexposed Dud Guardrails',
+                'why': (
+                    f"overexposed_duds={overexposed_dud_count} (top: {top_dud}, overexposure={over_gap:+.1f}pp)"
+                    if pd.notna(over_gap)
+                    else f"overexposed_duds={overexposed_dud_count}"
+                ),
+                'next_slate_change': 'Cap fragile high-exposure plays when field is underweight and downside risk is high.',
+                'success_metric': 'Reduce negative-leverage overexposure without sacrificing ceiling.',
+            })
+            priority += 1
+
+        if value_tier_miss_count > 0:
+            top_value = str(value_tier_misses_df.iloc[0].get('display_name') or '')
+            improvement_rows.append({
+                'priority': priority,
+                'area': 'Value-Tier (4k-5k) Coverage',
+                'why': f"value_tier_misses={value_tier_miss_count} (top: {top_value})",
+                'next_slate_change': 'Reweight sub-$5k value detection and minutes/role volatility filters.',
+                'success_metric': 'Improve hit rate on 4k-5k core and standout outcomes.',
+            })
+            priority += 1
+
+        if combo_capture_miss_count > 0:
+            top_combo = str(combo_capture_misses_df.iloc[0].get('combo_players') or '')
+            top_combo_gap = pd.to_numeric(combo_capture_misses_df.iloc[0].get('combo_gap_pct'), errors='coerce')
+            improvement_rows.append({
+                'priority': priority,
+                'area': 'Pair/Triple Combo Capture',
+                'why': (
+                    f"combo_misses={combo_capture_miss_count} (top: {top_combo}, gap={top_combo_gap:.1f}pp)"
+                    if pd.notna(top_combo_gap)
+                    else f"combo_misses={combo_capture_miss_count}"
+                ),
+                'next_slate_change': 'Add co-occurrence boosts for high-field player pairs/triples in lineup generation.',
+                'success_metric': 'Increase capture rate of top-field combo structures.',
+            })
+            priority += 1
+
+        if team_concentration_mismatch_count > 0:
+            improvement_rows.append({
+                'priority': priority,
+                'area': 'Team Concentration Alignment',
+                'why': (
+                    f"team_mismatches={team_concentration_mismatch_count} "
+                    f"(largest: {largest_team_slot_gap_team} {largest_team_slot_gap:+.1f}pp)"
+                    if largest_team_slot_gap is not None and largest_team_slot_gap_team
+                    else f"team_mismatches={team_concentration_mismatch_count}"
+                ),
+                'next_slate_change': 'Constrain team slot-share drift vs top-field concentration patterns.',
+                'success_metric': 'Shrink team concentration gap on heavily targeted games/teams.',
+            })
 
         result['improvements_df'] = (
             pd.DataFrame(improvement_rows).sort_values('priority')
@@ -1985,6 +2347,11 @@ def build_tournament_postmortem(
         result['exposure_comparison_df'] = exposure_df.reset_index(drop=True)
         result['missed_core_df'] = missed_core_df.reset_index(drop=True)
         result['missed_standouts_df'] = missed_standouts_df.reset_index(drop=True)
+        result['ownership_polarity_df'] = ownership_polarity_df.reset_index(drop=True)
+        result['overexposed_duds_df'] = overexposed_duds_df.reset_index(drop=True)
+        result['value_tier_misses_df'] = value_tier_misses_df.reset_index(drop=True)
+        result['combo_capture_misses_df'] = combo_capture_misses_df.reset_index(drop=True)
+        result['team_concentration_mismatch_df'] = team_concentration_mismatch_df.reset_index(drop=True)
 
     except Exception as e:
         result['errors'].append(f"Postmortem build error: {e}")
