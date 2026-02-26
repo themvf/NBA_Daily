@@ -16348,6 +16348,57 @@ if selected_page == "DFS Lineup Builder":
                         and float(pm_payload.get('__min_error', -1.0)) == float(pm_min_error)
                     )
                     if pm_matches_selection:
+                        pm_export_payload = {
+                            "schema_version": "dfs_tournament_postmortem_v1",
+                            "generated_at": datetime.now(EASTERN_TZ).isoformat(),
+                            "context": {
+                                "slate_date": selected_slate,
+                                "top_n": int(top_n),
+                                "core_field_exposure_pct": int(pm_core_pct),
+                                "underexposure_ratio_pct": int(pm_under_ratio_pct),
+                                "standout_min_actual_minus_proj": float(pm_min_error),
+                            },
+                            "metrics": pm_payload.get("metrics") or {},
+                            "right_notes": pm_payload.get("right_notes") or [],
+                            "wrong_notes": pm_payload.get("wrong_notes") or [],
+                            "errors": pm_payload.get("errors") or [],
+                            "tables": {
+                                "top_field_players": (
+                                    pm_payload.get("top_field_players_df").to_dict(orient="records")
+                                    if isinstance(pm_payload.get("top_field_players_df"), pd.DataFrame)
+                                    else []
+                                ),
+                                "exposure_comparison": (
+                                    pm_payload.get("exposure_comparison_df").to_dict(orient="records")
+                                    if isinstance(pm_payload.get("exposure_comparison_df"), pd.DataFrame)
+                                    else []
+                                ),
+                                "missed_core": (
+                                    pm_payload.get("missed_core_df").to_dict(orient="records")
+                                    if isinstance(pm_payload.get("missed_core_df"), pd.DataFrame)
+                                    else []
+                                ),
+                                "missed_standouts": (
+                                    pm_payload.get("missed_standouts_df").to_dict(orient="records")
+                                    if isinstance(pm_payload.get("missed_standouts_df"), pd.DataFrame)
+                                    else []
+                                ),
+                                "improvements": (
+                                    pm_payload.get("improvements_df").to_dict(orient="records")
+                                    if isinstance(pm_payload.get("improvements_df"), pd.DataFrame)
+                                    else []
+                                ),
+                            },
+                        }
+                        pm_export_json = json.dumps(pm_export_payload, indent=2, default=str)
+                        st.download_button(
+                            "📥 Download Postmortem JSON",
+                            data=pm_export_json,
+                            file_name=f"dfs_tournament_postmortem_{selected_slate}_top{int(top_n)}.json",
+                            mime="application/json",
+                            key="download_dfs_tournament_postmortem_json",
+                        )
+
                         pm_errors = pm_payload.get('errors') or []
                         if pm_errors:
                             for err in pm_errors:
