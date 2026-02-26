@@ -11,7 +11,7 @@ import sqlite3
 import tempfile
 from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterable, Mapping, Tuple, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -16348,6 +16348,40 @@ if selected_page == "DFS Lineup Builder":
                         and float(pm_payload.get('__min_error', -1.0)) == float(pm_min_error)
                     )
                     if pm_matches_selection:
+                        def _df_records_safe(df: pd.DataFrame) -> List[Dict[str, Any]]:
+                            if not isinstance(df, pd.DataFrame) or df.empty:
+                                return []
+                            safe_df = df.replace([np.inf, -np.inf], np.nan)
+                            safe_df = safe_df.where(pd.notna(safe_df), None)
+                            return safe_df.to_dict(orient="records")
+
+                        def _json_safe(value: Any) -> Any:
+                            if isinstance(value, dict):
+                                return {str(k): _json_safe(v) for k, v in value.items()}
+                            if isinstance(value, list):
+                                return [_json_safe(v) for v in value]
+                            if isinstance(value, (np.floating, float)):
+                                if np.isnan(float(value)) or np.isinf(float(value)):
+                                    return None
+                                return float(value)
+                            if isinstance(value, (np.integer, int)):
+                                return int(value)
+                            if isinstance(value, (np.bool_, bool)):
+                                return bool(value)
+                            return value
+
+                        top_field_df = pm_payload.get("top_field_players_df")
+                        exp_comp_df = pm_payload.get("exposure_comparison_df")
+                        exp_comp_top_field_df = pd.DataFrame()
+                        if isinstance(exp_comp_df, pd.DataFrame) and not exp_comp_df.empty:
+                            if "field_slots" in exp_comp_df.columns:
+                                exp_comp_top_field_df = exp_comp_df[
+                                    pd.to_numeric(exp_comp_df["field_slots"], errors="coerce").fillna(0) > 0
+                                ].copy()
+                            else:
+                                exp_comp_top_field_df = exp_comp_df.copy()
+
+                        metrics_payload = pm_payload.get("metrics") or {}
                         pm_export_payload = {
                             "schema_version": "dfs_tournament_postmortem_v1",
                             "generated_at": datetime.now(EASTERN_TZ).isoformat(),
@@ -16358,39 +16392,31 @@ if selected_page == "DFS Lineup Builder":
                                 "underexposure_ratio_pct": int(pm_under_ratio_pct),
                                 "standout_min_actual_minus_proj": float(pm_min_error),
                             },
-                            "metrics": pm_payload.get("metrics") or {},
+                            "metrics": metrics_payload,
+                            "denominators": {
+                                "field_exposure_pct": {
+                                    "lineups": int(metrics_payload.get("field_lineups_analyzed") or 0),
+                                    "description": "Percent of top-N field lineups analyzed for this postmortem.",
+                                },
+                                "our_exposure_pct": {
+                                    "lineups": int(metrics_payload.get("our_lineups") or 0),
+                                    "description": "Percent of our generated lineups for this slate.",
+                                },
+                            },
                             "right_notes": pm_payload.get("right_notes") or [],
                             "wrong_notes": pm_payload.get("wrong_notes") or [],
                             "errors": pm_payload.get("errors") or [],
                             "tables": {
-                                "top_field_players": (
-                                    pm_payload.get("top_field_players_df").to_dict(orient="records")
-                                    if isinstance(pm_payload.get("top_field_players_df"), pd.DataFrame)
-                                    else []
-                                ),
-                                "exposure_comparison": (
-                                    pm_payload.get("exposure_comparison_df").to_dict(orient="records")
-                                    if isinstance(pm_payload.get("exposure_comparison_df"), pd.DataFrame)
-                                    else []
-                                ),
-                                "missed_core": (
-                                    pm_payload.get("missed_core_df").to_dict(orient="records")
-                                    if isinstance(pm_payload.get("missed_core_df"), pd.DataFrame)
-                                    else []
-                                ),
-                                "missed_standouts": (
-                                    pm_payload.get("missed_standouts_df").to_dict(orient="records")
-                                    if isinstance(pm_payload.get("missed_standouts_df"), pd.DataFrame)
-                                    else []
-                                ),
-                                "improvements": (
-                                    pm_payload.get("improvements_df").to_dict(orient="records")
-                                    if isinstance(pm_payload.get("improvements_df"), pd.DataFrame)
-                                    else []
-                                ),
+                                "top_field_players": _df_records_safe(top_field_df),
+                                "exposure_comparison": _df_records_safe(exp_comp_df),
+                                "exposure_comparison_top_field_only": _df_records_safe(exp_comp_top_field_df),
+                                "missed_core": _df_records_safe(pm_payload.get("missed_core_df")),
+                                "missed_standouts": _df_records_safe(pm_payload.get("missed_standouts_df")),
+                                "improvements": _df_records_safe(pm_payload.get("improvements_df")),
                             },
                         }
-                        pm_export_json = json.dumps(pm_export_payload, indent=2, default=str)
+                        pm_export_payload = _json_safe(pm_export_payload)
+                        pm_export_json = json.dumps(pm_export_payload, indent=2, allow_nan=False, default=str)
                         st.download_button(
                             "📥 Download Postmortem JSON",
                             data=pm_export_json,

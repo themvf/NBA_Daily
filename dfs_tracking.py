@@ -241,7 +241,7 @@ def save_slate_lineups(
                 slate_date, lineup_num, model_key, model_label, generation_strategy,
                 total_proj_fpts, total_salary,
                 pg_id, sg_id, sf_id, pf_id, c_id, g_id, f_id, util_id, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             slate_date, i, model_key, model_label, generation_strategy,
             lineup.total_proj_fpts, lineup.total_salary,

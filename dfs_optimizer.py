@@ -631,6 +631,10 @@ LINEUP_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
         "description": "Balanced baseline blend of projection, ceiling, value, and leverage.",
         "aggressive_ceiling_stack": False,
         "overlap_cap": 6,
+        "core_play_inject_prob": 0.20,
+        "core_play_min_own_pct": 14.0,
+        "core_play_max_own_pct": 60.0,
+        "core_play_min_projection": 24.0,
         "low_own_inject_prob": 0.12,
         "low_own_max_own_pct": 10.0,
         "low_own_min_projection": 22.0,
@@ -649,6 +653,10 @@ LINEUP_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
         "description": "Legacy spike profile with stronger upside and leverage tilt.",
         "aggressive_ceiling_stack": True,
         "overlap_cap": 5,
+        "core_play_inject_prob": 0.12,
+        "core_play_min_own_pct": 14.0,
+        "core_play_max_own_pct": 60.0,
+        "core_play_min_projection": 23.0,
         "low_own_inject_prob": 0.30,
         "low_own_max_own_pct": 12.0,
         "low_own_min_projection": 20.0,
@@ -666,6 +674,10 @@ LINEUP_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
         "description": "Tail-seeking profile emphasizing ceiling outcomes and contrarian leverage.",
         "aggressive_ceiling_stack": True,
         "overlap_cap": 4,
+        "core_play_inject_prob": 0.08,
+        "core_play_min_own_pct": 15.0,
+        "core_play_max_own_pct": 60.0,
+        "core_play_min_projection": 24.0,
         "low_own_inject_prob": 0.42,
         "low_own_max_own_pct": 14.0,
         "low_own_min_projection": 18.0,
@@ -682,6 +694,10 @@ LINEUP_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
         "description": "High-diversity exploratory profile with wider randomization.",
         "aggressive_ceiling_stack": False,
         "overlap_cap": 5,
+        "core_play_inject_prob": 0.10,
+        "core_play_min_own_pct": 14.0,
+        "core_play_max_own_pct": 60.0,
+        "core_play_min_projection": 23.0,
         "low_own_inject_prob": 0.25,
         "low_own_max_own_pct": 12.0,
         "low_own_min_projection": 20.0,
@@ -699,6 +715,10 @@ LINEUP_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
         "description": "Ceiling-first profile for capturing overlooked breakout outcomes.",
         "aggressive_ceiling_stack": True,
         "overlap_cap": 4,
+        "core_play_inject_prob": 0.06,
+        "core_play_min_own_pct": 15.0,
+        "core_play_max_own_pct": 60.0,
+        "core_play_min_projection": 24.0,
         "low_own_inject_prob": 0.45,
         "low_own_max_own_pct": 15.0,
         "low_own_min_projection": 18.0,
@@ -997,14 +1017,15 @@ STAT_OPP_ADJUSTMENT_MAP = {
 def _estimate_ownership(player, has_injury_boost: bool = False) -> float:
     """Estimate ownership % using nonlinear model calibrated to actual DFS data.
 
-    Calibrated against 312 players across 3 slates (2026-02-04 to 02-06).
-    Uses power-law sharpening to separate chalk (30%+) from contrarian (<3%).
+    Uses a nonlinear signal that combines value, DK card visibility, and
+    raw projection strength to separate chalk (30%+) from contrarian (<3%).
 
     Key drivers:
     1. Value (FPTS/$) -- optimizers push toward high-value plays
     2. DK AvgPointsPerGame -- visible on DK player card, influences casual players
-    3. Salary tier -- determines base ownership and scaling ceiling
-    4. Injury boost -- players absorbing injured teammates' usage draw higher ownership
+    3. Projection signal (projected FPTS) -- captures emerging chalk before DK averages catch up
+    4. Salary tier -- determines base ownership and scaling ceiling
+    5. Injury boost -- players absorbing injured teammates' usage draw higher ownership
     """
     if player.salary <= 0 or player.proj_fpts <= 0:
         return 0.5
@@ -1016,32 +1037,41 @@ def _estimate_ownership(player, has_injury_boost: bool = False) -> float:
     dk_avg = getattr(player, 'dk_avg_pts', 0.0) or 0.0
     dk_visibility = min(10.0, dk_avg / 7.0) if dk_avg > 0 else value_score * 0.7
 
-    # --- Factor 3: Salary-tier parameters ---
-    # Calibrated from actual contest ownership data:
-    #   Stars:  high base (always rostered), visibility-driven
-    #   Mid:    moderate base, balanced drivers
-    #   Value:  low base, value-driven, can spike on obvious plays
-    #   Punt:   very low base, almost entirely value-driven
+    # --- Factor 3: Projection signal (0-10 range) ---
+    projection_signal = min(10.0, float(getattr(player, 'proj_fpts', 0.0) or 0.0) / 5.0)
+
+    # --- Factor 4: Salary-tier parameters ---
+    # Stars: high base and visibility/projection driven
+    # Mid/Value: balanced value + projection
+    # Punt: low base but can jump on elite value + projection
     if player.salary >= 9000:
         tier_base = 8.0
         tier_ceiling = 55.0
-        vis_weight = 0.65  # Stars: name recognition dominates
+        vis_weight = 0.50
+        proj_weight = 0.30
     elif player.salary >= 7000:
         tier_base = 3.0
         tier_ceiling = 30.0
-        vis_weight = 0.55
+        vis_weight = 0.42
+        proj_weight = 0.28
     elif player.salary >= 5000:
         tier_base = 1.5
         tier_ceiling = 32.0
-        vis_weight = 0.40  # Value: optimizer value matters more
+        vis_weight = 0.28
+        proj_weight = 0.32
     else:
         tier_base = 0.5
         tier_ceiling = 35.0
-        vis_weight = 0.30  # Punt: almost entirely value-driven
+        vis_weight = 0.20
+        proj_weight = 0.30
 
     # --- Combine factors with tier-specific weighting ---
-    val_weight = 1.0 - vis_weight
-    raw_signal = value_score * val_weight + dk_visibility * vis_weight
+    val_weight = max(0.0, 1.0 - vis_weight - proj_weight)
+    raw_signal = (
+        value_score * val_weight
+        + dk_visibility * vis_weight
+        + projection_signal * proj_weight
+    )
 
     # --- Power-law sharpening (exponent 2.0) ---
     # High signals stay high, low signals collapse toward zero
@@ -1060,6 +1090,51 @@ def _estimate_ownership(player, has_injury_boost: bool = False) -> float:
     ownership = min(55.0, max(0.5, ownership))
 
     return round(ownership, 1)
+
+
+def _project_player_ownership(
+    conn: sqlite3.Connection,
+    player: DFSPlayer,
+    today_num_games: Optional[int] = None,
+    has_injury_boost: bool = False,
+) -> float:
+    """Project ownership using blended historical + model estimate.
+
+    Historical ownership is strong when available, but can be stale on
+    rapidly changing slates. Blend it with the current-model estimate so
+    projected ownership adapts to today's projection/value context.
+    """
+    model_own = _estimate_ownership(player, has_injury_boost=has_injury_boost)
+    hist_own = _get_historical_ownership(conn, player.player_id, today_num_games=today_num_games)
+
+    if hist_own is None:
+        return model_own
+
+    ceiling_gap = max(
+        0.0,
+        float(getattr(player, 'proj_ceiling', 0.0) or 0.0)
+        - float(getattr(player, 'proj_fpts', 0.0) or 0.0),
+    )
+    value_score = float(getattr(player, 'fpts_per_dollar', 0.0) or 0.0)
+
+    # Base: favor history but keep room for same-day model information.
+    hist_weight = 0.65
+
+    # Emerging chalk tends to show up first in value/projection signals.
+    if value_score >= 6.0 or ceiling_gap >= 9.0:
+        hist_weight = 0.55
+
+    # If model and history diverge materially, reduce inertia.
+    if abs(model_own - hist_own) >= 12.0:
+        hist_weight = 0.50
+
+    blended = hist_weight * hist_own + (1.0 - hist_weight) * model_own
+
+    # Guardrail: avoid suppressing clear chalk too aggressively from stale history.
+    if model_own >= 28.0:
+        blended = max(blended, model_own * 0.70)
+
+    return round(min(55.0, max(0.5, blended)), 1)
 
 
 def _get_historical_ownership(conn: sqlite3.Connection, player_id: int,
@@ -1324,11 +1399,12 @@ def _generate_simple_projections(
     player.calculate_projections()
 
     if player.salary > 0:
-        hist_own = _get_historical_ownership(conn, player.player_id, today_num_games=num_games)
-        if hist_own is not None:
-            player.ownership_proj = hist_own
-        else:
-            player.ownership_proj = _estimate_ownership(player)
+        player.ownership_proj = _project_player_ownership(
+            conn,
+            player,
+            today_num_games=num_games,
+            has_injury_boost=False,
+        )
 
     return player
 
@@ -1389,8 +1465,12 @@ def generate_player_projections(
             player.proj_points = dk_avg * 0.45   # ~45% of FPTS from points
             player.proj_rebounds = dk_avg * 0.10
             player.proj_assists = dk_avg * 0.08
-            hist_own = _get_historical_ownership(conn, player.player_id, today_num_games=num_games)
-            player.ownership_proj = hist_own if hist_own is not None else 5.0
+            player.ownership_proj = _project_player_ownership(
+                conn,
+                player,
+                today_num_games=num_games,
+                has_injury_boost=False,
+            )
         return player
 
     # Load historical stats
@@ -1708,14 +1788,13 @@ def generate_player_projections(
     if player.salary > 0:
         player.fpts_per_dollar = (player.proj_fpts / player.salary) * 1000
 
-    # Ownership: use historical average from past slates, fall back to model estimate
-    hist_own = _get_historical_ownership(conn, player.player_id, today_num_games=num_games)
-    if hist_own is not None:
-        player.ownership_proj = hist_own
-    else:
-        player.ownership_proj = _estimate_ownership(
-            player, has_injury_boost=("💉" in player.analytics_used)
-        )
+    # Ownership: blend historical ownership with slate-context model estimate.
+    player.ownership_proj = _project_player_ownership(
+        conn,
+        player,
+        today_num_games=num_games,
+        has_injury_boost=("💉" in player.analytics_used),
+    )
 
     # Leverage score: projection + amplified upside, relative to ownership
     if player.ownership_proj > 0:
@@ -2555,6 +2634,10 @@ def generate_diversified_lineups(
 
     profile_cfg = LINEUP_MODEL_PROFILES.get(model_key, {}) if model_key else {}
     overlap_cap = int(profile_cfg.get("overlap_cap", 8) or 8)
+    core_play_inject_prob = float(profile_cfg.get("core_play_inject_prob", 0.0) or 0.0)
+    core_play_min_own_pct = float(profile_cfg.get("core_play_min_own_pct", 14.0) or 14.0)
+    core_play_max_own_pct = float(profile_cfg.get("core_play_max_own_pct", 60.0) or 60.0)
+    core_play_min_projection = float(profile_cfg.get("core_play_min_projection", 24.0) or 24.0)
     low_own_inject_prob = float(profile_cfg.get("low_own_inject_prob", 0.0) or 0.0)
     low_own_max_own_pct = float(profile_cfg.get("low_own_max_own_pct", 12.0) or 12.0)
     low_own_min_projection = float(profile_cfg.get("low_own_min_projection", 20.0) or 20.0)
@@ -2580,6 +2663,29 @@ def generate_diversified_lineups(
             if len(candidate_set & existing) > overlap_cap:
                 return False
         return True
+
+    core_play_candidates = [
+        p for p in filtered_pool
+        if (
+            p.player_id not in locked_ids
+            and not p.is_excluded
+            and not p.is_injured
+            and core_play_min_own_pct <= float(getattr(p, "ownership_proj", 0.0) or 0.0) <= core_play_max_own_pct
+            and float(getattr(p, "proj_fpts", 0.0) or 0.0) >= core_play_min_projection
+        )
+    ]
+    core_play_candidates = sorted(
+        core_play_candidates,
+        key=lambda p: (
+            (
+                float(getattr(p, "proj_fpts", 0.0) or 0.0) * 0.65
+                + float(getattr(p, "proj_ceiling", 0.0) or 0.0) * 0.35
+            )
+            * (1.0 + min(30.0, float(getattr(p, "ownership_proj", 0.0) or 0.0)) / 100.0),
+            float(getattr(p, "salary", 0.0) or 0.0),
+        ),
+        reverse=True,
+    )
 
     low_own_candidates = [
         p for p in filtered_pool
@@ -2696,6 +2802,27 @@ def generate_diversified_lineups(
                     lock_prob = min(1.0, needed / remaining_lineups)
                     if random.random() < lock_prob:
                         _add_lock_candidate(attempt_locked, info['player'])
+
+            # Profile: inject core-play anchors to reduce missed high-field outcomes.
+            if core_play_candidates and random.random() < core_play_inject_prob:
+                available_core = [
+                    p for p in core_play_candidates
+                    if _can_use_for_lock(p)
+                    and p.player_id not in {lp.player_id for lp in attempt_locked}
+                ]
+                if available_core:
+                    weighted_pool = available_core[:20]
+                    weights = [
+                        max(
+                            0.05,
+                            float(getattr(p, "proj_fpts", 0.0) or 0.0)
+                            + (float(getattr(p, "proj_ceiling", 0.0) or 0.0) * 0.20)
+                            + (float(getattr(p, "ownership_proj", 0.0) or 0.0) * 0.30),
+                        )
+                        for p in weighted_pool
+                    ]
+                    core_choice = random.choices(weighted_pool, weights=weights, k=1)[0]
+                    _add_lock_candidate(attempt_locked, core_choice)
 
             # Profile: inject low-owned upside candidates at controlled frequency.
             if low_own_candidates and random.random() < low_own_inject_prob:
