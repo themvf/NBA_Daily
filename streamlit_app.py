@@ -13273,6 +13273,7 @@ if selected_page == "DFS Lineup Builder":
 
         extra_model_keys = [k for k in model_profiles.keys() if k not in expected_model_labels]
         model_keys = list(expected_model_labels.keys()) + sorted(extra_model_keys)
+        all_versions_model_keys = list(model_keys)
 
         run_mode = st.selectbox(
             "Run Mode",
@@ -13304,8 +13305,8 @@ if selected_page == "DFS Lineup Builder":
         else:
             selected_model_key = default_model_key
             st.caption(
-                "All Versions enabled: standard_v1, spike_v1_legacy, "
-                "spike_v2_tail, cluster_v1_experimental, standout_v1_capture"
+                "All Versions enabled: "
+                + ", ".join(model_profiles[k].get("label", k) for k in all_versions_model_keys)
             )
 
         ceiling_focus_pct = st.slider(
@@ -14610,13 +14611,7 @@ if selected_page == "DFS Lineup Builder":
 
                     with st.spinner("Optimizing lineups..."):
                         if run_mode == "All Versions":
-                            model_run_keys = [
-                                "standard_v1",
-                                "spike_v1_legacy",
-                                "spike_v2_tail",
-                                "cluster_v1_experimental",
-                                "standout_v1_capture",
-                            ]
+                            model_run_keys = list(all_versions_model_keys)
                         else:
                             model_run_keys = [selected_model_key]
 
@@ -14976,6 +14971,8 @@ if selected_page == "DFS Lineup Builder":
                 get_slate_projection_df,
                 get_value_accuracy_df,
                 get_slate_lineup_df,
+                get_slate_model_backtest_df,
+                get_model_backtest_summary,
                 import_contest_results,
             )
             from dfs_optimizer import parse_contest_standings
@@ -15223,6 +15220,251 @@ if selected_page == "DFS Lineup Builder":
 
                     st.dataframe(display_summary, use_container_width=True, hide_index=True)
 
+                    with st.expander("Model Backtest Summary", expanded=True):
+                        model_catalog_df = pd.DataFrame(
+                            [
+                                {
+                                    "model_key": key,
+                                    "model_label": str(model_profiles.get(key, {}).get("label", key)),
+                                }
+                                for key in model_keys
+                            ]
+                        ).drop_duplicates(subset=["model_key"])
+
+                        coverage_df = pd.read_sql_query(
+                            """
+                            WITH normalized AS (
+                                SELECT
+                                    slate_date,
+                                    COALESCE(NULLIF(model_key, ''), 'standard_v1') AS model_key,
+                                    total_actual_fpts
+                                FROM dfs_slate_lineups
+                            )
+                            SELECT
+                                model_key,
+                                COUNT(*) AS tracked_lineups,
+                                COUNT(DISTINCT slate_date) AS tracked_slates,
+                                SUM(CASE WHEN total_actual_fpts IS NOT NULL THEN 1 ELSE 0 END) AS lineups_with_actuals,
+                                COUNT(DISTINCT CASE WHEN total_actual_fpts IS NOT NULL THEN slate_date END) AS slates_with_actuals
+                            FROM normalized
+                            GROUP BY model_key
+                            """,
+                            dfs_conn,
+                        )
+                        model_coverage_df = model_catalog_df.merge(
+                            coverage_df, on="model_key", how="left"
+                        )
+                        for int_col in [
+                            "tracked_lineups",
+                            "tracked_slates",
+                            "lineups_with_actuals",
+                            "slates_with_actuals",
+                        ]:
+                            model_coverage_df[int_col] = (
+                                model_coverage_df[int_col].fillna(0).astype(int)
+                            )
+
+                        st.markdown("**Model Tracking Coverage**")
+                        coverage_display = model_coverage_df[
+                            [
+                                "model_label",
+                                "model_key",
+                                "tracked_lineups",
+                                "tracked_slates",
+                                "lineups_with_actuals",
+                                "slates_with_actuals",
+                            ]
+                        ].copy()
+                        coverage_display.columns = [
+                            "Model",
+                            "Model Key",
+                            "Tracked Lineups",
+                            "Tracked Slates",
+                            "Lineups w/ Actuals",
+                            "Slates w/ Actuals",
+                        ]
+                        st.dataframe(coverage_display, use_container_width=True, hide_index=True)
+
+                        coverage_plot_df = model_coverage_df[
+                            model_coverage_df["tracked_lineups"] > 0
+                        ].copy()
+                        if not coverage_plot_df.empty:
+                            fig_coverage = px.bar(
+                                coverage_plot_df,
+                                x="model_label",
+                                y=["tracked_lineups", "lineups_with_actuals"],
+                                barmode="group",
+                                labels={
+                                    "model_label": "Model",
+                                    "value": "Lineups",
+                                    "variable": "Metric",
+                                },
+                                title="Tracked vs Scored Lineups by Model",
+                            )
+                            fig_coverage.update_layout(height=340)
+                            st.plotly_chart(fig_coverage, use_container_width=True)
+
+                        min_model_lineups = st.slider(
+                            "Minimum lineups per model",
+                            min_value=1,
+                            max_value=500,
+                            value=1,
+                            step=1,
+                            key="dfs_model_backtest_min_lineups",
+                        )
+                        model_backtest_df = get_model_backtest_summary(
+                            dfs_conn,
+                            min_lineups=min_model_lineups,
+                        )
+                        if not model_backtest_df.empty:
+                            model_backtest_df = model_backtest_df.merge(
+                                model_catalog_df.rename(columns={"model_label": "catalog_label"}),
+                                on="model_key",
+                                how="left",
+                            )
+                            model_backtest_df["model_label"] = model_backtest_df[
+                                "catalog_label"
+                            ].fillna(model_backtest_df["model_label"])
+                            model_backtest_df = model_backtest_df.drop(columns=["catalog_label"])
+
+                            mbt_display = model_backtest_df.copy()
+                            mbt_display = mbt_display[
+                                [
+                                    "model_label",
+                                    "model_key",
+                                    "lineups",
+                                    "slates",
+                                    "avg_proj_fpts",
+                                    "avg_actual_fpts",
+                                    "avg_vs_proj_fpts",
+                                    "proj_capture_pct",
+                                    "best_actual_fpts",
+                                    "avg_salary",
+                                ]
+                            ]
+                            mbt_display.columns = [
+                                "Model",
+                                "Model Key",
+                                "Lineups",
+                                "Slates",
+                                "Avg Proj",
+                                "Avg Actual",
+                                "Avg vs Proj",
+                                "Proj Capture %",
+                                "Best Actual",
+                                "Avg Salary",
+                            ]
+                            for col in ["Avg Proj", "Avg Actual", "Avg vs Proj", "Proj Capture %", "Best Actual"]:
+                                mbt_display[col] = mbt_display[col].apply(
+                                    lambda x: f"{x:.1f}" if pd.notna(x) else "—"
+                                )
+                            mbt_display["Avg Salary"] = mbt_display["Avg Salary"].apply(
+                                lambda x: f"${int(round(x)):,.0f}" if pd.notna(x) else "—"
+                            )
+                            st.dataframe(mbt_display, use_container_width=True, hide_index=True)
+
+                            chart_df = model_backtest_df.dropna(subset=["avg_actual_fpts"]).copy()
+                            if not chart_df.empty:
+                                fig_model = px.bar(
+                                    chart_df,
+                                    x="model_label",
+                                    y=["avg_proj_fpts", "avg_actual_fpts"],
+                                    barmode="group",
+                                    labels={
+                                        "model_label": "Model",
+                                        "value": "Fantasy Points",
+                                        "variable": "Metric",
+                                    },
+                                    title="Average Projected vs Actual FPTS by Model",
+                                )
+                                fig_model.update_layout(height=380)
+                                st.plotly_chart(fig_model, use_container_width=True)
+
+                                model_metric_cols = st.columns(2)
+                                with model_metric_cols[0]:
+                                    fig_capture = px.bar(
+                                        chart_df.sort_values("proj_capture_pct", ascending=False),
+                                        x="model_label",
+                                        y="proj_capture_pct",
+                                        color="proj_capture_pct",
+                                        color_continuous_scale="Blues",
+                                        labels={
+                                            "model_label": "Model",
+                                            "proj_capture_pct": "Proj Capture %",
+                                        },
+                                        title="Projection Capture % by Model",
+                                    )
+                                    fig_capture.update_layout(height=340, coloraxis_showscale=False)
+                                    st.plotly_chart(fig_capture, use_container_width=True)
+
+                                with model_metric_cols[1]:
+                                    fig_delta = px.bar(
+                                        chart_df.sort_values("avg_vs_proj_fpts", ascending=False),
+                                        x="model_label",
+                                        y="avg_vs_proj_fpts",
+                                        color="avg_vs_proj_fpts",
+                                        color_continuous_scale="RdBu",
+                                        labels={
+                                            "model_label": "Model",
+                                            "avg_vs_proj_fpts": "Avg Actual - Proj FPTS",
+                                        },
+                                        title="Average Actual Minus Projected by Model",
+                                    )
+                                    fig_delta.add_hline(y=0, line_dash="dash", line_color="gray")
+                                    fig_delta.update_layout(height=340, coloraxis_showscale=False)
+                                    st.plotly_chart(fig_delta, use_container_width=True)
+
+                                model_trend_df = pd.read_sql_query(
+                                    """
+                                    WITH normalized AS (
+                                        SELECT
+                                            slate_date,
+                                            COALESCE(NULLIF(model_key, ''), 'standard_v1') AS model_key,
+                                            COALESCE(NULLIF(model_label, ''), COALESCE(NULLIF(model_key, ''), 'standard_v1')) AS model_label,
+                                            total_proj_fpts,
+                                            total_actual_fpts
+                                        FROM dfs_slate_lineups
+                                        WHERE total_actual_fpts IS NOT NULL
+                                    )
+                                    SELECT
+                                        slate_date,
+                                        model_key,
+                                        MAX(model_label) AS model_label,
+                                        COUNT(*) AS lineups,
+                                        AVG(total_actual_fpts) AS avg_actual_fpts,
+                                        AVG(total_actual_fpts - total_proj_fpts) AS avg_vs_proj_fpts
+                                    FROM normalized
+                                    GROUP BY slate_date, model_key
+                                    ORDER BY slate_date ASC, model_key ASC
+                                    """,
+                                    dfs_conn,
+                                )
+                                if (
+                                    not model_trend_df.empty
+                                    and model_trend_df["slate_date"].nunique() >= 2
+                                    and model_trend_df["model_key"].nunique() >= 1
+                                ):
+                                    fig_model_trend = px.line(
+                                        model_trend_df,
+                                        x="slate_date",
+                                        y="avg_actual_fpts",
+                                        color="model_label",
+                                        markers=True,
+                                        labels={
+                                            "slate_date": "Slate Date",
+                                            "avg_actual_fpts": "Avg Actual FPTS",
+                                            "model_label": "Model",
+                                        },
+                                        title="Average Actual FPTS by Model Across Slates",
+                                    )
+                                    fig_model_trend.update_layout(height=360)
+                                    st.plotly_chart(fig_model_trend, use_container_width=True)
+                        else:
+                            st.info(
+                                "No model backtest rows for this filter yet. Lower the lineup threshold, "
+                                "generate lineups with model tags, and update slate actuals to populate this."
+                            )
+
                     # --- Trend Charts (3+ slates) ---
                     if len(summary_df) >= 2:
                         st.divider()
@@ -15468,6 +15710,40 @@ if selected_page == "DFS Lineup Builder":
                                     )
                                     fig_lineup.update_layout(height=400)
                                     st.plotly_chart(fig_lineup, use_container_width=True)
+                                    model_perf = get_slate_model_backtest_df(dfs_conn, detail_date)
+                                    if not model_perf.empty:
+                                        st.markdown("**Per-Model Results**")
+                                        model_display = model_perf.copy()
+                                        model_display = model_display[
+                                            [
+                                                'model_label',
+                                                'model_key',
+                                                'lineups',
+                                                'avg_proj_fpts',
+                                                'avg_actual_fpts',
+                                                'avg_vs_proj_fpts',
+                                                'best_actual_fpts',
+                                                'avg_salary',
+                                            ]
+                                        ]
+                                        model_display.columns = [
+                                            'Model',
+                                            'Model Key',
+                                            'Lineups',
+                                            'Avg Proj',
+                                            'Avg Actual',
+                                            'Avg vs Proj',
+                                            'Best Actual',
+                                            'Avg Salary',
+                                        ]
+                                        for c in ['Avg Proj', 'Avg Actual', 'Avg vs Proj', 'Best Actual']:
+                                            model_display[c] = model_display[c].apply(
+                                                lambda x: f"{x:.1f}" if pd.notna(x) else "—"
+                                            )
+                                        model_display['Avg Salary'] = model_display['Avg Salary'].apply(
+                                            lambda x: f"${int(round(x)):,.0f}" if pd.notna(x) else "—"
+                                        )
+                                        st.dataframe(model_display, use_container_width=True, hide_index=True)
                                 else:
                                     st.info("Lineup actuals not yet available. Click 'Update Actuals' after games complete.")
 
@@ -15539,6 +15815,7 @@ if selected_page == "DFS Lineup Builder":
                 get_shark_strategy_profile,
                 analyze_top_finishers,
                 analyze_game_environment,
+                build_tournament_postmortem,
             )
             import plotly.express as px
 
@@ -15998,6 +16275,274 @@ if selected_page == "DFS Lineup Builder":
                                     st.markdown("**Key Findings:**")
                                     for ins in env_analysis['insights']:
                                         st.markdown(f"• {ins}")
+
+                    # --- Tournament Postmortem Review ---
+                    st.divider()
+                    st.subheader("🧠 Tournament Postmortem Review")
+                    st.caption(
+                        "Post-game debrief: compare top field lineups to our generated lineups, "
+                        "surface missed core plays/standouts, and produce next-slate action items."
+                    )
+
+                    pm_c1, pm_c2, pm_c3 = st.columns(3)
+                    with pm_c1:
+                        pm_core_pct = st.slider(
+                            "Core Field Exposure %",
+                            min_value=10,
+                            max_value=80,
+                            value=30,
+                            step=5,
+                            key="postmortem_core_field_pct",
+                            help="Players at or above this field exposure are treated as core plays.",
+                        )
+                    with pm_c2:
+                        pm_under_ratio_pct = st.slider(
+                            "Under-Exposure Ratio %",
+                            min_value=25,
+                            max_value=100,
+                            value=60,
+                            step=5,
+                            key="postmortem_underexposure_ratio_pct",
+                            help="Flag as missed core when our exposure is below this fraction of field exposure.",
+                        )
+                    with pm_c3:
+                        pm_min_error = st.slider(
+                            "Standout Min (Actual - Proj)",
+                            min_value=4.0,
+                            max_value=20.0,
+                            value=8.0,
+                            step=0.5,
+                            key="postmortem_standout_min_error",
+                        )
+
+                    run_postmortem = st.button(
+                        "Run Tournament Postmortem",
+                        type="primary",
+                        key="run_tournament_postmortem_review",
+                    )
+                    postmortem_state_key = "dfs_tournament_postmortem_payload"
+                    if run_postmortem:
+                        with st.spinner("Building tournament postmortem review..."):
+                            pm_payload = build_tournament_postmortem(
+                                dfs_conn,
+                                selected_slate,
+                                top_n=top_n,
+                                core_field_exposure_pct=float(pm_core_pct),
+                                underexposure_ratio=float(pm_under_ratio_pct) / 100.0,
+                                standout_min_error=float(pm_min_error),
+                            )
+                        pm_payload['__slate_date'] = selected_slate
+                        pm_payload['__top_n'] = int(top_n)
+                        pm_payload['__core_pct'] = int(pm_core_pct)
+                        pm_payload['__under_ratio_pct'] = int(pm_under_ratio_pct)
+                        pm_payload['__min_error'] = float(pm_min_error)
+                        st.session_state[postmortem_state_key] = pm_payload
+
+                    pm_payload = st.session_state.get(postmortem_state_key)
+                    pm_matches_selection = (
+                        isinstance(pm_payload, dict)
+                        and pm_payload.get('__slate_date') == selected_slate
+                        and int(pm_payload.get('__top_n', -1)) == int(top_n)
+                        and int(pm_payload.get('__core_pct', -1)) == int(pm_core_pct)
+                        and int(pm_payload.get('__under_ratio_pct', -1)) == int(pm_under_ratio_pct)
+                        and float(pm_payload.get('__min_error', -1.0)) == float(pm_min_error)
+                    )
+                    if pm_matches_selection:
+                        pm_errors = pm_payload.get('errors') or []
+                        if pm_errors:
+                            for err in pm_errors:
+                                st.warning(f"⚠️ {err}")
+                        else:
+                            pm_metrics = pm_payload.get('metrics') or {}
+                            pm_m1, pm_m2, pm_m3, pm_m4, pm_m5 = st.columns(5)
+                            winner_score = pm_metrics.get('winner_score')
+                            our_best = pm_metrics.get('our_best_score')
+                            winner_gap = pm_metrics.get('winner_gap')
+                            proj_mae = pm_metrics.get('projection_mae')
+                            own_mae = pm_metrics.get('ownership_mae')
+
+                            pm_m1.metric(
+                                "Winner Score",
+                                f"{winner_score:.1f}" if winner_score is not None else "—",
+                            )
+                            pm_m2.metric(
+                                "Our Best Lineup",
+                                f"{our_best:.1f}" if our_best is not None else "—",
+                            )
+                            pm_m3.metric(
+                                "Gap to Winner",
+                                f"{winner_gap:+.1f}" if winner_gap is not None else "—",
+                                delta_color="inverse",
+                            )
+                            pm_m4.metric(
+                                "Projection MAE",
+                                f"{proj_mae:.2f}" if proj_mae is not None else "—",
+                            )
+                            pm_m5.metric(
+                                "Ownership MAE",
+                                f"{own_mae:.2f}%" if own_mae is not None else "—",
+                            )
+
+                            pm_m6, pm_m7, pm_m8, pm_m9 = st.columns(4)
+                            pm_m6.metric("Field Lineups", int(pm_metrics.get('field_lineups_analyzed') or 0))
+                            pm_m7.metric("Our Lineups", int(pm_metrics.get('our_lineups') or 0))
+                            pm_m8.metric("Missed Core Plays", int(pm_metrics.get('missed_core_count') or 0))
+                            pm_m9.metric("Missed Standouts", int(pm_metrics.get('missed_standout_count') or 0))
+
+                            top_scorer_name = str(pm_metrics.get('top_scorer_name') or "").strip()
+                            top_scorer_actual = pm_metrics.get('top_scorer_actual')
+                            if top_scorer_name and top_scorer_actual is not None:
+                                st.caption(
+                                    f"Top scorer in top-{top_n} field lineups: "
+                                    f"`{top_scorer_name}` ({float(top_scorer_actual):.1f} DK points)."
+                                )
+
+                            exp_df = pm_payload.get('top_field_players_df')
+                            if isinstance(exp_df, pd.DataFrame) and not exp_df.empty:
+                                st.markdown("**Field vs Our Exposure (Top Field Players)**")
+                                exp_view = exp_df.copy()
+                                exp_view = exp_view[
+                                    [
+                                        'display_name',
+                                        'field_exposure_pct',
+                                        'our_exposure_pct',
+                                        'exposure_gap_pct',
+                                        'proj_fpts',
+                                        'actual_fpts',
+                                        'actual_minus_proj',
+                                        'ownership_proj',
+                                        'actual_ownership',
+                                    ]
+                                ]
+                                exp_view.columns = [
+                                    'Player',
+                                    'Field Exp %',
+                                    'Our Exp %',
+                                    'Gap (Field-Our)',
+                                    'Proj FPTS',
+                                    'Actual FPTS',
+                                    'Actual-Proj',
+                                    'Proj Own%',
+                                    'Actual Own%',
+                                ]
+
+                                for c in ['Field Exp %', 'Our Exp %', 'Gap (Field-Our)', 'Proj Own%', 'Actual Own%']:
+                                    exp_view[c] = exp_view[c].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "—")
+                                for c in ['Proj FPTS', 'Actual FPTS', 'Actual-Proj']:
+                                    exp_view[c] = exp_view[c].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "—")
+
+                                st.dataframe(exp_view.head(30), use_container_width=True, hide_index=True)
+
+                                chart_df = exp_df.sort_values('field_exposure_pct', ascending=False).head(15).copy()
+                                if not chart_df.empty:
+                                    chart_df = chart_df[['display_name', 'field_exposure_pct', 'our_exposure_pct']]
+                                    chart_df = chart_df.rename(columns={'display_name': 'Player'})
+                                    chart_long = chart_df.melt(
+                                        id_vars=['Player'],
+                                        value_vars=['field_exposure_pct', 'our_exposure_pct'],
+                                        var_name='Series',
+                                        value_name='Exposure %',
+                                    )
+                                    chart_long['Series'] = chart_long['Series'].map({
+                                        'field_exposure_pct': 'Field',
+                                        'our_exposure_pct': 'Our',
+                                    })
+                                    fig_pm_exp = px.bar(
+                                        chart_long,
+                                        x='Player',
+                                        y='Exposure %',
+                                        color='Series',
+                                        barmode='group',
+                                        title='Top 15 Field Exposure vs Our Exposure',
+                                        labels={'Player': 'Player', 'Exposure %': 'Exposure %'},
+                                    )
+                                    fig_pm_exp.update_layout(height=380, xaxis_tickangle=-45)
+                                    st.plotly_chart(fig_pm_exp, use_container_width=True)
+
+                            missed_core_df = pm_payload.get('missed_core_df')
+                            if isinstance(missed_core_df, pd.DataFrame) and not missed_core_df.empty:
+                                st.markdown("**Missed Core Field Plays**")
+                                core_view = missed_core_df[
+                                    [
+                                        'display_name',
+                                        'field_exposure_pct',
+                                        'our_exposure_pct',
+                                        'exposure_gap_pct',
+                                        'actual_fpts',
+                                        'actual_minus_proj',
+                                    ]
+                                ].copy()
+                                core_view.columns = [
+                                    'Player',
+                                    'Field Exp %',
+                                    'Our Exp %',
+                                    'Gap (Field-Our)',
+                                    'Actual FPTS',
+                                    'Actual-Proj',
+                                ]
+                                for c in ['Field Exp %', 'Our Exp %', 'Gap (Field-Our)']:
+                                    core_view[c] = core_view[c].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "—")
+                                for c in ['Actual FPTS', 'Actual-Proj']:
+                                    core_view[c] = core_view[c].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "—")
+                                st.dataframe(core_view, use_container_width=True, hide_index=True)
+
+                            missed_standouts_df = pm_payload.get('missed_standouts_df')
+                            if isinstance(missed_standouts_df, pd.DataFrame) and not missed_standouts_df.empty:
+                                st.markdown("**Missed Standout Outcomes**")
+                                standout_view = missed_standouts_df[
+                                    [
+                                        'display_name',
+                                        'field_exposure_pct',
+                                        'our_exposure_pct',
+                                        'actual_fpts',
+                                        'proj_fpts',
+                                        'actual_minus_proj',
+                                        'actual_ownership',
+                                    ]
+                                ].copy()
+                                standout_view.columns = [
+                                    'Player',
+                                    'Field Exp %',
+                                    'Our Exp %',
+                                    'Actual FPTS',
+                                    'Proj FPTS',
+                                    'Actual-Proj',
+                                    'Actual Own%',
+                                ]
+                                for c in ['Field Exp %', 'Our Exp %', 'Actual Own%']:
+                                    standout_view[c] = standout_view[c].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "—")
+                                for c in ['Actual FPTS', 'Proj FPTS', 'Actual-Proj']:
+                                    standout_view[c] = standout_view[c].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "—")
+                                st.dataframe(standout_view, use_container_width=True, hide_index=True)
+
+                            rw_left, rw_right = st.columns(2)
+                            with rw_left:
+                                st.markdown("**What Went Right**")
+                                right_notes = pm_payload.get('right_notes') or []
+                                if right_notes:
+                                    for note in right_notes:
+                                        st.markdown(f"- {note}")
+                                else:
+                                    st.caption("No strong positive signals detected yet.")
+                            with rw_right:
+                                st.markdown("**What Went Wrong**")
+                                wrong_notes = pm_payload.get('wrong_notes') or []
+                                if wrong_notes:
+                                    for note in wrong_notes:
+                                        st.markdown(f"- {note}")
+                                else:
+                                    st.caption("No major negative signals detected from current thresholds.")
+
+                            improvements_df = pm_payload.get('improvements_df')
+                            st.markdown("**Next-Slate Action Plan**")
+                            if isinstance(improvements_df, pd.DataFrame) and not improvements_df.empty:
+                                st.dataframe(improvements_df, use_container_width=True, hide_index=True)
+                            else:
+                                st.info("No improvement actions generated for this sample.")
+                    elif isinstance(pm_payload, dict) and pm_payload.get('__slate_date') == selected_slate:
+                        st.info("Postmortem settings changed. Click **Run Tournament Postmortem** to refresh.")
+                    elif run_postmortem:
+                        st.info("No postmortem output generated for this slate.")
 
                     # --- Cross-Slate Aggregate ---
                     if len(slate_dates) >= 2:

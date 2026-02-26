@@ -16,7 +16,7 @@ import unicodedata
 import numpy as np
 import pandas as pd
 from datetime import datetime
-from typing import List, Optional, Dict, Tuple
+from typing import Any, List, Optional, Dict, Tuple
 from pathlib import Path
 
 # Import DFS types and scoring from the optimizer
@@ -65,6 +65,9 @@ def create_dfs_tracking_tables(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS dfs_slate_lineups (
             slate_date TEXT NOT NULL,
             lineup_num INTEGER NOT NULL,
+            model_key TEXT,
+            model_label TEXT,
+            generation_strategy TEXT,
             total_proj_fpts REAL,
             total_salary INTEGER,
             pg_id INTEGER,
@@ -76,6 +79,7 @@ def create_dfs_tracking_tables(conn: sqlite3.Connection) -> None:
             f_id INTEGER,
             util_id INTEGER,
             total_actual_fpts REAL,
+            created_at TEXT,
             PRIMARY KEY (slate_date, lineup_num)
         );
 
@@ -111,6 +115,10 @@ def create_dfs_tracking_tables(conn: sqlite3.Connection) -> None:
         ("dfs_slate_projections", "actual_ownership", "REAL"),
         ("dfs_slate_results", "ownership_mae", "REAL"),
         ("dfs_slate_results", "ownership_correlation", "REAL"),
+        ("dfs_slate_lineups", "model_key", "TEXT"),
+        ("dfs_slate_lineups", "model_label", "TEXT"),
+        ("dfs_slate_lineups", "generation_strategy", "TEXT"),
+        ("dfs_slate_lineups", "created_at", "TEXT"),
     ]
     for table, col, col_type in migrations:
         # Check if column exists first to avoid ALTER TABLE errors
@@ -120,6 +128,13 @@ def create_dfs_tracking_tables(conn: sqlite3.Connection) -> None:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
             except Exception:
                 pass  # Column might have been added concurrently
+
+    conn.executescript("""
+        CREATE INDEX IF NOT EXISTS idx_dsl_slate_model
+            ON dfs_slate_lineups(slate_date, model_key);
+        CREATE INDEX IF NOT EXISTS idx_dsl_model
+            ON dfs_slate_lineups(model_key);
+    """)
 
     # --- Opponent tracking tables ---
     conn.executescript("""
@@ -218,13 +233,18 @@ def save_slate_lineups(
 
     for i, lineup in enumerate(sorted_lineups, start=1):
         players = lineup.players
+        model_key = getattr(lineup, "model_key", "") or "standard_v1"
+        model_label = getattr(lineup, "model_label", "") or model_key
+        generation_strategy = getattr(lineup, "generation_strategy", "") or ""
         cursor.execute("""
             INSERT OR REPLACE INTO dfs_slate_lineups (
-                slate_date, lineup_num, total_proj_fpts, total_salary,
-                pg_id, sg_id, sf_id, pf_id, c_id, g_id, f_id, util_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                slate_date, lineup_num, model_key, model_label, generation_strategy,
+                total_proj_fpts, total_salary,
+                pg_id, sg_id, sf_id, pf_id, c_id, g_id, f_id, util_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            slate_date, i, lineup.total_proj_fpts, lineup.total_salary,
+            slate_date, i, model_key, model_label, generation_strategy,
+            lineup.total_proj_fpts, lineup.total_salary,
             players['PG'].player_id if players.get('PG') else None,
             players['SG'].player_id if players.get('SG') else None,
             players['SF'].player_id if players.get('SF') else None,
@@ -233,6 +253,7 @@ def save_slate_lineups(
             players['G'].player_id if players.get('G') else None,
             players['F'].player_id if players.get('F') else None,
             players['UTIL'].player_id if players.get('UTIL') else None,
+            datetime.now().isoformat(),
         ))
 
     conn.commit()
@@ -772,11 +793,96 @@ def get_value_accuracy_df(conn: sqlite3.Connection, slate_date: str) -> pd.DataF
 def get_slate_lineup_df(conn: sqlite3.Connection, slate_date: str) -> pd.DataFrame:
     """Get lineup performance data for a specific slate."""
     return pd.read_sql_query(
-        "SELECT lineup_num, total_proj_fpts, total_salary, total_actual_fpts "
+        "SELECT lineup_num, "
+        "COALESCE(NULLIF(model_key, ''), 'standard_v1') AS model_key, "
+        "COALESCE(NULLIF(model_label, ''), COALESCE(NULLIF(model_key, ''), 'standard_v1')) AS model_label, "
+        "generation_strategy, total_proj_fpts, total_salary, total_actual_fpts "
         "FROM dfs_slate_lineups "
         "WHERE slate_date = ? "
         "ORDER BY lineup_num",
         conn, params=[slate_date]
+    )
+
+
+def get_slate_model_backtest_df(conn: sqlite3.Connection, slate_date: str) -> pd.DataFrame:
+    """Get per-model lineup performance for a specific slate."""
+    return pd.read_sql_query(
+        """
+        WITH normalized AS (
+            SELECT
+                slate_date,
+                COALESCE(NULLIF(model_key, ''), 'standard_v1') AS model_key,
+                COALESCE(NULLIF(model_label, ''), COALESCE(NULLIF(model_key, ''), 'standard_v1')) AS model_label,
+                total_proj_fpts,
+                total_actual_fpts,
+                total_salary
+            FROM dfs_slate_lineups
+            WHERE slate_date = ?
+        )
+        SELECT
+            model_key,
+            MAX(model_label) AS model_label,
+            COUNT(*) AS lineups,
+            AVG(total_proj_fpts) AS avg_proj_fpts,
+            AVG(total_actual_fpts) AS avg_actual_fpts,
+            AVG(total_actual_fpts - total_proj_fpts) AS avg_vs_proj_fpts,
+            MAX(total_actual_fpts) AS best_actual_fpts,
+            AVG(total_salary) AS avg_salary
+        FROM normalized
+        GROUP BY model_key
+        ORDER BY avg_actual_fpts DESC, lineups DESC
+        """,
+        conn,
+        params=[slate_date],
+    )
+
+
+def get_model_backtest_summary(
+    conn: sqlite3.Connection,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    min_lineups: int = 1,
+) -> pd.DataFrame:
+    """Get cross-slate model performance for backtesting."""
+    return pd.read_sql_query(
+        """
+        WITH normalized AS (
+            SELECT
+                slate_date,
+                COALESCE(NULLIF(model_key, ''), 'standard_v1') AS model_key,
+                COALESCE(NULLIF(model_label, ''), COALESCE(NULLIF(model_key, ''), 'standard_v1')) AS model_label,
+                total_proj_fpts,
+                total_actual_fpts,
+                total_salary
+            FROM dfs_slate_lineups
+            WHERE total_actual_fpts IS NOT NULL
+              AND (? IS NULL OR slate_date >= ?)
+              AND (? IS NULL OR slate_date <= ?)
+        )
+        SELECT
+            model_key,
+            MAX(model_label) AS model_label,
+            COUNT(*) AS lineups,
+            COUNT(DISTINCT slate_date) AS slates,
+            AVG(total_proj_fpts) AS avg_proj_fpts,
+            AVG(total_actual_fpts) AS avg_actual_fpts,
+            AVG(total_actual_fpts - total_proj_fpts) AS avg_vs_proj_fpts,
+            MAX(total_actual_fpts) AS best_actual_fpts,
+            AVG(total_salary) AS avg_salary,
+            AVG(
+                CASE
+                    WHEN total_proj_fpts > 0
+                    THEN (100.0 * total_actual_fpts / total_proj_fpts)
+                    ELSE NULL
+                END
+            ) AS proj_capture_pct
+        FROM normalized
+        GROUP BY model_key
+        HAVING COUNT(*) >= ?
+        ORDER BY avg_actual_fpts DESC, lineups DESC
+        """,
+        conn,
+        params=[start_date, start_date, end_date, end_date, int(min_lineups)],
     )
 
 
@@ -1390,6 +1496,500 @@ def get_shark_strategy_profile(
         'favorite_players': list(fav_df.itertuples(index=False, name=None)),
         'lineup_history': history,
     }
+
+
+# =============================================================================
+# Tournament Postmortem Review
+# =============================================================================
+
+def build_tournament_postmortem(
+    conn: sqlite3.Connection,
+    slate_date: str,
+    top_n: int = 10,
+    core_field_exposure_pct: float = 30.0,
+    underexposure_ratio: float = 0.60,
+    standout_min_error: float = 8.0,
+) -> Dict[str, Any]:
+    """Build a postmortem review packet for a DFS tournament slate.
+
+    Compares top field lineups vs. our generated lineups and identifies:
+    - winner gap and top-end capture
+    - field-vs-our player exposure differences
+    - missed core plays and standout outcomes
+    - concise "what went right / wrong" notes and next-slate actions
+    """
+    top_n = max(1, int(top_n))
+    core_field_exposure_pct = float(max(0.0, min(100.0, core_field_exposure_pct)))
+    underexposure_ratio = float(max(0.0, min(1.0, underexposure_ratio)))
+    standout_min_error = float(standout_min_error)
+
+    result: Dict[str, Any] = {
+        'slate_date': slate_date,
+        'top_n': top_n,
+        'metrics': {},
+        'top_field_players_df': pd.DataFrame(),
+        'exposure_comparison_df': pd.DataFrame(),
+        'missed_core_df': pd.DataFrame(),
+        'missed_standouts_df': pd.DataFrame(),
+        'improvements_df': pd.DataFrame(),
+        'right_notes': [],
+        'wrong_notes': [],
+        'errors': [],
+    }
+
+    try:
+        # 1) Top-N field lineups from contest standings
+        top_entries_df = pd.read_sql_query(
+            """
+            SELECT rank, points, username, pg, sg, sf, pf, c, g, f, util
+            FROM dfs_contest_entries
+            WHERE slate_date = ? AND rank IS NOT NULL
+            ORDER BY rank ASC
+            LIMIT ?
+            """,
+            conn,
+            params=[slate_date, top_n],
+        )
+        if top_entries_df.empty:
+            result['errors'].append("No contest standings found for this slate.")
+            return result
+
+        field_lineups = int(len(top_entries_df))
+        pos_cols = ['pg', 'sg', 'sf', 'pf', 'c', 'g', 'f', 'util']
+        field_long = top_entries_df[pos_cols].melt(
+            var_name='slot',
+            value_name='player',
+        )
+        field_long['player'] = field_long['player'].astype(str).str.strip()
+        field_long = field_long[field_long['player'].ne('') & field_long['player'].ne('nan')]
+        if field_long.empty:
+            result['errors'].append("Contest standings have no parsed lineup player names.")
+            return result
+        field_long['name_key'] = field_long['player'].map(_normalize_name)
+
+        field_exposure_df = (
+            field_long.groupby('name_key', as_index=False)
+            .agg(
+                field_slots=('player', 'size'),
+                field_player=('player', lambda s: s.value_counts().index[0]),
+            )
+        )
+        field_exposure_df['field_exposure_pct'] = (
+            100.0 * field_exposure_df['field_slots'] / float(max(1, field_lineups))
+        )
+
+        # 2) Our generated lineup exposures on this slate
+        our_lineups_df = pd.read_sql_query(
+            """
+            SELECT lineup_num, total_actual_fpts,
+                   pg_id, sg_id, sf_id, pf_id, c_id, g_id, f_id, util_id
+            FROM dfs_slate_lineups
+            WHERE slate_date = ?
+            ORDER BY lineup_num
+            """,
+            conn,
+            params=[slate_date],
+        )
+        our_lineups = int(len(our_lineups_df))
+
+        id_map_df = pd.read_sql_query(
+            """
+            SELECT DISTINCT player_id, player_name
+            FROM dfs_slate_projections
+            WHERE slate_date = ? AND player_id IS NOT NULL
+            """,
+            conn,
+            params=[slate_date],
+        )
+        id_to_name = {}
+        for _, row in id_map_df.iterrows():
+            pid = row.get('player_id')
+            if pd.notna(pid):
+                try:
+                    id_to_name[int(pid)] = row.get('player_name')
+                except (TypeError, ValueError):
+                    continue
+
+        id_cols = ['pg_id', 'sg_id', 'sf_id', 'pf_id', 'c_id', 'g_id', 'f_id', 'util_id']
+        our_name_cols: List[str] = []
+        if not our_lineups_df.empty:
+            def _map_player_name(pid: Any) -> Optional[str]:
+                if pd.isna(pid):
+                    return None
+                text = str(pid).strip()
+                if not text:
+                    return None
+                try:
+                    return id_to_name.get(int(float(text)))
+                except (TypeError, ValueError):
+                    return None
+
+            for col in id_cols:
+                name_col = f"{col}_name"
+                our_name_cols.append(name_col)
+                our_lineups_df[name_col] = our_lineups_df[col].apply(_map_player_name)
+
+        our_exposure_df = pd.DataFrame(columns=['name_key', 'our_slots', 'our_player', 'our_exposure_pct'])
+        lineup_name_sets: List[set] = []
+        if our_lineups > 0 and our_name_cols:
+            our_long = our_lineups_df[['lineup_num'] + our_name_cols].melt(
+                id_vars=['lineup_num'],
+                var_name='slot',
+                value_name='player',
+            )
+            our_long['player'] = our_long['player'].astype(str).str.strip()
+            our_long = our_long[our_long['player'].ne('') & our_long['player'].ne('nan')]
+            if not our_long.empty:
+                our_long['name_key'] = our_long['player'].map(_normalize_name)
+                our_exposure_df = (
+                    our_long.groupby('name_key', as_index=False)
+                    .agg(
+                        our_slots=('player', 'size'),
+                        our_player=('player', lambda s: s.value_counts().index[0]),
+                    )
+                )
+                our_exposure_df['our_exposure_pct'] = (
+                    100.0 * our_exposure_df['our_slots'] / float(max(1, our_lineups))
+                )
+                lineup_name_sets = (
+                    our_long.groupby('lineup_num')['name_key']
+                    .apply(lambda s: {x for x in s.tolist() if x})
+                    .tolist()
+                )
+
+        # 3) Player performance context (projection vs actual)
+        perf_df = pd.read_sql_query(
+            """
+            SELECT player_name, team, salary, proj_fpts, actual_fpts,
+                   ownership_proj, actual_ownership
+            FROM dfs_slate_projections
+            WHERE slate_date = ? AND did_play = 1 AND actual_fpts IS NOT NULL
+            """,
+            conn,
+            params=[slate_date],
+        )
+        perf_agg = pd.DataFrame(
+            columns=[
+                'name_key', 'player_name', 'team', 'salary',
+                'proj_fpts', 'actual_fpts', 'actual_minus_proj',
+                'ownership_proj', 'actual_ownership',
+            ]
+        )
+        if not perf_df.empty:
+            perf_df['name_key'] = perf_df['player_name'].map(_normalize_name)
+            perf_df['actual_minus_proj'] = (
+                pd.to_numeric(perf_df['actual_fpts'], errors='coerce')
+                - pd.to_numeric(perf_df['proj_fpts'], errors='coerce')
+            )
+            perf_agg = (
+                perf_df.groupby('name_key', as_index=False)
+                .agg(
+                    player_name=('player_name', 'first'),
+                    team=('team', 'first'),
+                    salary=('salary', 'first'),
+                    proj_fpts=('proj_fpts', 'first'),
+                    actual_fpts=('actual_fpts', 'first'),
+                    actual_minus_proj=('actual_minus_proj', 'first'),
+                    ownership_proj=('ownership_proj', 'first'),
+                    actual_ownership=('actual_ownership', 'first'),
+                )
+            )
+
+        # 4) Exposure comparison frame
+        exposure_df = field_exposure_df.merge(
+            our_exposure_df[['name_key', 'our_slots', 'our_player', 'our_exposure_pct']],
+            on='name_key',
+            how='outer',
+        ).merge(
+            perf_agg,
+            on='name_key',
+            how='left',
+        )
+
+        for num_col in ['field_slots', 'field_exposure_pct', 'our_slots', 'our_exposure_pct']:
+            exposure_df[num_col] = pd.to_numeric(exposure_df.get(num_col), errors='coerce').fillna(0.0)
+
+        exposure_df['display_name'] = (
+            exposure_df.get('field_player')
+            .fillna(exposure_df.get('our_player'))
+            .fillna(exposure_df.get('player_name'))
+            .fillna(exposure_df.get('name_key'))
+        )
+        exposure_df['exposure_gap_pct'] = exposure_df['field_exposure_pct'] - exposure_df['our_exposure_pct']
+        exposure_df = exposure_df.sort_values(
+            ['field_exposure_pct', 'actual_minus_proj'],
+            ascending=[False, False],
+        )
+
+        top_field_players_df = exposure_df[exposure_df['field_slots'] > 0].copy()
+
+        missed_core_df = top_field_players_df[
+            (top_field_players_df['field_exposure_pct'] >= core_field_exposure_pct)
+            & (
+                top_field_players_df['our_exposure_pct']
+                < (top_field_players_df['field_exposure_pct'] * underexposure_ratio)
+            )
+        ].copy().sort_values('exposure_gap_pct', ascending=False)
+
+        missed_standouts_df = top_field_players_df[
+            (pd.to_numeric(top_field_players_df['actual_minus_proj'], errors='coerce') >= standout_min_error)
+            & (top_field_players_df['field_exposure_pct'] >= 10.0)
+            & (top_field_players_df['our_exposure_pct'] < top_field_players_df['field_exposure_pct'])
+        ].copy().sort_values(
+            ['actual_minus_proj', 'field_exposure_pct'],
+            ascending=[False, False],
+        )
+
+        # 5) Score and accuracy metrics
+        winner_row = conn.execute(
+            """
+            SELECT top_score
+            FROM dfs_contest_meta
+            WHERE slate_date = ?
+            ORDER BY import_date DESC
+            LIMIT 1
+            """,
+            (slate_date,),
+        ).fetchone()
+        winner_score = float(winner_row[0]) if winner_row and pd.notna(winner_row[0]) else None
+
+        our_scores = pd.to_numeric(our_lineups_df.get('total_actual_fpts'), errors='coerce').dropna()
+        our_best_score = float(our_scores.max()) if not our_scores.empty else None
+        our_avg_score = float(our_scores.mean()) if not our_scores.empty else None
+        winner_gap = (
+            float(winner_score - our_best_score)
+            if winner_score is not None and our_best_score is not None
+            else None
+        )
+
+        topn_avg_points = float(pd.to_numeric(top_entries_df['points'], errors='coerce').mean())
+        topn_best_points = float(pd.to_numeric(top_entries_df['points'], errors='coerce').max())
+
+        proj_mae = None
+        proj_rank_corr = None
+        if not perf_df.empty:
+            proj_errors = (
+                pd.to_numeric(perf_df['actual_fpts'], errors='coerce')
+                - pd.to_numeric(perf_df['proj_fpts'], errors='coerce')
+            )
+            proj_mae = float(proj_errors.abs().mean())
+            if (
+                pd.to_numeric(perf_df['proj_fpts'], errors='coerce').nunique() > 1
+                and pd.to_numeric(perf_df['actual_fpts'], errors='coerce').nunique() > 1
+            ):
+                proj_rank_corr = float(
+                    pd.to_numeric(perf_df['proj_fpts'], errors='coerce').corr(
+                        pd.to_numeric(perf_df['actual_fpts'], errors='coerce'),
+                        method='spearman',
+                    )
+                )
+
+        ownership_mae = None
+        ownership_rank_corr = None
+        if not perf_df.empty:
+            own_df = perf_df[['ownership_proj', 'actual_ownership']].dropna()
+            if not own_df.empty:
+                ownership_mae = float(
+                    (
+                        pd.to_numeric(own_df['actual_ownership'], errors='coerce')
+                        - pd.to_numeric(own_df['ownership_proj'], errors='coerce')
+                    ).abs().mean()
+                )
+                if (
+                    pd.to_numeric(own_df['ownership_proj'], errors='coerce').nunique() > 1
+                    and pd.to_numeric(own_df['actual_ownership'], errors='coerce').nunique() > 1
+                ):
+                    ownership_rank_corr = float(
+                        pd.to_numeric(own_df['ownership_proj'], errors='coerce').corr(
+                            pd.to_numeric(own_df['actual_ownership'], errors='coerce'),
+                            method='spearman',
+                        )
+                    )
+
+        our_name_keys = set()
+        if not our_exposure_df.empty:
+            our_name_keys = set(our_exposure_df['name_key'].tolist())
+
+        top_actual_df = top_field_players_df.dropna(subset=['actual_fpts']).copy()
+        top_actual_df = top_actual_df.sort_values('actual_fpts', ascending=False)
+        top_scorer_name = ""
+        top_scorer_actual = None
+        top_scorer_in_our = None
+        top3_target_count = 0
+        top3_covered_count = 0
+        top3_all_in_single = None
+        if not top_actual_df.empty:
+            top_scorer_name = str(top_actual_df.iloc[0].get('display_name') or "")
+            top_scorer_actual = pd.to_numeric(top_actual_df.iloc[0].get('actual_fpts'), errors='coerce')
+            top_scorer_key = str(top_actual_df.iloc[0].get('name_key') or "")
+            top_scorer_in_our = bool(top_scorer_key and top_scorer_key in our_name_keys)
+
+            top3_keys = [k for k in top_actual_df['name_key'].head(3).tolist() if k]
+            top3_target_count = len(top3_keys)
+            top3_covered_count = int(sum(1 for k in top3_keys if k in our_name_keys))
+            if top3_target_count > 0:
+                if lineup_name_sets:
+                    top3_all_in_single = any(set(top3_keys).issubset(s) for s in lineup_name_sets)
+                else:
+                    top3_all_in_single = False
+
+        result['metrics'] = {
+            'field_lineups_analyzed': field_lineups,
+            'our_lineups': our_lineups,
+            'winner_score': winner_score,
+            'our_best_score': our_best_score,
+            'winner_gap': winner_gap,
+            'our_avg_score': our_avg_score,
+            'topn_avg_score': topn_avg_points,
+            'topn_best_score': topn_best_points,
+            'projection_mae': proj_mae,
+            'projection_rank_corr': proj_rank_corr,
+            'ownership_mae': ownership_mae,
+            'ownership_rank_corr': ownership_rank_corr,
+            'missed_core_count': int(len(missed_core_df)),
+            'missed_standout_count': int(len(missed_standouts_df)),
+            'top_scorer_name': top_scorer_name,
+            'top_scorer_actual': float(top_scorer_actual) if pd.notna(top_scorer_actual) else None,
+            'top_scorer_in_our_lineups': top_scorer_in_our,
+            'top3_target_count': int(top3_target_count),
+            'top3_covered_count': int(top3_covered_count),
+            'top3_all_in_single_lineup': top3_all_in_single,
+        }
+
+        # 6) What went right / wrong notes
+        right_notes: List[str] = []
+        wrong_notes: List[str] = []
+
+        if winner_gap is not None:
+            if winner_gap <= 15:
+                right_notes.append(f"Winner gap was tight at {winner_gap:.1f} DK points.")
+            else:
+                wrong_notes.append(f"Winner gap was {winner_gap:.1f} DK points.")
+        else:
+            wrong_notes.append("Winner gap is unavailable (missing winner score or lineup actuals).")
+
+        if proj_mae is not None:
+            if proj_mae <= 10:
+                right_notes.append(f"Projection MAE was solid at {proj_mae:.2f}.")
+            else:
+                wrong_notes.append(f"Projection MAE was high at {proj_mae:.2f}.")
+        else:
+            wrong_notes.append("Projection MAE is unavailable for this slate.")
+
+        if ownership_mae is not None:
+            if ownership_mae <= 10:
+                right_notes.append(f"Ownership MAE was controlled at {ownership_mae:.2f}%.")
+            else:
+                wrong_notes.append(f"Ownership MAE was elevated at {ownership_mae:.2f}%.")
+
+        if len(missed_core_df) == 0:
+            right_notes.append("No major underexposure on core field plays.")
+        else:
+            wrong_notes.append(
+                f"Missed {len(missed_core_df)} core field plays (field >= {core_field_exposure_pct:.0f}% with underexposure)."
+            )
+
+        if len(missed_standouts_df) > 0:
+            wrong_notes.append(
+                f"Missed {len(missed_standouts_df)} standout performers (actual-projection >= {standout_min_error:.1f})."
+            )
+        else:
+            right_notes.append("No major missed standout outcomes under current thresholds.")
+
+        if top3_target_count > 0:
+            if top3_covered_count == top3_target_count:
+                right_notes.append("Covered all top-3 actual scorers in at least one lineup.")
+            else:
+                wrong_notes.append(
+                    f"Covered {top3_covered_count}/{top3_target_count} top-3 actual scorers."
+                )
+            if top3_all_in_single is True:
+                right_notes.append("At least one lineup contained all top-3 actual scorers.")
+            elif top3_all_in_single is False:
+                wrong_notes.append("No lineup captured all top-3 actual scorers together.")
+
+        result['right_notes'] = right_notes
+        result['wrong_notes'] = wrong_notes
+
+        # 7) Next-slate improvement actions
+        improvement_rows: List[Dict[str, Any]] = []
+        priority = 1
+
+        if proj_mae is not None:
+            improvement_rows.append({
+                'priority': priority,
+                'area': 'Projection Calibration',
+                'why': f"MAE={proj_mae:.2f}, rank_corr={proj_rank_corr:.2f}" if proj_rank_corr is not None else f"MAE={proj_mae:.2f}",
+                'next_slate_change': 'Recalibrate projection weights by role/salary tier for this slate profile.',
+                'success_metric': 'Lower MAE while holding or improving rank correlation.',
+            })
+            priority += 1
+
+        if ownership_mae is not None:
+            improvement_rows.append({
+                'priority': priority,
+                'area': 'Ownership Calibration',
+                'why': (
+                    f"ownership_mae={ownership_mae:.2f}, rank_corr={ownership_rank_corr:.2f}"
+                    if ownership_rank_corr is not None
+                    else f"ownership_mae={ownership_mae:.2f}"
+                ),
+                'next_slate_change': 'Adjust ownership curve by projection tier and game environment.',
+                'success_metric': 'Reduce ownership MAE and improve ownership rank correlation.',
+            })
+            priority += 1
+
+        if winner_gap is not None and winner_gap > 0:
+            improvement_rows.append({
+                'priority': priority,
+                'area': 'Top-End Ceiling Capture',
+                'why': f"winner_gap={winner_gap:.1f}",
+                'next_slate_change': 'Increase exposure to high-ceiling constructions present in top field entries.',
+                'success_metric': 'Shrink winner gap and raise best-lineup actual FPTS.',
+            })
+            priority += 1
+
+        if not missed_core_df.empty:
+            top_core = str(missed_core_df.iloc[0].get('display_name') or '')
+            improvement_rows.append({
+                'priority': priority,
+                'area': 'Core Field Coverage',
+                'why': f"missed_core={len(missed_core_df)} (largest gap: {top_core})",
+                'next_slate_change': 'Add guardrail minimum exposure for core field plays in high-leverage builds.',
+                'success_metric': 'Reduce count of core underexposure misses.',
+            })
+            priority += 1
+
+        if not missed_standouts_df.empty:
+            top_miss = str(missed_standouts_df.iloc[0].get('display_name') or '')
+            top_err = pd.to_numeric(missed_standouts_df.iloc[0].get('actual_minus_proj'), errors='coerce')
+            improvement_rows.append({
+                'priority': priority,
+                'area': 'Missed Standout Detection',
+                'why': (
+                    f"missed_standouts={len(missed_standouts_df)} (top: {top_miss}, +{top_err:.1f})"
+                    if pd.notna(top_err)
+                    else f"missed_standouts={len(missed_standouts_df)}"
+                ),
+                'next_slate_change': 'Strengthen standout rules for volatile upside profiles and stack contexts.',
+                'success_metric': 'Improve coverage of high actual-minus-projection players.',
+            })
+
+        result['improvements_df'] = (
+            pd.DataFrame(improvement_rows).sort_values('priority')
+            if improvement_rows
+            else pd.DataFrame(columns=['priority', 'area', 'why', 'next_slate_change', 'success_metric'])
+        )
+
+        result['top_field_players_df'] = top_field_players_df.reset_index(drop=True)
+        result['exposure_comparison_df'] = exposure_df.reset_index(drop=True)
+        result['missed_core_df'] = missed_core_df.reset_index(drop=True)
+        result['missed_standouts_df'] = missed_standouts_df.reset_index(drop=True)
+
+    except Exception as e:
+        result['errors'].append(f"Postmortem build error: {e}")
+
+    return result
 
 
 # =============================================================================
