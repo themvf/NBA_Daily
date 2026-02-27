@@ -401,6 +401,7 @@ tab_titles = [
     "Model vs FanDuel",
     "Model Review",
     "DFS Lineup Builder",
+    "DFS Player Review",
 ]
 
 # Initialize selected page in session state
@@ -17321,6 +17322,134 @@ if selected_page == "DFS Lineup Builder":
 
         except Exception as e:
             st.error(f"Failed to load scouting data: {e}")
+
+if selected_page == "DFS Player Review":
+    st.title("DFS Player Review")
+    st.caption("Season and recent DFS metrics for fantasy points, ownership, and salary.")
+
+    season_options = fetch_distinct_values(str(db_path), "player_game_logs", "season")
+    if not season_options:
+        season_options = [DEFAULT_SEASON]
+
+    default_idx = season_options.index(DEFAULT_SEASON) if DEFAULT_SEASON in season_options else 0
+    review_season = st.selectbox(
+        "Season",
+        options=season_options,
+        index=default_idx,
+        key="dfs_player_review_season",
+    )
+    review_season_type = st.selectbox(
+        "Season Type",
+        options=["Regular Season", "Playoffs"],
+        index=0,
+        key="dfs_player_review_season_type",
+    )
+
+    season_start = f"{review_season[:4]}-07-01"
+    season_end = f"{int(review_season[:4]) + 1}-06-30"
+
+    review_query = """
+        WITH season_games AS (
+            SELECT
+                pgl.player_id,
+                pgl.player_name,
+                pgl.team_abbreviation,
+                date(pgl.game_date) AS game_date,
+                (
+                    COALESCE(pgl.points, 0) * 1.0
+                    + COALESCE(pgl.rebounds, 0) * 1.25
+                    + COALESCE(pgl.assists, 0) * 1.5
+                    + COALESCE(pgl.steals, 0) * 2.0
+                    + COALESCE(pgl.blocks, 0) * 2.0
+                    - COALESCE(pgl.turnovers, 0) * 0.5
+                    + COALESCE(pgl.fg3m, 0) * 0.5
+                ) AS dk_fpts,
+                ROW_NUMBER() OVER (
+                    PARTITION BY pgl.player_id
+                    ORDER BY date(pgl.game_date) DESC
+                ) AS fpts_rn
+            FROM player_game_logs pgl
+            WHERE pgl.season = ?
+              AND pgl.season_type = ?
+        ),
+        fpts_agg AS (
+            SELECT
+                player_id,
+                MAX(player_name) AS player_name,
+                MAX(CASE WHEN fpts_rn = 1 THEN team_abbreviation END) AS team,
+                ROUND(SUM(dk_fpts), 2) AS total_fpts_season,
+                ROUND(SUM(CASE WHEN fpts_rn <= 5 THEN dk_fpts ELSE 0 END), 2) AS total_fpts_last5
+            FROM season_games
+            GROUP BY player_id
+        ),
+        dfs_base AS (
+            SELECT
+                dsp.player_id,
+                dsp.player_name,
+                dsp.team,
+                dsp.positions,
+                date(dsp.slate_date) AS slate_date,
+                COALESCE(NULLIF(dsp.actual_ownership, 0), NULLIF(dsp.ownership_proj, 0)) AS own_pct,
+                dsp.salary,
+                ROW_NUMBER() OVER (
+                    PARTITION BY dsp.player_id
+                    ORDER BY date(dsp.slate_date) DESC
+                ) AS own_rn
+            FROM dfs_slate_projections dsp
+            WHERE date(dsp.slate_date) BETWEEN date(?) AND date(?)
+        ),
+        own_agg AS (
+            SELECT
+                player_id,
+                MAX(player_name) AS player_name,
+                MAX(CASE WHEN own_rn = 1 THEN team END) AS team,
+                MAX(CASE WHEN own_rn = 1 THEN positions END) AS position,
+                ROUND(AVG(own_pct), 2) AS avg_own_season,
+                ROUND(AVG(CASE WHEN own_rn <= 5 THEN own_pct END), 2) AS avg_own_last5,
+                ROUND(AVG(salary), 2) AS avg_salary_season
+            FROM dfs_base
+            GROUP BY player_id
+        )
+        SELECT
+            COALESCE(o.player_name, f.player_name) AS "Player Name",
+            COALESCE(o.team, f.team, '-') AS "Team",
+            COALESCE(o.position, '-') AS "Position",
+            COALESCE(f.total_fpts_season, 0) AS "Total Fantasy Points Season",
+            COALESCE(f.total_fpts_last5, 0) AS "Total Fantasy Points Last 5 Games",
+            o.avg_own_season AS "Average Ownership Season",
+            o.avg_own_last5 AS "Average Ownership Last 5 Games",
+            o.avg_salary_season AS "Average DK Salary This Season"
+        FROM own_agg o
+        LEFT JOIN fpts_agg f
+            ON f.player_id = o.player_id
+        ORDER BY "Total Fantasy Points Season" DESC, "Player Name" ASC
+    """
+
+    try:
+        review_df = run_query(
+            str(db_path),
+            review_query,
+            params=[review_season, review_season_type, season_start, season_end],
+        )
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Failed to load DFS player review: {exc}")
+        review_df = pd.DataFrame()
+
+    if review_df.empty:
+        st.info("No DFS player review data available for the selected season.")
+    else:
+        st.dataframe(
+            review_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Total Fantasy Points Season": st.column_config.NumberColumn(format="%.2f"),
+                "Total Fantasy Points Last 5 Games": st.column_config.NumberColumn(format="%.2f"),
+                "Average Ownership Season": st.column_config.NumberColumn(format="%.2f%%"),
+                "Average Ownership Last 5 Games": st.column_config.NumberColumn(format="%.2f%%"),
+                "Average DK Salary This Season": st.column_config.NumberColumn(format="$%.0f"),
+            },
+        )
 
 st.divider()
 st.caption(
