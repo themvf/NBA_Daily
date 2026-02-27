@@ -1141,13 +1141,24 @@ class DFSLineup:
             stacks[player.game_id].append(player.name)
         return stacks
 
-    def to_dk_export_row(self) -> Dict[str, str]:
+    def to_dk_export_row(self) -> Dict[str, Any]:
         """Convert to DraftKings CSV export format."""
         row = {}
         for slot in ROSTER_SLOTS:
             player = self.players.get(slot)
             if player:
                 row[slot] = player.dk_id if player.dk_id else str(player.player_id)
+        lineup_type_parts = []
+        if self.model_label:
+            lineup_type_parts.append(self.model_label)
+        elif self.model_key:
+            lineup_type_parts.append(self.model_key)
+        if self.generation_strategy:
+            lineup_type_parts.append(self.generation_strategy.title())
+
+        row["Total Salary"] = int(self.total_salary)
+        row["Lineup Type"] = " | ".join(lineup_type_parts) if lineup_type_parts else "Standard"
+        row["Ceiling"] = round(float(self.total_ceiling), 1)
         return row
 
     def get_player_list(self) -> List[DFSPlayer]:
