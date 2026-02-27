@@ -17381,7 +17381,25 @@ if selected_page == "DFS Player Review":
                 MAX(CASE WHEN fpts_rn = 1 THEN team_abbreviation END) AS team,
                 ROUND(AVG(CASE WHEN minutes_played > 0 THEN minutes_played END), 2) AS avg_minutes_season,
                 ROUND(AVG(CASE WHEN usage_pct > 0 THEN usage_pct END), 2) AS avg_usage_season,
+                ROUND(
+                    CASE
+                        WHEN SUM(CASE WHEN minutes_played > 0 THEN 1 ELSE 0 END) > 1 THEN
+                            AVG(CASE WHEN minutes_played > 0 THEN minutes_played * minutes_played END)
+                            - AVG(CASE WHEN minutes_played > 0 THEN minutes_played END)
+                              * AVG(CASE WHEN minutes_played > 0 THEN minutes_played END)
+                        ELSE 0
+                    END,
+                    4
+                ) AS var_minutes_season,
                 ROUND(SUM(dk_fpts), 2) AS total_fpts_season,
+                ROUND(
+                    CASE
+                        WHEN COUNT(*) > 1 THEN
+                            AVG(dk_fpts * dk_fpts) - AVG(dk_fpts) * AVG(dk_fpts)
+                        ELSE 0
+                    END,
+                    4
+                ) AS var_fpts_season,
                 ROUND(AVG(CASE WHEN fpts_rn <= 5 THEN dk_fpts END), 2) AS avg_fpts_last5
             FROM season_games
             GROUP BY player_id
@@ -17410,7 +17428,24 @@ if selected_page == "DFS Player Review":
                 MAX(CASE WHEN own_rn = 1 THEN positions END) AS position,
                 ROUND(AVG(own_pct), 2) AS avg_own_season,
                 ROUND(AVG(CASE WHEN own_rn <= 5 THEN own_pct END), 2) AS avg_own_last5,
-                ROUND(AVG(salary), 2) AS avg_salary_season
+                ROUND(
+                    CASE
+                        WHEN SUM(CASE WHEN own_pct IS NOT NULL THEN 1 ELSE 0 END) > 1 THEN
+                            AVG(CASE WHEN own_pct IS NOT NULL THEN own_pct * own_pct END)
+                            - AVG(own_pct) * AVG(own_pct)
+                        ELSE 0
+                    END,
+                    4
+                ) AS var_own_season,
+                ROUND(AVG(salary), 2) AS avg_salary_season,
+                ROUND(
+                    CASE
+                        WHEN COUNT(*) > 1 THEN
+                            AVG(salary * salary) - AVG(salary) * AVG(salary)
+                        ELSE 0
+                    END,
+                    4
+                ) AS var_salary_season
             FROM dfs_base
             GROUP BY player_id
         )
@@ -17420,11 +17455,15 @@ if selected_page == "DFS Player Review":
             COALESCE(o.position, '-') AS "Position",
             COALESCE(f.avg_minutes_season, 0) AS "Average Minutes Per Game",
             COALESCE(f.avg_usage_season, 0) AS "Average Usage % Season",
+            COALESCE(f.var_minutes_season, 0) AS "Minutes Variance",
             COALESCE(f.total_fpts_season, 0) AS "Total Fantasy Points Season",
             COALESCE(f.avg_fpts_last5, 0) AS "Average Fantasy Points Last 5 Games",
+            COALESCE(f.var_fpts_season, 0) AS "Fantasy Points Variance",
             o.avg_own_season AS "Average Ownership Season",
             o.avg_own_last5 AS "Average Ownership Last 5 Games",
-            o.avg_salary_season AS "Average DK Salary This Season"
+            COALESCE(o.var_own_season, 0) AS "Ownership Variance",
+            o.avg_salary_season AS "Average DK Salary This Season",
+            COALESCE(o.var_salary_season, 0) AS "Salary Variance"
         FROM own_agg o
         LEFT JOIN fpts_agg f
             ON f.player_id = o.player_id
@@ -17447,11 +17486,15 @@ if selected_page == "DFS Player Review":
         table_column_config = {
             "Average Minutes Per Game": st.column_config.NumberColumn(format="%.2f"),
             "Average Usage % Season": st.column_config.NumberColumn(format="%.2f"),
+            "Minutes Variance": st.column_config.NumberColumn(format="%.4f"),
             "Total Fantasy Points Season": st.column_config.NumberColumn(format="%.2f"),
             "Average Fantasy Points Last 5 Games": st.column_config.NumberColumn(format="%.2f"),
+            "Fantasy Points Variance": st.column_config.NumberColumn(format="%.4f"),
             "Average Ownership Season": st.column_config.NumberColumn(format="%.2f%%"),
             "Average Ownership Last 5 Games": st.column_config.NumberColumn(format="%.2f%%"),
+            "Ownership Variance": st.column_config.NumberColumn(format="%.4f"),
             "Average DK Salary This Season": st.column_config.NumberColumn(format="$%.0f"),
+            "Salary Variance": st.column_config.NumberColumn(format="%.4f"),
         }
 
         st.dataframe(
