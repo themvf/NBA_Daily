@@ -17743,6 +17743,440 @@ if selected_page == "DFS Player Review":
                         with kpi_col3:
                             st.metric("High-Low Delta", f"{delta:+.2f}")
 
+            st.divider()
+            st.subheader("Lineup Generator Diagnostics")
+            st.caption(
+                "Use these visuals to isolate projection bias, confidence calibration gaps, "
+                "and leverage misses."
+            )
+
+            # Pull slate-level DFS projection data for diagnostics.
+            diagnostics_query = """
+                SELECT
+                    date(dsp.slate_date) AS slate_date,
+                    dsp.player_id,
+                    dsp.player_name,
+                    dsp.team,
+                    dsp.positions,
+                    dsp.salary,
+                    dsp.proj_fpts,
+                    dsp.actual_fpts,
+                    COALESCE(NULLIF(dsp.actual_ownership, 0), NULLIF(dsp.ownership_proj, 0)) AS own_pct
+                FROM dfs_slate_projections dsp
+                WHERE date(dsp.slate_date) BETWEEN date(?) AND date(?)
+                  AND dsp.salary BETWEEN ? AND ?
+            """
+            diagnostics_df = run_query(
+                str(db_path),
+                diagnostics_query,
+                params=[
+                    season_start,
+                    season_end,
+                    int(selected_salary_range[0]),
+                    int(selected_salary_range[1]),
+                ],
+            )
+
+            for col in ["salary", "proj_fpts", "actual_fpts", "own_pct"]:
+                if col in diagnostics_df.columns:
+                    diagnostics_df[col] = pd.to_numeric(diagnostics_df[col], errors="coerce")
+
+            diagnostics_df["fpts_error"] = (
+                diagnostics_df["actual_fpts"] - diagnostics_df["proj_fpts"]
+            )
+
+            def get_primary_position(pos_value: object) -> str:
+                if pd.isna(pos_value):
+                    return "UNK"
+                raw = str(pos_value).strip().upper().replace("-", "/")
+                primary = raw.split("/")[0].strip() if raw else "UNK"
+                if primary in {"PG", "SG", "SF", "PF", "C"}:
+                    return primary
+                return "UNK"
+
+            diagnostics_df["primary_position"] = diagnostics_df["positions"].apply(
+                get_primary_position
+            )
+
+            import plotly.express as px
+            import plotly.graph_objects as go
+
+            # 1) Projection bias heatmap: salary bucket x position.
+            st.markdown("#### 1) Projection Bias Heatmap (Salary x Position)")
+            heatmap_df = diagnostics_df.dropna(
+                subset=["salary", "proj_fpts", "actual_fpts", "primary_position", "fpts_error"]
+            ).copy()
+
+            if len(heatmap_df) < 15:
+                st.info("Not enough slate rows with actual results to render projection bias heatmap.")
+            else:
+                max_salary = float(heatmap_df["salary"].max())
+                top_bin_ceiling = max(13000, int(np.ceil(max_salary / 500.0) * 500 + 500))
+                salary_bins = [0, 5000, 6500, 8000, 9500, top_bin_ceiling]
+                salary_labels = [
+                    "Value (<5k)",
+                    "Low Mid (5k-6.5k)",
+                    "Mid (6.5k-8k)",
+                    "Upper (8k-9.5k)",
+                    "Stud (9.5k+)",
+                ]
+
+                heatmap_df["salary_bucket"] = pd.cut(
+                    heatmap_df["salary"],
+                    bins=salary_bins,
+                    labels=salary_labels,
+                    include_lowest=True,
+                    right=False,
+                )
+
+                segment_df = (
+                    heatmap_df.dropna(subset=["salary_bucket"])
+                    .groupby(["primary_position", "salary_bucket"], observed=True)
+                    .agg(
+                        avg_error=("fpts_error", "mean"),
+                        mae=("fpts_error", lambda s: float(np.mean(np.abs(s)))),
+                        samples=("fpts_error", "count"),
+                    )
+                    .reset_index()
+                )
+
+                pivot_df = (
+                    segment_df.pivot(
+                        index="primary_position", columns="salary_bucket", values="avg_error"
+                    )
+                    .reindex(index=["PG", "SG", "SF", "PF", "C", "UNK"], columns=salary_labels)
+                )
+
+                heatmap_fig = px.imshow(
+                    pivot_df,
+                    color_continuous_scale="RdBu",
+                    zmin=-8,
+                    zmax=8,
+                    aspect="auto",
+                    title="Average Error (Actual FPTS - Projected FPTS)",
+                    labels={"x": "Salary Bucket", "y": "Primary Position", "color": "Avg Error"},
+                    text_auto=".2f",
+                )
+                heatmap_fig.update_coloraxes(cmid=0)
+                heatmap_fig.update_layout(height=460)
+                st.plotly_chart(heatmap_fig, use_container_width=True)
+
+                issue_segments = segment_df[segment_df["samples"] >= 5].copy()
+                if not issue_segments.empty:
+                    issue_segments["bias_type"] = np.where(
+                        issue_segments["avg_error"] < 0,
+                        "Over-projected",
+                        "Under-projected",
+                    )
+                    issue_segments["abs_bias"] = issue_segments["avg_error"].abs()
+                    issue_segments = issue_segments.sort_values(
+                        ["abs_bias", "samples"], ascending=[False, False]
+                    ).head(8)
+                    issue_segments = issue_segments.rename(
+                        columns={
+                            "primary_position": "Position",
+                            "salary_bucket": "Salary Bucket",
+                            "avg_error": "Avg Error",
+                            "mae": "MAE",
+                            "samples": "Samples",
+                            "bias_type": "Bias Type",
+                        }
+                    )
+                    issue_segments["Avg Error"] = issue_segments["Avg Error"].round(2)
+                    issue_segments["MAE"] = issue_segments["MAE"].round(2)
+                    st.caption("Highest-bias segments (n >= 5)")
+                    st.dataframe(issue_segments, use_container_width=True, hide_index=True)
+
+            # 2) Confidence calibration curve from predictions table.
+            st.markdown("#### 2) Confidence Calibration (Predictions vs Hit Rate)")
+            calibration_query = """
+                SELECT
+                    date(game_date) AS game_date,
+                    player_id,
+                    player_name,
+                    team_name,
+                    proj_confidence,
+                    proj_floor,
+                    proj_ceiling,
+                    actual_ppg
+                FROM predictions
+                WHERE date(game_date) BETWEEN date(?) AND date(?)
+                  AND actual_ppg IS NOT NULL
+                  AND proj_confidence IS NOT NULL
+                  AND proj_floor IS NOT NULL
+                  AND proj_ceiling IS NOT NULL
+            """
+            calibration_df = run_query(
+                str(db_path),
+                calibration_query,
+                params=[season_start, season_end],
+            )
+
+            for col in ["proj_confidence", "proj_floor", "proj_ceiling", "actual_ppg"]:
+                if col in calibration_df.columns:
+                    calibration_df[col] = pd.to_numeric(
+                        calibration_df[col], errors="coerce"
+                    )
+            calibration_df = calibration_df.dropna(
+                subset=["proj_confidence", "proj_floor", "proj_ceiling", "actual_ppg"]
+            )
+
+            if len(calibration_df) < 30:
+                st.info("Not enough prediction rows with actuals to render calibration curve.")
+            else:
+                calibration_df["hit_floor_ceiling"] = (
+                    (calibration_df["actual_ppg"] >= calibration_df["proj_floor"])
+                    & (calibration_df["actual_ppg"] <= calibration_df["proj_ceiling"])
+                ).astype(int)
+
+                conf_bins = [0.0, 0.5, 0.6, 0.7, 0.8, 0.9, 1.01]
+                conf_labels = [
+                    "<50%",
+                    "50-59%",
+                    "60-69%",
+                    "70-79%",
+                    "80-89%",
+                    "90-100%",
+                ]
+                calibration_df["conf_bucket"] = pd.cut(
+                    calibration_df["proj_confidence"],
+                    bins=conf_bins,
+                    labels=conf_labels,
+                    include_lowest=True,
+                    right=False,
+                )
+
+                cal_summary = (
+                    calibration_df.dropna(subset=["conf_bucket"])
+                    .groupby("conf_bucket", observed=True)
+                    .agg(
+                        samples=("hit_floor_ceiling", "count"),
+                        predicted_conf=("proj_confidence", "mean"),
+                        observed_hit_rate=("hit_floor_ceiling", "mean"),
+                    )
+                    .reset_index()
+                )
+                cal_summary = cal_summary[cal_summary["samples"] >= 20].copy()
+
+                if len(cal_summary) < 2:
+                    st.info(
+                        "Calibration bins need at least two confidence ranges with >=20 samples."
+                    )
+                else:
+                    cal_summary["abs_gap"] = (
+                        cal_summary["observed_hit_rate"] - cal_summary["predicted_conf"]
+                    ).abs()
+
+                    cal_fig = go.Figure()
+                    cal_fig.add_trace(
+                        go.Scatter(
+                            x=cal_summary["predicted_conf"],
+                            y=cal_summary["observed_hit_rate"],
+                            mode="lines+markers",
+                            name="Observed",
+                            text=cal_summary["samples"].apply(lambda n: f"n={n}"),
+                            hovertemplate=(
+                                "Predicted: %{x:.1%}<br>"
+                                "Observed: %{y:.1%}<br>"
+                                "%{text}<extra></extra>"
+                            ),
+                        )
+                    )
+                    cal_fig.add_trace(
+                        go.Scatter(
+                            x=[0.0, 1.0],
+                            y=[0.0, 1.0],
+                            mode="lines",
+                            line={"dash": "dash", "color": "#9aa0a6"},
+                            name="Perfect Calibration",
+                            hoverinfo="skip",
+                        )
+                    )
+                    cal_fig.update_layout(
+                        height=430,
+                        xaxis_title="Predicted Confidence",
+                        yaxis_title="Observed Hit Rate (Floor/Ceiling)",
+                        xaxis_tickformat=".0%",
+                        yaxis_tickformat=".0%",
+                        title="Confidence Calibration Curve",
+                    )
+                    st.plotly_chart(cal_fig, use_container_width=True)
+
+                    total_cal_samples = cal_summary["samples"].sum()
+                    ece = (
+                        (cal_summary["abs_gap"] * cal_summary["samples"]).sum()
+                        / total_cal_samples
+                        if total_cal_samples > 0
+                        else 0.0
+                    )
+                    avg_gap = (
+                        cal_summary["observed_hit_rate"] - cal_summary["predicted_conf"]
+                    ).mean()
+                    cal_col1, cal_col2, cal_col3 = st.columns(3)
+                    with cal_col1:
+                        st.metric("Calibration ECE", f"{ece:.1%}")
+                    with cal_col2:
+                        st.metric("Avg Gap (Obs - Pred)", f"{avg_gap:+.1%}")
+                    with cal_col3:
+                        st.metric("Rows Used", f"{int(total_cal_samples):,}")
+
+            # 3) Ownership leverage quadrant to identify chalk traps and leverage winners.
+            st.markdown("#### 3) Ownership Leverage Quadrant (Ownership vs Error)")
+            leverage_df = diagnostics_df.dropna(
+                subset=["player_id", "player_name", "team", "salary", "own_pct", "fpts_error"]
+            ).copy()
+
+            if len(leverage_df) < 20:
+                st.info("Not enough rows with ownership + actuals to render leverage quadrant.")
+            else:
+                player_leverage_df = (
+                    leverage_df.groupby(["player_id", "player_name", "team"], as_index=False)
+                    .agg(
+                        slate_samples=("slate_date", "count"),
+                        avg_ownership=("own_pct", "mean"),
+                        avg_error=("fpts_error", "mean"),
+                        avg_salary=("salary", "mean"),
+                        avg_proj_fpts=("proj_fpts", "mean"),
+                        avg_actual_fpts=("actual_fpts", "mean"),
+                    )
+                    .sort_values(["slate_samples", "avg_ownership"], ascending=[False, False])
+                )
+
+                min_samples = int(
+                    st.slider(
+                        "Minimum slate samples per player (quadrant)",
+                        min_value=1,
+                        max_value=min(5, max(1, int(player_leverage_df["slate_samples"].max()))),
+                        value=1,
+                        step=1,
+                        key="dfs_player_review_leverage_min_samples",
+                    )
+                )
+                player_leverage_df = player_leverage_df[
+                    player_leverage_df["slate_samples"] >= min_samples
+                ].copy()
+
+                if len(player_leverage_df) < 10:
+                    st.info(
+                        "Not enough players after min-sample filter to render leverage quadrant."
+                    )
+                else:
+                    own_median = float(player_leverage_df["avg_ownership"].median())
+                    lev_fig = px.scatter(
+                        player_leverage_df,
+                        x="avg_ownership",
+                        y="avg_error",
+                        size="slate_samples",
+                        color="avg_salary",
+                        color_continuous_scale="Turbo",
+                        hover_name="player_name",
+                        hover_data={
+                            "team": True,
+                            "avg_ownership": ":.2f",
+                            "avg_error": ":.2f",
+                            "avg_salary": ":.0f",
+                            "avg_proj_fpts": ":.2f",
+                            "avg_actual_fpts": ":.2f",
+                            "slate_samples": True,
+                        },
+                        labels={
+                            "avg_ownership": "Average Ownership %",
+                            "avg_error": "Average Error (Actual - Projected FPTS)",
+                            "avg_salary": "Average Salary",
+                            "slate_samples": "Slate Samples",
+                        },
+                        title="Leverage Quadrant: Low-Owned Hits vs Chalk Misses",
+                    )
+                    lev_fig.add_hline(y=0, line_dash="dash", line_color="#8f8f8f")
+                    lev_fig.add_vline(x=own_median, line_dash="dash", line_color="#8f8f8f")
+                    lev_fig.update_layout(height=500)
+                    st.plotly_chart(lev_fig, use_container_width=True)
+
+                    chalk_traps = player_leverage_df[
+                        (player_leverage_df["avg_ownership"] >= own_median)
+                        & (player_leverage_df["avg_error"] < 0)
+                    ].copy()
+                    leverage_winners = player_leverage_df[
+                        (player_leverage_df["avg_ownership"] < own_median)
+                        & (player_leverage_df["avg_error"] > 0)
+                    ].copy()
+
+                    chalk_traps = chalk_traps.sort_values(
+                        ["avg_ownership", "avg_error"], ascending=[False, True]
+                    ).head(8)
+                    leverage_winners = leverage_winners.sort_values(
+                        ["avg_error", "avg_ownership"], ascending=[False, True]
+                    ).head(8)
+
+                    trap_col, winner_col = st.columns(2)
+                    with trap_col:
+                        st.caption("Potential Chalk Traps (high own, negative error)")
+                        if chalk_traps.empty:
+                            st.info("No clear chalk traps in current filtered sample.")
+                        else:
+                            st.dataframe(
+                                chalk_traps[
+                                    [
+                                        "player_name",
+                                        "team",
+                                        "slate_samples",
+                                        "avg_ownership",
+                                        "avg_error",
+                                        "avg_salary",
+                                    ]
+                                ].rename(
+                                    columns={
+                                        "player_name": "Player",
+                                        "team": "Team",
+                                        "slate_samples": "Samples",
+                                        "avg_ownership": "Avg Own%",
+                                        "avg_error": "Avg Error",
+                                        "avg_salary": "Avg Salary",
+                                    }
+                                ),
+                                use_container_width=True,
+                                hide_index=True,
+                                column_config={
+                                    "Avg Own%": st.column_config.NumberColumn(format="%.2f%%"),
+                                    "Avg Error": st.column_config.NumberColumn(format="%.2f"),
+                                    "Avg Salary": st.column_config.NumberColumn(format="$%.0f"),
+                                },
+                            )
+
+                    with winner_col:
+                        st.caption("Leverage Winners (low own, positive error)")
+                        if leverage_winners.empty:
+                            st.info("No clear leverage winners in current filtered sample.")
+                        else:
+                            st.dataframe(
+                                leverage_winners[
+                                    [
+                                        "player_name",
+                                        "team",
+                                        "slate_samples",
+                                        "avg_ownership",
+                                        "avg_error",
+                                        "avg_salary",
+                                    ]
+                                ].rename(
+                                    columns={
+                                        "player_name": "Player",
+                                        "team": "Team",
+                                        "slate_samples": "Samples",
+                                        "avg_ownership": "Avg Own%",
+                                        "avg_error": "Avg Error",
+                                        "avg_salary": "Avg Salary",
+                                    }
+                                ),
+                                use_container_width=True,
+                                hide_index=True,
+                                column_config={
+                                    "Avg Own%": st.column_config.NumberColumn(format="%.2f%%"),
+                                    "Avg Error": st.column_config.NumberColumn(format="%.2f"),
+                                    "Avg Salary": st.column_config.NumberColumn(format="$%.0f"),
+                                },
+                            )
+
 st.divider()
 st.caption(
     "Need more context? Re-run the builder (`python nba_to_sqlite.py ...`) to refresh "
