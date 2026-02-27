@@ -17566,6 +17566,182 @@ if selected_page == "DFS Player Review":
                 with avg_col2:
                     st.metric("Avg Fantasy Points (Filtered)", f"{raw_avg_fpts:.2f}")
 
+            st.subheader("Minutes Variance Impact")
+            st.caption("Charts reflect active salary-range filter.")
+
+            viz_columns = [
+                "Player Name",
+                "Team",
+                "Position",
+                "Average Minutes Per Game",
+                "Minutes Variance",
+                "Average Fantasy Points Last 5 Games",
+                "Average DK Salary This Season",
+            ]
+            viz_numeric_cols = [
+                "Average Minutes Per Game",
+                "Minutes Variance",
+                "Average Fantasy Points Last 5 Games",
+                "Average DK Salary This Season",
+            ]
+            viz_df = filtered_review_df[viz_columns].copy()
+            for col in viz_numeric_cols:
+                viz_df[col] = pd.to_numeric(viz_df[col], errors="coerce")
+            viz_df = viz_df.dropna(subset=viz_numeric_cols)
+
+            sample_size = len(viz_df)
+            st.caption(f"Sample size (n): {sample_size}")
+
+            if sample_size < 8:
+                st.info(
+                    "Not enough players in the filtered set to render variance impact visuals "
+                    "(need at least 8)."
+                )
+            else:
+                import plotly.express as px
+
+                scatter_fig = px.scatter(
+                    viz_df,
+                    x="Minutes Variance",
+                    y="Average Fantasy Points Last 5 Games",
+                    color="Average DK Salary This Season",
+                    color_continuous_scale="Viridis",
+                    hover_name="Player Name",
+                    hover_data={
+                        "Team": True,
+                        "Position": True,
+                        "Average Minutes Per Game": ":.2f",
+                        "Minutes Variance": ":.4f",
+                        "Average Fantasy Points Last 5 Games": ":.2f",
+                        "Average DK Salary This Season": ":.0f",
+                    },
+                    labels={
+                        "Minutes Variance": "Minutes Variance",
+                        "Average Fantasy Points Last 5 Games": "Avg Fantasy Points (Last 5)",
+                        "Average DK Salary This Season": "Avg Salary",
+                    },
+                    trendline="ols",
+                    title="Minutes Variance vs Fantasy Points (Last 5 Avg)",
+                )
+                scatter_fig.update_layout(height=500)
+                st.plotly_chart(scatter_fig, use_container_width=True)
+
+                variance_bucket_col = "Minutes Variance Bucket"
+                bucket_order: List[str] = []
+                for q in [4, 3, 2]:
+                    try:
+                        raw_buckets = pd.qcut(
+                            viz_df["Minutes Variance"], q=q, duplicates="drop"
+                        )
+                    except ValueError:
+                        continue
+
+                    intervals = list(raw_buckets.cat.categories)
+                    if len(intervals) < 2:
+                        continue
+
+                    if len(intervals) == 4:
+                        labels = ["Q1 (Low)", "Q2", "Q3", "Q4 (High)"]
+                    elif len(intervals) == 3:
+                        labels = ["Q1 (Low)", "Q2", "Q3 (High)"]
+                    else:
+                        labels = ["Q1 (Low)", "Q2 (High)"]
+
+                    interval_to_label = {
+                        interval: labels[idx] for idx, interval in enumerate(intervals)
+                    }
+                    labeled_buckets = raw_buckets.map(interval_to_label)
+                    viz_df[variance_bucket_col] = pd.Categorical(
+                        labeled_buckets, categories=labels, ordered=True
+                    )
+                    bucket_order = labels
+                    break
+
+                if not bucket_order:
+                    st.info(
+                        "Minutes variance buckets could not be computed for this filter range."
+                    )
+                else:
+                    bucket_summary = (
+                        viz_df.dropna(subset=[variance_bucket_col])
+                        .groupby(variance_bucket_col, observed=True)
+                        .agg(
+                            Player_Count=("Player Name", "count"),
+                            Avg_Fantasy_Last5=("Average Fantasy Points Last 5 Games", "mean"),
+                            Avg_Minutes=("Average Minutes Per Game", "mean"),
+                            Avg_Salary=("Average DK Salary This Season", "mean"),
+                        )
+                        .reset_index()
+                    )
+
+                    if len(bucket_summary) < 2:
+                        st.info(
+                            "Not enough distinct variance buckets to compare low vs high impact."
+                        )
+                    else:
+                        bucket_summary["Avg_Fantasy_Last5"] = bucket_summary[
+                            "Avg_Fantasy_Last5"
+                        ].round(2)
+                        bucket_summary["Avg_Minutes"] = bucket_summary["Avg_Minutes"].round(2)
+                        bucket_summary["Avg_Salary"] = bucket_summary["Avg_Salary"].round(0)
+
+                        bucket_fig = px.bar(
+                            bucket_summary,
+                            x=variance_bucket_col,
+                            y="Avg_Fantasy_Last5",
+                            text="Player_Count",
+                            color="Avg_Fantasy_Last5",
+                            color_continuous_scale="Blues",
+                            title="Average Fantasy Points by Minutes Variance Bucket",
+                            labels={
+                                variance_bucket_col: "Minutes Variance Bucket",
+                                "Avg_Fantasy_Last5": "Avg Fantasy Points (Last 5)",
+                                "Player_Count": "Players",
+                                "Avg_Minutes": "Avg Minutes",
+                                "Avg_Salary": "Avg Salary",
+                            },
+                            hover_data={
+                                variance_bucket_col: True,
+                                "Player_Count": True,
+                                "Avg_Fantasy_Last5": ":.2f",
+                                "Avg_Minutes": ":.2f",
+                                "Avg_Salary": ":.0f",
+                            },
+                        )
+                        bucket_fig.update_traces(texttemplate="n=%{text}", textposition="outside")
+                        bucket_fig.update_layout(height=420, coloraxis_showscale=False)
+                        st.plotly_chart(bucket_fig, use_container_width=True)
+
+                        ordered_bucket_summary = bucket_summary.sort_values(
+                            variance_bucket_col
+                        ).reset_index(drop=True)
+                        low_row = ordered_bucket_summary.iloc[0]
+                        high_row = ordered_bucket_summary.iloc[-1]
+                        low_avg = float(low_row["Avg_Fantasy_Last5"])
+                        high_avg = float(high_row["Avg_Fantasy_Last5"])
+                        delta = high_avg - low_avg
+
+                        low_bucket_label = str(low_row[variance_bucket_col])
+                        high_bucket_label = str(high_row[variance_bucket_col])
+                        low_metric_title = (
+                            "Q1 Avg Fantasy"
+                            if low_bucket_label.startswith("Q1")
+                            else f"{low_bucket_label} Avg Fantasy"
+                        )
+                        high_metric_title = (
+                            "Q4 Avg Fantasy"
+                            if high_bucket_label.startswith("Q4")
+                            else f"{high_bucket_label} Avg Fantasy"
+                        )
+
+                        kpi_col1, kpi_col2, kpi_col3 = st.columns(3)
+                        with kpi_col1:
+                            st.metric(low_metric_title, f"{low_avg:.2f}")
+                        with kpi_col2:
+                            st.metric(high_metric_title, f"{high_avg:.2f}")
+                        with kpi_col3:
+                            st.metric("High-Low Delta", f"{delta:+.2f}")
+
 st.divider()
 st.caption(
     "Need more context? Re-run the builder (`python nba_to_sqlite.py ...`) to refresh "
