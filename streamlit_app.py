@@ -17514,6 +17514,15 @@ if selected_page == "DFS Player Review":
                 corr_matrix = corr_input.corr(method="pearson").round(3)
                 st.dataframe(corr_matrix, use_container_width=False)
 
+                raw_avg_minutes = float(corr_input["Average Minutes Per Game"].mean())
+                raw_avg_fpts = float(corr_input["Average Fantasy Points Last 5 Games"].mean())
+                st.caption("Raw filtered averages")
+                avg_col1, avg_col2 = st.columns(2)
+                with avg_col1:
+                    st.metric("Avg Minutes (Filtered)", f"{raw_avg_minutes:.2f}")
+                with avg_col2:
+                    st.metric("Avg Fantasy Points (Filtered)", f"{raw_avg_fpts:.2f}")
+
 st.divider()
 st.caption(
     "Need more context? Re-run the builder (`python nba_to_sqlite.py ...`) to refresh "
