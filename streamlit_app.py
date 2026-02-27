@@ -17378,7 +17378,7 @@ if selected_page == "DFS Player Review":
                 MAX(player_name) AS player_name,
                 MAX(CASE WHEN fpts_rn = 1 THEN team_abbreviation END) AS team,
                 ROUND(SUM(dk_fpts), 2) AS total_fpts_season,
-                ROUND(SUM(CASE WHEN fpts_rn <= 5 THEN dk_fpts ELSE 0 END), 2) AS total_fpts_last5
+                ROUND(AVG(CASE WHEN fpts_rn <= 5 THEN dk_fpts END), 2) AS avg_fpts_last5
             FROM season_games
             GROUP BY player_id
         ),
@@ -17415,7 +17415,7 @@ if selected_page == "DFS Player Review":
             COALESCE(o.team, f.team, '-') AS "Team",
             COALESCE(o.position, '-') AS "Position",
             COALESCE(f.total_fpts_season, 0) AS "Total Fantasy Points Season",
-            COALESCE(f.total_fpts_last5, 0) AS "Total Fantasy Points Last 5 Games",
+            COALESCE(f.avg_fpts_last5, 0) AS "Average Fantasy Points Last 5 Games",
             o.avg_own_season AS "Average Ownership Season",
             o.avg_own_last5 AS "Average Ownership Last 5 Games",
             o.avg_salary_season AS "Average DK Salary This Season"
@@ -17444,7 +17444,7 @@ if selected_page == "DFS Player Review":
             hide_index=True,
             column_config={
                 "Total Fantasy Points Season": st.column_config.NumberColumn(format="%.2f"),
-                "Total Fantasy Points Last 5 Games": st.column_config.NumberColumn(format="%.2f"),
+                "Average Fantasy Points Last 5 Games": st.column_config.NumberColumn(format="%.2f"),
                 "Average Ownership Season": st.column_config.NumberColumn(format="%.2f%%"),
                 "Average Ownership Last 5 Games": st.column_config.NumberColumn(format="%.2f%%"),
                 "Average DK Salary This Season": st.column_config.NumberColumn(format="$%.0f"),
