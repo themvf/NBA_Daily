@@ -17355,6 +17355,8 @@ if selected_page == "DFS Player Review":
                 pgl.player_name,
                 pgl.team_abbreviation,
                 date(pgl.game_date) AS game_date,
+                CAST(NULLIF(pgl.minutes, '') AS REAL) AS minutes_played,
+                pgl.usg_pct AS usage_pct,
                 (
                     COALESCE(pgl.points, 0) * 1.0
                     + COALESCE(pgl.rebounds, 0) * 1.25
@@ -17377,6 +17379,8 @@ if selected_page == "DFS Player Review":
                 player_id,
                 MAX(player_name) AS player_name,
                 MAX(CASE WHEN fpts_rn = 1 THEN team_abbreviation END) AS team,
+                ROUND(AVG(CASE WHEN minutes_played > 0 THEN minutes_played END), 2) AS avg_minutes_season,
+                ROUND(AVG(CASE WHEN usage_pct > 0 THEN usage_pct END), 2) AS avg_usage_season,
                 ROUND(SUM(dk_fpts), 2) AS total_fpts_season,
                 ROUND(AVG(CASE WHEN fpts_rn <= 5 THEN dk_fpts END), 2) AS avg_fpts_last5
             FROM season_games
@@ -17414,6 +17418,8 @@ if selected_page == "DFS Player Review":
             COALESCE(o.player_name, f.player_name) AS "Player Name",
             COALESCE(o.team, f.team, '-') AS "Team",
             COALESCE(o.position, '-') AS "Position",
+            COALESCE(f.avg_minutes_season, 0) AS "Average Minutes Per Game",
+            COALESCE(f.avg_usage_season, 0) AS "Average Usage % Season",
             COALESCE(f.total_fpts_season, 0) AS "Total Fantasy Points Season",
             COALESCE(f.avg_fpts_last5, 0) AS "Average Fantasy Points Last 5 Games",
             o.avg_own_season AS "Average Ownership Season",
@@ -17439,6 +17445,8 @@ if selected_page == "DFS Player Review":
         st.info("No DFS player review data available for the selected season.")
     else:
         table_column_config = {
+            "Average Minutes Per Game": st.column_config.NumberColumn(format="%.2f"),
+            "Average Usage % Season": st.column_config.NumberColumn(format="%.2f"),
             "Total Fantasy Points Season": st.column_config.NumberColumn(format="%.2f"),
             "Average Fantasy Points Last 5 Games": st.column_config.NumberColumn(format="%.2f"),
             "Average Ownership Season": st.column_config.NumberColumn(format="%.2f%%"),
@@ -17492,6 +17500,19 @@ if selected_page == "DFS Player Review":
                 hide_index=True,
                 column_config=table_column_config,
             )
+
+            st.subheader("Correlation (Filtered Table)")
+            corr_cols = [
+                "Average Minutes Per Game",
+                "Average Fantasy Points Last 5 Games",
+                "Average DK Salary This Season",
+            ]
+            corr_input = filtered_review_df[corr_cols].apply(pd.to_numeric, errors="coerce").dropna()
+            if len(corr_input) < 3:
+                st.info("Not enough rows with complete numeric values to compute correlation.")
+            else:
+                corr_matrix = corr_input.corr(method="pearson").round(3)
+                st.dataframe(corr_matrix, use_container_width=False)
 
 st.divider()
 st.caption(
