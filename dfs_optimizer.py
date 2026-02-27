@@ -566,6 +566,7 @@ class DFSPlayer:
     # Minutes validation
     recent_minutes_avg: float = 0.0  # Last 5 games avg minutes
     minutes_validated: bool = True    # False if player fails minutes check
+    minutes_variance: float = 0.0     # Last 10 games variance of non-zero minutes
 
     # Research / scouting fields
     role_tier: str = ""              # STAR, STARTER, ROTATION, BENCH
@@ -620,6 +621,10 @@ MIN_GAMES = 2
 MIN_PLAYER_SALARY = 3000
 MIN_SALARY_PROJ_FPTS_GATE = 12.0
 MAX_MIN_SALARY_PLAYERS_PER_LINEUP = 1
+MINUTES_VARIANCE_FILTER_MIN_SAMPLE = 8
+MINUTES_VARIANCE_FILTER_PERCENTILE = 75.0
+MINUTES_VARIANCE_ELITE_PROJ_FPTS = 34.0
+MINUTES_VARIANCE_ELITE_CEILING = 50.0
 
 # League average stats per game (2025-26 season, for opponent adjustment)
 LEAGUE_AVG_TEAM_REB = 44.0
@@ -1493,6 +1498,11 @@ def generate_player_projections(
             min_vals = pd.to_numeric(logs['minutes'].head(10), errors='coerce').fillna(0)
             recent_5_min = min_vals.head(5)
             player.recent_minutes_avg = round(float(recent_5_min.mean()), 1)
+            valid_minutes = min_vals[min_vals > 0]
+            if len(valid_minutes) > 1:
+                player.minutes_variance = round(float(valid_minutes.var(ddof=0)), 4)
+            else:
+                player.minutes_variance = 0.0
 
             games_with_minutes = (min_vals > 0).sum()
             if games_with_minutes == 0:
@@ -2649,6 +2659,35 @@ def generate_diversified_lineups(
     # Get locked players (ensure they're not injured)
     locked = [p for p in filtered_pool if p.is_locked and not p.is_injured]
     locked_ids = {p.player_id for p in locked}
+
+    # Minutes variance filter:
+    # Exclude top-quartile volatility plays unless they are elite projection/ceiling
+    # or explicitly locked by the user.
+    variance_values = [
+        float(getattr(p, "minutes_variance", 0.0) or 0.0)
+        for p in filtered_pool
+        if float(getattr(p, "minutes_variance", 0.0) or 0.0) > 0
+    ]
+    if len(variance_values) >= MINUTES_VARIANCE_FILTER_MIN_SAMPLE:
+        variance_cutoff = float(np.percentile(variance_values, MINUTES_VARIANCE_FILTER_PERCENTILE))
+
+        def _passes_minutes_variance_filter(player: DFSPlayer) -> bool:
+            if player.player_id in locked_ids:
+                return True
+            minutes_var = float(getattr(player, "minutes_variance", 0.0) or 0.0)
+            if minutes_var <= 0 or minutes_var <= variance_cutoff:
+                return True
+
+            proj_fpts = float(getattr(player, "proj_fpts", 0.0) or 0.0)
+            proj_ceiling = float(getattr(player, "proj_ceiling", 0.0) or 0.0)
+            return (
+                proj_fpts >= MINUTES_VARIANCE_ELITE_PROJ_FPTS
+                or proj_ceiling >= MINUTES_VARIANCE_ELITE_CEILING
+            )
+
+        filtered_pool = [p for p in filtered_pool if _passes_minutes_variance_filter(p)]
+        if not filtered_pool:
+            return []
 
     # Resolve exposure target players
     exposure_targets = exposure_targets or {}

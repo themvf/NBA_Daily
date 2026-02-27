@@ -13349,8 +13349,9 @@ if selected_page == "DFS Lineup Builder":
             help="Maximum unused salary allowed per lineup. Lower values force fuller salary usage. $0 = must use exactly $50,000."
         )
         st.caption(
-            "Minutes auto-filter is disabled. Lineup creation now lets projections speak for themselves "
-            "(injured/excluded players are still removed)."
+            "Minutes auto-filter is disabled, but high minutes-variance plays are now trimmed in the "
+            "lineup generator (with elite projection/ceiling exceptions). Injured/excluded players are "
+            "still removed."
         )
 
         st.divider()
@@ -14600,8 +14601,8 @@ if selected_page == "DFS Lineup Builder":
                     if salary_filtered_count > 0:
                         st.info(f"💰 Filtered out {salary_filtered_count} players below ${min_salary:,} salary")
 
-                    # Minutes-based exclusion is intentionally disabled.
-                    # We allow projections (plus injury exclusions) to drive candidate selection.
+                    # Minutes-based exclusion is intentionally disabled at this stage.
+                    # The optimizer still applies a minutes-variance risk filter internally.
 
                     if len(filtered_players) < 15:
                         st.error(f"Only {len(filtered_players)} players remain after filtering — need at least 15 to build lineups. Try disabling the minutes filter or lowering the salary minimum.")
