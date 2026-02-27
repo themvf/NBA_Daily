@@ -573,6 +573,17 @@ class DFSPlayer:
     avg_fpts_last7: float = 0.0     # Average DK FPTS over last 7 games
     fpts_variance: float = 0.0      # Std dev of recent DK FPTS
 
+    # Segment-level calibration/risk controls
+    primary_position: str = ""        # Canonical primary position bucket (PG/SG/SF/PF/C/UNK)
+    salary_bucket: str = ""           # VALUE/LOW_MID/MID/UPPER/STUD
+    segment_bias_correction: float = 0.0
+    segment_mae: float = 0.0
+    segment_sample_size: int = 0
+    segment_risk_penalty: float = 0.0
+    risk_adjusted_proj_fpts: float = 0.0
+    segment_exposure_cap: float = 1.0
+    is_overproj_redflag: bool = False
+
     def calculate_projections(self) -> None:
         """Calculate derived projection values."""
         self.proj_fpts = calculate_dk_fantasy_points(
@@ -625,6 +636,35 @@ MINUTES_VARIANCE_FILTER_MIN_SAMPLE = 8
 MINUTES_VARIANCE_FILTER_PERCENTILE = 75.0
 MINUTES_VARIANCE_ELITE_PROJ_FPTS = 34.0
 MINUTES_VARIANCE_ELITE_CEILING = 50.0
+MAX_REDFLAG_SEGMENTS_PER_LINEUP = 1
+
+# Segment calibration constants from DFS Player Review diagnostics.
+# avg_error is defined as (actual_fpts - proj_fpts), so:
+# - negative => historically over-projected (needs downward correction)
+# - positive => historically under-projected (needs upward correction)
+SEGMENT_CALIBRATION_METRICS: Dict[Tuple[str, str], Dict[str, float]] = {
+    ("C", "UPPER"): {"avg_error": 6.99, "mae": 10.09, "samples": 8},
+    ("SF", "UPPER"): {"avg_error": -6.27, "mae": 11.08, "samples": 5},
+    ("PG", "UPPER"): {"avg_error": -6.02, "mae": 12.47, "samples": 27},
+    ("SG", "MID"): {"avg_error": -4.29, "mae": 7.77, "samples": 22},
+    ("C", "MID"): {"avg_error": -3.90, "mae": 9.59, "samples": 29},
+    ("PF", "MID"): {"avg_error": -3.00, "mae": 7.00, "samples": 11},
+    ("C", "LOW_MID"): {"avg_error": -2.49, "mae": 11.10, "samples": 39},
+    ("PG", "STUD"): {"avg_error": 2.23, "mae": 10.56, "samples": 7},
+}
+
+# Segment-aware caps for historically problematic buckets.
+SEGMENT_EXPOSURE_CAPS: Dict[Tuple[str, str], float] = {
+    ("PG", "UPPER"): 0.25,
+    ("SG", "MID"): 0.35,
+    ("C", "LOW_MID"): 0.30,
+}
+
+SEGMENT_SHRINKAGE_K = 30.0
+SEGMENT_CORRECTION_CAP = 4.0
+SEGMENT_MAE_BASELINE = 8.0
+SEGMENT_MAE_PENALTY_WEIGHT = 0.18
+SEGMENT_MAE_PENALTY_CAP = 2.0
 
 # League average stats per game (2025-26 season, for opponent adjustment)
 LEAGUE_AVG_TEAM_REB = 44.0
@@ -745,6 +785,87 @@ LINEUP_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
 def get_lineup_model_profiles() -> Dict[str, Dict[str, Any]]:
     """Return lineup model profile metadata for UI and engine wiring."""
     return LINEUP_MODEL_PROFILES
+
+
+def _canonical_primary_position(positions: List[str], fallback: str = "") -> str:
+    """Resolve a player's primary DFS position into canonical buckets."""
+    valid = {"PG", "SG", "SF", "PF", "C"}
+    for pos in positions or []:
+        clean = str(pos).strip().upper()
+        if clean in valid:
+            return clean
+
+    if fallback:
+        clean_fallback = str(fallback).strip().upper().replace("-", "/")
+        clean_fallback = clean_fallback.split("/")[0].strip()
+        if clean_fallback in valid:
+            return clean_fallback
+
+    return "UNK"
+
+
+def _salary_bucket_from_salary(salary: int) -> str:
+    """Map salary to calibration bucket labels used by DFS diagnostics."""
+    if salary >= 9500:
+        return "STUD"
+    if salary >= 8000:
+        return "UPPER"
+    if salary >= 6500:
+        return "MID"
+    if salary >= 5000:
+        return "LOW_MID"
+    return "VALUE"
+
+
+def _is_overproj_redflag_segment(position: str, bucket: str) -> bool:
+    """Flag robustly over-projected segments for lineup-level composition control."""
+    metrics = SEGMENT_CALIBRATION_METRICS.get((position, bucket))
+    if not metrics:
+        return False
+    return metrics.get("avg_error", 0.0) <= -4.0 and metrics.get("samples", 0) >= 20
+
+
+def _apply_segment_calibration_and_risk(player: DFSPlayer) -> None:
+    """Apply shrunk position/salary bias correction and MAE-driven risk controls."""
+    player.primary_position = _canonical_primary_position(player.positions, player.position)
+    player.salary_bucket = _salary_bucket_from_salary(int(player.salary or 0))
+
+    metrics = SEGMENT_CALIBRATION_METRICS.get((player.primary_position, player.salary_bucket))
+    if not metrics:
+        player.segment_bias_correction = 0.0
+        player.segment_mae = 0.0
+        player.segment_sample_size = 0
+        player.segment_risk_penalty = 0.0
+        player.segment_exposure_cap = 1.0
+        player.is_overproj_redflag = False
+        player.risk_adjusted_proj_fpts = max(0.0, float(player.proj_fpts or 0.0))
+        return
+
+    avg_error = float(metrics.get("avg_error", 0.0) or 0.0)
+    mae = float(metrics.get("mae", 0.0) or 0.0)
+    samples = int(metrics.get("samples", 0) or 0)
+
+    # Shrink toward zero when sample size is small.
+    shrink = samples / (samples + SEGMENT_SHRINKAGE_K) if samples > 0 else 0.0
+    correction = avg_error * shrink
+    correction = max(-SEGMENT_CORRECTION_CAP, min(SEGMENT_CORRECTION_CAP, correction))
+    player.proj_fpts = max(0.0, float(player.proj_fpts or 0.0) + correction)
+
+    # MAE penalty controls lineup scoring/exposure for noisy segments.
+    excess_mae = max(0.0, mae - SEGMENT_MAE_BASELINE)
+    risk_penalty = min(SEGMENT_MAE_PENALTY_CAP, excess_mae * SEGMENT_MAE_PENALTY_WEIGHT)
+    player.risk_adjusted_proj_fpts = max(0.0, float(player.proj_fpts or 0.0) - risk_penalty)
+
+    player.segment_bias_correction = correction
+    player.segment_mae = mae
+    player.segment_sample_size = samples
+    player.segment_risk_penalty = risk_penalty
+    player.segment_exposure_cap = SEGMENT_EXPOSURE_CAPS.get(
+        (player.primary_position, player.salary_bucket), 1.0
+    )
+    player.is_overproj_redflag = _is_overproj_redflag_segment(
+        player.primary_position, player.salary_bucket
+    )
 
 
 # =============================================================================
@@ -1405,6 +1526,9 @@ def _generate_simple_projections(
         player.proj_ceiling = avg_fpts * 1.5
 
     player.calculate_projections()
+    _apply_segment_calibration_and_risk(player)
+    if player.salary > 0:
+        player.fpts_per_dollar = (player.proj_fpts / player.salary) * 1000
 
     if player.salary > 0:
         player.ownership_proj = _project_player_ownership(
@@ -1413,6 +1537,11 @@ def _generate_simple_projections(
             today_num_games=num_games,
             has_injury_boost=False,
         )
+        if player.ownership_proj > 0:
+            upside = max(0, player.proj_ceiling - player.proj_fpts)
+            player.leverage_score = (player.proj_fpts + upside * 1.5) / max(1, player.ownership_proj)
+
+    player.position = _get_player_position(conn, player.player_id)
 
     return player
 
@@ -1468,17 +1597,22 @@ def generate_player_projections(
             player.proj_fpts = dk_avg
             player.proj_floor = dk_avg * 0.5   # Wider range for uncertainty
             player.proj_ceiling = dk_avg * 1.8
-            player.fpts_per_dollar = (dk_avg / player.salary * 1000) if player.salary > 0 else 0
             # Rough stat estimates (for display purposes only)
             player.proj_points = dk_avg * 0.45   # ~45% of FPTS from points
             player.proj_rebounds = dk_avg * 0.10
             player.proj_assists = dk_avg * 0.08
+            _apply_segment_calibration_and_risk(player)
+            player.fpts_per_dollar = (player.proj_fpts / player.salary * 1000) if player.salary > 0 else 0
             player.ownership_proj = _project_player_ownership(
                 conn,
                 player,
                 today_num_games=num_games,
                 has_injury_boost=False,
             )
+            if player.ownership_proj > 0:
+                upside = max(0, player.proj_ceiling - player.proj_fpts)
+                player.leverage_score = (player.proj_fpts + upside * 1.5) / max(1, player.ownership_proj)
+            player.position = _get_player_position(conn, player.player_id)
         return player
 
     # Load historical stats
@@ -1742,26 +1876,14 @@ def generate_player_projections(
         player.proj_fg3m
     )
 
-    # --- Calibration: Salary-tier bias correction ---
-    # Based on 312-player analysis across 3 contest slates (2026-02-04 to 02-06):
-    #   Stars ($8K+):    bias -1.60 (over-projecting) -> scale down 4%
-    #   Mid ($6K-7.9K):  bias +0.64 (negligible)      -> no change
-    #   Value ($4K-5.9K): bias +0.98 (under-proj)     -> scale up 5%
-    #   Punt (<$4K):     bias +2.09 (under-proj)       -> scale up 20%
-    if player.salary >= 8000:
-        player.proj_fpts *= 0.96
-    elif player.salary >= 6000:
-        pass  # Mid-tier bias is negligible
-    elif player.salary >= 4000:
-        player.proj_fpts *= 1.05
-    else:
-        player.proj_fpts *= 1.20
-
     # --- Recency blend: nudge projection toward recent 7-game average ---
     # If a player's recent production diverges significantly from the model,
     # blend in the recent average at 20% weight (captures hot/cold streaks)
     if player.avg_fpts_last7 > 0 and abs(player.avg_fpts_last7 - player.proj_fpts) > 3.0:
         player.proj_fpts = round(player.proj_fpts * 0.80 + player.avg_fpts_last7 * 0.20, 1)
+
+    # Apply position-salary segment calibration with shrinkage and MAE-based risk penalties.
+    _apply_segment_calibration_and_risk(player)
 
     # Floor/ceiling from actual DK FPTS distribution (preserves stat correlations)
     if len(logs) >= 3:
@@ -2436,16 +2558,27 @@ def optimize_lineup_randomized(
     if not available:
         return None
 
-    # Get score function based on strategy
+    # Get score function based on strategy.
+    # Use risk-adjusted projection for historically noisy segments.
     def get_score(p: DFSPlayer) -> float:
+        risk_penalty = float(getattr(p, "segment_risk_penalty", 0.0) or 0.0)
+        proj_for_scoring = float(
+            getattr(p, "risk_adjusted_proj_fpts", 0.0)
+            or (float(getattr(p, "proj_fpts", 0.0) or 0.0) - risk_penalty)
+        )
+        proj_for_scoring = max(0.0, proj_for_scoring)
         if strategy == "ceiling":
-            return p.proj_ceiling
+            return max(0.1, float(getattr(p, "proj_ceiling", 0.0) or 0.0) - (risk_penalty * 0.5))
         elif strategy == "value":
-            return p.fpts_per_dollar
+            if p.salary <= 0:
+                return 0.1
+            return max(0.1, (proj_for_scoring / p.salary) * 1000)
         elif strategy == "leverage":
-            return p.leverage_score
+            leverage = float(getattr(p, "leverage_score", 0.0) or 0.0)
+            leverage_decay = max(0.70, 1.0 - (risk_penalty / 6.0))
+            return max(0.1, leverage * leverage_decay)
         else:  # projection
-            return p.proj_fpts
+            return max(0.1, proj_for_scoring)
 
     lineup = DFSLineup()
     used_player_ids = set()
@@ -2453,9 +2586,17 @@ def optimize_lineup_randomized(
     def lineup_min_salary_count() -> int:
         return sum(1 for p in lineup.players.values() if is_min_salary_player(p))
 
+    def lineup_redflag_count() -> int:
+        return sum(1 for p in lineup.players.values() if bool(getattr(p, "is_overproj_redflag", False)))
+
     # Add locked players first
     for player in locked_players:
         if not min_salary_player_eligible(player):
+            return None
+        if (
+            bool(getattr(player, "is_overproj_redflag", False))
+            and lineup_redflag_count() >= MAX_REDFLAG_SEGMENTS_PER_LINEUP
+        ):
             return None
         if (
             is_min_salary_player(player)
@@ -2475,6 +2616,11 @@ def optimize_lineup_randomized(
             if player.player_id in used_player_ids:
                 continue
             if not min_salary_player_eligible(player):
+                continue
+            if (
+                bool(getattr(player, "is_overproj_redflag", False))
+                and lineup_redflag_count() >= MAX_REDFLAG_SEGMENTS_PER_LINEUP
+            ):
                 continue
             if (
                 is_min_salary_player(player)
@@ -2500,6 +2646,11 @@ def optimize_lineup_randomized(
             if player.player_id in used_player_ids:
                 continue
             if not player.can_fill_slot(slot):
+                continue
+            if (
+                bool(getattr(player, "is_overproj_redflag", False))
+                and lineup_redflag_count() >= MAX_REDFLAG_SEGMENTS_PER_LINEUP
+            ):
                 continue
             if is_min_salary_player(player):
                 if not min_salary_player_eligible(player):
@@ -2711,6 +2862,12 @@ def generate_diversified_lineups(
     for pid, info in target_player_map.items():
         max_exp[pid] = max(max_player_exposure, info['target'])
 
+    # Segment-aware safety caps from calibration diagnostics.
+    # These caps are intentionally stricter for historically problematic buckets.
+    for p in filtered_pool:
+        segment_cap = float(getattr(p, "segment_exposure_cap", 1.0) or 1.0)
+        max_exp[p.player_id] = min(max_exp.get(p.player_id, max_player_exposure), segment_cap)
+
     profile_cfg = LINEUP_MODEL_PROFILES.get(model_key, {}) if model_key else {}
     overlap_cap = int(profile_cfg.get("overlap_cap", 8) or 8)
     core_play_inject_prob = float(profile_cfg.get("core_play_inject_prob", 0.0) or 0.0)
@@ -2743,6 +2900,13 @@ def generate_diversified_lineups(
                 return False
         return True
 
+    def _risk_adjusted_fpts(player: DFSPlayer) -> float:
+        return float(
+            getattr(player, "risk_adjusted_proj_fpts", 0.0)
+            or getattr(player, "proj_fpts", 0.0)
+            or 0.0
+        )
+
     core_play_candidates = [
         p for p in filtered_pool
         if (
@@ -2750,14 +2914,14 @@ def generate_diversified_lineups(
             and not p.is_excluded
             and not p.is_injured
             and core_play_min_own_pct <= float(getattr(p, "ownership_proj", 0.0) or 0.0) <= core_play_max_own_pct
-            and float(getattr(p, "proj_fpts", 0.0) or 0.0) >= core_play_min_projection
+            and _risk_adjusted_fpts(p) >= core_play_min_projection
         )
     ]
     core_play_candidates = sorted(
         core_play_candidates,
         key=lambda p: (
             (
-                float(getattr(p, "proj_fpts", 0.0) or 0.0) * 0.65
+                _risk_adjusted_fpts(p) * 0.65
                 + float(getattr(p, "proj_ceiling", 0.0) or 0.0) * 0.35
             )
             * (1.0 + min(30.0, float(getattr(p, "ownership_proj", 0.0) or 0.0)) / 100.0),
@@ -2773,7 +2937,7 @@ def generate_diversified_lineups(
             and not p.is_excluded
             and not p.is_injured
             and float(getattr(p, "ownership_proj", 0.0) or 0.0) <= low_own_max_own_pct
-            and float(getattr(p, "proj_fpts", 0.0) or 0.0) >= low_own_min_projection
+            and _risk_adjusted_fpts(p) >= low_own_min_projection
         )
     ]
     low_own_candidates = sorted(
@@ -2789,7 +2953,7 @@ def generate_diversified_lineups(
     for p in filtered_pool:
         if p.player_id in locked_ids or p.is_excluded or p.is_injured:
             continue
-        ceiling_gap = float(getattr(p, "proj_ceiling", 0.0) or 0.0) - float(getattr(p, "proj_fpts", 0.0) or 0.0)
+        ceiling_gap = float(getattr(p, "proj_ceiling", 0.0) or 0.0) - _risk_adjusted_fpts(p)
         if ceiling_gap < standout_min_ceiling_gap:
             continue
         ownership = max(1.0, float(getattr(p, "ownership_proj", 0.0) or 0.0))
@@ -2894,7 +3058,7 @@ def generate_diversified_lineups(
                     weights = [
                         max(
                             0.05,
-                            float(getattr(p, "proj_fpts", 0.0) or 0.0)
+                            _risk_adjusted_fpts(p)
                             + (float(getattr(p, "proj_ceiling", 0.0) or 0.0) * 0.20)
                             + (float(getattr(p, "ownership_proj", 0.0) or 0.0) * 0.30),
                         )
