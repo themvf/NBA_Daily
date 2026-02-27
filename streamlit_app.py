@@ -13277,6 +13277,7 @@ if selected_page == "DFS Lineup Builder":
             "spike_v2_tail": "Spike v2 (Tail)",
             "cluster_v1_experimental": "Cluster v1 (Experimental)",
             "standout_v1_capture": "Standout v1 (Missed-Capture)",
+            "midrange_v1_minutes_vegas": "Midrange v1 (Minutes+Vegas Test)",
         }
         for key, label in expected_model_labels.items():
             if key not in model_profiles:
@@ -13741,6 +13742,14 @@ if selected_page == "DFS Lineup Builder":
 
             # Vegas blending
             vegas_sigs = st.session_state.get('dfs_vegas_signals', {})
+
+            # Attach Vegas signal fields directly to player objects so lineup models
+            # can use the same enrichment data as the review table/UI.
+            for p in players:
+                v_sig = vegas_sigs.get(p.player_id, {}) if vegas_sigs else {}
+                p.vegas_implied_fpts = float(v_sig.get('vegas_fpts', 0.0) or 0.0)
+                p.vegas_edge_pct = float(v_sig.get('edge_pct', 0.0) or 0.0)
+                p.vegas_signal = str(v_sig.get('signal', '') or '').strip().upper()
 
             if vegas_sigs:
                 blend_col1, blend_col2 = st.columns([1, 2])

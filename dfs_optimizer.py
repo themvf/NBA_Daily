@@ -527,6 +527,9 @@ class DFSPlayer:
     # GPP metrics
     ownership_proj: float = 0.0  # Expected ownership %
     leverage_score: float = 0.0  # Ceiling / ownership ratio
+    vegas_implied_fpts: float = 0.0  # Vegas-implied fantasy points from props feed
+    vegas_edge_pct: float = 0.0      # (Vegas implied - model proj) / model proj
+    vegas_signal: str = ""           # BOOST / WATCH / FADE guidance from props edge
 
     # Status flags
     is_locked: bool = False      # Force include in all lineups
@@ -779,6 +782,40 @@ LINEUP_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
             ("projection", 0.78, 0.10),
         ],
     },
+    "midrange_v1_minutes_vegas": {
+        "label": "Midrange v1 (Minutes+Vegas Test)",
+        "description": (
+            "Targets $5k-$6.5k players when recent minutes are elevated or Vegas "
+            "implied output beats the peer average."
+        ),
+        "aggressive_ceiling_stack": False,
+        "overlap_cap": 5,
+        "core_play_inject_prob": 0.10,
+        "core_play_min_own_pct": 10.0,
+        "core_play_max_own_pct": 45.0,
+        "core_play_min_projection": 22.0,
+        "low_own_inject_prob": 0.10,
+        "low_own_max_own_pct": 12.0,
+        "low_own_min_projection": 20.0,
+        "standout_lock_prob": 0.08,
+        "standout_min_ceiling_gap": 7.5,
+        "midrange_focus_enabled": True,
+        "midrange_focus_min_salary": 5000,
+        "midrange_focus_max_salary": 6500,
+        "midrange_signal_inject_prob": 0.55,
+        "midrange_base_bonus": 0.12,
+        "midrange_minutes_bonus": 0.16,
+        "midrange_vegas_bonus": 0.16,
+        "midrange_combo_bonus": 0.10,
+        "midrange_minutes_floor": 26.0,
+        "strategy_mix": [
+            ("value", 0.22, 0.34),
+            ("projection", 0.28, 0.28),
+            ("ceiling", 0.24, 0.14),
+            ("leverage", 0.30, 0.12),
+            ("projection", 0.58, 0.12),
+        ],
+    },
 }
 
 
@@ -887,6 +924,156 @@ def _apply_segment_calibration_and_risk(player: DFSPlayer) -> None:
     )
     player.is_overproj_redflag = _is_overproj_redflag_segment(
         player.primary_position, player.salary_bucket
+    )
+
+
+def _build_midrange_minutes_vegas_context(
+    player_pool: List[DFSPlayer], profile_cfg: Dict[str, Any]
+) -> Dict[str, float]:
+    """Compute peer averages for the midrange minutes/Vegas test profile."""
+    if not bool(profile_cfg.get("midrange_focus_enabled", False)):
+        return {}
+
+    min_salary = int(profile_cfg.get("midrange_focus_min_salary", 5000) or 5000)
+    max_salary = int(profile_cfg.get("midrange_focus_max_salary", 6500) or 6500)
+    focus_players = [
+        p
+        for p in player_pool
+        if min_salary <= int(getattr(p, "salary", 0) or 0) <= max_salary
+        and not bool(getattr(p, "is_excluded", False))
+        and not bool(getattr(p, "is_injured", False))
+    ]
+
+    recent_minutes = [
+        float(getattr(p, "recent_minutes_avg", 0.0) or 0.0)
+        for p in focus_players
+        if float(getattr(p, "recent_minutes_avg", 0.0) or 0.0) > 0
+    ]
+    vegas_implied = [
+        float(getattr(p, "vegas_implied_fpts", 0.0) or 0.0)
+        for p in focus_players
+        if float(getattr(p, "vegas_implied_fpts", 0.0) or 0.0) > 0
+    ]
+    vegas_edges = [
+        float(getattr(p, "vegas_edge_pct", 0.0) or 0.0)
+        for p in focus_players
+        if str(getattr(p, "vegas_signal", "") or "").strip() or
+        abs(float(getattr(p, "vegas_edge_pct", 0.0) or 0.0)) > 0
+    ]
+
+    recent_minutes_avg = float(np.mean(recent_minutes)) if recent_minutes else 0.0
+    vegas_implied_avg = float(np.mean(vegas_implied)) if vegas_implied else 0.0
+    vegas_edge_avg = float(np.mean(vegas_edges)) if vegas_edges else 0.0
+
+    return {
+        "focus_player_count": float(len(focus_players)),
+        "focus_min_salary": float(min_salary),
+        "focus_max_salary": float(max_salary),
+        "recent_minutes_avg": recent_minutes_avg,
+        "recent_minutes_threshold": max(
+            float(profile_cfg.get("midrange_minutes_floor", 26.0) or 26.0),
+            recent_minutes_avg,
+        ),
+        "vegas_implied_avg": vegas_implied_avg,
+        "vegas_edge_avg": vegas_edge_avg,
+    }
+
+
+def _midrange_minutes_vegas_flags(
+    player: DFSPlayer, profile_cfg: Dict[str, Any], model_context: Optional[Dict[str, float]]
+) -> Dict[str, bool]:
+    """Evaluate whether a player qualifies for the midrange minutes/Vegas bonuses."""
+    profile_cfg = profile_cfg or {}
+    model_context = model_context or {}
+
+    min_salary = int(
+        model_context.get(
+            "focus_min_salary",
+            float(profile_cfg.get("midrange_focus_min_salary", 5000) or 5000),
+        )
+    )
+    max_salary = int(
+        model_context.get(
+            "focus_max_salary",
+            float(profile_cfg.get("midrange_focus_max_salary", 6500) or 6500),
+        )
+    )
+    salary = int(getattr(player, "salary", 0) or 0)
+    in_range = min_salary <= salary <= max_salary
+
+    recent_minutes = float(getattr(player, "recent_minutes_avg", 0.0) or 0.0)
+    recent_minutes_threshold = float(
+        model_context.get(
+            "recent_minutes_threshold",
+            profile_cfg.get("midrange_minutes_floor", 26.0) or 26.0,
+        )
+    )
+    has_minutes_bonus = in_range and recent_minutes > 0 and recent_minutes >= recent_minutes_threshold
+
+    vegas_implied = float(getattr(player, "vegas_implied_fpts", 0.0) or 0.0)
+    vegas_edge = float(getattr(player, "vegas_edge_pct", 0.0) or 0.0)
+    vegas_signal = str(getattr(player, "vegas_signal", "") or "").strip().upper()
+    vegas_implied_avg = float(model_context.get("vegas_implied_avg", 0.0) or 0.0)
+    vegas_edge_threshold = max(0.0, float(model_context.get("vegas_edge_avg", 0.0) or 0.0))
+    has_vegas_bonus = in_range and (
+        vegas_signal == "BOOST"
+        or (vegas_implied > 0 and vegas_implied_avg > 0 and vegas_implied >= vegas_implied_avg)
+        or (vegas_edge > 0 and vegas_edge >= vegas_edge_threshold)
+    )
+
+    return {
+        "in_range": in_range,
+        "has_minutes_bonus": has_minutes_bonus,
+        "has_vegas_bonus": has_vegas_bonus,
+    }
+
+
+def _midrange_minutes_vegas_multiplier(
+    player: DFSPlayer, profile_cfg: Dict[str, Any], model_context: Optional[Dict[str, float]]
+) -> float:
+    """Score multiplier for the $5k-$6.5k minutes/Vegas test profile."""
+    if not bool((profile_cfg or {}).get("midrange_focus_enabled", False)):
+        return 1.0
+
+    flags = _midrange_minutes_vegas_flags(player, profile_cfg, model_context)
+    if not flags["in_range"]:
+        return 1.0
+
+    bonus = float(profile_cfg.get("midrange_base_bonus", 0.0) or 0.0)
+    if flags["has_minutes_bonus"]:
+        bonus += float(profile_cfg.get("midrange_minutes_bonus", 0.0) or 0.0)
+    if flags["has_vegas_bonus"]:
+        bonus += float(profile_cfg.get("midrange_vegas_bonus", 0.0) or 0.0)
+    if flags["has_minutes_bonus"] and flags["has_vegas_bonus"]:
+        bonus += float(profile_cfg.get("midrange_combo_bonus", 0.0) or 0.0)
+
+    return max(1.0, 1.0 + bonus)
+
+
+def _midrange_minutes_vegas_signal_score(
+    player: DFSPlayer, profile_cfg: Dict[str, Any], model_context: Optional[Dict[str, float]]
+) -> float:
+    """Weighted ranking score for selecting midrange signal candidates."""
+    flags = _midrange_minutes_vegas_flags(player, profile_cfg, model_context)
+    if not flags["in_range"]:
+        return 0.0
+
+    model_context = model_context or {}
+    base_proj = float(
+        getattr(player, "risk_adjusted_proj_fpts", 0.0)
+        or getattr(player, "proj_fpts", 0.0)
+        or 0.0
+    )
+    minutes_threshold = float(model_context.get("recent_minutes_threshold", 0.0) or 0.0)
+    minutes_excess = max(0.0, float(getattr(player, "recent_minutes_avg", 0.0) or 0.0) - minutes_threshold)
+    vegas_edge = max(0.0, float(getattr(player, "vegas_edge_pct", 0.0) or 0.0))
+    multiplier = _midrange_minutes_vegas_multiplier(player, profile_cfg, model_context)
+
+    return max(
+        0.0,
+        (base_proj * multiplier)
+        + (minutes_excess * 0.60)
+        + (vegas_edge * 0.12),
     )
 
 
@@ -2505,6 +2692,9 @@ def _select_stack_players(
 def optimize_lineup_randomized(
     player_pool: List[DFSPlayer],
     strategy: str = "projection",
+    model_key: str = "",
+    model_profile: Optional[Dict[str, Any]] = None,
+    model_context: Optional[Dict[str, float]] = None,
     locked_players: Optional[List[DFSPlayer]] = None,
     excluded_ids: Optional[Set[int]] = None,
     max_exposure: Optional[Dict[int, float]] = None,
@@ -2539,6 +2729,8 @@ def optimize_lineup_randomized(
     locked_players = locked_players or []
     max_exposure = max_exposure or {}
     current_exposures = current_exposures or {}
+    model_profile = model_profile or {}
+    model_context = model_context or {}
 
     def _dbg(key: str, value: int = 1) -> None:
         if debug_stats is None:
@@ -2599,17 +2791,26 @@ def optimize_lineup_randomized(
         )
         proj_for_scoring = max(0.0, proj_for_scoring)
         if strategy == "ceiling":
-            return max(0.1, float(getattr(p, "proj_ceiling", 0.0) or 0.0) - (risk_penalty * 0.5))
+            base_score = max(
+                0.1, float(getattr(p, "proj_ceiling", 0.0) or 0.0) - (risk_penalty * 0.5)
+            )
         elif strategy == "value":
             if p.salary <= 0:
                 return 0.1
-            return max(0.1, (proj_for_scoring / p.salary) * 1000)
+            base_score = max(0.1, (proj_for_scoring / p.salary) * 1000)
         elif strategy == "leverage":
             leverage = float(getattr(p, "leverage_score", 0.0) or 0.0)
             leverage_decay = max(0.70, 1.0 - (risk_penalty / 6.0))
-            return max(0.1, leverage * leverage_decay)
+            base_score = max(0.1, leverage * leverage_decay)
         else:  # projection
-            return max(0.1, proj_for_scoring)
+            base_score = max(0.1, proj_for_scoring)
+
+        if model_key == "midrange_v1_minutes_vegas":
+            base_score *= _midrange_minutes_vegas_multiplier(
+                p, model_profile, model_context
+            )
+
+        return max(0.1, base_score)
 
     lineup = DFSLineup()
     used_player_ids = set()
@@ -2931,6 +3132,10 @@ def generate_diversified_lineups(
     low_own_min_projection = float(profile_cfg.get("low_own_min_projection", 20.0) or 20.0)
     standout_lock_prob = float(profile_cfg.get("standout_lock_prob", 0.0) or 0.0)
     standout_min_ceiling_gap = float(profile_cfg.get("standout_min_ceiling_gap", 8.0) or 8.0)
+    midrange_signal_inject_prob = float(
+        profile_cfg.get("midrange_signal_inject_prob", 0.0) or 0.0
+    )
+    model_context = _build_midrange_minutes_vegas_context(filtered_pool, profile_cfg)
 
     lineup_player_sets: List[Set[int]] = []
 
@@ -3013,6 +3218,20 @@ def generate_diversified_lineups(
         standout_scored.append((p, standout_score))
     standout_scored.sort(key=lambda x: x[1], reverse=True)
     standout_scored = standout_scored[:40]
+
+    midrange_signal_scored: List[Tuple[DFSPlayer, float]] = []
+    if bool(profile_cfg.get("midrange_focus_enabled", False)):
+        for p in filtered_pool:
+            if p.player_id in locked_ids or p.is_excluded or p.is_injured:
+                continue
+            signal_score = _midrange_minutes_vegas_signal_score(
+                p, profile_cfg, model_context
+            )
+            if signal_score <= 0:
+                continue
+            midrange_signal_scored.append((p, signal_score))
+        midrange_signal_scored.sort(key=lambda x: x[1], reverse=True)
+        midrange_signal_scored = midrange_signal_scored[:40]
 
     # Strategy configuration: (strategy, randomization_factor, target_count_pct)
     strategies = strategy_mix or [
@@ -3139,6 +3358,22 @@ def generate_diversified_lineups(
                     lock_choice = random.choices(weighted_pool, weights=weights, k=1)[0]
                     _add_lock_candidate(attempt_locked, lock_choice)
 
+            # Profile: prioritize a $5k-$6.5k signal play with rising minutes or strong Vegas.
+            if midrange_signal_scored and random.random() < midrange_signal_inject_prob:
+                available_midrange = [
+                    (p, score) for p, score in midrange_signal_scored
+                    if _can_use_for_lock(p)
+                    and p.player_id not in {lp.player_id for lp in attempt_locked}
+                ]
+                if available_midrange:
+                    weighted_pool = available_midrange[:15]
+                    lock_choice = random.choices(
+                        [p for p, _ in weighted_pool],
+                        weights=[score for _, score in weighted_pool],
+                        k=1,
+                    )[0]
+                    _add_lock_candidate(attempt_locked, lock_choice)
+
             # Profile: force occasional standout missed-capture candidates.
             if standout_scored and random.random() < standout_lock_prob:
                 available_standout = [
@@ -3227,6 +3462,9 @@ def generate_diversified_lineups(
             lineup = optimize_lineup_randomized(
                 player_pool=filtered_pool,
                 strategy=strategy,
+                model_key=model_key,
+                model_profile=profile_cfg,
+                model_context=model_context,
                 locked_players=attempt_locked,
                 max_exposure=max_exp,
                 current_exposures=exposures,
