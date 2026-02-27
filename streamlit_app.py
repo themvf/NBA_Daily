@@ -18521,8 +18521,155 @@ if selected_page == "DFS Player Review":
                                         hide_index=True,
                                     )
 
-            # 5) Before vs after calibration impact using optimizer's segment correction.
-            st.markdown("#### 5) Pre vs Post Calibration Comparison")
+            # 5) Coverage of calibration application by segment.
+            st.markdown("#### 5) Calibration Coverage Heatmap (Position x Salary)")
+            st.caption(
+                "Shows the share of rows receiving non-zero segment correction under the "
+                "current calibration dictionary."
+            )
+            coverage_df = diagnostics_df.dropna(
+                subset=["salary", "proj_fpts", "actual_fpts", "primary_position"]
+            ).copy()
+
+            if len(coverage_df) < 25:
+                st.info(
+                    "Not enough rows with projection + actuals to render calibration "
+                    "coverage heatmap."
+                )
+            else:
+                segment_metrics_cov = getattr(dfs, "SEGMENT_CALIBRATION_METRICS", {}) or {}
+                shrink_k_cov = float(getattr(dfs, "SEGMENT_SHRINKAGE_K", 30.0) or 30.0)
+                correction_cap_cov = float(
+                    getattr(dfs, "SEGMENT_CORRECTION_CAP", 4.0) or 4.0
+                )
+
+                def _coverage_bucket_key(salary_value: float) -> str:
+                    salary_value = float(salary_value or 0.0)
+                    if salary_value >= 9500:
+                        return "STUD"
+                    if salary_value >= 8000:
+                        return "UPPER"
+                    if salary_value >= 6500:
+                        return "MID"
+                    if salary_value >= 5000:
+                        return "LOW_MID"
+                    return "VALUE"
+
+                def _coverage_segment_correction(row: pd.Series) -> float:
+                    metric = segment_metrics_cov.get(
+                        (str(row["primary_position"]), str(row["bucket_key"]))
+                    )
+                    if not metric:
+                        return 0.0
+                    avg_error = float(metric.get("avg_error", 0.0) or 0.0)
+                    samples = float(metric.get("samples", 0.0) or 0.0)
+                    shrink = samples / (samples + shrink_k_cov) if samples > 0 else 0.0
+                    correction = avg_error * shrink
+                    return max(-correction_cap_cov, min(correction_cap_cov, correction))
+
+                coverage_df["bucket_key"] = coverage_df["salary"].apply(_coverage_bucket_key)
+                coverage_df["segment_correction"] = coverage_df.apply(
+                    _coverage_segment_correction, axis=1
+                )
+                coverage_df["has_correction"] = (
+                    coverage_df["segment_correction"].abs() > 1e-9
+                )
+
+                overall_coverage_pct = float(coverage_df["has_correction"].mean() * 100.0)
+                corrected_rows = int(coverage_df["has_correction"].sum())
+                total_rows_cov = int(len(coverage_df))
+                cov_col1, cov_col2, cov_col3 = st.columns(3)
+                with cov_col1:
+                    st.metric("Rows with Correction", f"{corrected_rows:,}")
+                with cov_col2:
+                    st.metric("Total Rows", f"{total_rows_cov:,}")
+                with cov_col3:
+                    st.metric("Coverage %", f"{overall_coverage_pct:.1f}%")
+
+                segment_coverage_df = (
+                    coverage_df.groupby(["primary_position", "bucket_key"], observed=True)
+                    .agg(
+                        rows=("player_id", "count"),
+                        corrected_rows=("has_correction", "sum"),
+                        avg_abs_correction=(
+                            "segment_correction",
+                            lambda s: float(np.mean(np.abs(s))),
+                        ),
+                    )
+                    .reset_index()
+                )
+                segment_coverage_df["coverage_pct"] = np.where(
+                    segment_coverage_df["rows"] > 0,
+                    (segment_coverage_df["corrected_rows"] / segment_coverage_df["rows"]) * 100.0,
+                    np.nan,
+                )
+
+                pos_order = ["PG", "SG", "SF", "PF", "C", "UNK"]
+                bucket_order = ["VALUE", "LOW_MID", "MID", "UPPER", "STUD"]
+                bucket_labels = {
+                    "VALUE": "Value (<5k)",
+                    "LOW_MID": "Low Mid (5k-6.5k)",
+                    "MID": "Mid (6.5k-8k)",
+                    "UPPER": "Upper (8k-9.5k)",
+                    "STUD": "Stud (9.5k+)",
+                }
+                coverage_pivot = (
+                    segment_coverage_df.pivot(
+                        index="primary_position", columns="bucket_key", values="coverage_pct"
+                    )
+                    .reindex(index=pos_order, columns=bucket_order)
+                    .rename(columns=bucket_labels)
+                )
+
+                coverage_fig = px.imshow(
+                    coverage_pivot,
+                    color_continuous_scale="YlGnBu",
+                    zmin=0,
+                    zmax=100,
+                    aspect="auto",
+                    text_auto=".0f",
+                    labels={
+                        "x": "Salary Bucket",
+                        "y": "Primary Position",
+                        "color": "Coverage %",
+                    },
+                    title="Calibration Coverage (% Rows with Non-Zero Correction)",
+                )
+                coverage_fig.update_layout(height=460)
+                st.plotly_chart(coverage_fig, use_container_width=True)
+
+                uncovered_df = segment_coverage_df[
+                    (segment_coverage_df["rows"] >= 5)
+                    & (segment_coverage_df["coverage_pct"] <= 0.0)
+                ].copy()
+                if not uncovered_df.empty:
+                    uncovered_df["segment"] = (
+                        uncovered_df["primary_position"] + " | " + uncovered_df["bucket_key"]
+                    )
+                    uncovered_df["avg_abs_correction"] = uncovered_df["avg_abs_correction"].round(3)
+                    st.caption("High-sample uncovered segments (n >= 5)")
+                    st.dataframe(
+                        uncovered_df[
+                            ["segment", "rows", "corrected_rows", "coverage_pct", "avg_abs_correction"]
+                        ].rename(
+                            columns={
+                                "segment": "Segment",
+                                "rows": "Rows",
+                                "corrected_rows": "Corrected Rows",
+                                "coverage_pct": "Coverage %",
+                                "avg_abs_correction": "Avg |Correction|",
+                            }
+                        ),
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Coverage %": st.column_config.NumberColumn(format="%.1f"),
+                            "Avg |Correction|": st.column_config.NumberColumn(format="%.3f"),
+                        },
+                    )
+
+            # 6) Before vs after calibration impact using optimizer's segment correction.
+            st.markdown("#### 6) Pre vs Post Calibration Comparison")
             st.caption(
                 "Applies the same shrinkage-based segment correction used by the lineup "
                 "generator, then compares overall and segment-level error."
