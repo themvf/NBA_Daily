@@ -2490,7 +2490,8 @@ def optimize_lineup_randomized(
     num_lineups_total: int = 1,
     randomization_factor: float = 0.3,
     min_salary_floor: int = 0,
-    stack_config: Optional[Dict[str, Dict]] = None
+    stack_config: Optional[Dict[str, Dict]] = None,
+    debug_stats: Optional[Dict[str, int]] = None,
 ) -> Optional[DFSLineup]:
     """
     Build an optimized lineup with controlled randomization for diversity.
@@ -2516,6 +2517,13 @@ def optimize_lineup_randomized(
     locked_players = locked_players or []
     max_exposure = max_exposure or {}
     current_exposures = current_exposures or {}
+
+    def _dbg(key: str, value: int = 1) -> None:
+        if debug_stats is None:
+            return
+        debug_stats[key] = int(debug_stats.get(key, 0)) + int(value)
+
+    _dbg("attempts_optimizer")
 
     def is_min_salary_player(player: DFSPlayer) -> bool:
         return player.salary <= MIN_PLAYER_SALARY
@@ -2556,6 +2564,7 @@ def optimize_lineup_randomized(
     available = [p for p in available if can_use_player(p)]
 
     if not available:
+        _dbg("reject_no_available_after_filters")
         return None
 
     # Get score function based on strategy.
@@ -2592,16 +2601,19 @@ def optimize_lineup_randomized(
     # Add locked players first
     for player in locked_players:
         if not min_salary_player_eligible(player):
+            _dbg("reject_locked_min_salary_gate")
             return None
         if (
             bool(getattr(player, "is_overproj_redflag", False))
             and lineup_redflag_count() >= MAX_REDFLAG_SEGMENTS_PER_LINEUP
         ):
+            _dbg("reject_locked_redflag_cap")
             return None
         if (
             is_min_salary_player(player)
             and lineup_min_salary_count() >= MAX_MIN_SALARY_PLAYERS_PER_LINEUP
         ):
+            _dbg("reject_locked_min_salary_cap")
             return None
         for slot in ROSTER_SLOTS:
             if slot not in lineup.players and player.can_fill_slot(slot):
@@ -2688,6 +2700,7 @@ def optimize_lineup_randomized(
             candidates.append(player)
 
         if not candidates:
+            _dbg("reject_no_candidates_for_slot")
             continue
 
         # Weighted random selection based on score
@@ -2739,11 +2752,15 @@ def optimize_lineup_randomized(
         # Check minimum salary floor constraint
         if min_salary_floor > 0 and lineup.total_salary < min_salary_floor:
             # Lineup doesn't use enough salary - reject it
+            _dbg("reject_final_salary_floor")
             return None
         if lineup_min_salary_count() > MAX_MIN_SALARY_PLAYERS_PER_LINEUP:
+            _dbg("reject_final_min_salary_cap")
             return None
+        _dbg("accepted_optimizer")
         return lineup
 
+    _dbg("reject_invalid_lineup")
     return None
 
 
@@ -2761,6 +2778,7 @@ def generate_diversified_lineups(
     aggressive_ceiling_stack: bool = False,
     model_key: str = "",
     model_label: str = "",
+    debug_stats: Optional[Dict[str, int]] = None,
 ) -> List[DFSLineup]:
     """
     Generate diversified GPP tournament lineups using randomized optimization.
@@ -2796,15 +2814,25 @@ def generate_diversified_lineups(
     exposures: Dict[int, int] = {}
     existing_lineup_keys: Set[Tuple[int, ...]] = set()
 
+    def _dbg(key: str, value: int = 1) -> None:
+        if debug_stats is None:
+            return
+        debug_stats[key] = int(debug_stats.get(key, 0)) + int(value)
+
+    _dbg("pool_initial", len(player_pool))
+
     # Filter out excluded games
     excluded_games = excluded_games or set()
     filtered_pool = [p for p in player_pool if p.game_id not in excluded_games]
+    _dbg("pool_after_game_filter", len(filtered_pool))
 
     # Filter out injured players (OUT/DOUBTFUL)
     injured_count = len([p for p in filtered_pool if p.is_injured])
     filtered_pool = [p for p in filtered_pool if not p.is_injured]
+    _dbg("pool_after_injury_filter", len(filtered_pool))
 
     if not filtered_pool:
+        _dbg("reject_empty_pool")
         return []
 
     # Get locked players (ensure they're not injured)
@@ -2837,7 +2865,9 @@ def generate_diversified_lineups(
             )
 
         filtered_pool = [p for p in filtered_pool if _passes_minutes_variance_filter(p)]
+        _dbg("pool_after_minutes_variance_filter", len(filtered_pool))
         if not filtered_pool:
+            _dbg("reject_empty_pool_after_minutes_filter")
             return []
 
     # Resolve exposure target players
@@ -3181,7 +3211,8 @@ def generate_diversified_lineups(
                 num_lineups_total=num_lineups,
                 randomization_factor=rand_factor,
                 min_salary_floor=min_salary_floor,
-                stack_config=attempt_stack
+                stack_config=attempt_stack,
+                debug_stats=debug_stats,
             )
 
             if lineup and lineup.is_valid:
@@ -3197,13 +3228,22 @@ def generate_diversified_lineups(
                     lineup_player_sets.append(set(lineup_key))
                     strategy_generated += 1
                     total_generated += 1
+                    _dbg("accepted_lineups")
 
                     # Update exposures
                     for player in lineup.players.values():
                         exposures[player.player_id] = exposures.get(player.player_id, 0) + 1
+                elif lineup_key in existing_lineup_keys:
+                    _dbg("reject_duplicate_lineup")
+                else:
+                    _dbg("reject_overlap_cap")
+            else:
+                _dbg("reject_optimizer_none")
 
     if progress_callback:
         progress_callback(total_generated, num_lineups, "Complete!")
+
+    _dbg("lineups_returned", len(lineups))
 
     return lineups
 

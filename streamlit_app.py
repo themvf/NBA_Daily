@@ -13250,6 +13250,10 @@ if selected_page == "DFS Lineup Builder":
         st.session_state.dfs_ai_adjustments = {}
     if 'dfs_ai_last_model' not in st.session_state:
         st.session_state.dfs_ai_last_model = dfs_ai.DEFAULT_MODEL
+    if 'dfs_optimizer_debug_stats' not in st.session_state:
+        st.session_state.dfs_optimizer_debug_stats = {}
+    if 'dfs_optimizer_debug_by_model' not in st.session_state:
+        st.session_state.dfs_optimizer_debug_by_model = {}
 
     # Get database connection
     dfs_conn = get_connection(str(db_path))
@@ -14588,6 +14592,8 @@ if selected_page == "DFS Lineup Builder":
             col1, col2 = st.columns([2, 1])
             with col1:
                 if st.button("🚀 Generate Lineups", type="primary", use_container_width=True):
+                    st.session_state.dfs_optimizer_debug_stats = {}
+                    st.session_state.dfs_optimizer_debug_by_model = {}
                     progress_bar = st.progress(0)
                     status_text = st.empty()
 
@@ -14621,13 +14627,22 @@ if selected_page == "DFS Lineup Builder":
                         lineups = []
                         existing_lineup_keys = set()
                         model_lineup_counts = {}
+                        optimizer_debug_totals: Dict[str, int] = {}
+                        optimizer_debug_by_model: Dict[str, Dict[str, int]] = {}
                         completed_target = 0
+
+                        def _merge_debug_counts(
+                            target: Dict[str, int], source: Dict[str, int]
+                        ) -> None:
+                            for key, value in source.items():
+                                target[key] = int(target.get(key, 0)) + int(value)
 
                         for model_key in model_run_keys:
                             profile = model_profiles.get(model_key, {}) or {}
                             profile_label = str(profile.get("label", model_key))
                             profile_strategy_mix = profile.get("strategy_mix")
                             profile_stack_bias = bool(profile.get("aggressive_ceiling_stack", False))
+                            model_debug_stats: Dict[str, int] = {}
 
                             def update_model_progress(current, total, message,
                                                       _offset=completed_target, _label=profile_label):
@@ -14651,7 +14666,10 @@ if selected_page == "DFS Lineup Builder":
                                 aggressive_ceiling_stack=(aggressive_ceiling_stacks or profile_stack_bias),
                                 model_key=model_key,
                                 model_label=profile_label,
+                                debug_stats=model_debug_stats,
                             )
+                            optimizer_debug_by_model[model_key] = model_debug_stats
+                            _merge_debug_counts(optimizer_debug_totals, model_debug_stats)
                             completed_target += num_lineups
 
                             kept_for_model = 0
@@ -14670,6 +14688,8 @@ if selected_page == "DFS Lineup Builder":
                     status_text.empty()
 
                     st.session_state.dfs_lineups = lineups
+                    st.session_state.dfs_optimizer_debug_stats = optimizer_debug_totals
+                    st.session_state.dfs_optimizer_debug_by_model = optimizer_debug_by_model
 
                     if lineups:
                         st.success(f"✅ Generated {len(lineups)} valid lineups!")
@@ -14719,6 +14739,148 @@ if selected_page == "DFS Lineup Builder":
                         mime="text/csv",
                         use_container_width=True
                     )
+
+            def _render_optimizer_debug_panel() -> None:
+                optimizer_debug_stats = (
+                    st.session_state.get("dfs_optimizer_debug_stats", {}) or {}
+                )
+                optimizer_debug_by_model = (
+                    st.session_state.get("dfs_optimizer_debug_by_model", {}) or {}
+                )
+                if not optimizer_debug_stats:
+                    return
+
+                st.subheader("Candidate Rejection Funnel")
+                st.caption(
+                    "Tracks where lineup attempts fail so constraints and pool filters can "
+                    "be tuned with evidence."
+                )
+
+                attempts = int(optimizer_debug_stats.get("attempts_optimizer", 0))
+                valid_optimizer = int(optimizer_debug_stats.get("accepted_optimizer", 0))
+                accepted_unique = int(optimizer_debug_stats.get("accepted_lineups", 0))
+                final_returned = int(optimizer_debug_stats.get("lineups_returned", 0))
+
+                funnel_col1, funnel_col2, funnel_col3 = st.columns(3)
+                with funnel_col1:
+                    st.metric("Optimizer Attempts", f"{attempts:,}")
+                with funnel_col2:
+                    attempt_to_valid = (valid_optimizer / attempts) if attempts > 0 else 0.0
+                    st.metric("Attempt -> Valid", f"{attempt_to_valid:.1%}")
+                with funnel_col3:
+                    valid_to_final = (
+                        (final_returned / valid_optimizer) if valid_optimizer > 0 else 0.0
+                    )
+                    st.metric("Valid -> Final", f"{valid_to_final:.1%}")
+
+                if attempts > 0:
+                    import plotly.graph_objects as go
+
+                    funnel_fig = go.Figure(
+                        go.Funnel(
+                            y=[
+                                "Optimizer Attempts",
+                                "Valid Lineups",
+                                "Accepted (Unique/Overlap)",
+                                "Final Returned",
+                            ],
+                            x=[
+                                attempts,
+                                valid_optimizer,
+                                accepted_unique,
+                                final_returned,
+                            ],
+                            textinfo="value+percent initial",
+                        )
+                    )
+                    funnel_fig.update_layout(height=430, title="Lineup Build Funnel")
+                    st.plotly_chart(funnel_fig, use_container_width=True)
+
+                    reject_map = [
+                        ("reject_no_available_after_filters", "No candidates after base filters"),
+                        ("reject_no_candidates_for_slot", "No candidate for required slot"),
+                        ("reject_final_salary_floor", "Failed minimum salary floor"),
+                        ("reject_final_min_salary_cap", "Exceeded min-salary player cap"),
+                        ("reject_locked_min_salary_gate", "Locked player failed min-salary gate"),
+                        ("reject_locked_redflag_cap", "Locked player exceeded red-flag cap"),
+                        ("reject_locked_min_salary_cap", "Locked player exceeded min-salary cap"),
+                        ("reject_invalid_lineup", "Invalid lineup after build"),
+                        ("reject_duplicate_lineup", "Duplicate lineup rejected"),
+                        ("reject_overlap_cap", "Rejected by overlap cap"),
+                        ("reject_optimizer_none", "Optimizer returned no lineup"),
+                        ("reject_empty_pool", "Pool empty after injury filter"),
+                        (
+                            "reject_empty_pool_after_minutes_filter",
+                            "Pool empty after minutes-variance filter",
+                        ),
+                    ]
+                    reject_rows: List[Dict[str, Any]] = []
+                    for key, reason in reject_map:
+                        count = int(optimizer_debug_stats.get(key, 0))
+                        if count <= 0:
+                            continue
+                        reject_rows.append(
+                            {
+                                "Reason": reason,
+                                "Count": count,
+                                "Rate vs Attempts": (count / attempts) if attempts > 0 else 0.0,
+                            }
+                        )
+
+                    if reject_rows:
+                        reject_df = (
+                            pd.DataFrame(reject_rows)
+                            .sort_values("Count", ascending=False)
+                            .reset_index(drop=True)
+                        )
+                        st.caption("Top rejection reasons")
+                        st.dataframe(
+                            reject_df,
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "Rate vs Attempts": st.column_config.NumberColumn(format="%.1f%%"),
+                            },
+                        )
+
+                if optimizer_debug_by_model:
+                    model_rows: List[Dict[str, Any]] = []
+                    for model_key, stats in optimizer_debug_by_model.items():
+                        attempts_model = int(stats.get("attempts_optimizer", 0))
+                        valid_model = int(stats.get("accepted_optimizer", 0))
+                        final_model = int(stats.get("lineups_returned", 0))
+                        model_rows.append(
+                            {
+                                "Model": model_profiles.get(model_key, {}).get("label", model_key),
+                                "Attempts": attempts_model,
+                                "Valid": valid_model,
+                                "Final": final_model,
+                                "Attempt -> Valid": (
+                                    valid_model / attempts_model if attempts_model > 0 else np.nan
+                                ),
+                                "Valid -> Final": (
+                                    final_model / valid_model if valid_model > 0 else np.nan
+                                ),
+                            }
+                        )
+                    if model_rows:
+                        model_debug_df = pd.DataFrame(model_rows).sort_values(
+                            "Final", ascending=False
+                        )
+                        st.caption("Model-level funnel snapshot")
+                        st.dataframe(
+                            model_debug_df,
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "Attempt -> Valid": st.column_config.NumberColumn(format="%.1f%%"),
+                                "Valid -> Final": st.column_config.NumberColumn(format="%.1f%%"),
+                            },
+                        )
+
+            if st.session_state.get("dfs_optimizer_debug_stats"):
+                st.divider()
+                _render_optimizer_debug_panel()
 
             # Display generated lineups (sorted by projected FPTS, highest first)
             if st.session_state.dfs_lineups:
@@ -18176,6 +18338,373 @@ if selected_page == "DFS Player Review":
                                     "Avg Salary": st.column_config.NumberColumn(format="$%.0f"),
                                 },
                             )
+
+            # 4) Segment-level bias stability trends over time.
+            st.markdown("#### 4) Bias Stability Over Time (Rolling)")
+            st.caption(
+                "Tracks whether position x salary bias is persistent or cooling off across "
+                "recent slates."
+            )
+            stability_df = diagnostics_df.dropna(
+                subset=["slate_date", "salary", "fpts_error", "primary_position"]
+            ).copy()
+
+            if len(stability_df) < 40:
+                st.info(
+                    "Not enough historical rows with date/segment/error to render bias "
+                    "stability trends."
+                )
+            else:
+                stability_df["slate_date"] = pd.to_datetime(
+                    stability_df["slate_date"], errors="coerce"
+                )
+                stability_df = stability_df.dropna(subset=["slate_date"])
+
+                salary_labels = [
+                    "Value (<5k)",
+                    "Low Mid (5k-6.5k)",
+                    "Mid (6.5k-8k)",
+                    "Upper (8k-9.5k)",
+                    "Stud (9.5k+)",
+                ]
+                max_salary_stability = float(stability_df["salary"].max())
+                top_bin_ceiling_stability = max(
+                    13000, int(np.ceil(max_salary_stability / 500.0) * 500 + 500)
+                )
+                salary_bins_stability = [0, 5000, 6500, 8000, 9500, top_bin_ceiling_stability]
+                stability_df["salary_bucket"] = pd.cut(
+                    stability_df["salary"],
+                    bins=salary_bins_stability,
+                    labels=salary_labels,
+                    include_lowest=True,
+                    right=False,
+                )
+                stability_df = stability_df.dropna(subset=["salary_bucket"])
+                stability_df["segment"] = (
+                    stability_df["primary_position"].astype(str)
+                    + " | "
+                    + stability_df["salary_bucket"].astype(str)
+                )
+
+                segment_watchlist = (
+                    stability_df.groupby("segment", observed=True)
+                    .agg(
+                        samples=("fpts_error", "count"),
+                        avg_error=("fpts_error", "mean"),
+                    )
+                    .reset_index()
+                )
+                segment_watchlist["abs_bias"] = segment_watchlist["avg_error"].abs()
+                segment_watchlist = segment_watchlist[segment_watchlist["samples"] >= 10].copy()
+                segment_watchlist = segment_watchlist.sort_values(
+                    ["samples", "abs_bias"], ascending=[False, False]
+                )
+
+                if segment_watchlist.empty:
+                    st.info(
+                        "No segment has enough rows (n >= 10) to monitor bias stability yet."
+                    )
+                else:
+                    segment_options = segment_watchlist["segment"].head(8).tolist()
+                    default_segments = segment_options[: min(4, len(segment_options))]
+                    selected_segments = st.multiselect(
+                        "Segments to track",
+                        options=segment_options,
+                        default=default_segments,
+                        key="dfs_player_review_bias_stability_segments",
+                    )
+                    trend_grain = st.selectbox(
+                        "Trend granularity",
+                        options=["Weekly", "Daily"],
+                        index=0,
+                        key="dfs_player_review_bias_stability_grain",
+                    )
+
+                    if not selected_segments:
+                        st.info("Select at least one segment to render the stability chart.")
+                    else:
+                        trend_df = stability_df[
+                            stability_df["segment"].isin(selected_segments)
+                        ].copy()
+                        if trend_df.empty:
+                            st.info(
+                                "Selected segments do not have enough rows after current "
+                                "filters."
+                            )
+                        else:
+                            if trend_grain == "Weekly":
+                                trend_df["trend_date"] = trend_df["slate_date"].dt.to_period(
+                                    "W-MON"
+                                ).apply(lambda p: p.start_time)
+                            else:
+                                trend_df["trend_date"] = trend_df["slate_date"].dt.floor("D")
+
+                            trend_summary = (
+                                trend_df.groupby(["trend_date", "segment"], observed=True)
+                                .agg(
+                                    avg_error=("fpts_error", "mean"),
+                                    samples=("fpts_error", "count"),
+                                )
+                                .reset_index()
+                                .sort_values("trend_date")
+                            )
+                            trend_summary["rolling_bias"] = trend_summary.groupby("segment")[
+                                "avg_error"
+                            ].transform(lambda s: s.rolling(window=3, min_periods=1).mean())
+
+                            if len(trend_summary) < 4:
+                                st.info(
+                                    "Not enough points in selected segments to render rolling "
+                                    "bias trends."
+                                )
+                            else:
+                                stability_fig = px.line(
+                                    trend_summary,
+                                    x="trend_date",
+                                    y="rolling_bias",
+                                    color="segment",
+                                    markers=True,
+                                    hover_data={
+                                        "avg_error": ":.2f",
+                                        "samples": True,
+                                        "rolling_bias": ":.2f",
+                                    },
+                                    labels={
+                                        "trend_date": "Date",
+                                        "rolling_bias": "Rolling Avg Error (Actual - Proj)",
+                                        "segment": "Segment",
+                                    },
+                                    title="Segment Bias Stability (3-Period Rolling Mean)",
+                                )
+                                stability_fig.add_hline(
+                                    y=0.0, line_dash="dash", line_color="#8f8f8f"
+                                )
+                                stability_fig.update_layout(height=500)
+                                st.plotly_chart(stability_fig, use_container_width=True)
+
+                                latest_bias = (
+                                    trend_summary.sort_values("trend_date")
+                                    .groupby("segment", observed=True)
+                                    .tail(1)
+                                    .merge(
+                                        segment_watchlist[["segment", "samples"]],
+                                        on="segment",
+                                        how="left",
+                                        suffixes=("", "_total"),
+                                    )
+                                )
+                                if not latest_bias.empty:
+                                    latest_bias = latest_bias.rename(
+                                        columns={
+                                            "segment": "Segment",
+                                            "trend_date": "Latest Period",
+                                            "samples_total": "Total Samples",
+                                            "samples": "Samples in Latest Period",
+                                            "rolling_bias": "Rolling Bias",
+                                        }
+                                    )
+                                    latest_bias["Rolling Bias"] = latest_bias[
+                                        "Rolling Bias"
+                                    ].round(2)
+                                    st.caption("Latest rolling bias snapshot")
+                                    st.dataframe(
+                                        latest_bias[
+                                            [
+                                                "Segment",
+                                                "Latest Period",
+                                                "Total Samples",
+                                                "Samples in Latest Period",
+                                                "Rolling Bias",
+                                            ]
+                                        ].sort_values("Rolling Bias"),
+                                        use_container_width=True,
+                                        hide_index=True,
+                                    )
+
+            # 5) Before vs after calibration impact using optimizer's segment correction.
+            st.markdown("#### 5) Pre vs Post Calibration Comparison")
+            st.caption(
+                "Applies the same shrinkage-based segment correction used by the lineup "
+                "generator, then compares overall and segment-level error."
+            )
+            calibration_eval_df = diagnostics_df.dropna(
+                subset=["salary", "proj_fpts", "actual_fpts", "primary_position"]
+            ).copy()
+
+            if len(calibration_eval_df) < 25:
+                st.info(
+                    "Not enough rows with projection + actuals to evaluate pre/post "
+                    "calibration impact."
+                )
+            else:
+                segment_metrics = getattr(dfs, "SEGMENT_CALIBRATION_METRICS", {}) or {}
+                shrink_k = float(getattr(dfs, "SEGMENT_SHRINKAGE_K", 30.0) or 30.0)
+                correction_cap = float(
+                    getattr(dfs, "SEGMENT_CORRECTION_CAP", 4.0) or 4.0
+                )
+
+                def _bucket_key(salary_value: float) -> str:
+                    salary_value = float(salary_value or 0.0)
+                    if salary_value >= 9500:
+                        return "STUD"
+                    if salary_value >= 8000:
+                        return "UPPER"
+                    if salary_value >= 6500:
+                        return "MID"
+                    if salary_value >= 5000:
+                        return "LOW_MID"
+                    return "VALUE"
+
+                def _segment_correction(row: pd.Series) -> float:
+                    metric = segment_metrics.get(
+                        (str(row["primary_position"]), str(row["bucket_key"]))
+                    )
+                    if not metric:
+                        return 0.0
+                    avg_error = float(metric.get("avg_error", 0.0) or 0.0)
+                    samples = float(metric.get("samples", 0.0) or 0.0)
+                    shrink = samples / (samples + shrink_k) if samples > 0 else 0.0
+                    correction = avg_error * shrink
+                    return max(-correction_cap, min(correction_cap, correction))
+
+                calibration_eval_df["bucket_key"] = calibration_eval_df["salary"].apply(
+                    _bucket_key
+                )
+                calibration_eval_df["segment_correction"] = calibration_eval_df.apply(
+                    _segment_correction, axis=1
+                )
+                calibration_eval_df["proj_post"] = np.maximum(
+                    0.0,
+                    calibration_eval_df["proj_fpts"]
+                    + calibration_eval_df["segment_correction"],
+                )
+                calibration_eval_df["pre_error"] = (
+                    calibration_eval_df["actual_fpts"] - calibration_eval_df["proj_fpts"]
+                )
+                calibration_eval_df["post_error"] = (
+                    calibration_eval_df["actual_fpts"] - calibration_eval_df["proj_post"]
+                )
+                calibration_eval_df["pre_abs_error"] = calibration_eval_df["pre_error"].abs()
+                calibration_eval_df["post_abs_error"] = calibration_eval_df["post_error"].abs()
+
+                pre_mae = float(calibration_eval_df["pre_abs_error"].mean())
+                post_mae = float(calibration_eval_df["post_abs_error"].mean())
+                pre_bias = float(calibration_eval_df["pre_error"].mean())
+                post_bias = float(calibration_eval_df["post_error"].mean())
+                improved_rows = int(
+                    (calibration_eval_df["post_abs_error"] < calibration_eval_df["pre_abs_error"]).sum()
+                )
+                total_rows_eval = int(len(calibration_eval_df))
+
+                metric_col1, metric_col2, metric_col3 = st.columns(3)
+                with metric_col1:
+                    st.metric("MAE (Pre)", f"{pre_mae:.2f}")
+                with metric_col2:
+                    st.metric("MAE (Post)", f"{post_mae:.2f}", delta=f"{post_mae - pre_mae:+.2f}")
+                with metric_col3:
+                    improve_rate = improved_rows / total_rows_eval if total_rows_eval > 0 else 0.0
+                    st.metric("Rows Improved", f"{improved_rows:,}", f"{improve_rate:.1%}")
+
+                bias_col1, bias_col2 = st.columns(2)
+                with bias_col1:
+                    st.metric("Mean Bias (Pre)", f"{pre_bias:+.2f}")
+                with bias_col2:
+                    st.metric("Mean Bias (Post)", f"{post_bias:+.2f}")
+
+                overall_compare_df = pd.DataFrame(
+                    {
+                        "Metric": ["MAE", "Absolute Mean Bias"],
+                        "Pre": [pre_mae, abs(pre_bias)],
+                        "Post": [post_mae, abs(post_bias)],
+                    }
+                )
+                overall_compare_long = overall_compare_df.melt(
+                    id_vars="Metric", var_name="Version", value_name="Value"
+                )
+                compare_fig = px.bar(
+                    overall_compare_long,
+                    x="Metric",
+                    y="Value",
+                    color="Version",
+                    barmode="group",
+                    text="Value",
+                    title="Overall Error Comparison: Pre vs Post Calibration",
+                )
+                compare_fig.update_traces(texttemplate="%{text:.2f}", textposition="outside")
+                compare_fig.update_layout(height=430)
+                st.plotly_chart(compare_fig, use_container_width=True)
+
+                segment_compare_df = (
+                    calibration_eval_df.groupby(["primary_position", "bucket_key"], observed=True)
+                    .agg(
+                        samples=("player_id", "count"),
+                        pre_mae=("pre_abs_error", "mean"),
+                        post_mae=("post_abs_error", "mean"),
+                        pre_bias=("pre_error", "mean"),
+                        post_bias=("post_error", "mean"),
+                    )
+                    .reset_index()
+                )
+                segment_compare_df = segment_compare_df[segment_compare_df["samples"] >= 5].copy()
+
+                if segment_compare_df.empty:
+                    st.info(
+                        "No segment has enough rows (n >= 5) for pre/post calibration "
+                        "segment comparison."
+                    )
+                else:
+                    segment_compare_df["segment"] = (
+                        segment_compare_df["primary_position"]
+                        + " | "
+                        + segment_compare_df["bucket_key"]
+                    )
+                    segment_compare_df["mae_delta"] = (
+                        segment_compare_df["post_mae"] - segment_compare_df["pre_mae"]
+                    )
+                    segment_compare_df["abs_bias_delta"] = (
+                        segment_compare_df["post_bias"].abs()
+                        - segment_compare_df["pre_bias"].abs()
+                    )
+                    segment_compare_df = segment_compare_df.sort_values(
+                        ["mae_delta", "samples"], ascending=[True, False]
+                    )
+
+                    st.caption("Segment impact table (negative delta = improvement)")
+                    st.dataframe(
+                        segment_compare_df[
+                            [
+                                "segment",
+                                "samples",
+                                "pre_mae",
+                                "post_mae",
+                                "mae_delta",
+                                "pre_bias",
+                                "post_bias",
+                                "abs_bias_delta",
+                            ]
+                        ].rename(
+                            columns={
+                                "segment": "Segment",
+                                "samples": "Samples",
+                                "pre_mae": "MAE Pre",
+                                "post_mae": "MAE Post",
+                                "mae_delta": "MAE Delta",
+                                "pre_bias": "Bias Pre",
+                                "post_bias": "Bias Post",
+                                "abs_bias_delta": "Abs Bias Delta",
+                            }
+                        ),
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "MAE Pre": st.column_config.NumberColumn(format="%.2f"),
+                            "MAE Post": st.column_config.NumberColumn(format="%.2f"),
+                            "MAE Delta": st.column_config.NumberColumn(format="%.2f"),
+                            "Bias Pre": st.column_config.NumberColumn(format="%.2f"),
+                            "Bias Post": st.column_config.NumberColumn(format="%.2f"),
+                            "Abs Bias Delta": st.column_config.NumberColumn(format="%.2f"),
+                        },
+                    )
 
 st.divider()
 st.caption(
