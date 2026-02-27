@@ -617,6 +617,9 @@ POSITION_SLOTS = {
 ROSTER_SLOTS = ['PG', 'SG', 'SF', 'PF', 'C', 'G', 'F', 'UTIL']
 SALARY_CAP = 50000
 MIN_GAMES = 2
+MIN_PLAYER_SALARY = 3000
+MIN_SALARY_PROJ_FPTS_GATE = 12.0
+MAX_MIN_SALARY_PLAYERS_PER_LINEUP = 1
 
 # League average stats per game (2025-26 season, for opponent adjustment)
 LEAGUE_AVG_TEAM_REB = 44.0
@@ -2382,6 +2385,17 @@ def optimize_lineup_randomized(
     max_exposure = max_exposure or {}
     current_exposures = current_exposures or {}
 
+    def is_min_salary_player(player: DFSPlayer) -> bool:
+        return player.salary <= MIN_PLAYER_SALARY
+
+    def min_salary_player_eligible(player: DFSPlayer) -> bool:
+        if not is_min_salary_player(player):
+            return True
+        proj_fpts = float(getattr(player, "proj_fpts", 0.0) or 0.0)
+        minutes_ok = bool(getattr(player, "minutes_validated", False))
+        # Allow $3K players only if they project well OR pass minutes validation.
+        return proj_fpts >= MIN_SALARY_PROJ_FPTS_GATE or minutes_ok
+
     # Filter available players (exclude injured, excluded, and specified IDs)
     available = [
         p for p in player_pool
@@ -2397,6 +2411,8 @@ def optimize_lineup_randomized(
         if player.is_injured:
             return False
         if player.is_excluded:
+            return False
+        if not min_salary_player_eligible(player):
             return False
 
         max_exp = max_exposure.get(player.player_id, 1.0)
@@ -2424,8 +2440,18 @@ def optimize_lineup_randomized(
     lineup = DFSLineup()
     used_player_ids = set()
 
+    def lineup_min_salary_count() -> int:
+        return sum(1 for p in lineup.players.values() if is_min_salary_player(p))
+
     # Add locked players first
     for player in locked_players:
+        if not min_salary_player_eligible(player):
+            return None
+        if (
+            is_min_salary_player(player)
+            and lineup_min_salary_count() >= MAX_MIN_SALARY_PLAYERS_PER_LINEUP
+        ):
+            return None
         for slot in ROSTER_SLOTS:
             if slot not in lineup.players and player.can_fill_slot(slot):
                 lineup.players[slot] = player
@@ -2437,6 +2463,13 @@ def optimize_lineup_randomized(
         stack_players = _select_stack_players(available, stack_config, used_player_ids, strategy)
         for player in stack_players:
             if player.player_id in used_player_ids:
+                continue
+            if not min_salary_player_eligible(player):
+                continue
+            if (
+                is_min_salary_player(player)
+                and lineup_min_salary_count() >= MAX_MIN_SALARY_PLAYERS_PER_LINEUP
+            ):
                 continue
             for slot in ROSTER_SLOTS:
                 if slot not in lineup.players and player.can_fill_slot(slot):
@@ -2458,6 +2491,11 @@ def optimize_lineup_randomized(
                 continue
             if not player.can_fill_slot(slot):
                 continue
+            if is_min_salary_player(player):
+                if not min_salary_player_eligible(player):
+                    continue
+                if lineup_min_salary_count() >= MAX_MIN_SALARY_PLAYERS_PER_LINEUP:
+                    continue
 
             # Check salary cap constraint (don't exceed max)
             tentative_salary = lineup.total_salary + player.salary
@@ -2540,6 +2578,8 @@ def optimize_lineup_randomized(
         # Check minimum salary floor constraint
         if min_salary_floor > 0 and lineup.total_salary < min_salary_floor:
             # Lineup doesn't use enough salary - reject it
+            return None
+        if lineup_min_salary_count() > MAX_MIN_SALARY_PLAYERS_PER_LINEUP:
             return None
         return lineup
 
