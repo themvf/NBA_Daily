@@ -13254,6 +13254,12 @@ if selected_page == "DFS Lineup Builder":
         st.session_state.dfs_optimizer_debug_stats = {}
     if 'dfs_optimizer_debug_by_model' not in st.session_state:
         st.session_state.dfs_optimizer_debug_by_model = {}
+    if 'dfs_last_calibration_coverage_pct' not in st.session_state:
+        st.session_state.dfs_last_calibration_coverage_pct = np.nan
+    if 'dfs_last_calibration_corrected_rows' not in st.session_state:
+        st.session_state.dfs_last_calibration_corrected_rows = 0
+    if 'dfs_last_calibration_total_rows' not in st.session_state:
+        st.session_state.dfs_last_calibration_total_rows = 0
 
     # Get database connection
     dfs_conn = get_connection(str(db_path))
@@ -14594,6 +14600,9 @@ if selected_page == "DFS Lineup Builder":
                 if st.button("🚀 Generate Lineups", type="primary", use_container_width=True):
                     st.session_state.dfs_optimizer_debug_stats = {}
                     st.session_state.dfs_optimizer_debug_by_model = {}
+                    st.session_state.dfs_last_calibration_coverage_pct = np.nan
+                    st.session_state.dfs_last_calibration_corrected_rows = 0
+                    st.session_state.dfs_last_calibration_total_rows = 0
                     progress_bar = st.progress(0)
                     status_text = st.empty()
 
@@ -14606,6 +14615,90 @@ if selected_page == "DFS Lineup Builder":
                     salary_filtered_count = len(players) - len(filtered_players)
                     if salary_filtered_count > 0:
                         st.info(f"💰 Filtered out {salary_filtered_count} players below ${min_salary:,} salary")
+
+                    # Snapshot calibration coverage in the active pool so we can flag
+                    # low-coverage slates before trusting corrected projections.
+                    segment_metrics = getattr(dfs, "SEGMENT_CALIBRATION_METRICS", {}) or {}
+                    shrink_k = float(getattr(dfs, "SEGMENT_SHRINKAGE_K", 30.0) or 30.0)
+                    correction_cap = float(getattr(dfs, "SEGMENT_CORRECTION_CAP", 4.0) or 4.0)
+
+                    alias_to_primary = {
+                        "G": "PG",
+                        "GUARD": "PG",
+                        "F": "PF",
+                        "FORWARD": "PF",
+                        "UTIL": "C",
+                        "U": "C",
+                    }
+                    valid_positions = {"PG", "SG", "SF", "PF", "C"}
+
+                    def _expand_pos_tokens(raw_value: object) -> List[str]:
+                        raw = str(raw_value or "").strip().upper().replace("-", "/")
+                        if not raw:
+                            return []
+                        parts = [p.strip() for p in raw.replace(",", "/").split("/") if p.strip()]
+                        return parts if parts else [raw]
+
+                    def _resolve_player_primary(player: Any) -> str:
+                        current = str(getattr(player, "primary_position", "") or "").strip().upper()
+                        if current in valid_positions:
+                            return current
+                        for pos in getattr(player, "positions", []) or []:
+                            for token in _expand_pos_tokens(pos):
+                                if token in valid_positions:
+                                    return token
+                                mapped = alias_to_primary.get(token)
+                                if mapped:
+                                    return mapped
+                        for token in _expand_pos_tokens(getattr(player, "position", "")):
+                            if token in valid_positions:
+                                return token
+                            mapped = alias_to_primary.get(token)
+                            if mapped:
+                                return mapped
+                        return "UNK"
+
+                    def _resolve_salary_bucket(player: Any) -> str:
+                        bucket = str(getattr(player, "salary_bucket", "") or "").strip().upper()
+                        if bucket in {"VALUE", "LOW_MID", "MID", "UPPER", "STUD"}:
+                            return bucket
+                        salary_val = int(getattr(player, "salary", 0) or 0)
+                        if salary_val >= 9500:
+                            return "STUD"
+                        if salary_val >= 8000:
+                            return "UPPER"
+                        if salary_val >= 6500:
+                            return "MID"
+                        if salary_val >= 5000:
+                            return "LOW_MID"
+                        return "VALUE"
+
+                    def _estimate_segment_correction(player: Any) -> float:
+                        position_key = _resolve_player_primary(player)
+                        bucket_key = _resolve_salary_bucket(player)
+                        metric = segment_metrics.get((position_key, bucket_key))
+                        if not metric:
+                            return 0.0
+                        avg_error = float(metric.get("avg_error", 0.0) or 0.0)
+                        samples = float(metric.get("samples", 0.0) or 0.0)
+                        shrink = samples / (samples + shrink_k) if samples > 0 else 0.0
+                        correction = avg_error * shrink
+                        return max(-correction_cap, min(correction_cap, correction))
+
+                    corrected_players_count = sum(
+                        1
+                        for player in filtered_players
+                        if abs(_estimate_segment_correction(player)) > 1e-9
+                    )
+                    total_players_count = len(filtered_players)
+                    coverage_pct = (
+                        (corrected_players_count / total_players_count) * 100.0
+                        if total_players_count > 0
+                        else 0.0
+                    )
+                    st.session_state.dfs_last_calibration_corrected_rows = int(corrected_players_count)
+                    st.session_state.dfs_last_calibration_total_rows = int(total_players_count)
+                    st.session_state.dfs_last_calibration_coverage_pct = float(coverage_pct)
 
                     # Minutes-based exclusion is intentionally disabled at this stage.
                     # The optimizer still applies a minutes-variance risk filter internally.
@@ -14760,18 +14853,79 @@ if selected_page == "DFS Lineup Builder":
                 valid_optimizer = int(optimizer_debug_stats.get("accepted_optimizer", 0))
                 accepted_unique = int(optimizer_debug_stats.get("accepted_lineups", 0))
                 final_returned = int(optimizer_debug_stats.get("lineups_returned", 0))
+                attempt_to_valid = (valid_optimizer / attempts) if attempts > 0 else 0.0
+                valid_to_final = (final_returned / valid_optimizer) if valid_optimizer > 0 else 0.0
+                coverage_pct = float(
+                    st.session_state.get("dfs_last_calibration_coverage_pct", np.nan)
+                )
+                coverage_corrected_rows = int(
+                    st.session_state.get("dfs_last_calibration_corrected_rows", 0) or 0
+                )
+                coverage_total_rows = int(
+                    st.session_state.get("dfs_last_calibration_total_rows", 0) or 0
+                )
 
-                funnel_col1, funnel_col2, funnel_col3 = st.columns(3)
+                funnel_col1, funnel_col2, funnel_col3, funnel_col4 = st.columns(4)
                 with funnel_col1:
                     st.metric("Optimizer Attempts", f"{attempts:,}")
                 with funnel_col2:
-                    attempt_to_valid = (valid_optimizer / attempts) if attempts > 0 else 0.0
                     st.metric("Attempt -> Valid", f"{attempt_to_valid:.1%}")
                 with funnel_col3:
-                    valid_to_final = (
-                        (final_returned / valid_optimizer) if valid_optimizer > 0 else 0.0
-                    )
                     st.metric("Valid -> Final", f"{valid_to_final:.1%}")
+                with funnel_col4:
+                    if coverage_total_rows > 0 and not np.isnan(coverage_pct):
+                        st.metric("Calibration Coverage", f"{coverage_pct:.1f}%")
+                    else:
+                        st.metric("Calibration Coverage", "n/a")
+
+                reject_map = [
+                    ("reject_no_available_after_filters", "No candidates after base filters"),
+                    ("reject_no_candidates_for_slot", "No candidate for required slot"),
+                    ("reject_final_salary_floor", "Failed minimum salary floor"),
+                    ("reject_final_min_salary_cap", "Exceeded min-salary player cap"),
+                    ("reject_locked_min_salary_gate", "Locked player failed min-salary gate"),
+                    ("reject_locked_redflag_cap", "Locked player exceeded red-flag cap"),
+                    ("reject_locked_min_salary_cap", "Locked player exceeded min-salary cap"),
+                    ("reject_invalid_lineup", "Invalid lineup after build"),
+                    ("reject_duplicate_lineup", "Duplicate lineup rejected"),
+                    ("reject_overlap_cap", "Rejected by overlap cap"),
+                    ("reject_optimizer_none", "Optimizer returned no lineup"),
+                    ("reject_empty_pool", "Pool empty after injury filter"),
+                    (
+                        "reject_empty_pool_after_minutes_filter",
+                        "Pool empty after minutes-variance filter",
+                    ),
+                ]
+                reject_reason_lookup = {key: reason for key, reason in reject_map}
+                top_reason_key = ""
+                top_reason_count = 0
+                for key in reject_reason_lookup:
+                    count = int(optimizer_debug_stats.get(key, 0) or 0)
+                    if count > top_reason_count:
+                        top_reason_count = count
+                        top_reason_key = key
+
+                warning_messages: List[str] = []
+                if coverage_total_rows > 0 and not np.isnan(coverage_pct) and coverage_pct < 20.0:
+                    warning_messages.append(
+                        "Calibration coverage is below 20% for the active player pool "
+                        f"({coverage_corrected_rows}/{coverage_total_rows}, {coverage_pct:.1f}%)."
+                    )
+                if attempts > 0 and attempt_to_valid < 0.05:
+                    warning_messages.append(
+                        "Attempt-to-valid conversion is below 5%; constraints may be too tight "
+                        f"for this slate ({attempt_to_valid:.1%})."
+                    )
+                if top_reason_key == "reject_no_candidates_for_slot" and top_reason_count > 0:
+                    warning_messages.append(
+                        "Top rejection reason is 'No candidate for required slot'; review "
+                        "position scarcity, locks, and exposure caps."
+                    )
+                if warning_messages:
+                    st.warning(
+                        "Builder warning thresholds triggered:\n- "
+                        + "\n- ".join(warning_messages)
+                    )
 
                 if attempts > 0:
                     import plotly.graph_objects as go
@@ -14796,24 +14950,6 @@ if selected_page == "DFS Lineup Builder":
                     funnel_fig.update_layout(height=430, title="Lineup Build Funnel")
                     st.plotly_chart(funnel_fig, use_container_width=True)
 
-                    reject_map = [
-                        ("reject_no_available_after_filters", "No candidates after base filters"),
-                        ("reject_no_candidates_for_slot", "No candidate for required slot"),
-                        ("reject_final_salary_floor", "Failed minimum salary floor"),
-                        ("reject_final_min_salary_cap", "Exceeded min-salary player cap"),
-                        ("reject_locked_min_salary_gate", "Locked player failed min-salary gate"),
-                        ("reject_locked_redflag_cap", "Locked player exceeded red-flag cap"),
-                        ("reject_locked_min_salary_cap", "Locked player exceeded min-salary cap"),
-                        ("reject_invalid_lineup", "Invalid lineup after build"),
-                        ("reject_duplicate_lineup", "Duplicate lineup rejected"),
-                        ("reject_overlap_cap", "Rejected by overlap cap"),
-                        ("reject_optimizer_none", "Optimizer returned no lineup"),
-                        ("reject_empty_pool", "Pool empty after injury filter"),
-                        (
-                            "reject_empty_pool_after_minutes_filter",
-                            "Pool empty after minutes-variance filter",
-                        ),
-                    ]
                     reject_rows: List[Dict[str, Any]] = []
                     for key, reason in reject_map:
                         count = int(optimizer_debug_stats.get(key, 0))
@@ -17951,9 +18087,22 @@ if selected_page == "DFS Player Review":
                 if pd.isna(pos_value):
                     return "UNK"
                 raw = str(pos_value).strip().upper().replace("-", "/")
-                primary = raw.split("/")[0].strip() if raw else "UNK"
-                if primary in {"PG", "SG", "SF", "PF", "C"}:
-                    return primary
+                valid = {"PG", "SG", "SF", "PF", "C"}
+                alias_to_primary = {
+                    "G": "PG",
+                    "GUARD": "PG",
+                    "F": "PF",
+                    "FORWARD": "PF",
+                    "UTIL": "C",
+                    "U": "C",
+                }
+                tokens = [t.strip() for t in raw.replace(",", "/").split("/") if t.strip()]
+                for token in tokens:
+                    if token in valid:
+                        return token
+                    mapped = alias_to_primary.get(token)
+                    if mapped:
+                        return mapped
                 return "UNK"
 
             diagnostics_df["primary_position"] = diagnostics_df["positions"].apply(

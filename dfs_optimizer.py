@@ -790,16 +790,38 @@ def get_lineup_model_profiles() -> Dict[str, Dict[str, Any]]:
 def _canonical_primary_position(positions: List[str], fallback: str = "") -> str:
     """Resolve a player's primary DFS position into canonical buckets."""
     valid = {"PG", "SG", "SF", "PF", "C"}
-    for pos in positions or []:
-        clean = str(pos).strip().upper()
-        if clean in valid:
-            return clean
 
-    if fallback:
-        clean_fallback = str(fallback).strip().upper().replace("-", "/")
-        clean_fallback = clean_fallback.split("/")[0].strip()
-        if clean_fallback in valid:
-            return clean_fallback
+    # Generic DraftKings labels mapped to a deterministic primary bucket.
+    alias_to_primary = {
+        "G": "PG",
+        "GUARD": "PG",
+        "F": "PF",
+        "FORWARD": "PF",
+        "UTIL": "C",
+        "U": "C",
+    }
+
+    def _expand_tokens(raw_value: object) -> List[str]:
+        raw = str(raw_value or "").strip().upper().replace("-", "/")
+        if not raw:
+            return []
+        parts = [p.strip() for p in raw.replace(",", "/").split("/") if p.strip()]
+        return parts if parts else [raw]
+
+    for pos in positions or []:
+        for token in _expand_tokens(pos):
+            if token in valid:
+                return token
+            mapped = alias_to_primary.get(token)
+            if mapped:
+                return mapped
+
+    for token in _expand_tokens(fallback):
+        if token in valid:
+            return token
+        mapped = alias_to_primary.get(token)
+        if mapped:
+            return mapped
 
     return "UNK"
 
