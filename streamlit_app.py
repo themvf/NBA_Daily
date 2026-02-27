@@ -17438,18 +17438,60 @@ if selected_page == "DFS Player Review":
     if review_df.empty:
         st.info("No DFS player review data available for the selected season.")
     else:
+        table_column_config = {
+            "Total Fantasy Points Season": st.column_config.NumberColumn(format="%.2f"),
+            "Average Fantasy Points Last 5 Games": st.column_config.NumberColumn(format="%.2f"),
+            "Average Ownership Season": st.column_config.NumberColumn(format="%.2f%%"),
+            "Average Ownership Last 5 Games": st.column_config.NumberColumn(format="%.2f%%"),
+            "Average DK Salary This Season": st.column_config.NumberColumn(format="$%.0f"),
+        }
+
         st.dataframe(
             review_df,
             use_container_width=True,
             hide_index=True,
-            column_config={
-                "Total Fantasy Points Season": st.column_config.NumberColumn(format="%.2f"),
-                "Average Fantasy Points Last 5 Games": st.column_config.NumberColumn(format="%.2f"),
-                "Average Ownership Season": st.column_config.NumberColumn(format="%.2f%%"),
-                "Average Ownership Last 5 Games": st.column_config.NumberColumn(format="%.2f%%"),
-                "Average DK Salary This Season": st.column_config.NumberColumn(format="$%.0f"),
-            },
+            column_config=table_column_config,
         )
+
+        st.subheader("Salary Range Filter")
+        salary_series = pd.to_numeric(
+            review_df["Average DK Salary This Season"], errors="coerce"
+        ).dropna()
+
+        if salary_series.empty:
+            st.info("No salary values available for range filtering.")
+        else:
+            salary_min = int(np.floor(float(salary_series.min())))
+            salary_max = int(np.ceil(float(salary_series.max())))
+
+            if salary_min == salary_max:
+                selected_salary_range = (salary_min, salary_max)
+            else:
+                selected_salary_range = st.slider(
+                    "Average DK Salary Range",
+                    min_value=salary_min,
+                    max_value=salary_max,
+                    value=(salary_min, salary_max),
+                    step=100,
+                    key="dfs_player_review_salary_range",
+                )
+
+            filtered_review_df = review_df[
+                review_df["Average DK Salary This Season"].between(
+                    selected_salary_range[0], selected_salary_range[1], inclusive="both"
+                )
+            ].copy()
+
+            st.caption(
+                f"{len(filtered_review_df)} players in selected salary range "
+                f"${selected_salary_range[0]:,} - ${selected_salary_range[1]:,}"
+            )
+            st.dataframe(
+                filtered_review_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config=table_column_config,
+            )
 
 st.divider()
 st.caption(
