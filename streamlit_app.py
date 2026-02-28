@@ -14089,6 +14089,163 @@ def _compute_dfs_supplement_run_key(
     return digest.hexdigest()[:20]
 
 
+def _load_saved_dfs_supplement_state(
+    conn: sqlite3.Connection,
+    slate_date: str,
+) -> Dict[str, Any]:
+    """Rehydrate the latest saved supplement snapshot for a slate."""
+    if not slate_date:
+        return {}
+
+    try:
+        summary_df = pd.read_sql_query(
+            """
+            SELECT
+                run_key,
+                slate_date,
+                source_name,
+                source_filename,
+                projection_col,
+                ownership_col,
+                rows_total,
+                rows_matched,
+                rows_unmatched,
+                match_rate,
+                projection_mae,
+                ownership_mae,
+                avg_proj_delta,
+                avg_own_delta,
+                created_at
+            FROM dfs_supplement_runs
+            WHERE slate_date = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            conn,
+            params=[str(slate_date)],
+        )
+    except Exception:
+        return {}
+
+    if summary_df.empty:
+        return {}
+
+    summary_row = summary_df.iloc[0].to_dict()
+    run_key = str(summary_row.get("run_key") or "").strip()
+    if not run_key:
+        return {}
+
+    try:
+        detail_df = pd.read_sql_query(
+            """
+            SELECT
+                player_id,
+                supplement_player,
+                supplement_team,
+                our_player,
+                our_team,
+                pos,
+                salary,
+                match_method,
+                match_score,
+                our_proj_fpts,
+                supplement_proj_fpts,
+                proj_delta,
+                our_own_pct,
+                supplement_own_pct,
+                own_delta_pp
+            FROM dfs_supplement_player_deltas
+            WHERE run_key = ?
+            ORDER BY player_id
+            """,
+            conn,
+            params=[run_key],
+        )
+    except Exception:
+        detail_df = pd.DataFrame()
+
+    comparison_records: List[Dict[str, Any]] = []
+    player_map: Dict[int, Dict[str, Any]] = {}
+    if not detail_df.empty:
+        for _, row in detail_df.iterrows():
+            try:
+                player_id = int(row.get("player_id") or 0)
+            except (TypeError, ValueError):
+                player_id = 0
+
+            record = {
+                "Our Player ID": player_id if player_id > 0 else None,
+                "Supplement Player": row.get("supplement_player"),
+                "Supplement Team": row.get("supplement_team"),
+                "Our Player": row.get("our_player"),
+                "Our Team": row.get("our_team"),
+                "Pos": row.get("pos"),
+                "Salary": row.get("salary"),
+                "Match Method": row.get("match_method"),
+                "Match Score": row.get("match_score"),
+                "Our Proj FPTS": row.get("our_proj_fpts"),
+                "Supplement Proj FPTS": row.get("supplement_proj_fpts"),
+                "Proj Delta": row.get("proj_delta"),
+                "Our Own %": row.get("our_own_pct"),
+                "Supplement Own %": row.get("supplement_own_pct"),
+                "Own Delta (pp)": row.get("own_delta_pp"),
+            }
+            comparison_records.append(record)
+
+            if player_id > 0:
+                player_map[player_id] = {
+                    "match_method": str(row.get("match_method") or ""),
+                    "match_score": float(row.get("match_score") or 0.0),
+                    "supplement_proj_fpts": (
+                        float(row.get("supplement_proj_fpts"))
+                        if pd.notna(row.get("supplement_proj_fpts")) else None
+                    ),
+                    "supplement_ownership": (
+                        float(row.get("supplement_own_pct"))
+                        if pd.notna(row.get("supplement_own_pct")) else None
+                    ),
+                    "proj_delta": (
+                        float(row.get("proj_delta"))
+                        if pd.notna(row.get("proj_delta")) else None
+                    ),
+                    "own_delta_pp": (
+                        float(row.get("own_delta_pp"))
+                        if pd.notna(row.get("own_delta_pp")) else None
+                    ),
+                }
+
+    proj_mae = summary_row.get("projection_mae")
+    own_mae = summary_row.get("ownership_mae")
+    source_name = str(summary_row.get("source_name") or "")
+    return {
+        "run_key": run_key,
+        "slate_date": str(summary_row.get("slate_date") or slate_date),
+        "source_name": source_name,
+        "source_filename": str(summary_row.get("source_filename") or ""),
+        "source_mode": "Fetch RotoWire" if "rotowire" in source_name.lower() else "Saved Snapshot",
+        "is_rotowire_source": "rotowire" in source_name.lower(),
+        "projection_col": summary_row.get("projection_col"),
+        "ownership_col": summary_row.get("ownership_col"),
+        "raw_records": [],
+        "raw_columns": [],
+        "comparison_records": comparison_records,
+        "player_map": player_map,
+        "summary": {
+            "total_rows": int(summary_row.get("rows_total") or 0),
+            "matched_rows": int(summary_row.get("rows_matched") or 0),
+            "match_rate": float(summary_row.get("match_rate") or 0.0),
+            "projection_mae": float(proj_mae) if pd.notna(proj_mae) else np.nan,
+            "projection_mae_display": (
+                f"{float(proj_mae):.2f}" if pd.notna(proj_mae) else "—"
+            ),
+            "ownership_mae": float(own_mae) if pd.notna(own_mae) else np.nan,
+            "ownership_mae_display": (
+                f"{float(own_mae):.2f}pp" if pd.notna(own_mae) else "—"
+            ),
+        },
+    }
+
+
 def _apply_supplement_profile_blend(
     players: List[Any],
     supplement_player_map: Mapping[int, Mapping[str, Any]],
@@ -15411,10 +15568,18 @@ if selected_page == "DFS Lineup Builder":
         else:
             players = st.session_state.dfs_player_pool
             ai_adjustments = st.session_state.get("dfs_ai_adjustments", {}) or {}
-            supplement_state = st.session_state.get("dfs_supplement_state", {}) or {}
             current_slate_date = (
                 st.session_state.get("dfs_projection_date") or str(datetime.now(EASTERN_TZ).date())
             )
+            supplement_state = st.session_state.get("dfs_supplement_state", {}) or {}
+            if str(supplement_state.get("slate_date") or "") != current_slate_date:
+                saved_supplement_state = _load_saved_dfs_supplement_state(
+                    dfs_conn,
+                    current_slate_date,
+                )
+                if saved_supplement_state:
+                    st.session_state.dfs_supplement_state = saved_supplement_state
+                    supplement_state = saved_supplement_state
             if ai_adjustments:
                 total_ai_delta = sum(float(v.get("delta_fpts", 0.0) or 0.0) for v in ai_adjustments.values())
                 st.info(
@@ -15424,6 +15589,7 @@ if selected_page == "DFS Lineup Builder":
             if supplement_state.get("summary"):
                 supp_summary = supplement_state["summary"]
                 source_name = str(supplement_state.get("source_name") or "Supplement")
+                source_mode = str(supplement_state.get("source_mode") or "")
                 supplement_slate_date = str(supplement_state.get("slate_date") or "")
                 suffix = ""
                 if supplement_slate_date and supplement_slate_date != current_slate_date:
@@ -15434,6 +15600,43 @@ if selected_page == "DFS Lineup Builder":
                     f"Proj MAE {supp_summary.get('projection_mae_display', '—')} | "
                     f"Own MAE {supp_summary.get('ownership_mae_display', '—')}"
                     f"{suffix}"
+                )
+                if source_mode == "Saved Snapshot":
+                    st.caption(
+                        f"Loaded saved supplement snapshot for {current_slate_date}. "
+                        "Open `DFS Supplement` to refresh from the latest source."
+                    )
+
+            model_profiles = dfs.get_lineup_model_profiles()
+            supplement_required_models = {
+                key
+                for key, profile in model_profiles.items()
+                if float(profile.get("supplement_proj_weight", 0.0) or 0.0) > 0
+                or float(profile.get("supplement_own_weight", 0.0) or 0.0) > 0
+            }
+            has_current_supplement = bool(
+                supplement_state
+                and str(supplement_state.get("slate_date") or "") == current_slate_date
+                and (supplement_state.get("player_map") or {})
+            )
+            if run_mode == "All Versions" and not has_current_supplement and supplement_required_models:
+                st.warning(
+                    f"No active or saved supplement snapshot is loaded for {current_slate_date}. "
+                    "Supplement blend models will be skipped in `All Versions`. "
+                    "Open `DFS Supplement` and fetch/compare the source first."
+                )
+            elif (
+                run_mode == "Single Version"
+                and selected_model_key in supplement_required_models
+                and not has_current_supplement
+            ):
+                selected_model_label = model_profiles.get(selected_model_key, {}).get(
+                    "label",
+                    selected_model_key,
+                )
+                st.warning(
+                    f"{selected_model_label} needs a supplement snapshot for {current_slate_date}. "
+                    "Open `DFS Supplement` and fetch/compare the source first."
                 )
 
             # --- Game Stack Selection ---
