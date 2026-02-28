@@ -13226,6 +13226,7 @@ def _normalize_dfs_supplement_team(value: object) -> str:
     if not text or text.lower() in {"nan", "none", "null"}:
         return ""
 
+    text = text.lstrip("@").strip()
     upper = text.upper()
     if upper in ABBR_TO_TEAM_NAME:
         return upper
@@ -13252,7 +13253,94 @@ def _normalize_supplement_column_name(column_name: object) -> str:
     return " ".join(text.split())
 
 
-def _infer_supplement_column(columns: List[str], role: str) -> Optional[str]:
+DFS_SUPPLEMENT_STATUS_TOKENS = {
+    "Q",
+    "QUES",
+    "QUESTIONABLE",
+    "P",
+    "PROB",
+    "PROBABLE",
+    "D",
+    "DOUB",
+    "DOUBTFUL",
+    "O",
+    "OUT",
+    "GTD",
+    "INJ",
+    "SUSP",
+}
+
+
+def _clean_dfs_supplement_player_name(value: object) -> str:
+    """Strip feed-specific status markers from player name cells."""
+    text = str(value or "").replace("\xa0", " ").strip()
+    if not text or text.lower() in {"nan", "none", "null"}:
+        return ""
+
+    text = " ".join(text.split())
+    if text.upper() in DFS_SUPPLEMENT_STATUS_TOKENS:
+        return ""
+
+    status_pattern = r"(?:Q|QUES|QUESTIONABLE|P|PROB|PROBABLE|D|DOUB|DOUBTFUL|O|OUT|GTD|INJ|SUSP)"
+    prev_text = None
+    while text and text != prev_text:
+        prev_text = text
+        text = re.sub(
+            rf"\s*(?:[-|/]|(?:\()|(?:\[))?\s*{status_pattern}\s*(?:\)|\])?\s*$",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        ).strip(" -|/()[]")
+
+    return "" if text.upper() in DFS_SUPPLEMENT_STATUS_TOKENS else text
+
+
+def _is_probably_headerless_supplement(columns: List[str]) -> bool:
+    """Heuristic: detect feeds where the first data row was treated as headers."""
+    if not columns:
+        return False
+
+    unnamed_count = sum(
+        1
+        for col in columns
+        if str(col).strip().lower().startswith("unnamed:")
+        or str(col).strip().lower() in {"", "nan", "none"}
+    )
+    value_like_count = 0
+    for col in columns:
+        text = str(col).strip()
+        normalized = _normalize_supplement_column_name(text)
+        if re.fullmatch(r"\$?[\d,]+(?:\.\d+)?", text):
+            value_like_count += 1
+        elif normalized in {"yes", "no", "bn", "pg", "sg", "sf", "pf", "c"}:
+            value_like_count += 1
+        elif bool(_normalize_dfs_supplement_team(text)):
+            value_like_count += 1
+        elif text.startswith("@"):
+            value_like_count += 1
+
+    return unnamed_count >= max(2, len(columns) // 3) or (
+        unnamed_count >= 1 and value_like_count >= max(3, len(columns) // 4)
+    )
+
+
+def _read_dfs_supplement_csv(csv_path: Path) -> Tuple[pd.DataFrame, bool]:
+    """Read supplement CSV and fall back to a headerless parse when needed."""
+    df = pd.read_csv(csv_path, encoding="utf-8-sig")
+    headerless_detected = _is_probably_headerless_supplement(df.columns.tolist())
+    if not headerless_detected:
+        return df, False
+
+    headerless_df = pd.read_csv(csv_path, encoding="utf-8-sig", header=None)
+    headerless_df.columns = [f"Column {idx + 1}" for idx in range(headerless_df.shape[1])]
+    return headerless_df, True
+
+
+def _infer_supplement_column(
+    columns: List[str],
+    role: str,
+    sample_df: Optional[pd.DataFrame] = None,
+) -> Optional[str]:
     best_col = None
     best_score = -1
 
@@ -13300,6 +13388,46 @@ def _infer_supplement_column(columns: List[str], role: str) -> Optional[str]:
                 score = 85
             elif "own" in norm:
                 score = 75
+
+        if sample_df is not None and col in sample_df.columns:
+            raw_values = sample_df[col].dropna()
+            if not raw_values.empty:
+                values = raw_values.astype(str).str.strip()
+                numeric_values = _coerce_supplement_numeric(values)
+                numeric_rate = float(numeric_values.notna().mean())
+
+                if role == "player":
+                    cleaned_values = values.map(_clean_dfs_supplement_player_name)
+                    cleaned_nonempty = cleaned_values[cleaned_values.ne("")]
+                    if not cleaned_nonempty.empty:
+                        alpha_rate = float(cleaned_nonempty.str.contains(r"[A-Za-z]", regex=True).mean())
+                        spaced_rate = float(cleaned_nonempty.str.contains(r"\s", regex=True).mean())
+                        team_like_rate = float(cleaned_nonempty.map(_normalize_dfs_supplement_team).ne("").mean())
+                        score += int(alpha_rate * 35)
+                        score += int(spaced_rate * 35)
+                        score += int((1.0 - min(team_like_rate, 1.0)) * 25)
+                elif role == "team":
+                    team_rate = float(values.map(_normalize_dfs_supplement_team).ne("").mean())
+                    score += int(team_rate * 80)
+                elif role == "projection":
+                    if numeric_rate > 0:
+                        score += int(numeric_rate * 35)
+                        numeric_nonempty = numeric_values.dropna()
+                        if not numeric_nonempty.empty:
+                            mean_val = float(numeric_nonempty.mean())
+                            if 10.0 <= mean_val <= 80.0:
+                                score += 20
+                            if float(numeric_nonempty.max()) >= 20.0:
+                                score += 15
+                elif role == "ownership":
+                    if numeric_rate > 0:
+                        score += int(numeric_rate * 35)
+                        ownership_like = float(
+                            numeric_values.dropna().between(0.0, 100.0, inclusive="both").mean()
+                        ) if numeric_values.notna().any() else 0.0
+                        pct_symbol_rate = float(values.str.contains("%", regex=False).mean())
+                        score += int(ownership_like * 25)
+                        score += int(pct_symbol_rate * 20)
 
         if score > best_score:
             best_col = col
@@ -13358,7 +13486,7 @@ def _match_dfs_supplement_player(
     raw_team: object,
     lookup: Dict[str, Any],
 ) -> Tuple[Optional[Dict[str, Any]], str, Optional[float]]:
-    player_name = str(raw_name or "").strip()
+    player_name = _clean_dfs_supplement_player_name(raw_name)
     if not player_name:
         return None, "unmatched", None
 
@@ -13428,13 +13556,13 @@ def _build_dfs_supplement_comparison(
     unmatched_rows: List[Dict[str, Any]] = []
 
     working_df = supplement_df.copy()
-    working_df[player_col] = working_df[player_col].astype(str).str.strip()
+    working_df[player_col] = working_df[player_col].map(_clean_dfs_supplement_player_name)
     if team_col:
         working_df[team_col] = working_df[team_col].astype(str).str.strip()
 
     for _, row in working_df.iterrows():
-        player_name = str(row.get(player_col, "") or "").strip()
-        if not player_name or player_name.lower() == "nan":
+        player_name = _clean_dfs_supplement_player_name(row.get(player_col, ""))
+        if not player_name:
             continue
 
         team_value = str(row.get(team_col, "") or "").strip() if team_col else ""
@@ -18258,20 +18386,27 @@ if selected_page == "DFS Lineup Builder":
             if supplement_file is not None:
                 supplement_path = persist_uploaded_file(supplement_file, ".csv")
                 try:
-                    supplement_df = pd.read_csv(supplement_path, encoding="utf-8-sig")
+                    supplement_df, headerless_detected = _read_dfs_supplement_csv(supplement_path)
                 except Exception as exc:
                     st.error(f"Could not read supplement CSV: {exc}")
                     supplement_df = pd.DataFrame()
+                    headerless_detected = False
 
                 if not supplement_df.empty:
                     supplement_df.columns = [str(col).strip() for col in supplement_df.columns]
                     column_options = supplement_df.columns.tolist()
                     none_option = "— None —"
 
-                    inferred_player_col = _infer_supplement_column(column_options, "player")
-                    inferred_team_col = _infer_supplement_column(column_options, "team")
-                    inferred_proj_col = _infer_supplement_column(column_options, "projection")
-                    inferred_own_col = _infer_supplement_column(column_options, "ownership")
+                    inferred_player_col = _infer_supplement_column(column_options, "player", supplement_df)
+                    inferred_team_col = _infer_supplement_column(column_options, "team", supplement_df)
+                    inferred_proj_col = _infer_supplement_column(column_options, "projection", supplement_df)
+                    inferred_own_col = _infer_supplement_column(column_options, "ownership", supplement_df)
+
+                    if headerless_detected:
+                        st.info(
+                            "Headerless CSV detected. Generic column names were assigned, "
+                            "so verify the mapping before trusting the comparison."
+                        )
 
                     st.markdown("**Column Mapping**")
                     map_col1, map_col2, map_col3, map_col4 = st.columns(4)
@@ -18349,12 +18484,7 @@ if selected_page == "DFS Lineup Builder":
                         )
 
                         total_rows = int(
-                            working_df[player_col]
-                            .astype(str)
-                            .str.strip()
-                            .replace({"nan": ""})
-                            .ne("")
-                            .sum()
+                            working_df[player_col].map(_clean_dfs_supplement_player_name).ne("").sum()
                         )
                         matched_rows = int(len(comparison_df))
                         match_rate = (matched_rows / total_rows * 100.0) if total_rows > 0 else 0.0
