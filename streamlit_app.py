@@ -14246,6 +14246,300 @@ def _load_saved_dfs_supplement_state(
     }
 
 
+def _build_dfs_supplement_state(
+    slate_date: str,
+    source_name: str,
+    source_filename: str,
+    source_mode: str,
+    is_rotowire_source: bool,
+    projection_col: Optional[str],
+    ownership_col: Optional[str],
+    supplement_df: pd.DataFrame,
+    comparison_df: pd.DataFrame,
+    unmatched_df: pd.DataFrame,
+) -> Dict[str, Any]:
+    """Construct normalized supplement session state from comparison outputs."""
+    proj_comp_df = comparison_df.dropna(
+        subset=["Supplement Proj FPTS", "Our Proj FPTS"]
+    ).copy()
+    own_comp_df = comparison_df.dropna(
+        subset=["Supplement Own %", "Our Own %"]
+    ).copy()
+    projection_mae_value = (
+        float(proj_comp_df["Proj Delta"].abs().mean())
+        if not proj_comp_df.empty else np.nan
+    )
+    ownership_mae_value = (
+        float(own_comp_df["Own Delta (pp)"].abs().mean())
+        if not own_comp_df.empty else np.nan
+    )
+    total_rows = int(len(supplement_df))
+    matched_rows = int(len(comparison_df))
+    match_rate = float((matched_rows / total_rows) * 100.0) if total_rows > 0 else 0.0
+    supplement_player_map = _build_dfs_supplement_player_map(comparison_df)
+    run_key = _compute_dfs_supplement_run_key(
+        slate_date=slate_date,
+        source_filename=source_filename,
+        projection_col=projection_col,
+        ownership_col=ownership_col,
+        comparison_df=comparison_df,
+        unmatched_df=unmatched_df,
+    )
+    return {
+        "run_key": run_key,
+        "slate_date": slate_date,
+        "source_name": source_name,
+        "source_filename": source_filename,
+        "source_mode": source_mode,
+        "is_rotowire_source": bool(is_rotowire_source),
+        "projection_col": projection_col,
+        "ownership_col": ownership_col,
+        "raw_records": supplement_df.to_dict("records"),
+        "raw_columns": supplement_df.columns.tolist(),
+        "comparison_records": comparison_df.to_dict("records"),
+        "player_map": supplement_player_map,
+        "summary": {
+            "total_rows": total_rows,
+            "matched_rows": matched_rows,
+            "match_rate": match_rate,
+            "projection_mae": projection_mae_value,
+            "projection_mae_display": (
+                f"{projection_mae_value:.2f}"
+                if np.isfinite(projection_mae_value) else "—"
+            ),
+            "ownership_mae": ownership_mae_value,
+            "ownership_mae_display": (
+                f"{ownership_mae_value:.2f}pp"
+                if np.isfinite(ownership_mae_value) else "—"
+            ),
+        },
+    }
+
+
+def _save_dfs_supplement_state(
+    conn: sqlite3.Connection,
+    supplement_state: Mapping[str, Any],
+    comparison_df: pd.DataFrame,
+    unmatched_df: pd.DataFrame,
+) -> Optional[str]:
+    """Persist supplement snapshot to tracking tables and cloud storage."""
+    try:
+        from dfs_tracking import save_supplement_snapshot as _save_supplement_snapshot
+
+        run_key = str(supplement_state.get("run_key") or "")
+        if not run_key:
+            return "Missing supplement run key."
+
+        _save_supplement_snapshot(
+            conn,
+            slate_date=str(supplement_state.get("slate_date") or ""),
+            run_key=run_key,
+            source_name=str(supplement_state.get("source_name") or ""),
+            source_filename=str(supplement_state.get("source_filename") or ""),
+            projection_col=supplement_state.get("projection_col"),
+            ownership_col=supplement_state.get("ownership_col"),
+            comparison_df=comparison_df,
+            unmatched_df=unmatched_df,
+            rows_total=int(supplement_state.get("summary", {}).get("total_rows", 0) or 0),
+        )
+        st.session_state.dfs_supplement_saved_run_key = run_key
+
+        slate_date = str(supplement_state.get("slate_date") or "")
+        source_name = str(supplement_state.get("source_name") or "supplement")
+        artifact_token = _sanitize_supplement_artifact_token(source_name)
+        raw_records = supplement_state.get("raw_records", []) or []
+
+        if raw_records:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                suffix=".csv",
+                delete=False,
+                encoding="utf-8",
+            ) as tmp_source_csv:
+                pd.DataFrame(raw_records).to_csv(tmp_source_csv, index=False)
+                tmp_source_csv_path = Path(tmp_source_csv.name)
+            _s3_upload_slate_file(
+                tmp_source_csv_path,
+                slate_date,
+                f"{artifact_token}_supplement_raw.csv",
+            )
+            try:
+                tmp_source_csv_path.unlink()
+            except OSError:
+                pass
+
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".csv",
+            delete=False,
+            encoding="utf-8",
+        ) as tmp_csv:
+            tmp_csv.write(comparison_df.to_csv(index=False))
+            tmp_csv_path = Path(tmp_csv.name)
+        _s3_upload_slate_file(
+            tmp_csv_path,
+            slate_date,
+            f"{artifact_token}_supplement_comparison.csv",
+        )
+        try:
+            tmp_csv_path.unlink()
+        except OSError:
+            pass
+
+        proj_mae_raw = supplement_state.get("summary", {}).get("projection_mae", np.nan)
+        own_mae_raw = supplement_state.get("summary", {}).get("ownership_mae", np.nan)
+        proj_mae_value = float(proj_mae_raw) if pd.notna(proj_mae_raw) else np.nan
+        own_mae_value = float(own_mae_raw) if pd.notna(own_mae_raw) else np.nan
+
+        summary_payload = {
+            "run_key": run_key,
+            "slate_date": slate_date,
+            "source_name": source_name,
+            "source_filename": str(supplement_state.get("source_filename") or ""),
+            "projection_col": supplement_state.get("projection_col"),
+            "ownership_col": supplement_state.get("ownership_col"),
+            "rows_total": int(supplement_state.get("summary", {}).get("total_rows", 0) or 0),
+            "rows_matched": int(supplement_state.get("summary", {}).get("matched_rows", 0) or 0),
+            "rows_unmatched": int(len(unmatched_df)),
+            "match_rate": float(supplement_state.get("summary", {}).get("match_rate", 0.0) or 0.0),
+            "projection_mae": proj_mae_value if np.isfinite(proj_mae_value) else None,
+            "ownership_mae": own_mae_value if np.isfinite(own_mae_value) else None,
+        }
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".json",
+            delete=False,
+            encoding="utf-8",
+        ) as tmp_json:
+            json.dump(summary_payload, tmp_json, indent=2, default=str)
+            tmp_json_path = Path(tmp_json.name)
+        _s3_upload_slate_file(
+            tmp_json_path,
+            slate_date,
+            f"{artifact_token}_supplement_summary.json",
+        )
+        try:
+            tmp_json_path.unlink()
+        except OSError:
+            pass
+        return None
+    except Exception as exc:
+        return str(exc)
+
+
+def _autofetch_rotowire_supplement_state(
+    conn: sqlite3.Connection,
+    players: List[Any],
+    slate_date: str,
+) -> Tuple[Dict[str, Any], str]:
+    """Fetch, compare, and save a RotoWire supplement snapshot for the slate."""
+    if not slate_date:
+        return {}, "Missing slate date."
+
+    rotowire_cookie_value = (_resolve_rotowire_cookie() or "").strip() or None
+    try:
+        rotowire_slates_df = load_nba_rotowire_slates_frame(
+            site_id=1,
+            cookie_header=rotowire_cookie_value,
+        )
+    except Exception as exc:
+        return {}, f"Could not fetch RotoWire slate catalog: {exc}"
+
+    if rotowire_slates_df.empty:
+        return {}, "No RotoWire slates returned."
+
+    candidate_slates = rotowire_slates_df.loc[
+        rotowire_slates_df["slate_date"].astype(str) == str(slate_date)
+    ].copy()
+    if candidate_slates.empty:
+        return {}, f"No RotoWire slates found for {slate_date}."
+
+    classic_slates = candidate_slates.loc[
+        candidate_slates["contest_type"].astype(str).str.lower() == "classic"
+    ].copy()
+    if not classic_slates.empty:
+        candidate_slates = classic_slates
+
+    def _slate_priority(row: pd.Series) -> Tuple[int, int, str]:
+        slate_name = str(row.get("slate_name") or "").strip().lower()
+        if "main" in slate_name:
+            priority = 0
+        elif slate_name == "all" or slate_name.startswith("all "):
+            priority = 1
+        elif "night" in slate_name:
+            priority = 2
+        else:
+            priority = 3
+        try:
+            game_count = -int(row.get("game_count") or 0)
+        except (TypeError, ValueError):
+            game_count = 0
+        return priority, game_count, slate_name
+
+    selected_rotowire_slate = sorted(
+        [row for _, row in candidate_slates.iterrows()],
+        key=_slate_priority,
+    )[0]
+
+    try:
+        supplement_df = load_nba_rotowire_players_frame(
+            site_id=1,
+            slate_id=int(selected_rotowire_slate.get("slate_id")),
+            slate_date=str(selected_rotowire_slate.get("slate_date") or ""),
+            contest_type=str(selected_rotowire_slate.get("contest_type") or ""),
+            slate_name=str(selected_rotowire_slate.get("slate_name") or ""),
+            cookie_header=rotowire_cookie_value,
+        )
+    except Exception as exc:
+        return {}, f"Could not fetch RotoWire players: {exc}"
+
+    if supplement_df.empty:
+        return {}, "RotoWire returned no player rows for the selected slate."
+
+    comparison_df, unmatched_df = _build_dfs_supplement_comparison(
+        supplement_df=supplement_df,
+        players=players,
+        player_col="player_name",
+        team_col="team_abbr",
+        projection_col="proj_fantasy_points",
+        ownership_col="proj_ownership",
+    )
+    if comparison_df.empty:
+        return {}, "RotoWire data fetched but matched zero players in the active pool."
+
+    source_name = "RotoWire NBA Optimizer"
+    source_filename = f"rotowire_nba_{int(selected_rotowire_slate.get('slate_id'))}.csv"
+    supplement_state = _build_dfs_supplement_state(
+        slate_date=str(slate_date),
+        source_name=source_name,
+        source_filename=source_filename,
+        source_mode="Auto Fetch RotoWire",
+        is_rotowire_source=True,
+        projection_col="proj_fantasy_points",
+        ownership_col="proj_ownership",
+        supplement_df=supplement_df,
+        comparison_df=comparison_df,
+        unmatched_df=unmatched_df,
+    )
+    save_error = _save_dfs_supplement_state(
+        conn,
+        supplement_state=supplement_state,
+        comparison_df=comparison_df,
+        unmatched_df=unmatched_df,
+    )
+    if save_error:
+        return supplement_state, f"RotoWire supplement loaded but save failed: {save_error}"
+
+    summary = supplement_state.get("summary", {}) or {}
+    return (
+        supplement_state,
+        (
+            f"Auto-loaded RotoWire supplement for {slate_date}: "
+            f"{summary.get('matched_rows', 0)}/{summary.get('total_rows', 0)} matched."
+        ),
+    )
+
+
 def _apply_supplement_profile_blend(
     players: List[Any],
     supplement_player_map: Mapping[int, Mapping[str, Any]],
@@ -15929,6 +16223,36 @@ if selected_page == "DFS Lineup Builder":
                         else:
                             model_run_keys = [selected_model_key]
 
+                        supplement_required_models = {
+                            key
+                            for key, profile in model_profiles.items()
+                            if float(profile.get("supplement_proj_weight", 0.0) or 0.0) > 0
+                            or float(profile.get("supplement_own_weight", 0.0) or 0.0) > 0
+                        }
+                        requested_supplement_models = [
+                            key for key in model_run_keys if key in supplement_required_models
+                        ]
+                        current_supplement_loaded = bool(
+                            supplement_state
+                            and str(supplement_state.get("slate_date") or "") == current_slate_date
+                            and (supplement_state.get("player_map") or {})
+                        )
+                        if requested_supplement_models and not current_supplement_loaded:
+                            auto_supplement_state, auto_supplement_msg = _autofetch_rotowire_supplement_state(
+                                dfs_conn,
+                                players,
+                                current_slate_date,
+                            )
+                            if auto_supplement_state:
+                                st.session_state.dfs_supplement_state = auto_supplement_state
+                                supplement_state = auto_supplement_state
+                                st.info(auto_supplement_msg)
+                            elif auto_supplement_msg:
+                                st.warning(
+                                    "Could not auto-load RotoWire supplement. "
+                                    + auto_supplement_msg
+                                )
+
                         supplement_player_map = {}
                         supplement_source_name = str(supplement_state.get("source_name") or "")
                         supplement_is_rotowire = bool(
@@ -15936,12 +16260,6 @@ if selected_page == "DFS Lineup Builder":
                         ) or ("rotowire" in supplement_source_name.lower())
                         if supplement_state and str(supplement_state.get("slate_date") or "") == current_slate_date:
                             supplement_player_map = supplement_state.get("player_map", {}) or {}
-                        supplement_required_models = {
-                            key
-                            for key, profile in model_profiles.items()
-                            if float(profile.get("supplement_proj_weight", 0.0) or 0.0) > 0
-                            or float(profile.get("supplement_own_weight", 0.0) or 0.0) > 0
-                        }
                         skipped_supplement_models: List[str] = []
                         skipped_source_mismatch_models: List[str] = []
                         if not supplement_player_map:
