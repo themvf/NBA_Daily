@@ -1077,6 +1077,51 @@ def _midrange_minutes_vegas_signal_score(
     )
 
 
+def _vegas_signal_score_multiplier(
+    player: "DFSPlayer",
+    strategy: str = "projection",
+    model_key: str = "",
+    model_profile: Optional[Dict[str, Any]] = None,
+) -> float:
+    """Apply a bounded Vegas-based score adjustment without forcing exposure targets."""
+    vegas_signal = str(getattr(player, "vegas_signal", "") or "").strip().upper()
+    vegas_edge = float(getattr(player, "vegas_edge_pct", 0.0) or 0.0)
+    if not vegas_signal and abs(vegas_edge) < 0.01:
+        return 1.0
+
+    profile_cfg = model_profile or {}
+    positive_cap = float(profile_cfg.get("vegas_auto_boost_cap", 0.08) or 0.08)
+    negative_cap = float(profile_cfg.get("vegas_auto_fade_cap", 0.06) or 0.06)
+    blend_damp = 0.45 if bool(getattr(player, "vegas_blend_active", False)) else 1.0
+
+    adjustment = 0.0
+    if vegas_edge > 0 or vegas_signal == "BOOST":
+        if vegas_signal == "BOOST":
+            adjustment += 0.02
+        adjustment += max(0.0, vegas_edge) * 0.0025
+        adjustment = min(positive_cap, adjustment * blend_damp)
+    elif vegas_edge < 0 or vegas_signal == "FADE":
+        if vegas_signal == "FADE":
+            adjustment += 0.015
+        adjustment += abs(min(0.0, vegas_edge)) * 0.0020
+        adjustment = -min(negative_cap, adjustment * blend_damp)
+    elif vegas_signal == "WATCH":
+        adjustment = min(positive_cap * 0.5, max(0.0, vegas_edge) * 0.0015 * blend_damp)
+
+    strategy_scale = {
+        "projection": 1.00,
+        "value": 0.90,
+        "ceiling": 0.75,
+        "leverage": 0.65,
+    }.get(strategy, 1.0)
+
+    if model_key == "midrange_v1_minutes_vegas":
+        strategy_scale *= 0.50
+
+    adjustment *= strategy_scale
+    return max(0.85, 1.0 + adjustment)
+
+
 # =============================================================================
 # Lineup Data Class
 # =============================================================================
@@ -2570,7 +2615,9 @@ def _select_stack_players(
     available: List[DFSPlayer],
     stack_config: Dict[str, Dict],
     used_ids: Set[int],
-    strategy: str
+    strategy: str,
+    model_key: str = "",
+    model_profile: Optional[Dict[str, Any]] = None,
 ) -> List[DFSPlayer]:
     """
     Select players to force into a lineup based on game stacking configuration.
@@ -2586,12 +2633,23 @@ def _select_stack_players(
 
     def get_score(p: DFSPlayer) -> float:
         if strategy == "ceiling":
-            return p.proj_ceiling
+            base_score = p.proj_ceiling
         elif strategy == "value":
-            return p.fpts_per_dollar
+            base_score = p.fpts_per_dollar
         elif strategy == "leverage":
-            return p.leverage_score
-        return p.proj_fpts
+            base_score = p.leverage_score
+        else:
+            base_score = p.proj_fpts
+        return max(
+            0.1,
+            float(base_score or 0.0)
+            * _vegas_signal_score_multiplier(
+                p,
+                strategy=strategy,
+                model_key=model_key,
+                model_profile=model_profile,
+            ),
+        )
 
     def weighted_pick(candidates: List[DFSPlayer], n: int = 1) -> List[DFSPlayer]:
         """Pick n players from candidates using weighted random selection."""
@@ -2816,6 +2874,13 @@ def optimize_lineup_randomized(
         else:  # projection
             base_score = max(0.1, proj_for_scoring)
 
+        base_score *= _vegas_signal_score_multiplier(
+            p,
+            strategy=strategy,
+            model_key=model_key,
+            model_profile=model_profile,
+        )
+
         if model_key == "midrange_v1_minutes_vegas":
             base_score *= _midrange_minutes_vegas_multiplier(
                 p, model_profile, model_context
@@ -2857,7 +2922,14 @@ def optimize_lineup_randomized(
 
     # Add game stack players (after locked, before random fill)
     if stack_config:
-        stack_players = _select_stack_players(available, stack_config, used_player_ids, strategy)
+        stack_players = _select_stack_players(
+            available,
+            stack_config,
+            used_player_ids,
+            strategy,
+            model_key=model_key,
+            model_profile=model_profile,
+        )
         for player in stack_players:
             if player.player_id in used_player_ids:
                 continue

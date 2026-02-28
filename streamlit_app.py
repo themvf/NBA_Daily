@@ -14260,6 +14260,7 @@ if selected_page == "DFS Lineup Builder":
                 p.vegas_implied_fpts = float(v_sig.get('vegas_fpts', 0.0) or 0.0)
                 p.vegas_edge_pct = float(v_sig.get('edge_pct', 0.0) or 0.0)
                 p.vegas_signal = str(v_sig.get('signal', '') or '').strip().upper()
+                p.vegas_blend_active = False
 
             if vegas_sigs:
                 blend_col1, blend_col2 = st.columns([1, 2])
@@ -14295,10 +14296,12 @@ if selected_page == "DFS Lineup Builder":
                         if sig and sig.get('vegas_fpts') is not None:
                             p.proj_fpts = round(p._model_proj_fpts * model_weight + sig['vegas_fpts'] * blend_weight, 1)
                             p.fpts_per_dollar = round((p.proj_fpts / p.salary) * 1000, 3) if p.salary > 0 else 0
+                            p.vegas_blend_active = True
                             vegas_players_blended += 1
                         else:
                             p.proj_fpts = p._model_proj_fpts
                             p.fpts_per_dollar = p._model_fpts_per_dollar
+                            p.vegas_blend_active = False
                     st.session_state.dfs_vegas_blend_active = True
                     st.caption(f"🎰 Blended projections active — {vegas_players_blended} players adjusted ({int(blend_weight*100)}% Vegas / {int((1-blend_weight)*100)}% Model). Lineups will use these projections.")
                 else:
@@ -14308,6 +14311,7 @@ if selected_page == "DFS Lineup Builder":
                             if hasattr(p, '_model_proj_fpts'):
                                 p.proj_fpts = p._model_proj_fpts
                                 p.fpts_per_dollar = p._model_fpts_per_dollar
+                                p.vegas_blend_active = False
                         st.session_state.dfs_vegas_blend_active = False
 
             # Snapshot current projection state so AI deltas always apply from
@@ -14497,23 +14501,39 @@ if selected_page == "DFS Lineup Builder":
                         })
                     st.dataframe(pd.DataFrame(boost_data), use_container_width=True, hide_index=True)
 
-                    # Apply button
-                    if st.button("🚀 Apply Vegas Boost Suggestions", help="Add BOOST players to exposure targets at 25%"):
-                        current_targets = dict(st.session_state.dfs_exposure_targets)
-                        added = 0
-                        for p, _ in boost_players:
-                            if p.player_id not in current_targets:
-                                current_targets[p.player_id] = 0.25
-                                added += 1
-                        st.session_state.dfs_exposure_targets = current_targets
-                        if added:
-                            st.success(f"Added {added} BOOST player(s) to exposure targets at 25%")
-                        else:
-                            st.info("All BOOST players already have exposure targets set.")
-                        st.rerun()
+                    st.info(
+                        "Loaded Vegas signals now feed directly into lineup generation as a bounded score adjustment. "
+                        "BOOST players are nudged up automatically, but exposure is still determined by the optimizer "
+                        "alongside projection, ceiling, value, ownership, salary fit, and constraints."
+                    )
+
+                    legacy_target_ids = [
+                        p.player_id
+                        for p, _ in boost_players
+                        if abs(float(st.session_state.dfs_exposure_targets.get(p.player_id, 0.0) or 0.0) - 0.25) < 1e-9
+                    ]
+                    if legacy_target_ids:
+                        st.warning(
+                            f"Detected {len(legacy_target_ids)} legacy 25% Vegas exposure target(s). "
+                            "Those targets will still override the optimizer until cleared."
+                        )
+                        if st.button(
+                            "Clear Legacy Vegas 25% Targets",
+                            help="Remove old fixed 25% exposure targets for the current BOOST players.",
+                        ):
+                            current_targets = dict(st.session_state.dfs_exposure_targets)
+                            removed = 0
+                            for pid in legacy_target_ids:
+                                if pid in current_targets:
+                                    del current_targets[pid]
+                                    removed += 1
+                            st.session_state.dfs_exposure_targets = current_targets
+                            st.success(f"Cleared {removed} legacy Vegas exposure target(s).")
+                            st.rerun()
 
                     st.caption("Players where Vegas implied FPTS exceeds our projection by ≥10% at salary < $7K. "
-                               "These are value plays where the market sees upside our model may underweight.")
+                               "These are value plays where the market sees upside our model may underweight. "
+                               "They are now used as automatic scoring inputs, not fixed exposure floors.")
 
             # --- OpenAI Projection Review Agent ---
             with st.expander("OpenAI Projection Review Agent", expanded=False):
