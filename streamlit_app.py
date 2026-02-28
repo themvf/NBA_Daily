@@ -13270,6 +13270,10 @@ DFS_SUPPLEMENT_STATUS_TOKENS = {
     "SUSP",
 }
 
+DFS_SUPPLEMENT_NONE_OPTION = "— None —"
+DFS_SUPPLEMENT_ROTOWIRE_DERIVED_FPTS = "__rotowire_derived_fpts__"
+DFS_SUPPLEMENT_ROTOWIRE_DERIVED_LABEL = "Derived FPTS (SAL x VAL / 1000)"
+
 
 def _clean_dfs_supplement_player_name(value: object) -> str:
     """Strip feed-specific status markers from player name cells."""
@@ -13334,6 +13338,112 @@ def _read_dfs_supplement_csv(csv_path: Path) -> Tuple[pd.DataFrame, bool]:
     headerless_df = pd.read_csv(csv_path, encoding="utf-8-sig", header=None)
     headerless_df.columns = [f"Column {idx + 1}" for idx in range(headerless_df.shape[1])]
     return headerless_df, True
+
+
+def _detect_rotowire_supplement_layout(
+    supplement_df: pd.DataFrame,
+    headerless_detected: bool,
+) -> Optional[Dict[str, str]]:
+    """Detect the common RotoWire roster export shape and return recommended mappings."""
+    columns = [str(col).strip() for col in supplement_df.columns]
+    if len(columns) < 12:
+        return None
+
+    normalized_to_column = {
+        _normalize_supplement_column_name(col): col for col in columns
+    }
+
+    if headerless_detected:
+        if len(columns) < 15:
+            return None
+        mapping = {
+            "player_col": columns[0],
+            "team_col": columns[5],
+            "minutes_col": columns[8],
+            "salary_col": columns[9],
+            "value_col": columns[11],
+            "ownership_col": columns[14],
+            "projection_col": DFS_SUPPLEMENT_ROTOWIRE_DERIVED_FPTS,
+            "layout_name": "RotoWire headerless export",
+        }
+    else:
+        player_col = normalized_to_column.get("player")
+        team_col = normalized_to_column.get("team")
+        salary_col = (
+            normalized_to_column.get("sal")
+            or normalized_to_column.get("salary")
+        )
+        fpts_col = normalized_to_column.get("fpts")
+        value_col = normalized_to_column.get("val")
+        ownership_col = (
+            normalized_to_column.get("rst")
+            or normalized_to_column.get("rst percent")
+            or normalized_to_column.get("ownership")
+        )
+        minutes_col = normalized_to_column.get("min")
+
+        if not player_col or not team_col or not salary_col or not ownership_col:
+            return None
+        if not fpts_col and not value_col:
+            return None
+
+        mapping = {
+            "player_col": player_col,
+            "team_col": team_col,
+            "minutes_col": minutes_col or "",
+            "salary_col": salary_col,
+            "value_col": value_col or "",
+            "ownership_col": ownership_col,
+            "projection_col": fpts_col or DFS_SUPPLEMENT_ROTOWIRE_DERIVED_FPTS,
+            "layout_name": "RotoWire export",
+        }
+
+    player_rate = float(
+        supplement_df[mapping["player_col"]]
+        .map(_clean_dfs_supplement_player_name)
+        .ne("")
+        .mean()
+    )
+    team_rate = float(
+        supplement_df[mapping["team_col"]]
+        .map(_normalize_dfs_supplement_team)
+        .ne("")
+        .mean()
+    )
+    salary_rate = float(
+        _coerce_supplement_numeric(supplement_df[mapping["salary_col"]]).gt(0).mean()
+    )
+    own_rate = float(
+        _coerce_supplement_numeric(supplement_df[mapping["ownership_col"]])
+        .between(0.0, 100.0, inclusive="both")
+        .mean()
+    )
+
+    if mapping["projection_col"] == DFS_SUPPLEMENT_ROTOWIRE_DERIVED_FPTS:
+        if not mapping.get("value_col"):
+            return None
+        proj_rate = float(
+            _coerce_supplement_numeric(supplement_df[mapping["value_col"]]).gt(0).mean()
+        )
+    else:
+        proj_rate = float(
+            _coerce_supplement_numeric(supplement_df[mapping["projection_col"]]).gt(0).mean()
+        )
+
+    if min(player_rate, team_rate, salary_rate, own_rate, proj_rate) < 0.55:
+        return None
+
+    return mapping
+
+
+def _derive_rotowire_projection_series(
+    supplement_df: pd.DataFrame,
+    salary_col: str,
+    value_col: str,
+) -> pd.Series:
+    salary_vals = _coerce_supplement_numeric(supplement_df[salary_col])
+    value_vals = _coerce_supplement_numeric(supplement_df[value_col])
+    return (salary_vals * value_vals / 1000.0).round(3)
 
 
 def _infer_supplement_column(
@@ -13785,13 +13895,13 @@ if selected_page == "DFS Lineup Builder":
     builder_tabs = st.tabs([
         "📤 Upload & Configure",
         "👥 Player Pool",
+        "🧩 DFS Supplement",
         "📊 Generated Lineups",
         "📈 Exposure Report",
         "🎯 Model Accuracy",
         "🦈 Opponent Analysis",
         "🎰 FanDuel Props",
-        "🔬 Player Scouting",
-        "🧩 DFS Supplement"
+        "🔬 Player Scouting"
     ])
 
     # ==========================================================================
@@ -14818,9 +14928,9 @@ if selected_page == "DFS Lineup Builder":
             st.session_state.dfs_exposure_targets = exposure_targets
 
     # ==========================================================================
-    # TAB 3: Generated Lineups
+    # TAB 4: Generated Lineups
     # ==========================================================================
-    with builder_tabs[2]:
+    with builder_tabs[3]:
         st.subheader("Generated Lineups")
 
         if not st.session_state.dfs_player_pool:
@@ -15567,9 +15677,9 @@ if selected_page == "DFS Lineup Builder":
                             st.caption(f"Game Stacks: {', '.join(stack_info)}")
 
     # ==========================================================================
-    # TAB 4: Exposure Report
+    # TAB 5: Exposure Report
     # ==========================================================================
-    with builder_tabs[3]:
+    with builder_tabs[4]:
         st.subheader("Exposure Report")
 
         if not st.session_state.dfs_lineups:
@@ -15663,9 +15773,9 @@ if selected_page == "DFS Lineup Builder":
                 st.info("No significant stacks (2+ players from same game) found.")
 
     # ==========================================================================
-    # TAB 5: Model Accuracy
+    # TAB 6: Model Accuracy
     # ==========================================================================
-    with builder_tabs[4]:
+    with builder_tabs[5]:
         st.subheader("DFS Model Accuracy Tracking")
         st.caption("Track how well our projections match actual performance across slates")
 
@@ -16734,9 +16844,9 @@ if selected_page == "DFS Lineup Builder":
             st.code(traceback.format_exc())
 
     # ==========================================================================
-    # TAB 6: Opponent Analysis
+    # TAB 7: Opponent Analysis
     # ==========================================================================
-    with builder_tabs[5]:
+    with builder_tabs[6]:
         st.subheader("Opponent Analysis")
         st.caption("Track opponents across contests to identify sharks and reverse-engineer their strategies")
 
@@ -17914,9 +18024,9 @@ if selected_page == "DFS Lineup Builder":
             st.code(traceback.format_exc())
 
     # ==========================================================================
-    # TAB 7: FanDuel Props
+    # TAB 8: FanDuel Props
     # ==========================================================================
-    with builder_tabs[6]:
+    with builder_tabs[7]:
         st.subheader("FanDuel Player Props")
         st.caption("View all FanDuel player prop lines alongside our projections — verify API data is populated")
 
@@ -18179,9 +18289,9 @@ if selected_page == "DFS Lineup Builder":
                 )
 
     # ==========================================================================
-    # TAB 8: Player Scouting (database-driven, slate-independent)
+    # TAB 9: Player Scouting (database-driven, slate-independent)
     # ==========================================================================
-    with builder_tabs[7]:
+    with builder_tabs[8]:
         st.subheader("Player Scouting")
         st.caption("League-wide player research — independent of the current DK slate")
 
@@ -18348,9 +18458,9 @@ if selected_page == "DFS Lineup Builder":
             st.error(f"Failed to load scouting data: {e}")
 
     # ==========================================================================
-    # TAB 9: DFS Supplement
+    # TAB 3: DFS Supplement
     # ==========================================================================
-    with builder_tabs[8]:
+    with builder_tabs[2]:
         st.subheader("DFS Supplement")
         st.caption(
             "Upload a third-party NBA DFS CSV, map it to the active player pool, "
@@ -18395,17 +18505,34 @@ if selected_page == "DFS Lineup Builder":
                 if not supplement_df.empty:
                     supplement_df.columns = [str(col).strip() for col in supplement_df.columns]
                     column_options = supplement_df.columns.tolist()
-                    none_option = "— None —"
+                    none_option = DFS_SUPPLEMENT_NONE_OPTION
+                    rotowire_layout = _detect_rotowire_supplement_layout(
+                        supplement_df,
+                        headerless_detected=headerless_detected,
+                    )
 
                     inferred_player_col = _infer_supplement_column(column_options, "player", supplement_df)
                     inferred_team_col = _infer_supplement_column(column_options, "team", supplement_df)
                     inferred_proj_col = _infer_supplement_column(column_options, "projection", supplement_df)
                     inferred_own_col = _infer_supplement_column(column_options, "ownership", supplement_df)
 
+                    if rotowire_layout:
+                        inferred_player_col = rotowire_layout.get("player_col") or inferred_player_col
+                        inferred_team_col = rotowire_layout.get("team_col") or inferred_team_col
+                        inferred_proj_col = rotowire_layout.get("projection_col") or inferred_proj_col
+                        inferred_own_col = rotowire_layout.get("ownership_col") or inferred_own_col
+
                     if headerless_detected:
                         st.info(
                             "Headerless CSV detected. Generic column names were assigned, "
                             "so verify the mapping before trusting the comparison."
+                        )
+                    if rotowire_layout:
+                        layout_name = str(rotowire_layout.get("layout_name") or "RotoWire layout")
+                        st.caption(
+                            f"{layout_name} detected. Recommended mapping uses "
+                            "`RST%` for ownership and "
+                            "`FPTS` or derived `SAL x VAL / 1000` for projection."
                         )
 
                     st.markdown("**Column Mapping**")
@@ -18428,12 +18555,20 @@ if selected_page == "DFS Lineup Builder":
                             key="dfs_supplement_team_col",
                         )
                     with map_col3:
-                        proj_options = [none_option] + column_options
+                        proj_options = [none_option]
+                        if rotowire_layout and rotowire_layout.get("projection_col") == DFS_SUPPLEMENT_ROTOWIRE_DERIVED_FPTS:
+                            proj_options.append(DFS_SUPPLEMENT_ROTOWIRE_DERIVED_LABEL)
+                        proj_options += column_options
+                        default_proj_option = (
+                            DFS_SUPPLEMENT_ROTOWIRE_DERIVED_LABEL
+                            if inferred_proj_col == DFS_SUPPLEMENT_ROTOWIRE_DERIVED_FPTS
+                            else inferred_proj_col
+                        )
                         proj_col = st.selectbox(
                             "Projection Column",
                             options=proj_options,
-                            index=proj_options.index(inferred_proj_col)
-                            if inferred_proj_col in proj_options else 0,
+                            index=proj_options.index(default_proj_option)
+                            if default_proj_option in proj_options else 0,
                             key="dfs_supplement_proj_col",
                         )
                     with map_col4:
@@ -18448,6 +18583,8 @@ if selected_page == "DFS Lineup Builder":
 
                     resolved_team_col = None if team_col == none_option else team_col
                     resolved_proj_col = None if proj_col == none_option else proj_col
+                    if resolved_proj_col == DFS_SUPPLEMENT_ROTOWIRE_DERIVED_LABEL:
+                        resolved_proj_col = DFS_SUPPLEMENT_ROTOWIRE_DERIVED_FPTS
                     resolved_own_col = None if own_col == none_option else own_col
 
                     preview_df = supplement_df.head(10).copy()
@@ -18461,9 +18598,21 @@ if selected_page == "DFS Lineup Builder":
                     else:
                         working_df = supplement_df.copy()
                         if resolved_proj_col:
-                            working_df["_supplement_proj_fpts"] = _coerce_supplement_numeric(
-                                working_df[resolved_proj_col]
-                            )
+                            if resolved_proj_col == DFS_SUPPLEMENT_ROTOWIRE_DERIVED_FPTS:
+                                salary_col = str(rotowire_layout.get("salary_col") or "")
+                                value_col = str(rotowire_layout.get("value_col") or "")
+                                if salary_col and value_col and salary_col in working_df.columns and value_col in working_df.columns:
+                                    working_df["_supplement_proj_fpts"] = _derive_rotowire_projection_series(
+                                        working_df,
+                                        salary_col=salary_col,
+                                        value_col=value_col,
+                                    )
+                                else:
+                                    working_df["_supplement_proj_fpts"] = np.nan
+                            else:
+                                working_df["_supplement_proj_fpts"] = _coerce_supplement_numeric(
+                                    working_df[resolved_proj_col]
+                                )
                         else:
                             working_df["_supplement_proj_fpts"] = np.nan
 
