@@ -50,6 +50,7 @@ import dfs_ai_agent as dfs_ai
 import odds_api
 import coefficient_calibrator as coeff_cal
 from vegas_odds import TEAM_NAME_TO_ABBR
+import nba_rotowire as nba_rw
 
 # Reverse mapping: abbreviation -> full team name
 ABBR_TO_TEAM_NAME = {v: k for k, v in TEAM_NAME_TO_ABBR.items()}
@@ -13180,6 +13181,70 @@ def _get_openai_api_key() -> Optional[str]:
     return key or None
 
 
+def _resolve_rotowire_cookie() -> Optional[str]:
+    """Read optional RotoWire cookie header from secrets/env."""
+    key = ""
+    try:
+        rotowire_block = st.secrets.get("rotowire", {})
+        if rotowire_block:
+            key = (
+                str(rotowire_block.get("COOKIE", "")).strip()
+                or str(rotowire_block.get("cookie", "")).strip()
+                or str(rotowire_block.get("COOKIE_HEADER", "")).strip()
+                or str(rotowire_block.get("cookie_header", "")).strip()
+            )
+    except Exception:
+        pass
+
+    if not key:
+        try:
+            key = str(st.secrets.get("ROTOWIRE_COOKIE", "")).strip()
+        except Exception:
+            pass
+
+    if not key:
+        key = str(os.getenv("ROTOWIRE_COOKIE", "")).strip()
+
+    return key or None
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_nba_rotowire_slates_frame(
+    site_id: int,
+    cookie_header: str | None,
+) -> pd.DataFrame:
+    client = nba_rw.RotoWireClient(cookie_header=(cookie_header or None))
+    try:
+        catalog = client.fetch_slate_catalog(site_id=site_id)
+    finally:
+        client.close()
+    return nba_rw.flatten_slates(catalog, site_id=site_id)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_nba_rotowire_players_frame(
+    site_id: int,
+    slate_id: int,
+    slate_date: str | None,
+    contest_type: str | None,
+    slate_name: str | None,
+    cookie_header: str | None,
+) -> pd.DataFrame:
+    client = nba_rw.RotoWireClient(cookie_header=(cookie_header or None))
+    try:
+        raw_players = client.fetch_players(slate_id=int(slate_id))
+    finally:
+        client.close()
+    slate_row = {
+        "site_id": site_id,
+        "slate_id": int(slate_id),
+        "slate_date": slate_date,
+        "contest_type": contest_type,
+        "slate_name": slate_name,
+    }
+    return nba_rw.normalize_players(raw_players, slate_row=slate_row)
+
+
 def _apply_ai_adjustments_to_players(players: list[Any]) -> tuple[int, float]:
     """
     Apply stored AI deltas to current slate projections.
@@ -18859,26 +18924,215 @@ if selected_page == "DFS Lineup Builder":
                     + "."
                 )
 
-            supplement_file = st.file_uploader(
-                "Upload supplement CSV",
-                type=["csv"],
-                key="dfs_supplement_csv",
-                help="Upload the external projection or ownership CSV you want to compare.",
+            source_mode = st.radio(
+                "Supplement Source",
+                options=["Upload CSV", "Fetch RotoWire"],
+                horizontal=True,
+                key="dfs_supplement_source_mode",
             )
 
-            if supplement_file is not None:
-                supplement_path = persist_uploaded_file(supplement_file, ".csv")
-                try:
-                    supplement_df, headerless_detected = _read_dfs_supplement_csv(supplement_path)
-                except Exception as exc:
-                    st.error(f"Could not read supplement CSV: {exc}")
-                    supplement_df = pd.DataFrame()
-                    headerless_detected = False
+            supplement_df = pd.DataFrame()
+            headerless_detected = False
+            rotowire_layout = None
+            supplement_source_name = ""
+            supplement_source_filename = ""
+            known_mapping: Dict[str, Optional[str]] | None = None
+            supplement_file = None
+            supplement_path: Optional[Path] = None
 
-                if not supplement_df.empty:
-                    supplement_df.columns = [str(col).strip() for col in supplement_df.columns]
-                    column_options = supplement_df.columns.tolist()
-                    none_option = DFS_SUPPLEMENT_NONE_OPTION
+            if source_mode == "Upload CSV":
+                supplement_file = st.file_uploader(
+                    "Upload supplement CSV",
+                    type=["csv"],
+                    key="dfs_supplement_csv",
+                    help="Upload the external projection or ownership CSV you want to compare.",
+                )
+
+                if supplement_file is not None:
+                    supplement_path = persist_uploaded_file(supplement_file, ".csv")
+                    try:
+                        supplement_df, headerless_detected = _read_dfs_supplement_csv(supplement_path)
+                    except Exception as exc:
+                        st.error(f"Could not read supplement CSV: {exc}")
+                        supplement_df = pd.DataFrame()
+                        headerless_detected = False
+
+                    if not supplement_df.empty:
+                        supplement_source_filename = str(
+                            getattr(supplement_file, "name", supplement_path.name)
+                        )
+                        supplement_source_name = Path(supplement_source_filename).stem
+            else:
+                st.caption(
+                    "Fetch directly from [RotoWire NBA Optimizer](https://www.rotowire.com/daily/nba/optimizer.php) "
+                    "using the site API instead of uploading a file."
+                )
+                rotowire_site_id = 1
+                default_rotowire_cookie = (_resolve_rotowire_cookie() or "").strip()
+                default_rotowire_date = datetime.now(EASTERN_TZ).date()
+                try:
+                    projection_date = str(st.session_state.get("dfs_projection_date") or "").strip()
+                    if projection_date:
+                        default_rotowire_date = datetime.strptime(
+                            projection_date, "%Y-%m-%d"
+                        ).date()
+                except Exception:
+                    pass
+                rw1, rw2, rw3 = st.columns(3)
+                rotowire_selected_date = rw1.date_input(
+                    "RotoWire Slate Date",
+                    value=default_rotowire_date,
+                    key="dfs_supplement_rotowire_date",
+                )
+                rotowire_contest_type = rw2.selectbox(
+                    "Contest Type Filter",
+                    options=["All", "Classic", "Showdown"],
+                    index=1,
+                    key="dfs_supplement_rotowire_contest_type",
+                )
+                rotowire_name_filter = rw3.text_input(
+                    "Slate Name Filter",
+                    value="",
+                    key="dfs_supplement_rotowire_name_filter",
+                    help="Optional substring match on slate name such as All, Afternoon, or Night.",
+                )
+                rotowire_cookie_header = st.text_input(
+                    "RotoWire Cookie Header (optional)",
+                    value=default_rotowire_cookie,
+                    type="password",
+                    key="dfs_supplement_rotowire_cookie_header",
+                    help="Leave blank unless RotoWire requires authenticated requests for your account.",
+                )
+                rr1, rr2 = st.columns(2)
+                refresh_rotowire_clicked = rr1.button(
+                    "Refresh RotoWire Data",
+                    key="dfs_supplement_refresh_rotowire",
+                )
+                if refresh_rotowire_clicked:
+                    load_nba_rotowire_slates_frame.clear()
+                    load_nba_rotowire_players_frame.clear()
+                rr2.caption(
+                    "Cookie source: loaded from secrets/env."
+                    if default_rotowire_cookie
+                    else "Cookie source: not set."
+                )
+
+                try:
+                    rotowire_cookie_value = rotowire_cookie_header.strip() or None
+                    rotowire_slates_df = load_nba_rotowire_slates_frame(
+                        site_id=rotowire_site_id,
+                        cookie_header=rotowire_cookie_value,
+                    )
+                    if rotowire_slates_df.empty:
+                        st.warning("No RotoWire NBA slates returned for DraftKings.")
+                    else:
+                        filtered_rotowire_slates = rotowire_slates_df.loc[
+                            rotowire_slates_df["slate_date"].astype(str)
+                            == rotowire_selected_date.isoformat()
+                        ].copy()
+                        if rotowire_contest_type != "All":
+                            filtered_rotowire_slates = filtered_rotowire_slates.loc[
+                                filtered_rotowire_slates["contest_type"].astype(str).str.lower()
+                                == rotowire_contest_type.strip().lower()
+                            ]
+                        if rotowire_name_filter.strip():
+                            filtered_rotowire_slates = filtered_rotowire_slates.loc[
+                                filtered_rotowire_slates["slate_name"].astype(str).str.contains(
+                                    rotowire_name_filter.strip(),
+                                    case=False,
+                                    na=False,
+                                )
+                            ]
+
+                        st.caption(
+                            f"Matched `{len(filtered_rotowire_slates)}` of `{len(rotowire_slates_df)}` "
+                            "available DraftKings slates."
+                        )
+                        slate_show_cols = [
+                            "slate_id",
+                            "contest_type",
+                            "slate_name",
+                            "start_datetime",
+                            "end_datetime",
+                            "game_count",
+                        ]
+                        st.dataframe(
+                            filtered_rotowire_slates[
+                                [c for c in slate_show_cols if c in filtered_rotowire_slates.columns]
+                            ],
+                            hide_index=True,
+                            use_container_width=True,
+                        )
+
+                        if filtered_rotowire_slates.empty:
+                            st.info("Adjust the filters above to select a RotoWire slate.")
+                        else:
+                            rotowire_slate_labels = {
+                                int(row["slate_id"]): (
+                                    f"{row['contest_type']} | {row['slate_name']} | "
+                                    f"{row['start_datetime']} | slate {int(row['slate_id'])}"
+                                )
+                                for _, row in filtered_rotowire_slates.iterrows()
+                            }
+                            selected_rotowire_slate_id = st.selectbox(
+                                "Selected RotoWire Slate",
+                                options=list(rotowire_slate_labels.keys()),
+                                format_func=lambda slate_id: rotowire_slate_labels.get(
+                                    int(slate_id), str(slate_id)
+                                ),
+                                key="dfs_supplement_rotowire_selected_slate_id",
+                            )
+                            selected_rotowire_slate = filtered_rotowire_slates.loc[
+                                filtered_rotowire_slates["slate_id"]
+                                == int(selected_rotowire_slate_id)
+                            ].iloc[0]
+                            supplement_df = load_nba_rotowire_players_frame(
+                                site_id=rotowire_site_id,
+                                slate_id=int(selected_rotowire_slate_id),
+                                slate_date=str(selected_rotowire_slate.get("slate_date") or ""),
+                                contest_type=str(
+                                    selected_rotowire_slate.get("contest_type") or ""
+                                ),
+                                slate_name=str(selected_rotowire_slate.get("slate_name") or ""),
+                                cookie_header=rotowire_cookie_value,
+                            )
+                            supplement_source_name = "RotoWire NBA Optimizer"
+                            supplement_source_filename = (
+                                f"rotowire_nba_{int(selected_rotowire_slate_id)}.csv"
+                            )
+                            known_mapping = {
+                                "player_col": "player_name",
+                                "team_col": "team_abbr",
+                                "projection_col": "proj_fantasy_points",
+                                "ownership_col": "proj_ownership",
+                            }
+
+                            rw_metric1, rw_metric2, rw_metric3 = st.columns(3)
+                            rw_metric1.metric("RotoWire Players", int(len(supplement_df)))
+                            rw_metric2.metric(
+                                "Avg Proj FPTS",
+                                (
+                                    f"{pd.to_numeric(supplement_df.get('proj_fantasy_points'), errors='coerce').mean():.1f}"
+                                    if not supplement_df.empty else "—"
+                                ),
+                            )
+                            rw_metric3.metric(
+                                "Avg Ownership",
+                                (
+                                    f"{pd.to_numeric(supplement_df.get('proj_ownership'), errors='coerce').mean():.1f}%"
+                                    if not supplement_df.empty else "—"
+                                ),
+                            )
+                except Exception as exc:
+                    st.error(f"Could not fetch RotoWire data: {exc}")
+                    supplement_df = pd.DataFrame()
+
+            if not supplement_df.empty:
+                supplement_df.columns = [str(col).strip() for col in supplement_df.columns]
+                column_options = supplement_df.columns.tolist()
+                none_option = DFS_SUPPLEMENT_NONE_OPTION
+
+                if known_mapping is None:
                     rotowire_layout = _detect_rotowire_supplement_layout(
                         supplement_df,
                         headerless_detected=headerless_detected,
@@ -18959,35 +19213,50 @@ if selected_page == "DFS Lineup Builder":
                     if resolved_proj_col == DFS_SUPPLEMENT_ROTOWIRE_DERIVED_LABEL:
                         resolved_proj_col = DFS_SUPPLEMENT_ROTOWIRE_DERIVED_FPTS
                     resolved_own_col = None if own_col == none_option else own_col
+                    preview_label = "Upload Preview"
+                else:
+                    player_col = str(known_mapping.get("player_col") or "player_name")
+                    resolved_team_col = str(known_mapping.get("team_col") or "team_abbr")
+                    resolved_proj_col = str(
+                        known_mapping.get("projection_col") or "proj_fantasy_points"
+                    )
+                    resolved_own_col = str(
+                        known_mapping.get("ownership_col") or "proj_ownership"
+                    )
+                    st.caption(
+                        "Using fixed RotoWire mapping: "
+                        "`player_name` / `team_abbr` / `proj_fantasy_points` / `proj_ownership`."
+                    )
+                    preview_label = "RotoWire Preview"
 
-                    preview_df = supplement_df.head(10).copy()
-                    st.markdown("**Upload Preview**")
-                    st.dataframe(preview_df, use_container_width=True, hide_index=True)
+                preview_df = supplement_df.head(10).copy()
+                st.markdown(f"**{preview_label}**")
+                st.dataframe(preview_df, use_container_width=True, hide_index=True)
 
-                    if not resolved_proj_col and not resolved_own_col:
-                        st.warning(
-                            "Select at least one projection or ownership column to compare against our player pool."
-                        )
-                    else:
-                        working_df = supplement_df.copy()
-                        if resolved_proj_col:
-                            if resolved_proj_col == DFS_SUPPLEMENT_ROTOWIRE_DERIVED_FPTS:
-                                salary_col = str(rotowire_layout.get("salary_col") or "")
-                                value_col = str(rotowire_layout.get("value_col") or "")
-                                if salary_col and value_col and salary_col in working_df.columns and value_col in working_df.columns:
-                                    working_df["_supplement_proj_fpts"] = _derive_rotowire_projection_series(
-                                        working_df,
-                                        salary_col=salary_col,
-                                        value_col=value_col,
-                                    )
-                                else:
-                                    working_df["_supplement_proj_fpts"] = np.nan
-                            else:
-                                working_df["_supplement_proj_fpts"] = _coerce_supplement_numeric(
-                                    working_df[resolved_proj_col]
+                if not resolved_proj_col and not resolved_own_col:
+                    st.warning(
+                        "Select at least one projection or ownership column to compare against our player pool."
+                    )
+                else:
+                    working_df = supplement_df.copy()
+                    if resolved_proj_col:
+                        if resolved_proj_col == DFS_SUPPLEMENT_ROTOWIRE_DERIVED_FPTS:
+                            salary_col = str((rotowire_layout or {}).get("salary_col") or "")
+                            value_col = str((rotowire_layout or {}).get("value_col") or "")
+                            if salary_col and value_col and salary_col in working_df.columns and value_col in working_df.columns:
+                                working_df["_supplement_proj_fpts"] = _derive_rotowire_projection_series(
+                                    working_df,
+                                    salary_col=salary_col,
+                                    value_col=value_col,
                                 )
+                            else:
+                                working_df["_supplement_proj_fpts"] = np.nan
                         else:
-                            working_df["_supplement_proj_fpts"] = np.nan
+                            working_df["_supplement_proj_fpts"] = _coerce_supplement_numeric(
+                                working_df[resolved_proj_col]
+                            )
+                    else:
+                        working_df["_supplement_proj_fpts"] = np.nan
 
                         if resolved_own_col:
                             working_df["_supplement_ownership"] = _coerce_supplement_numeric(
@@ -19015,10 +19284,20 @@ if selected_page == "DFS Lineup Builder":
                             or str(datetime.now(EASTERN_TZ).date())
                         )
                         source_name = str(
-                            (rotowire_layout or {}).get("layout_name")
-                            or Path(getattr(supplement_file, "name", supplement_path.name)).stem
+                            supplement_source_name
+                            or (rotowire_layout or {}).get("layout_name")
+                            or "supplement"
                         )
-                        source_filename = str(getattr(supplement_file, "name", supplement_path.name))
+                        source_filename = str(
+                            supplement_source_filename
+                            or (
+                                str(getattr(supplement_file, "name", ""))
+                                if supplement_file is not None
+                                else ""
+                            )
+                            or (str(supplement_path.name) if supplement_path else "")
+                            or "supplement.csv"
+                        )
 
                         method_counts = (
                             comparison_df["Match Method"].value_counts().to_dict()
