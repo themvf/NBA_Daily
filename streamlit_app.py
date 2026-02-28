@@ -15283,6 +15283,7 @@ if selected_page == "DFS Lineup Builder":
                 get_slate_model_backtest_df,
                 get_model_backtest_summary,
                 import_contest_results,
+                build_tournament_postmortem,
             )
             from dfs_optimizer import parse_contest_standings
             import plotly.express as px
@@ -15482,6 +15483,215 @@ if selected_page == "DFS Lineup Builder":
                                 os.unlink(tmp_path)
                             except OSError:
                                 pass
+
+                # --- Tournament Postmortem Actions ---
+                st.divider()
+                st.subheader("🧠 Tournament Postmortem Actions")
+                st.caption(
+                    "Run and export the tournament postmortem packet before reviewing "
+                    "the slate summary below."
+                )
+
+                postmortem_state_key = "dfs_tournament_postmortem_payload"
+                postmortem_slate_options = sorted(all_dates, reverse=True) if all_dates else []
+                if postmortem_slate_options:
+                    pm_action_col1, pm_action_col2 = st.columns([2, 1])
+                    with pm_action_col1:
+                        selected_postmortem_slate = st.selectbox(
+                            "Postmortem Slate",
+                            postmortem_slate_options,
+                            key="model_accuracy_postmortem_slate",
+                        )
+                    with pm_action_col2:
+                        top_n_postmortem = st.slider(
+                            "Top Field Lineups",
+                            5,
+                            50,
+                            10,
+                            key="model_accuracy_postmortem_top_n",
+                        )
+
+                    pm_c1, pm_c2, pm_c3 = st.columns(3)
+                    with pm_c1:
+                        pm_core_pct = st.slider(
+                            "Core Field Exposure %",
+                            min_value=10,
+                            max_value=80,
+                            value=30,
+                            step=5,
+                            key="postmortem_core_field_pct",
+                            help="Players at or above this field exposure are treated as core plays.",
+                        )
+                    with pm_c2:
+                        pm_under_ratio_pct = st.slider(
+                            "Under-Exposure Ratio %",
+                            min_value=25,
+                            max_value=100,
+                            value=60,
+                            step=5,
+                            key="postmortem_underexposure_ratio_pct",
+                            help="Flag as missed core when our exposure is below this fraction of field exposure.",
+                        )
+                    with pm_c3:
+                        pm_min_error = st.slider(
+                            "Standout Min (Actual - Proj)",
+                            min_value=4.0,
+                            max_value=20.0,
+                            value=8.0,
+                            step=0.5,
+                            key="postmortem_standout_min_error",
+                        )
+
+                    run_postmortem = st.button(
+                        "Run Tournament Postmortem",
+                        type="primary",
+                        key="run_tournament_postmortem_review",
+                    )
+                    if run_postmortem:
+                        with st.spinner("Building tournament postmortem review..."):
+                            pm_payload = build_tournament_postmortem(
+                                dfs_conn,
+                                selected_postmortem_slate,
+                                top_n=top_n_postmortem,
+                                core_field_exposure_pct=float(pm_core_pct),
+                                underexposure_ratio=float(pm_under_ratio_pct) / 100.0,
+                                standout_min_error=float(pm_min_error),
+                            )
+                        pm_payload["__slate_date"] = selected_postmortem_slate
+                        pm_payload["__top_n"] = int(top_n_postmortem)
+                        pm_payload["__core_pct"] = int(pm_core_pct)
+                        pm_payload["__under_ratio_pct"] = int(pm_under_ratio_pct)
+                        pm_payload["__min_error"] = float(pm_min_error)
+                        st.session_state[postmortem_state_key] = pm_payload
+
+                    pm_payload = st.session_state.get(postmortem_state_key)
+                    pm_matches_selection = (
+                        isinstance(pm_payload, dict)
+                        and pm_payload.get("__slate_date") == selected_postmortem_slate
+                        and int(pm_payload.get("__top_n", -1)) == int(top_n_postmortem)
+                        and int(pm_payload.get("__core_pct", -1)) == int(pm_core_pct)
+                        and int(pm_payload.get("__under_ratio_pct", -1)) == int(pm_under_ratio_pct)
+                        and float(pm_payload.get("__min_error", -1.0)) == float(pm_min_error)
+                    )
+
+                    if pm_matches_selection:
+                        def _df_records_safe(df: pd.DataFrame) -> List[Dict[str, Any]]:
+                            if not isinstance(df, pd.DataFrame) or df.empty:
+                                return []
+                            safe_df = df.replace([np.inf, -np.inf], np.nan)
+                            safe_df = safe_df.where(pd.notna(safe_df), None)
+                            return safe_df.to_dict(orient="records")
+
+                        def _json_safe(value: Any) -> Any:
+                            if isinstance(value, dict):
+                                return {str(k): _json_safe(v) for k, v in value.items()}
+                            if isinstance(value, list):
+                                return [_json_safe(v) for v in value]
+                            if isinstance(value, (np.floating, float)):
+                                if np.isnan(float(value)) or np.isinf(float(value)):
+                                    return None
+                                return float(value)
+                            if isinstance(value, (np.integer, int)):
+                                return int(value)
+                            if isinstance(value, (np.bool_, bool)):
+                                return bool(value)
+                            return value
+
+                        top_field_df = pm_payload.get("top_field_players_df")
+                        exp_comp_df = pm_payload.get("exposure_comparison_df")
+                        exp_comp_top_field_df = pd.DataFrame()
+                        if isinstance(exp_comp_df, pd.DataFrame) and not exp_comp_df.empty:
+                            if "field_slots" in exp_comp_df.columns:
+                                exp_comp_top_field_df = exp_comp_df[
+                                    pd.to_numeric(
+                                        exp_comp_df["field_slots"], errors="coerce"
+                                    ).fillna(0)
+                                    > 0
+                                ].copy()
+                            else:
+                                exp_comp_top_field_df = exp_comp_df.copy()
+
+                        metrics_payload = pm_payload.get("metrics") or {}
+                        pm_export_payload = {
+                            "schema_version": "dfs_tournament_postmortem_v1",
+                            "generated_at": datetime.now(EASTERN_TZ).isoformat(),
+                            "context": {
+                                "slate_date": selected_postmortem_slate,
+                                "top_n": int(top_n_postmortem),
+                                "core_field_exposure_pct": int(pm_core_pct),
+                                "underexposure_ratio_pct": int(pm_under_ratio_pct),
+                                "standout_min_actual_minus_proj": float(pm_min_error),
+                            },
+                            "metrics": metrics_payload,
+                            "denominators": {
+                                "field_exposure_pct": {
+                                    "lineups": int(
+                                        metrics_payload.get("field_lineups_analyzed") or 0
+                                    ),
+                                    "description": "Percent of top-N field lineups analyzed for this postmortem.",
+                                },
+                                "our_exposure_pct": {
+                                    "lineups": int(metrics_payload.get("our_lineups") or 0),
+                                    "description": "Percent of our generated lineups for this slate.",
+                                },
+                            },
+                            "right_notes": pm_payload.get("right_notes") or [],
+                            "wrong_notes": pm_payload.get("wrong_notes") or [],
+                            "errors": pm_payload.get("errors") or [],
+                            "tables": {
+                                "top_field_players": _df_records_safe(top_field_df),
+                                "exposure_comparison": _df_records_safe(exp_comp_df),
+                                "exposure_comparison_top_field_only": _df_records_safe(
+                                    exp_comp_top_field_df
+                                ),
+                                "missed_core": _df_records_safe(pm_payload.get("missed_core_df")),
+                                "missed_standouts": _df_records_safe(
+                                    pm_payload.get("missed_standouts_df")
+                                ),
+                                "ownership_polarity": _df_records_safe(
+                                    pm_payload.get("ownership_polarity_df")
+                                ),
+                                "overexposed_duds": _df_records_safe(
+                                    pm_payload.get("overexposed_duds_df")
+                                ),
+                                "value_tier_misses": _df_records_safe(
+                                    pm_payload.get("value_tier_misses_df")
+                                ),
+                                "combo_capture_misses": _df_records_safe(
+                                    pm_payload.get("combo_capture_misses_df")
+                                ),
+                                "team_concentration_mismatch": _df_records_safe(
+                                    pm_payload.get("team_concentration_mismatch_df")
+                                ),
+                                "improvements": _df_records_safe(
+                                    pm_payload.get("improvements_df")
+                                ),
+                            },
+                        }
+                        pm_export_payload = _json_safe(pm_export_payload)
+                        pm_export_json = json.dumps(
+                            pm_export_payload, indent=2, allow_nan=False, default=str
+                        )
+                        st.download_button(
+                            "📥 Download Postmortem JSON",
+                            data=pm_export_json,
+                            file_name=(
+                                f"dfs_tournament_postmortem_"
+                                f"{selected_postmortem_slate}_top{int(top_n_postmortem)}.json"
+                            ),
+                            mime="application/json",
+                            key="download_dfs_tournament_postmortem_json",
+                        )
+                    elif isinstance(pm_payload, dict) and pm_payload.get("__slate_date") == selected_postmortem_slate:
+                        st.info(
+                            "Postmortem settings changed. Click `Run Tournament Postmortem` "
+                            "to refresh the export."
+                        )
+                else:
+                    st.info(
+                        "No tracked slates available yet. Generate lineups and import contest "
+                        "results before running a tournament postmortem."
+                    )
 
                 # --- Summary Table ---
                 st.divider()
@@ -16589,155 +16799,25 @@ if selected_page == "DFS Lineup Builder":
                     st.divider()
                     st.subheader("🧠 Tournament Postmortem Review")
                     st.caption(
-                        "Post-game debrief: compare top field lineups to our generated lineups, "
-                        "surface missed core plays/standouts, and produce next-slate action items."
+                        "Detailed results for the most recently run tournament postmortem. "
+                        "Use `Tournament Postmortem Actions` above `Slate Results Summary` "
+                        "in the `Model Accuracy` tab to refresh or export."
                     )
 
-                    pm_c1, pm_c2, pm_c3 = st.columns(3)
-                    with pm_c1:
-                        pm_core_pct = st.slider(
-                            "Core Field Exposure %",
-                            min_value=10,
-                            max_value=80,
-                            value=30,
-                            step=5,
-                            key="postmortem_core_field_pct",
-                            help="Players at or above this field exposure are treated as core plays.",
-                        )
-                    with pm_c2:
-                        pm_under_ratio_pct = st.slider(
-                            "Under-Exposure Ratio %",
-                            min_value=25,
-                            max_value=100,
-                            value=60,
-                            step=5,
-                            key="postmortem_underexposure_ratio_pct",
-                            help="Flag as missed core when our exposure is below this fraction of field exposure.",
-                        )
-                    with pm_c3:
-                        pm_min_error = st.slider(
-                            "Standout Min (Actual - Proj)",
-                            min_value=4.0,
-                            max_value=20.0,
-                            value=8.0,
-                            step=0.5,
-                            key="postmortem_standout_min_error",
-                        )
-
-                    run_postmortem = st.button(
-                        "Run Tournament Postmortem",
-                        type="primary",
-                        key="run_tournament_postmortem_review",
-                    )
                     postmortem_state_key = "dfs_tournament_postmortem_payload"
-                    if run_postmortem:
-                        with st.spinner("Building tournament postmortem review..."):
-                            pm_payload = build_tournament_postmortem(
-                                dfs_conn,
-                                selected_slate,
-                                top_n=top_n,
-                                core_field_exposure_pct=float(pm_core_pct),
-                                underexposure_ratio=float(pm_under_ratio_pct) / 100.0,
-                                standout_min_error=float(pm_min_error),
-                            )
-                        pm_payload['__slate_date'] = selected_slate
-                        pm_payload['__top_n'] = int(top_n)
-                        pm_payload['__core_pct'] = int(pm_core_pct)
-                        pm_payload['__under_ratio_pct'] = int(pm_under_ratio_pct)
-                        pm_payload['__min_error'] = float(pm_min_error)
-                        st.session_state[postmortem_state_key] = pm_payload
-
                     pm_payload = st.session_state.get(postmortem_state_key)
-                    pm_matches_selection = (
-                        isinstance(pm_payload, dict)
-                        and pm_payload.get('__slate_date') == selected_slate
-                        and int(pm_payload.get('__top_n', -1)) == int(top_n)
-                        and int(pm_payload.get('__core_pct', -1)) == int(pm_core_pct)
-                        and int(pm_payload.get('__under_ratio_pct', -1)) == int(pm_under_ratio_pct)
-                        and float(pm_payload.get('__min_error', -1.0)) == float(pm_min_error)
-                    )
-                    if pm_matches_selection:
-                        def _df_records_safe(df: pd.DataFrame) -> List[Dict[str, Any]]:
-                            if not isinstance(df, pd.DataFrame) or df.empty:
-                                return []
-                            safe_df = df.replace([np.inf, -np.inf], np.nan)
-                            safe_df = safe_df.where(pd.notna(safe_df), None)
-                            return safe_df.to_dict(orient="records")
-
-                        def _json_safe(value: Any) -> Any:
-                            if isinstance(value, dict):
-                                return {str(k): _json_safe(v) for k, v in value.items()}
-                            if isinstance(value, list):
-                                return [_json_safe(v) for v in value]
-                            if isinstance(value, (np.floating, float)):
-                                if np.isnan(float(value)) or np.isinf(float(value)):
-                                    return None
-                                return float(value)
-                            if isinstance(value, (np.integer, int)):
-                                return int(value)
-                            if isinstance(value, (np.bool_, bool)):
-                                return bool(value)
-                            return value
-
-                        top_field_df = pm_payload.get("top_field_players_df")
-                        exp_comp_df = pm_payload.get("exposure_comparison_df")
-                        exp_comp_top_field_df = pd.DataFrame()
-                        if isinstance(exp_comp_df, pd.DataFrame) and not exp_comp_df.empty:
-                            if "field_slots" in exp_comp_df.columns:
-                                exp_comp_top_field_df = exp_comp_df[
-                                    pd.to_numeric(exp_comp_df["field_slots"], errors="coerce").fillna(0) > 0
-                                ].copy()
-                            else:
-                                exp_comp_top_field_df = exp_comp_df.copy()
-
-                        metrics_payload = pm_payload.get("metrics") or {}
-                        pm_export_payload = {
-                            "schema_version": "dfs_tournament_postmortem_v1",
-                            "generated_at": datetime.now(EASTERN_TZ).isoformat(),
-                            "context": {
-                                "slate_date": selected_slate,
-                                "top_n": int(top_n),
-                                "core_field_exposure_pct": int(pm_core_pct),
-                                "underexposure_ratio_pct": int(pm_under_ratio_pct),
-                                "standout_min_actual_minus_proj": float(pm_min_error),
-                            },
-                            "metrics": metrics_payload,
-                            "denominators": {
-                                "field_exposure_pct": {
-                                    "lineups": int(metrics_payload.get("field_lineups_analyzed") or 0),
-                                    "description": "Percent of top-N field lineups analyzed for this postmortem.",
-                                },
-                                "our_exposure_pct": {
-                                    "lineups": int(metrics_payload.get("our_lineups") or 0),
-                                    "description": "Percent of our generated lineups for this slate.",
-                                },
-                            },
-                            "right_notes": pm_payload.get("right_notes") or [],
-                            "wrong_notes": pm_payload.get("wrong_notes") or [],
-                            "errors": pm_payload.get("errors") or [],
-                            "tables": {
-                                "top_field_players": _df_records_safe(top_field_df),
-                                "exposure_comparison": _df_records_safe(exp_comp_df),
-                                "exposure_comparison_top_field_only": _df_records_safe(exp_comp_top_field_df),
-                                "missed_core": _df_records_safe(pm_payload.get("missed_core_df")),
-                                "missed_standouts": _df_records_safe(pm_payload.get("missed_standouts_df")),
-                                "ownership_polarity": _df_records_safe(pm_payload.get("ownership_polarity_df")),
-                                "overexposed_duds": _df_records_safe(pm_payload.get("overexposed_duds_df")),
-                                "value_tier_misses": _df_records_safe(pm_payload.get("value_tier_misses_df")),
-                                "combo_capture_misses": _df_records_safe(pm_payload.get("combo_capture_misses_df")),
-                                "team_concentration_mismatch": _df_records_safe(pm_payload.get("team_concentration_mismatch_df")),
-                                "improvements": _df_records_safe(pm_payload.get("improvements_df")),
-                            },
-                        }
-                        pm_export_payload = _json_safe(pm_export_payload)
-                        pm_export_json = json.dumps(pm_export_payload, indent=2, allow_nan=False, default=str)
-                        st.download_button(
-                            "📥 Download Postmortem JSON",
-                            data=pm_export_json,
-                            file_name=f"dfs_tournament_postmortem_{selected_slate}_top{int(top_n)}.json",
-                            mime="application/json",
-                            key="download_dfs_tournament_postmortem_json",
+                    if isinstance(pm_payload, dict):
+                        pm_context = pm_payload.get("context") or {}
+                        pm_selected_slate = str(
+                            pm_context.get("slate_date") or pm_payload.get("__slate_date") or ""
                         )
+                        pm_top_n = int(pm_context.get("top_n") or pm_payload.get("__top_n") or 0)
+                        if pm_selected_slate:
+                            label = (
+                                f"Loaded postmortem: `{pm_selected_slate}`"
+                                + (f" | top-{pm_top_n}" if pm_top_n > 0 else "")
+                            )
+                            st.caption(label)
 
                         pm_errors = pm_payload.get('errors') or []
                         if pm_errors:
@@ -16791,7 +16871,7 @@ if selected_page == "DFS Lineup Builder":
                             top_scorer_actual = pm_metrics.get('top_scorer_actual')
                             if top_scorer_name and top_scorer_actual is not None:
                                 st.caption(
-                                    f"Top scorer in top-{top_n} field lineups: "
+                                    f"Top scorer in top-{pm_top_n} field lineups: "
                                     f"`{top_scorer_name}` ({float(top_scorer_actual):.1f} DK points)."
                                 )
 
@@ -17100,10 +17180,11 @@ if selected_page == "DFS Lineup Builder":
                                 st.dataframe(improvements_df, use_container_width=True, hide_index=True)
                             else:
                                 st.info("No improvement actions generated for this sample.")
-                    elif isinstance(pm_payload, dict) and pm_payload.get('__slate_date') == selected_slate:
-                        st.info("Postmortem settings changed. Click **Run Tournament Postmortem** to refresh.")
-                    elif run_postmortem:
-                        st.info("No postmortem output generated for this slate.")
+                    else:
+                        st.info(
+                            "No tournament postmortem loaded yet. Use `Tournament Postmortem Actions` "
+                            "above `Slate Results Summary` in the `Model Accuracy` tab."
+                        )
 
                     # --- Cross-Slate Aggregate ---
                     if len(slate_dates) >= 2:
