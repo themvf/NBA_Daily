@@ -906,6 +906,37 @@ LINEUP_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
             ("projection", 0.60, 0.25),
         ],
     },
+    "rotowire_both_v1_blend": {
+        "label": "RotoWire v1 (Proj+Own Blend)",
+        "description": (
+            "Standard portfolio logic with RotoWire fantasy-point and ownership "
+            "signals blended into our model for matched players."
+        ),
+        "aggressive_ceiling_stack": False,
+        "overlap_cap": 6,
+        "core_play_inject_prob": 0.20,
+        "core_play_min_own_pct": 14.0,
+        "core_play_max_own_pct": 60.0,
+        "core_play_min_projection": 24.0,
+        "low_own_inject_prob": 0.12,
+        "low_own_max_own_pct": 10.0,
+        "low_own_min_projection": 22.0,
+        "standout_lock_prob": 0.10,
+        "standout_min_ceiling_gap": 7.0,
+        "supplement_proj_weight": 0.30,
+        "supplement_own_weight": 0.50,
+        "supplement_match_score_min": 0.90,
+        "supplement_proj_delta_cap": 6.0,
+        "supplement_own_delta_cap": 20.0,
+        "supplement_source_required": "rotowire",
+        "strategy_mix": [
+            ("projection", 0.25, 0.20),
+            ("ceiling", 0.30, 0.25),
+            ("value", 0.25, 0.15),
+            ("leverage", 0.35, 0.15),
+            ("projection", 0.60, 0.25),
+        ],
+    },
 }
 
 

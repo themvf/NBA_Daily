@@ -516,6 +516,240 @@ def _s3_upload_slate_file(local_path: Path, slate_date: str,
         pass
 
 
+def _build_dfs_player_pool_snapshot_df(players: List[Any]) -> pd.DataFrame:
+    """Serialize the active DFS player pool for cloud backtesting snapshots."""
+    snapshot_rows: List[Dict[str, Any]] = []
+    for player in players or []:
+        snapshot_rows.append(
+            {
+                "player_id": getattr(player, "player_id", None),
+                "dk_id": getattr(player, "dk_id", ""),
+                "name": getattr(player, "name", ""),
+                "team": getattr(player, "team", ""),
+                "opponent": getattr(player, "opponent", ""),
+                "game_id": getattr(player, "game_id", ""),
+                "positions": "/".join(getattr(player, "positions", []) or []),
+                "salary": getattr(player, "salary", None),
+                "proj_fpts": round(float(getattr(player, "proj_fpts", 0.0) or 0.0), 3),
+                "base_model_proj_fpts": round(
+                    float(getattr(player, "_model_proj_fpts", getattr(player, "proj_fpts", 0.0)) or 0.0),
+                    3,
+                ),
+                "proj_floor": round(float(getattr(player, "proj_floor", 0.0) or 0.0), 3),
+                "proj_ceiling": round(float(getattr(player, "proj_ceiling", 0.0) or 0.0), 3),
+                "risk_adjusted_proj_fpts": round(
+                    float(getattr(player, "risk_adjusted_proj_fpts", 0.0) or 0.0),
+                    3,
+                ),
+                "fpts_per_dollar": round(float(getattr(player, "fpts_per_dollar", 0.0) or 0.0), 3),
+                "ownership_proj": round(float(getattr(player, "ownership_proj", 0.0) or 0.0), 3),
+                "leverage_score": round(float(getattr(player, "leverage_score", 0.0) or 0.0), 3),
+                "vegas_implied_fpts": round(
+                    float(getattr(player, "vegas_implied_fpts", 0.0) or 0.0),
+                    3,
+                ),
+                "vegas_edge_pct": round(float(getattr(player, "vegas_edge_pct", 0.0) or 0.0), 4),
+                "vegas_signal": getattr(player, "vegas_signal", ""),
+                "recent_minutes_avg": round(
+                    float(getattr(player, "recent_minutes_avg", 0.0) or 0.0),
+                    3,
+                ),
+                "minutes_validated": bool(getattr(player, "minutes_validated", False)),
+                "minutes_variance": round(
+                    float(getattr(player, "minutes_variance", 0.0) or 0.0),
+                    3,
+                ),
+                "primary_position": getattr(player, "primary_position", ""),
+                "salary_bucket": getattr(player, "salary_bucket", ""),
+                "segment_bias_correction": round(
+                    float(getattr(player, "segment_bias_correction", 0.0) or 0.0),
+                    3,
+                ),
+                "segment_risk_penalty": round(
+                    float(getattr(player, "segment_risk_penalty", 0.0) or 0.0),
+                    3,
+                ),
+                "segment_exposure_cap": round(
+                    float(getattr(player, "segment_exposure_cap", 0.0) or 0.0),
+                    3,
+                ),
+                "ai_adjustment_delta": round(
+                    float(getattr(player, "ai_adjustment_delta", 0.0) or 0.0),
+                    3,
+                ),
+                "supplement_proj_delta_applied": round(
+                    float(getattr(player, "supplement_proj_delta_applied", 0.0) or 0.0),
+                    3,
+                ),
+                "supplement_own_delta_applied": round(
+                    float(getattr(player, "supplement_own_delta_applied", 0.0) or 0.0),
+                    3,
+                ),
+                "is_locked": bool(getattr(player, "is_locked", False)),
+                "is_excluded": bool(getattr(player, "is_excluded", False)),
+                "is_injured": bool(getattr(player, "is_injured", False)),
+                "is_fallback": bool(getattr(player, "is_fallback", False)),
+                "injury_status": getattr(player, "injury_status", ""),
+            }
+        )
+    return pd.DataFrame(snapshot_rows)
+
+
+def _build_dfs_lineup_snapshot_df(lineups: List[Any]) -> pd.DataFrame:
+    """Serialize generated DFS lineups for cloud backtesting snapshots."""
+    snapshot_rows: List[Dict[str, Any]] = []
+    sorted_lineups = sorted(
+        lineups or [],
+        key=lambda lineup: float(getattr(lineup, "total_proj_fpts", 0.0) or 0.0),
+        reverse=True,
+    )
+    for lineup_num, lineup in enumerate(sorted_lineups, start=1):
+        row: Dict[str, Any] = {
+            "lineup_num": lineup_num,
+            "model_key": getattr(lineup, "model_key", "") or "standard_v1",
+            "model_label": getattr(lineup, "model_label", "") or "",
+            "generation_strategy": getattr(lineup, "generation_strategy", "") or "",
+            "total_salary": int(getattr(lineup, "total_salary", 0) or 0),
+            "total_proj_fpts": round(float(getattr(lineup, "total_proj_fpts", 0.0) or 0.0), 3),
+            "total_ceiling": round(float(getattr(lineup, "total_ceiling", 0.0) or 0.0), 3),
+            "total_floor": round(float(getattr(lineup, "total_floor", 0.0) or 0.0), 3),
+            "unique_games": len(getattr(lineup, "unique_games", set()) or set()),
+            "game_ids": " | ".join(sorted(getattr(lineup, "unique_games", set()) or set())),
+        }
+        players_by_slot = getattr(lineup, "players", {}) or {}
+        for slot in dfs.ROSTER_SLOTS:
+            player = players_by_slot.get(slot)
+            row[f"{slot}_name"] = getattr(player, "name", "") if player else ""
+            row[f"{slot}_id"] = getattr(player, "player_id", None) if player else None
+            row[f"{slot}_team"] = getattr(player, "team", "") if player else ""
+            row[f"{slot}_salary"] = getattr(player, "salary", None) if player else None
+            row[f"{slot}_proj_fpts"] = (
+                round(float(getattr(player, "proj_fpts", 0.0) or 0.0), 3) if player else None
+            )
+            row[f"{slot}_own_pct"] = (
+                round(float(getattr(player, "ownership_proj", 0.0) or 0.0), 3) if player else None
+            )
+        snapshot_rows.append(row)
+    return pd.DataFrame(snapshot_rows)
+
+
+def _persist_dfs_backtest_bundle(
+    slate_date: str,
+    players: List[Any],
+    lineups: List[Any],
+    supplement_state: Mapping[str, Any],
+    run_context: Mapping[str, Any],
+) -> tuple[bool, str]:
+    """Persist a reproducible DFS slate bundle to configured cloud storage."""
+    try:
+        from s3_storage import S3PredictionStorage
+
+        storage = S3PredictionStorage()
+        if not storage.is_connected():
+            return False, ""
+
+        if not slate_date or "/" in slate_date or ".." in slate_date:
+            return False, "Invalid slate date for cloud snapshot."
+
+        backend_label = storage.get_backend()
+        run_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        prefix = f"dfs_slates/{slate_date}"
+        uploaded_files: List[str] = []
+        errors: List[str] = []
+
+        def _upload_frame(df: pd.DataFrame, filename: str) -> None:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                suffix=".csv",
+                delete=False,
+                encoding="utf-8",
+                newline="",
+            ) as tmp_csv:
+                df.to_csv(tmp_csv, index=False)
+                tmp_path = Path(tmp_csv.name)
+            try:
+                success, msg = storage.upload_file(tmp_path, f"{prefix}/{filename}")
+                if success:
+                    uploaded_files.append(filename)
+                else:
+                    errors.append(f"{filename}: {msg}")
+            finally:
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+
+        def _upload_json(payload: Mapping[str, Any], filename: str) -> None:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                suffix=".json",
+                delete=False,
+                encoding="utf-8",
+            ) as tmp_json:
+                json.dump(payload, tmp_json, indent=2, default=str)
+                tmp_path = Path(tmp_json.name)
+            try:
+                success, msg = storage.upload_file(tmp_path, f"{prefix}/{filename}")
+                if success:
+                    uploaded_files.append(filename)
+                else:
+                    errors.append(f"{filename}: {msg}")
+            finally:
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+
+        player_pool_df = _build_dfs_player_pool_snapshot_df(players)
+        lineups_df = _build_dfs_lineup_snapshot_df(lineups)
+        _upload_frame(player_pool_df, f"backtest_player_pool_{run_stamp}.csv")
+        _upload_frame(lineups_df, f"backtest_lineups_{run_stamp}.csv")
+
+        supplement_raw_records = supplement_state.get("raw_records", []) or []
+        if supplement_raw_records:
+            raw_df = pd.DataFrame(supplement_raw_records)
+            if not raw_df.empty:
+                _upload_frame(raw_df, f"backtest_supplement_raw_{run_stamp}.csv")
+
+        manifest_payload = {
+            "schema_version": "dfs_slate_backtest_bundle_v1",
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "slate_date": slate_date,
+            "cloud_backend": backend_label,
+            "artifact_run_stamp": run_stamp,
+            "artifacts": {
+                "player_pool_rows": int(len(player_pool_df)),
+                "lineup_rows": int(len(lineups_df)),
+                "supplement_raw_rows": int(len(supplement_raw_records)),
+            },
+            "supplement": {
+                "run_key": supplement_state.get("run_key"),
+                "source_name": supplement_state.get("source_name"),
+                "source_filename": supplement_state.get("source_filename"),
+                "source_mode": supplement_state.get("source_mode"),
+                "is_rotowire_source": bool(supplement_state.get("is_rotowire_source")),
+                "projection_col": supplement_state.get("projection_col"),
+                "ownership_col": supplement_state.get("ownership_col"),
+                "summary": supplement_state.get("summary", {}),
+            },
+            "run_context": dict(run_context or {}),
+        }
+        _upload_json(manifest_payload, f"backtest_manifest_{run_stamp}.json")
+
+        if not uploaded_files:
+            return False, "; ".join(errors)
+
+        message = (
+            f"Saved {len(uploaded_files)} backtest artifact(s) to {backend_label} "
+            f"for {slate_date}."
+        )
+        if errors:
+            message += " Some uploads failed: " + "; ".join(errors[:3])
+        return True, message
+    except Exception as exc:
+        return False, str(exc)
+
+
 def normalize_weight_map(weight_map: Dict[str, float]) -> Dict[str, float]:
     sanitized = {k: max(0.0, float(v)) for k, v in weight_map.items()}
     total = sum(sanitized.values())
@@ -14005,6 +14239,7 @@ if selected_page == "DFS Lineup Builder":
             "supp_proj_v1_blend": "Supplement v1 (Proj Blend)",
             "supp_own_v1_blend": "Supplement v1 (Own Blend)",
             "supp_both_v1_blend": "Supplement v1 (Proj+Own Blend)",
+            "rotowire_both_v1_blend": "RotoWire v1 (Proj+Own Blend)",
         }
         for key, label in expected_model_labels.items():
             if key not in model_profiles:
@@ -15492,6 +15727,10 @@ if selected_page == "DFS Lineup Builder":
                             model_run_keys = [selected_model_key]
 
                         supplement_player_map = {}
+                        supplement_source_name = str(supplement_state.get("source_name") or "")
+                        supplement_is_rotowire = bool(
+                            supplement_state.get("is_rotowire_source")
+                        ) or ("rotowire" in supplement_source_name.lower())
                         if supplement_state and str(supplement_state.get("slate_date") or "") == current_slate_date:
                             supplement_player_map = supplement_state.get("player_map", {}) or {}
                         supplement_required_models = {
@@ -15501,6 +15740,7 @@ if selected_page == "DFS Lineup Builder":
                             or float(profile.get("supplement_own_weight", 0.0) or 0.0) > 0
                         }
                         skipped_supplement_models: List[str] = []
+                        skipped_source_mismatch_models: List[str] = []
                         if not supplement_player_map:
                             skipped_supplement_models = [
                                 key for key in model_run_keys if key in supplement_required_models
@@ -15521,6 +15761,42 @@ if selected_page == "DFS Lineup Builder":
                                 model_run_keys = [
                                     key for key in model_run_keys if key not in supplement_required_models
                                 ]
+                        elif supplement_required_models:
+                            valid_model_run_keys: List[str] = []
+                            for key in model_run_keys:
+                                profile = model_profiles.get(key, {}) or {}
+                                required_source = str(
+                                    profile.get("supplement_source_required", "") or ""
+                                ).strip().lower()
+                                if not required_source:
+                                    valid_model_run_keys.append(key)
+                                    continue
+
+                                source_matches = False
+                                if required_source == "rotowire":
+                                    source_matches = supplement_is_rotowire
+                                else:
+                                    source_matches = required_source in supplement_source_name.lower()
+
+                                if source_matches:
+                                    valid_model_run_keys.append(key)
+                                else:
+                                    skipped_source_mismatch_models.append(key)
+
+                            if skipped_source_mismatch_models:
+                                if run_mode == "Single Version":
+                                    missing_label = model_profiles.get(selected_model_key, {}).get(
+                                        "label", selected_model_key
+                                    )
+                                    active_source = supplement_source_name or "active supplement"
+                                    st.error(
+                                        f"{missing_label} requires a RotoWire supplement source for "
+                                        f"{current_slate_date}. Current source: {active_source}."
+                                    )
+                                    progress_bar.empty()
+                                    status_text.empty()
+                                    st.stop()
+                                model_run_keys = valid_model_run_keys
 
                         if not model_run_keys:
                             st.error("No lineup models are available for this run.")
@@ -15616,6 +15892,17 @@ if selected_page == "DFS Lineup Builder":
                             "Skipped supplement-dependent models because no saved supplement comparison was loaded: "
                             + ", ".join(skipped_labels)
                         )
+                    if skipped_source_mismatch_models and run_mode == "All Versions":
+                        skipped_labels = [
+                            model_profiles.get(key, {}).get("label", key)
+                            for key in skipped_source_mismatch_models
+                        ]
+                        active_source = supplement_source_name or "active supplement"
+                        st.warning(
+                            "Skipped supplement models because the active source did not satisfy "
+                            f"their source requirement ({active_source}): "
+                            + ", ".join(skipped_labels)
+                        )
 
                     st.session_state.dfs_lineups = lineups
                     st.session_state.dfs_optimizer_debug_stats = optimizer_debug_totals
@@ -15645,6 +15932,42 @@ if selected_page == "DFS Lineup Builder":
                             save_slate_projections(dfs_conn, slate_date, players)
                             save_slate_lineups(dfs_conn, slate_date, lineups)
                             st.toast(f"📊 Slate saved for {slate_date} tracking")
+                            snapshot_saved, snapshot_message = _persist_dfs_backtest_bundle(
+                                slate_date=slate_date,
+                                players=players,
+                                lineups=lineups,
+                                supplement_state=supplement_state,
+                                run_context={
+                                    "run_mode": run_mode,
+                                    "selected_model_key": selected_model_key if run_mode == "Single Version" else "",
+                                    "selected_model_keys": model_run_keys,
+                                    "model_lineup_counts": model_lineup_counts,
+                                    "num_lineups_requested": int(num_lineups),
+                                    "num_lineups_returned": int(len(lineups)),
+                                    "max_player_exposure": float(max_exposure),
+                                    "ceiling_focus_pct": int(ceiling_focus_pct),
+                                    "aggressive_ceiling_stacks": bool(
+                                        aggressive_ceiling_stacks or False
+                                    ),
+                                    "min_salary_floor": int(min_salary_floor),
+                                    "excluded_games": sorted(
+                                        st.session_state.get("dfs_excluded_games", set()) or set()
+                                    ),
+                                    "stack_config": st.session_state.get("dfs_stack_config", {}) or {},
+                                    "vegas_blend_active": bool(
+                                        st.session_state.get("dfs_vegas_blend_active", False)
+                                    ),
+                                    "ai_adjustment_count": int(
+                                        len(st.session_state.get("dfs_ai_adjustments", {}) or {})
+                                    ),
+                                    "optimizer_debug_stats": optimizer_debug_totals,
+                                    "optimizer_debug_by_model": optimizer_debug_by_model,
+                                },
+                            )
+                            if snapshot_saved and snapshot_message:
+                                st.caption(snapshot_message)
+                            elif snapshot_message:
+                                st.caption(f"Cloud backtest snapshot skipped: {snapshot_message}")
                             # Backup DB to S3 (persists projections + lineups)
                             _s3_backup_db(db_path)
                         except Exception as e:
@@ -19359,13 +19682,22 @@ if selected_page == "DFS Lineup Builder":
                             comparison_df=comparison_df,
                             unmatched_df=unmatched_df,
                         )
+                        is_rotowire_source = bool(
+                            source_mode == "Fetch RotoWire"
+                            or rotowire_layout is not None
+                            or "rotowire" in str(source_name or "").lower()
+                        )
                         st.session_state.dfs_supplement_state = {
                             "run_key": run_key,
                             "slate_date": slate_date,
                             "source_name": source_name,
                             "source_filename": source_filename,
+                            "source_mode": source_mode,
+                            "is_rotowire_source": is_rotowire_source,
                             "projection_col": resolved_proj_col,
                             "ownership_col": resolved_own_col,
+                            "raw_records": supplement_df.to_dict("records"),
+                            "raw_columns": supplement_df.columns.tolist(),
                             "comparison_records": comparison_df.to_dict("records"),
                             "player_map": supplement_player_map,
                             "summary": {
@@ -19410,6 +19742,24 @@ if selected_page == "DFS Lineup Builder":
                                     tmp_csv.write(comparison_df.to_csv(index=False))
                                     tmp_csv_path = Path(tmp_csv.name)
                                 artifact_token = _sanitize_supplement_artifact_token(source_name)
+                                with tempfile.NamedTemporaryFile(
+                                    mode="w",
+                                    suffix=".csv",
+                                    delete=False,
+                                    encoding="utf-8",
+                                ) as tmp_source_csv:
+                                    tmp_source_csv.write(supplement_df.to_csv(index=False))
+                                    tmp_source_csv_path = Path(tmp_source_csv.name)
+                                _s3_upload_slate_file(
+                                    tmp_source_csv_path,
+                                    slate_date,
+                                    f"{artifact_token}_supplement_raw.csv",
+                                )
+                                try:
+                                    tmp_source_csv_path.unlink()
+                                except OSError:
+                                    pass
+
                                 _s3_upload_slate_file(
                                     tmp_csv_path,
                                     slate_date,
