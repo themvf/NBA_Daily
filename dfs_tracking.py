@@ -9,6 +9,8 @@ Tables:
     dfs_slate_projections — Per-player projections + actuals for each slate
     dfs_slate_lineups     — Generated lineups per slate with actual FPTS
     dfs_slate_results     — Aggregate accuracy metrics per slate
+    dfs_supplement_runs   — Saved third-party supplement snapshot summaries
+    dfs_supplement_player_deltas — Per-player supplement comparison rows
 """
 
 import sqlite3
@@ -109,6 +111,46 @@ def create_dfs_tracking_tables(conn: sqlite3.Connection) -> None:
             value_correlation REAL,
             created_at TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS dfs_supplement_runs (
+            run_key TEXT PRIMARY KEY,
+            slate_date TEXT NOT NULL,
+            source_name TEXT,
+            source_filename TEXT,
+            projection_col TEXT,
+            ownership_col TEXT,
+            rows_total INTEGER,
+            rows_matched INTEGER,
+            rows_unmatched INTEGER,
+            match_rate REAL,
+            projection_mae REAL,
+            ownership_mae REAL,
+            avg_proj_delta REAL,
+            avg_own_delta REAL,
+            created_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS dfs_supplement_player_deltas (
+            run_key TEXT NOT NULL,
+            slate_date TEXT NOT NULL,
+            player_id INTEGER,
+            supplement_player TEXT,
+            supplement_team TEXT,
+            our_player TEXT,
+            our_team TEXT,
+            pos TEXT,
+            salary INTEGER,
+            match_method TEXT,
+            match_score REAL,
+            our_proj_fpts REAL,
+            supplement_proj_fpts REAL,
+            proj_delta REAL,
+            our_own_pct REAL,
+            supplement_own_pct REAL,
+            own_delta_pp REAL,
+            created_at TEXT,
+            PRIMARY KEY (run_key, player_id)
+        );
     """)
 
     # Migration-safe column additions (check first, then add if missing)
@@ -136,6 +178,12 @@ def create_dfs_tracking_tables(conn: sqlite3.Connection) -> None:
             ON dfs_slate_lineups(slate_date, model_key);
         CREATE INDEX IF NOT EXISTS idx_dsl_model
             ON dfs_slate_lineups(model_key);
+        CREATE INDEX IF NOT EXISTS idx_dsr_slate
+            ON dfs_supplement_runs(slate_date);
+        CREATE INDEX IF NOT EXISTS idx_dspd_slate
+            ON dfs_supplement_player_deltas(slate_date);
+        CREATE INDEX IF NOT EXISTS idx_dspd_player
+            ON dfs_supplement_player_deltas(player_id);
     """)
 
     # --- Opponent tracking tables ---
@@ -260,6 +308,188 @@ def save_slate_lineups(
 
     conn.commit()
     return len(sorted_lineups)
+
+
+def save_supplement_snapshot(
+    conn: sqlite3.Connection,
+    slate_date: str,
+    run_key: str,
+    source_name: str,
+    source_filename: str,
+    projection_col: Optional[str],
+    ownership_col: Optional[str],
+    comparison_df: pd.DataFrame,
+    unmatched_df: pd.DataFrame,
+    rows_total: int,
+) -> str:
+    """Persist a supplement comparison snapshot for later daily review."""
+    comparison_df = comparison_df.copy()
+    unmatched_df = unmatched_df.copy()
+
+    proj_comp_df = comparison_df.dropna(
+        subset=["Supplement Proj FPTS", "Our Proj FPTS"]
+    ).copy()
+    own_comp_df = comparison_df.dropna(
+        subset=["Supplement Own %", "Our Own %"]
+    ).copy()
+
+    rows_matched = int(len(comparison_df))
+    rows_unmatched = int(len(unmatched_df))
+    match_rate = float((rows_matched / rows_total) * 100.0) if rows_total > 0 else 0.0
+    projection_mae = (
+        float(pd.to_numeric(proj_comp_df["Proj Delta"], errors="coerce").abs().mean())
+        if not proj_comp_df.empty else None
+    )
+    ownership_mae = (
+        float(pd.to_numeric(own_comp_df["Own Delta (pp)"], errors="coerce").abs().mean())
+        if not own_comp_df.empty else None
+    )
+    avg_proj_delta = (
+        float(pd.to_numeric(proj_comp_df["Proj Delta"], errors="coerce").mean())
+        if not proj_comp_df.empty else None
+    )
+    avg_own_delta = (
+        float(pd.to_numeric(own_comp_df["Own Delta (pp)"], errors="coerce").mean())
+        if not own_comp_df.empty else None
+    )
+
+    created_at = datetime.now().isoformat(timespec="seconds")
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM dfs_supplement_player_deltas WHERE run_key = ?", (run_key,))
+    cursor.execute(
+        """
+        INSERT OR REPLACE INTO dfs_supplement_runs (
+            run_key, slate_date, source_name, source_filename,
+            projection_col, ownership_col, rows_total, rows_matched,
+            rows_unmatched, match_rate, projection_mae, ownership_mae,
+            avg_proj_delta, avg_own_delta, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            run_key,
+            slate_date,
+            source_name,
+            source_filename,
+            projection_col or "",
+            ownership_col or "",
+            int(rows_total),
+            rows_matched,
+            rows_unmatched,
+            match_rate,
+            projection_mae,
+            ownership_mae,
+            avg_proj_delta,
+            avg_own_delta,
+            created_at,
+        ),
+    )
+
+    for row in comparison_df.to_dict("records"):
+        try:
+            player_id = int(row.get("Our Player ID") or 0)
+        except (TypeError, ValueError):
+            player_id = 0
+        if player_id <= 0:
+            continue
+        cursor.execute(
+            """
+            INSERT OR REPLACE INTO dfs_supplement_player_deltas (
+                run_key, slate_date, player_id, supplement_player, supplement_team,
+                our_player, our_team, pos, salary, match_method, match_score,
+                our_proj_fpts, supplement_proj_fpts, proj_delta, our_own_pct,
+                supplement_own_pct, own_delta_pp, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_key,
+                slate_date,
+                player_id,
+                row.get("Supplement Player"),
+                row.get("Supplement Team"),
+                row.get("Our Player"),
+                row.get("Our Team"),
+                row.get("Pos"),
+                int(row.get("Salary") or 0),
+                row.get("Match Method"),
+                float(row.get("Match Score") or 0.0),
+                float(row.get("Our Proj FPTS")) if pd.notna(row.get("Our Proj FPTS")) else None,
+                float(row.get("Supplement Proj FPTS")) if pd.notna(row.get("Supplement Proj FPTS")) else None,
+                float(row.get("Proj Delta")) if pd.notna(row.get("Proj Delta")) else None,
+                float(row.get("Our Own %")) if pd.notna(row.get("Our Own %")) else None,
+                float(row.get("Supplement Own %")) if pd.notna(row.get("Supplement Own %")) else None,
+                float(row.get("Own Delta (pp)")) if pd.notna(row.get("Own Delta (pp)")) else None,
+                created_at,
+            ),
+        )
+
+    conn.commit()
+    return run_key
+
+
+def get_recent_supplement_runs(
+    conn: sqlite3.Connection,
+    limit: int = 20,
+) -> pd.DataFrame:
+    """Return recent saved supplement snapshots for review."""
+    return pd.read_sql_query(
+        """
+        SELECT
+            run_key,
+            slate_date,
+            source_name,
+            source_filename,
+            projection_col,
+            ownership_col,
+            rows_total,
+            rows_matched,
+            rows_unmatched,
+            match_rate,
+            projection_mae,
+            ownership_mae,
+            avg_proj_delta,
+            avg_own_delta,
+            created_at
+        FROM dfs_supplement_runs
+        ORDER BY slate_date DESC, created_at DESC
+        LIMIT ?
+        """,
+        conn,
+        params=[int(limit)],
+    )
+
+
+def get_supplement_run_player_deltas(
+    conn: sqlite3.Connection,
+    run_key: str,
+) -> pd.DataFrame:
+    """Return per-player deltas for a saved supplement snapshot."""
+    return pd.read_sql_query(
+        """
+        SELECT
+            slate_date,
+            supplement_player,
+            supplement_team,
+            our_player,
+            our_team,
+            pos,
+            salary,
+            match_method,
+            match_score,
+            our_proj_fpts,
+            supplement_proj_fpts,
+            proj_delta,
+            our_own_pct,
+            supplement_own_pct,
+            own_delta_pp
+        FROM dfs_supplement_player_deltas
+        WHERE run_key = ?
+        ORDER BY ABS(COALESCE(proj_delta, 0.0)) DESC,
+                 ABS(COALESCE(own_delta_pp, 0.0)) DESC,
+                 supplement_player ASC
+        """,
+        conn,
+        params=[run_key],
+    )
 
 
 # =============================================================================

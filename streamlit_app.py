@@ -10,7 +10,9 @@ import json
 import sqlite3
 import tempfile
 import difflib
+import hashlib
 import re
+from copy import deepcopy
 from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Tuple, Optional
@@ -13707,6 +13709,7 @@ def _build_dfs_supplement_comparison(
         our_own = float(matched_player.get("ownership_proj", 0.0) or 0.0)
         comparison_rows.append(
             {
+                "Our Player ID": matched_player.get("player_id"),
                 "Supplement Player": player_name,
                 "Supplement Team": _normalize_dfs_supplement_team(team_value) or team_value,
                 "Our Player": matched_player.get("name"),
@@ -13727,6 +13730,149 @@ def _build_dfs_supplement_comparison(
     return pd.DataFrame(comparison_rows), pd.DataFrame(unmatched_rows)
 
 
+def _sanitize_supplement_artifact_token(value: object) -> str:
+    token = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+    return token[:48] or "supplement"
+
+
+def _build_dfs_supplement_player_map(
+    comparison_df: pd.DataFrame,
+) -> Dict[int, Dict[str, Any]]:
+    player_map: Dict[int, Dict[str, Any]] = {}
+    if comparison_df.empty:
+        return player_map
+
+    for row in comparison_df.to_dict("records"):
+        try:
+            player_id = int(row.get("Our Player ID") or 0)
+        except (TypeError, ValueError):
+            player_id = 0
+        if player_id <= 0:
+            continue
+        player_map[player_id] = {
+            "match_method": str(row.get("Match Method") or ""),
+            "match_score": float(row.get("Match Score") or 0.0),
+            "supplement_proj_fpts": (
+                float(row.get("Supplement Proj FPTS"))
+                if pd.notna(row.get("Supplement Proj FPTS")) else None
+            ),
+            "supplement_ownership": (
+                float(row.get("Supplement Own %"))
+                if pd.notna(row.get("Supplement Own %")) else None
+            ),
+            "proj_delta": (
+                float(row.get("Proj Delta"))
+                if pd.notna(row.get("Proj Delta")) else None
+            ),
+            "own_delta_pp": (
+                float(row.get("Own Delta (pp)"))
+                if pd.notna(row.get("Own Delta (pp)")) else None
+            ),
+        }
+    return player_map
+
+
+def _compute_dfs_supplement_run_key(
+    slate_date: str,
+    source_filename: str,
+    projection_col: Optional[str],
+    ownership_col: Optional[str],
+    comparison_df: pd.DataFrame,
+    unmatched_df: pd.DataFrame,
+) -> str:
+    digest = hashlib.sha1()
+    digest.update(str(slate_date or "").encode("utf-8"))
+    digest.update(str(source_filename or "").encode("utf-8"))
+    digest.update(str(projection_col or "").encode("utf-8"))
+    digest.update(str(ownership_col or "").encode("utf-8"))
+    digest.update(comparison_df.to_csv(index=False).encode("utf-8"))
+    digest.update(unmatched_df.to_csv(index=False).encode("utf-8"))
+    return digest.hexdigest()[:20]
+
+
+def _apply_supplement_profile_blend(
+    players: List[Any],
+    supplement_player_map: Mapping[int, Mapping[str, Any]],
+    profile_cfg: Mapping[str, Any],
+) -> Tuple[List[Any], Dict[str, int]]:
+    """Return a model-specific player pool with supplement blends applied."""
+    proj_weight = float(profile_cfg.get("supplement_proj_weight", 0.0) or 0.0)
+    own_weight = float(profile_cfg.get("supplement_own_weight", 0.0) or 0.0)
+    if (proj_weight <= 0 and own_weight <= 0) or not supplement_player_map:
+        return players, {
+            "eligible_matches": 0,
+            "proj_adjusted": 0,
+            "own_adjusted": 0,
+        }
+
+    match_score_min = float(profile_cfg.get("supplement_match_score_min", 0.90) or 0.90)
+    proj_delta_cap = float(profile_cfg.get("supplement_proj_delta_cap", 6.0) or 0.0)
+    own_delta_cap = float(profile_cfg.get("supplement_own_delta_cap", 20.0) or 0.0)
+    blended_players = deepcopy(players)
+    eligible_matches = 0
+    proj_adjusted = 0
+    own_adjusted = 0
+
+    for player in blended_players:
+        try:
+            player_id = int(getattr(player, "player_id", 0) or 0)
+        except (TypeError, ValueError):
+            player_id = 0
+        supplement_info = supplement_player_map.get(player_id) or {}
+        if not supplement_info:
+            continue
+
+        match_score = float(supplement_info.get("match_score") or 0.0)
+        if match_score < match_score_min:
+            continue
+
+        eligible_matches += 1
+        base_proj = float(getattr(player, "proj_fpts", 0.0) or 0.0)
+        base_own = float(getattr(player, "ownership_proj", 0.0) or 0.0)
+        base_floor = float(getattr(player, "proj_floor", 0.0) or 0.0)
+        base_ceiling = float(getattr(player, "proj_ceiling", 0.0) or 0.0)
+        base_risk_adj = float(getattr(player, "risk_adjusted_proj_fpts", 0.0) or 0.0)
+
+        supplement_proj = supplement_info.get("supplement_proj_fpts")
+        if proj_weight > 0 and supplement_proj is not None and base_proj > 0:
+            raw_proj_delta = float(supplement_proj) - base_proj
+            capped_proj_delta = raw_proj_delta
+            if proj_delta_cap > 0:
+                capped_proj_delta = max(-proj_delta_cap, min(proj_delta_cap, raw_proj_delta))
+            new_proj = max(0.0, base_proj + (capped_proj_delta * proj_weight))
+            scale = (new_proj / base_proj) if base_proj > 0 else 1.0
+            player.proj_fpts = round(new_proj, 3)
+            player.proj_floor = round(max(0.0, base_floor * scale), 3)
+            player.proj_ceiling = round(max(player.proj_fpts, base_ceiling * scale), 3)
+            if base_risk_adj > 0:
+                player.risk_adjusted_proj_fpts = round(max(0.0, base_risk_adj * scale), 3)
+            player.fpts_per_dollar = round((player.proj_fpts / player.salary) * 1000, 3) if player.salary > 0 else 0.0
+            player.supplement_proj_delta_applied = round(player.proj_fpts - base_proj, 3)
+            proj_adjusted += 1
+
+        supplement_own = supplement_info.get("supplement_ownership")
+        if own_weight > 0 and supplement_own is not None:
+            raw_own_delta = float(supplement_own) - base_own
+            capped_own_delta = raw_own_delta
+            if own_delta_cap > 0:
+                capped_own_delta = max(-own_delta_cap, min(own_delta_cap, raw_own_delta))
+            player.ownership_proj = round(max(0.0, base_own + (capped_own_delta * own_weight)), 3)
+            player.supplement_own_delta_applied = round(player.ownership_proj - base_own, 3)
+            own_adjusted += 1
+
+        upside = max(0.0, float(getattr(player, "proj_ceiling", 0.0) or 0.0) - float(getattr(player, "proj_fpts", 0.0) or 0.0))
+        player.leverage_score = (
+            (float(getattr(player, "proj_fpts", 0.0) or 0.0) + upside * 1.5)
+            / max(1.0, float(getattr(player, "ownership_proj", 0.0) or 0.0))
+        )
+
+    return blended_players, {
+        "eligible_matches": eligible_matches,
+        "proj_adjusted": proj_adjusted,
+        "own_adjusted": own_adjusted,
+    }
+
+
 # DFS Lineup Builder tab ---------------------------------------------------
 if selected_page == "DFS Lineup Builder":
     st.title("🏀 DFS Lineup Builder")
@@ -13739,6 +13885,10 @@ if selected_page == "DFS Lineup Builder":
         st.session_state.dfs_lineups = []
     if 'dfs_upload_metadata' not in st.session_state:
         st.session_state.dfs_upload_metadata = {}
+    if 'dfs_supplement_state' not in st.session_state:
+        st.session_state.dfs_supplement_state = {}
+    if 'dfs_supplement_saved_run_key' not in st.session_state:
+        st.session_state.dfs_supplement_saved_run_key = ""
     if 'dfs_excluded_games' not in st.session_state:
         st.session_state.dfs_excluded_games = set()
     if 'dfs_all_games' not in st.session_state:
@@ -13787,6 +13937,9 @@ if selected_page == "DFS Lineup Builder":
             "cluster_v1_experimental": "Cluster v1 (Experimental)",
             "standout_v1_capture": "Standout v1 (Missed-Capture)",
             "midrange_v1_minutes_vegas": "Midrange v1 (Minutes+Vegas Test)",
+            "supp_proj_v1_blend": "Supplement v1 (Proj Blend)",
+            "supp_own_v1_blend": "Supplement v1 (Own Blend)",
+            "supp_both_v1_blend": "Supplement v1 (Proj+Own Blend)",
         }
         for key, label in expected_model_labels.items():
             if key not in model_profiles:
@@ -14958,16 +15111,34 @@ if selected_page == "DFS Lineup Builder":
         else:
             players = st.session_state.dfs_player_pool
             ai_adjustments = st.session_state.get("dfs_ai_adjustments", {}) or {}
+            supplement_state = st.session_state.get("dfs_supplement_state", {}) or {}
+            current_slate_date = (
+                st.session_state.get("dfs_projection_date") or str(datetime.now(EASTERN_TZ).date())
+            )
             if ai_adjustments:
                 total_ai_delta = sum(float(v.get("delta_fpts", 0.0) or 0.0) for v in ai_adjustments.values())
                 st.info(
                     f"AI adjustments are active for {len(ai_adjustments)} players "
                     f"({total_ai_delta:+.1f} total FPTS shift). Generated lineups use these projections."
                 )
+            if supplement_state.get("summary"):
+                supp_summary = supplement_state["summary"]
+                source_name = str(supplement_state.get("source_name") or "Supplement")
+                supplement_slate_date = str(supplement_state.get("slate_date") or "")
+                suffix = ""
+                if supplement_slate_date and supplement_slate_date != current_slate_date:
+                    suffix = f" | stale for current slate ({supplement_slate_date} vs {current_slate_date})"
+                st.caption(
+                    f"{source_name} loaded: {supp_summary.get('matched_rows', 0)}/"
+                    f"{supp_summary.get('total_rows', 0)} matched | "
+                    f"Proj MAE {supp_summary.get('projection_mae_display', '—')} | "
+                    f"Own MAE {supp_summary.get('ownership_mae_display', '—')}"
+                    f"{suffix}"
+                )
 
             # --- Game Stack Selection ---
             # Build game list directly from the player pool (always available)
-            proj_date_str = st.session_state.get('dfs_projection_date') or str(datetime.now(EASTERN_TZ).date())
+            proj_date_str = current_slate_date
             dk_games = {}  # dk_game_id -> {teams, players, stack_score}
             for p in players:
                 if p.game_id not in dk_games:
@@ -15255,6 +15426,43 @@ if selected_page == "DFS Lineup Builder":
                         else:
                             model_run_keys = [selected_model_key]
 
+                        supplement_player_map = {}
+                        if supplement_state and str(supplement_state.get("slate_date") or "") == current_slate_date:
+                            supplement_player_map = supplement_state.get("player_map", {}) or {}
+                        supplement_required_models = {
+                            key
+                            for key, profile in model_profiles.items()
+                            if float(profile.get("supplement_proj_weight", 0.0) or 0.0) > 0
+                            or float(profile.get("supplement_own_weight", 0.0) or 0.0) > 0
+                        }
+                        skipped_supplement_models: List[str] = []
+                        if not supplement_player_map:
+                            skipped_supplement_models = [
+                                key for key in model_run_keys if key in supplement_required_models
+                            ]
+                            if skipped_supplement_models:
+                                if run_mode == "Single Version":
+                                    missing_label = model_profiles.get(selected_model_key, {}).get(
+                                        "label", selected_model_key
+                                    )
+                                    st.error(
+                                        f"{missing_label} requires a saved DFS Supplement comparison for "
+                                        f"{current_slate_date}. Upload a supplement CSV in the DFS Supplement "
+                                        "tab first."
+                                    )
+                                    progress_bar.empty()
+                                    status_text.empty()
+                                    st.stop()
+                                model_run_keys = [
+                                    key for key in model_run_keys if key not in supplement_required_models
+                                ]
+
+                        if not model_run_keys:
+                            st.error("No lineup models are available for this run.")
+                            progress_bar.empty()
+                            status_text.empty()
+                            st.stop()
+
                         total_target = num_lineups * len(model_run_keys)
                         lineups = []
                         existing_lineup_keys = set()
@@ -15275,6 +15483,21 @@ if selected_page == "DFS Lineup Builder":
                             profile_strategy_mix = profile.get("strategy_mix")
                             profile_stack_bias = bool(profile.get("aggressive_ceiling_stack", False))
                             model_debug_stats: Dict[str, int] = {}
+                            model_player_pool = filtered_players
+                            if model_key in supplement_required_models:
+                                model_player_pool, blend_stats = _apply_supplement_profile_blend(
+                                    filtered_players,
+                                    supplement_player_map,
+                                    profile,
+                                )
+                                if blend_stats.get("eligible_matches", 0) <= 0:
+                                    model_lineup_counts[model_key] = 0
+                                    completed_target += num_lineups
+                                    st.warning(
+                                        f"{profile_label} skipped: no eligible supplement matches met the "
+                                        "blend confidence threshold in the active player pool."
+                                    )
+                                    continue
 
                             def update_model_progress(current, total, message,
                                                       _offset=completed_target, _label=profile_label):
@@ -15285,7 +15508,7 @@ if selected_page == "DFS Lineup Builder":
                                 )
 
                             model_lineups = dfs.generate_diversified_lineups(
-                                player_pool=filtered_players,
+                                player_pool=model_player_pool,
                                 num_lineups=num_lineups,
                                 max_player_exposure=max_exposure,
                                 progress_callback=update_model_progress,
@@ -15318,6 +15541,16 @@ if selected_page == "DFS Lineup Builder":
 
                     progress_bar.empty()
                     status_text.empty()
+
+                    if skipped_supplement_models and run_mode == "All Versions":
+                        skipped_labels = [
+                            model_profiles.get(key, {}).get("label", key)
+                            for key in skipped_supplement_models
+                        ]
+                        st.warning(
+                            "Skipped supplement-dependent models because no saved supplement comparison was loaded: "
+                            + ", ".join(skipped_labels)
+                        )
 
                     st.session_state.dfs_lineups = lineups
                     st.session_state.dfs_optimizer_debug_stats = optimizer_debug_totals
@@ -18486,6 +18719,126 @@ if selected_page == "DFS Lineup Builder":
             "Upload a third-party NBA DFS CSV, map it to the active player pool, "
             "and compare fantasy-point and ownership projections."
         )
+        from dfs_tracking import (
+            create_dfs_tracking_tables as _create_dfs_tracking_tables,
+            get_recent_supplement_runs as _get_recent_supplement_runs,
+            get_supplement_run_player_deltas as _get_supplement_run_player_deltas,
+            save_supplement_snapshot as _save_supplement_snapshot,
+        )
+
+        try:
+            _create_dfs_tracking_tables(dfs_conn)
+        except Exception:
+            pass
+
+        active_supplement_state = st.session_state.get("dfs_supplement_state", {}) or {}
+        if active_supplement_state.get("summary"):
+            active_summary = active_supplement_state["summary"]
+            active_col, clear_col = st.columns([5, 1])
+            with active_col:
+                st.info(
+                    f"Active supplement: {active_supplement_state.get('source_name', 'Supplement')} | "
+                    f"Slate {active_supplement_state.get('slate_date', '—')} | "
+                    f"Matched {active_summary.get('matched_rows', 0)}/{active_summary.get('total_rows', 0)} | "
+                    f"Proj MAE {active_summary.get('projection_mae_display', '—')} | "
+                    f"Own MAE {active_summary.get('ownership_mae_display', '—')}"
+                )
+            with clear_col:
+                if st.button("Clear", key="dfs_supplement_clear_loaded", use_container_width=True):
+                    st.session_state.dfs_supplement_state = {}
+                    st.rerun()
+
+        try:
+            recent_supplement_runs_df = _get_recent_supplement_runs(dfs_conn, limit=12)
+        except Exception:
+            recent_supplement_runs_df = pd.DataFrame()
+
+        if not recent_supplement_runs_df.empty:
+            with st.expander("Saved Supplement History", expanded=False):
+                history_view = recent_supplement_runs_df.copy()
+                history_view["Created"] = pd.to_datetime(
+                    history_view["created_at"], errors="coerce"
+                ).dt.strftime("%Y-%m-%d %H:%M")
+                history_view["Source"] = history_view["source_name"].fillna("").replace("", "Supplement")
+                history_view["Matched"] = history_view.apply(
+                    lambda row: f"{int(row.get('rows_matched', 0) or 0)}/{int(row.get('rows_total', 0) or 0)}",
+                    axis=1,
+                )
+                history_view = history_view.rename(
+                    columns={
+                        "slate_date": "Slate",
+                        "match_rate": "Match Rate %",
+                        "projection_mae": "Proj MAE",
+                        "ownership_mae": "Own MAE",
+                        "avg_proj_delta": "Avg Proj Delta",
+                        "avg_own_delta": "Avg Own Delta",
+                    }
+                )
+                st.dataframe(
+                    history_view[
+                        [
+                            "Slate",
+                            "Source",
+                            "Matched",
+                            "Match Rate %",
+                            "Proj MAE",
+                            "Own MAE",
+                            "Avg Proj Delta",
+                            "Avg Own Delta",
+                            "Created",
+                        ]
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Match Rate %": st.column_config.NumberColumn(format="%.1f%%"),
+                        "Proj MAE": st.column_config.NumberColumn(format="%.2f"),
+                        "Own MAE": st.column_config.NumberColumn(format="%.2f"),
+                        "Avg Proj Delta": st.column_config.NumberColumn(format="%+.2f"),
+                        "Avg Own Delta": st.column_config.NumberColumn(format="%+.2f"),
+                    },
+                )
+
+                history_records = recent_supplement_runs_df.to_dict("records")
+                history_lookup = {
+                    str(row.get("run_key") or ""): row
+                    for row in history_records
+                    if str(row.get("run_key") or "")
+                }
+                history_keys = list(history_lookup.keys())
+                selected_run_key = st.selectbox(
+                    "Review Saved Snapshot",
+                    options=history_keys,
+                    format_func=lambda key: (
+                        f"{history_lookup.get(key, {}).get('slate_date', '—')} | "
+                        f"{history_lookup.get(key, {}).get('source_name') or 'Supplement'} | "
+                        f"{int(history_lookup.get(key, {}).get('rows_matched', 0) or 0)}/"
+                        f"{int(history_lookup.get(key, {}).get('rows_total', 0) or 0)} matched"
+                    ),
+                    key="dfs_supplement_history_select",
+                )
+                if selected_run_key:
+                    try:
+                        history_details_df = _get_supplement_run_player_deltas(dfs_conn, selected_run_key)
+                    except Exception:
+                        history_details_df = pd.DataFrame()
+                    if not history_details_df.empty:
+                        st.markdown("**Saved Snapshot Detail**")
+                        st.dataframe(
+                            history_details_df.head(40),
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "salary": st.column_config.NumberColumn(format="$%d"),
+                                "match_score": st.column_config.NumberColumn(format="%.2f"),
+                                "our_proj_fpts": st.column_config.NumberColumn(format="%.1f"),
+                                "supplement_proj_fpts": st.column_config.NumberColumn(format="%.1f"),
+                                "proj_delta": st.column_config.NumberColumn(format="%+.1f"),
+                                "our_own_pct": st.column_config.NumberColumn(format="%.1f%%"),
+                                "supplement_own_pct": st.column_config.NumberColumn(format="%.1f%%"),
+                                "own_delta_pp": st.column_config.NumberColumn(format="%+.1f"),
+                            },
+                        )
 
         supplement_players = st.session_state.get("dfs_player_pool", []) or []
         if not supplement_players:
@@ -18657,6 +19010,15 @@ if selected_page == "DFS Lineup Builder":
                         )
                         matched_rows = int(len(comparison_df))
                         match_rate = (matched_rows / total_rows * 100.0) if total_rows > 0 else 0.0
+                        slate_date = (
+                            st.session_state.get("dfs_projection_date")
+                            or str(datetime.now(EASTERN_TZ).date())
+                        )
+                        source_name = str(
+                            (rotowire_layout or {}).get("layout_name")
+                            or Path(getattr(supplement_file, "name", supplement_path.name)).stem
+                        )
+                        source_filename = str(getattr(supplement_file, "name", supplement_path.name))
 
                         method_counts = (
                             comparison_df["Match Method"].value_counts().to_dict()
@@ -18701,6 +19063,121 @@ if selected_page == "DFS Lineup Builder":
                             int((own_comp_df["Own Delta (pp)"] > 0).sum()) if not own_comp_df.empty else 0,
                         )
 
+                        projection_mae_value = (
+                            float(proj_comp_df["Proj Delta"].abs().mean())
+                            if not proj_comp_df.empty else np.nan
+                        )
+                        ownership_mae_value = (
+                            float(own_comp_df["Own Delta (pp)"].abs().mean())
+                            if not own_comp_df.empty else np.nan
+                        )
+                        supplement_player_map = _build_dfs_supplement_player_map(comparison_df)
+                        run_key = _compute_dfs_supplement_run_key(
+                            slate_date=slate_date,
+                            source_filename=source_filename,
+                            projection_col=resolved_proj_col,
+                            ownership_col=resolved_own_col,
+                            comparison_df=comparison_df,
+                            unmatched_df=unmatched_df,
+                        )
+                        st.session_state.dfs_supplement_state = {
+                            "run_key": run_key,
+                            "slate_date": slate_date,
+                            "source_name": source_name,
+                            "source_filename": source_filename,
+                            "projection_col": resolved_proj_col,
+                            "ownership_col": resolved_own_col,
+                            "comparison_records": comparison_df.to_dict("records"),
+                            "player_map": supplement_player_map,
+                            "summary": {
+                                "total_rows": total_rows,
+                                "matched_rows": matched_rows,
+                                "match_rate": match_rate,
+                                "projection_mae": projection_mae_value,
+                                "projection_mae_display": (
+                                    f"{projection_mae_value:.2f}"
+                                    if np.isfinite(projection_mae_value) else "—"
+                                ),
+                                "ownership_mae": ownership_mae_value,
+                                "ownership_mae_display": (
+                                    f"{ownership_mae_value:.2f}pp"
+                                    if np.isfinite(ownership_mae_value) else "—"
+                                ),
+                            },
+                        }
+
+                        if run_key != st.session_state.get("dfs_supplement_saved_run_key", ""):
+                            try:
+                                _save_supplement_snapshot(
+                                    dfs_conn,
+                                    slate_date=slate_date,
+                                    run_key=run_key,
+                                    source_name=source_name,
+                                    source_filename=source_filename,
+                                    projection_col=resolved_proj_col,
+                                    ownership_col=resolved_own_col,
+                                    comparison_df=comparison_df,
+                                    unmatched_df=unmatched_df,
+                                    rows_total=total_rows,
+                                )
+                                st.session_state.dfs_supplement_saved_run_key = run_key
+
+                                with tempfile.NamedTemporaryFile(
+                                    mode="w",
+                                    suffix=".csv",
+                                    delete=False,
+                                    encoding="utf-8",
+                                ) as tmp_csv:
+                                    tmp_csv.write(comparison_df.to_csv(index=False))
+                                    tmp_csv_path = Path(tmp_csv.name)
+                                artifact_token = _sanitize_supplement_artifact_token(source_name)
+                                _s3_upload_slate_file(
+                                    tmp_csv_path,
+                                    slate_date,
+                                    f"{artifact_token}_supplement_comparison.csv",
+                                )
+                                try:
+                                    tmp_csv_path.unlink()
+                                except OSError:
+                                    pass
+
+                                summary_payload = {
+                                    "run_key": run_key,
+                                    "slate_date": slate_date,
+                                    "source_name": source_name,
+                                    "source_filename": source_filename,
+                                    "projection_col": resolved_proj_col,
+                                    "ownership_col": resolved_own_col,
+                                    "rows_total": total_rows,
+                                    "rows_matched": matched_rows,
+                                    "rows_unmatched": int(len(unmatched_df)),
+                                    "match_rate": match_rate,
+                                    "projection_mae": projection_mae_value if np.isfinite(projection_mae_value) else None,
+                                    "ownership_mae": ownership_mae_value if np.isfinite(ownership_mae_value) else None,
+                                }
+                                with tempfile.NamedTemporaryFile(
+                                    mode="w",
+                                    suffix=".json",
+                                    delete=False,
+                                    encoding="utf-8",
+                                ) as tmp_json:
+                                    json.dump(summary_payload, tmp_json, indent=2, default=str)
+                                    tmp_json_path = Path(tmp_json.name)
+                                _s3_upload_slate_file(
+                                    tmp_json_path,
+                                    slate_date,
+                                    f"{artifact_token}_supplement_summary.json",
+                                )
+                                try:
+                                    tmp_json_path.unlink()
+                                except OSError:
+                                    pass
+                                st.caption(
+                                    f"Saved supplement snapshot for {slate_date} to tracking and cloud storage."
+                                )
+                            except Exception as exc:
+                                st.warning(f"Could not save supplement snapshot: {exc}")
+
                         if method_counts:
                             method_parts = [
                                 f"{method}: {count}"
@@ -18716,6 +19193,10 @@ if selected_page == "DFS Lineup Builder":
                             comparison_view = comparison_view.sort_values(
                                 ["Abs Proj Delta", "Abs Own Delta", "Supplement Player"],
                                 ascending=[False, False, True],
+                            )
+                            comparison_view = comparison_view.drop(
+                                columns=["Our Player ID"],
+                                errors="ignore",
                             )
                             st.dataframe(
                                 comparison_view.drop(columns=["Abs Proj Delta", "Abs Own Delta"]),
