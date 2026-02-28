@@ -9,6 +9,8 @@ import os
 import json
 import sqlite3
 import tempfile
+import difflib
+import re
 from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Tuple, Optional
@@ -13218,6 +13220,275 @@ def _apply_ai_adjustments_to_players(players: list[Any]) -> tuple[int, float]:
     return adjusted_count, total_delta
 
 
+def _normalize_dfs_supplement_team(value: object) -> str:
+    """Map team labels from third-party CSVs to NBA abbreviations when possible."""
+    text = str(value or "").strip()
+    if not text or text.lower() in {"nan", "none", "null"}:
+        return ""
+
+    upper = text.upper()
+    if upper in ABBR_TO_TEAM_NAME:
+        return upper
+
+    normalized = " ".join(text.replace(".", " ").replace("-", " ").split()).lower()
+    full_name_lookup = {str(name).lower(): abbr for name, abbr in TEAM_NAME_TO_ABBR.items()}
+    if normalized in full_name_lookup:
+        return full_name_lookup[normalized]
+
+    nickname_lookup: Dict[str, str] = {}
+    for full_name, abbr in TEAM_NAME_TO_ABBR.items():
+        parts = str(full_name).lower().split()
+        if parts:
+            nickname_lookup[parts[-1]] = abbr
+            if len(parts) >= 2:
+                nickname_lookup[" ".join(parts[-2:])] = abbr
+
+    return nickname_lookup.get(normalized, "")
+
+
+def _normalize_supplement_column_name(column_name: object) -> str:
+    text = str(column_name or "").strip().lower()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return " ".join(text.split())
+
+
+def _infer_supplement_column(columns: List[str], role: str) -> Optional[str]:
+    best_col = None
+    best_score = -1
+
+    for col in columns:
+        norm = _normalize_supplement_column_name(col)
+        score = 0
+
+        if role == "player":
+            if norm == "player":
+                score = 100
+            elif norm in {"player name", "name"}:
+                score = 95
+            elif "player" in norm and "name" in norm:
+                score = 90
+            elif norm.endswith("name"):
+                score = 75
+        elif role == "team":
+            if norm == "team":
+                score = 100
+            elif "team" in norm:
+                score = 85
+            elif norm in {"tm", "abbr"}:
+                score = 70
+        elif role == "projection":
+            if "own" in norm or "ownership" in norm or "drafted" in norm:
+                score = 0
+            elif ("proj" in norm or "projection" in norm) and (
+                "fpts" in norm or "fantasy" in norm or "points" in norm
+            ):
+                score = 100
+            elif norm in {"fpts", "fantasy points", "projection", "proj"}:
+                score = 85
+            elif "fpts" in norm or "fantasy" in norm:
+                score = 75
+            elif "points" in norm and "actual" not in norm:
+                score = 50
+        elif role == "ownership":
+            if ("ownership" in norm or "own" in norm) and (
+                "proj" in norm or "projection" in norm
+            ):
+                score = 100
+            elif "ownership" in norm or norm in {"own", "own pct", "own percentage"}:
+                score = 90
+            elif "drafted" in norm or "rostered" in norm:
+                score = 85
+            elif "own" in norm:
+                score = 75
+
+        if score > best_score:
+            best_col = col
+            best_score = score
+
+    return best_col
+
+
+def _coerce_supplement_numeric(series: pd.Series) -> pd.Series:
+    cleaned = (
+        series.astype(str)
+        .str.strip()
+        .str.replace("%", "", regex=False)
+        .str.replace("$", "", regex=False)
+        .str.replace(",", "", regex=False)
+        .str.replace("DK", "", regex=False)
+    )
+    extracted = cleaned.str.extract(r"(-?\d+(?:\.\d+)?)", expand=False)
+    return pd.to_numeric(extracted, errors="coerce")
+
+
+def _build_dfs_supplement_player_lookup(players: List[Any]) -> Dict[str, Any]:
+    records: List[Dict[str, Any]] = []
+    name_to_records: Dict[str, List[Dict[str, Any]]] = {}
+    team_name_to_records: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+
+    for player in players:
+        record = {
+            "player_id": getattr(player, "player_id", None),
+            "name": str(getattr(player, "name", "") or "").strip(),
+            "team": str(getattr(player, "team", "") or "").strip().upper(),
+            "positions": "/".join(getattr(player, "positions", []) or []),
+            "salary": int(getattr(player, "salary", 0) or 0),
+            "proj_fpts": float(getattr(player, "proj_fpts", 0.0) or 0.0),
+            "ownership_proj": float(getattr(player, "ownership_proj", 0.0) or 0.0),
+        }
+        variants = dfs.generate_name_variants(record["name"]) or {dfs.normalize_name(record["name"])}
+        record["name_variants"] = sorted(v for v in variants if v)
+        records.append(record)
+
+        for variant in record["name_variants"]:
+            name_to_records.setdefault(variant, []).append(record)
+            if record["team"]:
+                team_name_to_records.setdefault((record["team"], variant), []).append(record)
+
+    return {
+        "records": records,
+        "name_to_records": name_to_records,
+        "team_name_to_records": team_name_to_records,
+        "all_name_keys": sorted(name_to_records.keys()),
+    }
+
+
+def _match_dfs_supplement_player(
+    raw_name: object,
+    raw_team: object,
+    lookup: Dict[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], str, Optional[float]]:
+    player_name = str(raw_name or "").strip()
+    if not player_name:
+        return None, "unmatched", None
+
+    normalized_team = _normalize_dfs_supplement_team(raw_team)
+    variants = sorted(
+        {v for v in (dfs.generate_name_variants(player_name) or {dfs.normalize_name(player_name)}) if v},
+        key=lambda value: (value != dfs.normalize_name(player_name), value),
+    )
+
+    def _dedupe(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        unique: Dict[Any, Dict[str, Any]] = {}
+        for rec in records:
+            unique[rec.get("player_id")] = rec
+        return list(unique.values())
+
+    for variant in variants:
+        if normalized_team:
+            team_matches = _dedupe(lookup["team_name_to_records"].get((normalized_team, variant), []))
+            if len(team_matches) == 1:
+                method = "exact_team" if variant == dfs.normalize_name(player_name) else "variant_team"
+                return team_matches[0], method, 1.0
+
+        name_matches = _dedupe(lookup["name_to_records"].get(variant, []))
+        if len(name_matches) == 1:
+            method = "exact_name" if variant == dfs.normalize_name(player_name) else "variant_name"
+            return name_matches[0], method, 1.0
+
+    candidate_keys = []
+    if normalized_team:
+        candidate_keys = sorted(
+            {
+                variant
+                for (team_key, variant), _records in lookup["team_name_to_records"].items()
+                if team_key == normalized_team
+            }
+        )
+    if not candidate_keys:
+        candidate_keys = lookup["all_name_keys"]
+
+    for variant in variants:
+        fuzzy_matches = difflib.get_close_matches(variant, candidate_keys, n=1, cutoff=0.84)
+        if not fuzzy_matches:
+            continue
+        best_key = fuzzy_matches[0]
+        if normalized_team:
+            candidates = _dedupe(lookup["team_name_to_records"].get((normalized_team, best_key), []))
+        else:
+            candidates = _dedupe(lookup["name_to_records"].get(best_key, []))
+        if len(candidates) != 1:
+            continue
+        score = difflib.SequenceMatcher(None, variant, best_key).ratio()
+        return candidates[0], "fuzzy", float(score)
+
+    return None, "unmatched", None
+
+
+def _build_dfs_supplement_comparison(
+    supplement_df: pd.DataFrame,
+    players: List[Any],
+    player_col: str,
+    team_col: Optional[str],
+    projection_col: Optional[str],
+    ownership_col: Optional[str],
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    lookup = _build_dfs_supplement_player_lookup(players)
+    comparison_rows: List[Dict[str, Any]] = []
+    unmatched_rows: List[Dict[str, Any]] = []
+
+    working_df = supplement_df.copy()
+    working_df[player_col] = working_df[player_col].astype(str).str.strip()
+    if team_col:
+        working_df[team_col] = working_df[team_col].astype(str).str.strip()
+
+    for _, row in working_df.iterrows():
+        player_name = str(row.get(player_col, "") or "").strip()
+        if not player_name or player_name.lower() == "nan":
+            continue
+
+        team_value = str(row.get(team_col, "") or "").strip() if team_col else ""
+        matched_player, match_method, match_score = _match_dfs_supplement_player(
+            player_name,
+            team_value,
+            lookup,
+        )
+        supp_proj = (
+            float(row.get("_supplement_proj_fpts"))
+            if projection_col and pd.notna(row.get("_supplement_proj_fpts"))
+            else np.nan
+        )
+        supp_own = (
+            float(row.get("_supplement_ownership"))
+            if ownership_col and pd.notna(row.get("_supplement_ownership"))
+            else np.nan
+        )
+
+        if not matched_player:
+            unmatched_rows.append(
+                {
+                    "Supplement Player": player_name,
+                    "Supplement Team": _normalize_dfs_supplement_team(team_value) or team_value,
+                    "Projection": supp_proj,
+                    "Ownership %": supp_own,
+                }
+            )
+            continue
+
+        our_proj = float(matched_player.get("proj_fpts", 0.0) or 0.0)
+        our_own = float(matched_player.get("ownership_proj", 0.0) or 0.0)
+        comparison_rows.append(
+            {
+                "Supplement Player": player_name,
+                "Supplement Team": _normalize_dfs_supplement_team(team_value) or team_value,
+                "Our Player": matched_player.get("name"),
+                "Our Team": matched_player.get("team"),
+                "Pos": matched_player.get("positions"),
+                "Salary": matched_player.get("salary"),
+                "Match Method": match_method,
+                "Match Score": match_score,
+                "Our Proj FPTS": our_proj,
+                "Supplement Proj FPTS": supp_proj,
+                "Proj Delta": supp_proj - our_proj if pd.notna(supp_proj) else np.nan,
+                "Our Own %": our_own,
+                "Supplement Own %": supp_own,
+                "Own Delta (pp)": supp_own - our_own if pd.notna(supp_own) else np.nan,
+            }
+        )
+
+    return pd.DataFrame(comparison_rows), pd.DataFrame(unmatched_rows)
+
+
 # DFS Lineup Builder tab ---------------------------------------------------
 if selected_page == "DFS Lineup Builder":
     st.title("🏀 DFS Lineup Builder")
@@ -13391,7 +13662,8 @@ if selected_page == "DFS Lineup Builder":
         "🎯 Model Accuracy",
         "🦈 Opponent Analysis",
         "🎰 FanDuel Props",
-        "🔬 Player Scouting"
+        "🔬 Player Scouting",
+        "🧩 DFS Supplement"
     ])
 
     # ==========================================================================
@@ -17946,6 +18218,303 @@ if selected_page == "DFS Lineup Builder":
 
         except Exception as e:
             st.error(f"Failed to load scouting data: {e}")
+
+    # ==========================================================================
+    # TAB 9: DFS Supplement
+    # ==========================================================================
+    with builder_tabs[8]:
+        st.subheader("DFS Supplement")
+        st.caption(
+            "Upload a third-party NBA DFS CSV, map it to the active player pool, "
+            "and compare fantasy-point and ownership projections."
+        )
+
+        supplement_players = st.session_state.get("dfs_player_pool", []) or []
+        if not supplement_players:
+            st.info(
+                "Load a DraftKings slate and generate projections first. "
+                "This tab compares the uploaded supplement against the active builder player pool."
+            )
+        else:
+            projection_notes: List[str] = []
+            if st.session_state.get("dfs_vegas_blend_active"):
+                projection_notes.append("Vegas blend active")
+            if st.session_state.get("dfs_ai_adjustments"):
+                projection_notes.append("AI adjustments active")
+            if projection_notes:
+                st.caption(
+                    "Comparison uses the current builder projection state: "
+                    + ", ".join(projection_notes)
+                    + "."
+                )
+
+            supplement_file = st.file_uploader(
+                "Upload supplement CSV",
+                type=["csv"],
+                key="dfs_supplement_csv",
+                help="Upload the external projection or ownership CSV you want to compare.",
+            )
+
+            if supplement_file is not None:
+                supplement_path = persist_uploaded_file(supplement_file, ".csv")
+                try:
+                    supplement_df = pd.read_csv(supplement_path, encoding="utf-8-sig")
+                except Exception as exc:
+                    st.error(f"Could not read supplement CSV: {exc}")
+                    supplement_df = pd.DataFrame()
+
+                if not supplement_df.empty:
+                    supplement_df.columns = [str(col).strip() for col in supplement_df.columns]
+                    column_options = supplement_df.columns.tolist()
+                    none_option = "— None —"
+
+                    inferred_player_col = _infer_supplement_column(column_options, "player")
+                    inferred_team_col = _infer_supplement_column(column_options, "team")
+                    inferred_proj_col = _infer_supplement_column(column_options, "projection")
+                    inferred_own_col = _infer_supplement_column(column_options, "ownership")
+
+                    st.markdown("**Column Mapping**")
+                    map_col1, map_col2, map_col3, map_col4 = st.columns(4)
+                    with map_col1:
+                        player_col = st.selectbox(
+                            "Player Column",
+                            options=column_options,
+                            index=column_options.index(inferred_player_col)
+                            if inferred_player_col in column_options else 0,
+                            key="dfs_supplement_player_col",
+                        )
+                    with map_col2:
+                        team_options = [none_option] + column_options
+                        team_col = st.selectbox(
+                            "Team Column",
+                            options=team_options,
+                            index=team_options.index(inferred_team_col)
+                            if inferred_team_col in team_options else 0,
+                            key="dfs_supplement_team_col",
+                        )
+                    with map_col3:
+                        proj_options = [none_option] + column_options
+                        proj_col = st.selectbox(
+                            "Projection Column",
+                            options=proj_options,
+                            index=proj_options.index(inferred_proj_col)
+                            if inferred_proj_col in proj_options else 0,
+                            key="dfs_supplement_proj_col",
+                        )
+                    with map_col4:
+                        own_options = [none_option] + column_options
+                        own_col = st.selectbox(
+                            "Ownership Column",
+                            options=own_options,
+                            index=own_options.index(inferred_own_col)
+                            if inferred_own_col in own_options else 0,
+                            key="dfs_supplement_own_col",
+                        )
+
+                    resolved_team_col = None if team_col == none_option else team_col
+                    resolved_proj_col = None if proj_col == none_option else proj_col
+                    resolved_own_col = None if own_col == none_option else own_col
+
+                    preview_df = supplement_df.head(10).copy()
+                    st.markdown("**Upload Preview**")
+                    st.dataframe(preview_df, use_container_width=True, hide_index=True)
+
+                    if not resolved_proj_col and not resolved_own_col:
+                        st.warning(
+                            "Select at least one projection or ownership column to compare against our player pool."
+                        )
+                    else:
+                        working_df = supplement_df.copy()
+                        if resolved_proj_col:
+                            working_df["_supplement_proj_fpts"] = _coerce_supplement_numeric(
+                                working_df[resolved_proj_col]
+                            )
+                        else:
+                            working_df["_supplement_proj_fpts"] = np.nan
+
+                        if resolved_own_col:
+                            working_df["_supplement_ownership"] = _coerce_supplement_numeric(
+                                working_df[resolved_own_col]
+                            )
+                        else:
+                            working_df["_supplement_ownership"] = np.nan
+
+                        comparison_df, unmatched_df = _build_dfs_supplement_comparison(
+                            supplement_df=working_df,
+                            players=supplement_players,
+                            player_col=player_col,
+                            team_col=resolved_team_col,
+                            projection_col=resolved_proj_col,
+                            ownership_col=resolved_own_col,
+                        )
+
+                        total_rows = int(
+                            working_df[player_col]
+                            .astype(str)
+                            .str.strip()
+                            .replace({"nan": ""})
+                            .ne("")
+                            .sum()
+                        )
+                        matched_rows = int(len(comparison_df))
+                        match_rate = (matched_rows / total_rows * 100.0) if total_rows > 0 else 0.0
+
+                        method_counts = (
+                            comparison_df["Match Method"].value_counts().to_dict()
+                            if not comparison_df.empty else {}
+                        )
+                        fuzzy_count = int(method_counts.get("fuzzy", 0))
+
+                        proj_comp_df = comparison_df.dropna(
+                            subset=["Supplement Proj FPTS", "Our Proj FPTS"]
+                        ).copy()
+                        own_comp_df = comparison_df.dropna(
+                            subset=["Supplement Own %", "Our Own %"]
+                        ).copy()
+
+                        metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+                        metric_col1.metric("Supplement Rows", total_rows)
+                        metric_col2.metric("Matched Players", matched_rows, f"{match_rate:.1f}%")
+                        metric_col3.metric("Fuzzy Matches", fuzzy_count)
+                        metric_col4.metric("Unmatched Rows", int(len(unmatched_df)))
+
+                        metric_col5, metric_col6, metric_col7, metric_col8 = st.columns(4)
+                        metric_col5.metric(
+                            "Projection MAE",
+                            (
+                                f"{proj_comp_df['Proj Delta'].abs().mean():.2f}"
+                                if not proj_comp_df.empty else "—"
+                            ),
+                        )
+                        metric_col6.metric(
+                            "Ownership MAE",
+                            (
+                                f"{own_comp_df['Own Delta (pp)'].abs().mean():.2f}pp"
+                                if not own_comp_df.empty else "—"
+                            ),
+                        )
+                        metric_col7.metric(
+                            "Supplement Higher Proj",
+                            int((proj_comp_df["Proj Delta"] > 0).sum()) if not proj_comp_df.empty else 0,
+                        )
+                        metric_col8.metric(
+                            "Supplement Higher Own",
+                            int((own_comp_df["Own Delta (pp)"] > 0).sum()) if not own_comp_df.empty else 0,
+                        )
+
+                        if method_counts:
+                            method_parts = [
+                                f"{method}: {count}"
+                                for method, count in method_counts.items()
+                            ]
+                            st.caption("Match methods — " + " | ".join(method_parts))
+
+                        if not comparison_df.empty:
+                            st.markdown("**Matched Player Comparison**")
+                            comparison_view = comparison_df.copy()
+                            comparison_view["Abs Proj Delta"] = comparison_view["Proj Delta"].abs()
+                            comparison_view["Abs Own Delta"] = comparison_view["Own Delta (pp)"].abs()
+                            comparison_view = comparison_view.sort_values(
+                                ["Abs Proj Delta", "Abs Own Delta", "Supplement Player"],
+                                ascending=[False, False, True],
+                            )
+                            st.dataframe(
+                                comparison_view.drop(columns=["Abs Proj Delta", "Abs Own Delta"]),
+                                use_container_width=True,
+                                hide_index=True,
+                                column_config={
+                                    "Salary": st.column_config.NumberColumn(format="$%d"),
+                                    "Match Score": st.column_config.NumberColumn(format="%.2f"),
+                                    "Our Proj FPTS": st.column_config.NumberColumn(format="%.1f"),
+                                    "Supplement Proj FPTS": st.column_config.NumberColumn(format="%.1f"),
+                                    "Proj Delta": st.column_config.NumberColumn(format="%+.1f"),
+                                    "Our Own %": st.column_config.NumberColumn(format="%.1f%%"),
+                                    "Supplement Own %": st.column_config.NumberColumn(format="%.1f%%"),
+                                    "Own Delta (pp)": st.column_config.NumberColumn(format="%+.1f"),
+                                },
+                            )
+
+                            top_left, top_right = st.columns(2)
+                            with top_left:
+                                if not proj_comp_df.empty:
+                                    st.markdown("**Largest Projection Gaps**")
+                                    proj_gap_view = proj_comp_df.copy()
+                                    proj_gap_view["Abs Proj Delta"] = proj_gap_view["Proj Delta"].abs()
+                                    proj_gap_view = proj_gap_view.sort_values(
+                                        "Abs Proj Delta", ascending=False
+                                    ).head(20)
+                                    st.dataframe(
+                                        proj_gap_view[
+                                            [
+                                                "Supplement Player",
+                                                "Our Player",
+                                                "Our Proj FPTS",
+                                                "Supplement Proj FPTS",
+                                                "Proj Delta",
+                                                "Match Method",
+                                            ]
+                                        ],
+                                        use_container_width=True,
+                                        hide_index=True,
+                                        column_config={
+                                            "Our Proj FPTS": st.column_config.NumberColumn(format="%.1f"),
+                                            "Supplement Proj FPTS": st.column_config.NumberColumn(format="%.1f"),
+                                            "Proj Delta": st.column_config.NumberColumn(format="%+.1f"),
+                                        },
+                                    )
+                            with top_right:
+                                if not own_comp_df.empty:
+                                    st.markdown("**Largest Ownership Gaps**")
+                                    own_gap_view = own_comp_df.copy()
+                                    own_gap_view["Abs Own Delta"] = own_gap_view["Own Delta (pp)"].abs()
+                                    own_gap_view = own_gap_view.sort_values(
+                                        "Abs Own Delta", ascending=False
+                                    ).head(20)
+                                    st.dataframe(
+                                        own_gap_view[
+                                            [
+                                                "Supplement Player",
+                                                "Our Player",
+                                                "Our Own %",
+                                                "Supplement Own %",
+                                                "Own Delta (pp)",
+                                                "Match Method",
+                                            ]
+                                        ],
+                                        use_container_width=True,
+                                        hide_index=True,
+                                        column_config={
+                                            "Our Own %": st.column_config.NumberColumn(format="%.1f%%"),
+                                            "Supplement Own %": st.column_config.NumberColumn(format="%.1f%%"),
+                                            "Own Delta (pp)": st.column_config.NumberColumn(format="%+.1f"),
+                                        },
+                                    )
+
+                            comparison_export = comparison_df.to_csv(index=False)
+                            st.download_button(
+                                "📥 Download Supplement Comparison",
+                                data=comparison_export,
+                                file_name="dfs_supplement_comparison.csv",
+                                mime="text/csv",
+                                key="dfs_supplement_comparison_export",
+                            )
+                        else:
+                            st.warning(
+                                "No supplement rows matched the active player pool. "
+                                "Adjust the player/team column mapping or review naming differences."
+                            )
+
+                        if not unmatched_df.empty:
+                            st.markdown("**Unmatched Supplement Rows**")
+                            st.dataframe(
+                                unmatched_df.head(50),
+                                use_container_width=True,
+                                hide_index=True,
+                                column_config={
+                                    "Projection": st.column_config.NumberColumn(format="%.1f"),
+                                    "Ownership %": st.column_config.NumberColumn(format="%.1f%%"),
+                                },
+                            )
 
 if selected_page == "DFS Player Review":
     st.title("DFS Player Review")
