@@ -15507,7 +15507,7 @@ if selected_page == "DFS Lineup Builder":
                             "Top Field Lineups",
                             5,
                             50,
-                            10,
+                            50,
                             key="model_accuracy_postmortem_top_n",
                         )
 
@@ -15517,7 +15517,7 @@ if selected_page == "DFS Lineup Builder":
                             "Core Field Exposure %",
                             min_value=10,
                             max_value=80,
-                            value=30,
+                            value=35,
                             step=5,
                             key="postmortem_core_field_pct",
                             help="Players at or above this field exposure are treated as core plays.",
@@ -15527,7 +15527,7 @@ if selected_page == "DFS Lineup Builder":
                             "Under-Exposure Ratio %",
                             min_value=25,
                             max_value=100,
-                            value=60,
+                            value=75,
                             step=5,
                             key="postmortem_underexposure_ratio_pct",
                             help="Flag as missed core when our exposure is below this fraction of field exposure.",
@@ -15537,7 +15537,7 @@ if selected_page == "DFS Lineup Builder":
                             "Standout Min (Actual - Proj)",
                             min_value=4.0,
                             max_value=20.0,
-                            value=8.0,
+                            value=12.0,
                             step=0.5,
                             key="postmortem_standout_min_error",
                         )

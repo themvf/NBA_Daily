@@ -1556,10 +1556,10 @@ def get_shark_strategy_profile(
 def build_tournament_postmortem(
     conn: sqlite3.Connection,
     slate_date: str,
-    top_n: int = 10,
-    core_field_exposure_pct: float = 30.0,
-    underexposure_ratio: float = 0.60,
-    standout_min_error: float = 8.0,
+    top_n: int = 50,
+    core_field_exposure_pct: float = 35.0,
+    underexposure_ratio: float = 0.75,
+    standout_min_error: float = 12.0,
 ) -> Dict[str, Any]:
     """Build a postmortem review packet for a DFS tournament slate.
 
