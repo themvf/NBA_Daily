@@ -983,6 +983,55 @@ def _normalize_name(name: str) -> str:
     return n
 
 
+def _stack_shape_from_teams(teams: List[str]) -> Tuple[int, int, str]:
+    """Summarize lineup team concentration as distinct teams, max stack, and shape."""
+    clean_teams = [str(team).strip() for team in teams if str(team).strip()]
+    if not clean_teams:
+        return 0, 0, ""
+
+    counts = Counter(clean_teams)
+    ordered = sorted(counts.values(), reverse=True)
+    return len(counts), int(ordered[0]), "-".join(str(v) for v in ordered)
+
+
+def _pairwise_overlap_summary(lineup_sets: List[set]) -> Dict[str, Optional[float]]:
+    """Return average/min/max shared-player overlap across a lineup portfolio."""
+    clean_sets = [set(s) for s in lineup_sets if s]
+    if len(clean_sets) < 2:
+        return {'avg': None, 'min': None, 'max': None}
+
+    overlaps: List[int] = []
+    for idx, left in enumerate(clean_sets[:-1]):
+        for right in clean_sets[idx + 1:]:
+            overlaps.append(len(left & right))
+
+    if not overlaps:
+        return {'avg': None, 'min': None, 'max': None}
+
+    return {
+        'avg': float(np.mean(overlaps)),
+        'min': float(np.min(overlaps)),
+        'max': float(np.max(overlaps)),
+    }
+
+
+def _normalized_entropy(counts: List[float]) -> Optional[float]:
+    """Return normalized Shannon entropy for a non-negative count vector."""
+    clean = np.asarray(
+        [float(c) for c in counts if pd.notna(c) and float(c) > 0],
+        dtype=float,
+    )
+    if clean.size <= 1:
+        return None
+
+    probs = clean / clean.sum()
+    entropy = float(-np.sum(probs * np.log(probs)))
+    max_entropy = float(np.log(clean.size))
+    if max_entropy <= 0:
+        return None
+    return entropy / max_entropy
+
+
 def get_opponent_contest_history(conn: sqlite3.Connection) -> pd.DataFrame:
     """Get list of imported contests with metadata."""
     return pd.read_sql_query(
@@ -1518,6 +1567,7 @@ def build_tournament_postmortem(
     - winner gap and top-end capture
     - field-vs-our player exposure differences
     - missed core plays and standout outcomes
+    - raw lineup structure and portfolio concentration diagnostics
     - concise "what went right / wrong" notes and next-slate actions
     """
     top_n = max(1, int(top_n))
@@ -1538,6 +1588,11 @@ def build_tournament_postmortem(
         'value_tier_misses_df': pd.DataFrame(),
         'combo_capture_misses_df': pd.DataFrame(),
         'team_concentration_mismatch_df': pd.DataFrame(),
+        'field_lineup_structures_df': pd.DataFrame(),
+        'our_lineup_structures_df': pd.DataFrame(),
+        'portfolio_diagnostics_df': pd.DataFrame(),
+        'model_strategy_breakdown_df': pd.DataFrame(),
+        'model_signal_coverage_df': pd.DataFrame(),
         'improvements_df': pd.DataFrame(),
         'right_notes': [],
         'wrong_notes': [],
@@ -1548,7 +1603,7 @@ def build_tournament_postmortem(
         # 1) Top-N field lineups from contest standings
         top_entries_df = pd.read_sql_query(
             """
-            SELECT rank, points, username, pg, sg, sf, pf, c, g, f, util
+            SELECT rank, points, username, total_salary, pg, sg, sf, pf, c, g, f, util
             FROM dfs_contest_entries
             WHERE slate_date = ? AND rank IS NOT NULL
             ORDER BY rank ASC
@@ -1596,7 +1651,13 @@ def build_tournament_postmortem(
         # 2) Our generated lineup exposures on this slate
         our_lineups_df = pd.read_sql_query(
             """
-            SELECT lineup_num, total_actual_fpts,
+            SELECT lineup_num,
+                   COALESCE(NULLIF(model_key, ''), 'standard_v1') AS model_key,
+                   COALESCE(NULLIF(model_label, ''), COALESCE(NULLIF(model_key, ''), 'standard_v1')) AS model_label,
+                   COALESCE(generation_strategy, '') AS generation_strategy,
+                   total_proj_fpts,
+                   total_salary,
+                   total_actual_fpts,
                    pg_id, sg_id, sf_id, pf_id, c_id, g_id, f_id, util_id
             FROM dfs_slate_lineups
             WHERE slate_date = ?
@@ -1647,6 +1708,14 @@ def build_tournament_postmortem(
         our_exposure_df = pd.DataFrame(columns=['name_key', 'our_slots', 'our_player', 'our_exposure_pct'])
         our_long = pd.DataFrame(columns=['lineup_num', 'slot', 'player', 'name_key'])
         lineup_name_sets: List[set] = []
+        if not our_lineups_df.empty:
+            for col in ['model_key', 'model_label', 'generation_strategy']:
+                our_lineups_df[col] = our_lineups_df[col].fillna('').astype(str).str.strip()
+            our_lineups_df['model_key'] = our_lineups_df['model_key'].replace('', 'standard_v1')
+            our_lineups_df['model_label'] = our_lineups_df['model_label'].where(
+                our_lineups_df['model_label'].ne(''),
+                our_lineups_df['model_key'],
+            )
         if our_lineups > 0 and our_name_cols:
             our_long = our_lineups_df[['lineup_num'] + our_name_cols].melt(
                 id_vars=['lineup_num'],
@@ -1673,17 +1742,25 @@ def build_tournament_postmortem(
                     .tolist()
                 )
 
-        # 3) Player performance context (projection vs actual)
-        perf_df = pd.read_sql_query(
+        # 3) Player context (projection, actuals, ownership) for enrichment + metrics
+        player_context_df = pd.read_sql_query(
             """
             SELECT player_name, team, salary, proj_fpts, actual_fpts,
-                   ownership_proj, actual_ownership
+                   ownership_proj, actual_ownership, did_play
             FROM dfs_slate_projections
-            WHERE slate_date = ? AND did_play = 1 AND actual_fpts IS NOT NULL
+            WHERE slate_date = ?
             """,
             conn,
             params=[slate_date],
         )
+        player_context_agg = pd.DataFrame(
+            columns=[
+                'name_key', 'player_name', 'team', 'salary',
+                'proj_fpts', 'actual_fpts', 'actual_minus_proj',
+                'ownership_proj', 'actual_ownership',
+            ]
+        )
+        perf_df = pd.DataFrame()
         perf_agg = pd.DataFrame(
             columns=[
                 'name_key', 'player_name', 'team', 'salary',
@@ -1691,14 +1768,14 @@ def build_tournament_postmortem(
                 'ownership_proj', 'actual_ownership',
             ]
         )
-        if not perf_df.empty:
-            perf_df['name_key'] = perf_df['player_name'].map(_normalize_name)
-            perf_df['actual_minus_proj'] = (
-                pd.to_numeric(perf_df['actual_fpts'], errors='coerce')
-                - pd.to_numeric(perf_df['proj_fpts'], errors='coerce')
+        if not player_context_df.empty:
+            player_context_df['name_key'] = player_context_df['player_name'].map(_normalize_name)
+            player_context_df['actual_minus_proj'] = (
+                pd.to_numeric(player_context_df['actual_fpts'], errors='coerce')
+                - pd.to_numeric(player_context_df['proj_fpts'], errors='coerce')
             )
-            perf_agg = (
-                perf_df.groupby('name_key', as_index=False)
+            player_context_agg = (
+                player_context_df.groupby('name_key', as_index=False)
                 .agg(
                     player_name=('player_name', 'first'),
                     team=('team', 'first'),
@@ -1709,6 +1786,53 @@ def build_tournament_postmortem(
                     ownership_proj=('ownership_proj', 'first'),
                     actual_ownership=('actual_ownership', 'first'),
                 )
+            )
+            perf_df = player_context_df[
+                (pd.to_numeric(player_context_df['did_play'], errors='coerce') == 1)
+                & pd.to_numeric(player_context_df['actual_fpts'], errors='coerce').notna()
+            ].copy()
+            if not perf_df.empty:
+                perf_agg = (
+                    perf_df.groupby('name_key', as_index=False)
+                    .agg(
+                        player_name=('player_name', 'first'),
+                        team=('team', 'first'),
+                        salary=('salary', 'first'),
+                        proj_fpts=('proj_fpts', 'first'),
+                        actual_fpts=('actual_fpts', 'first'),
+                        actual_minus_proj=('actual_minus_proj', 'first'),
+                        ownership_proj=('ownership_proj', 'first'),
+                        actual_ownership=('actual_ownership', 'first'),
+                    )
+                )
+
+        context_cols = [
+            'name_key',
+            'team',
+            'salary',
+            'proj_fpts',
+            'actual_fpts',
+            'actual_minus_proj',
+            'ownership_proj',
+            'actual_ownership',
+        ]
+        if not field_long.empty and not player_context_agg.empty:
+            field_long = field_long.merge(
+                player_context_agg[context_cols],
+                on='name_key',
+                how='left',
+            )
+        if not our_long.empty and not player_context_agg.empty:
+            our_long = our_long.merge(
+                player_context_agg[context_cols],
+                on='name_key',
+                how='left',
+            )
+        if not our_long.empty:
+            our_long = our_long.merge(
+                our_lineups_df[['lineup_num', 'model_key', 'model_label', 'generation_strategy']],
+                on='lineup_num',
+                how='left',
             )
 
         # 4) Exposure comparison frame
@@ -1755,6 +1879,80 @@ def build_tournament_postmortem(
             ['actual_minus_proj', 'field_exposure_pct'],
             ascending=[False, False],
         )
+
+        field_lineup_structures_df = pd.DataFrame()
+        if not top_entries_df.empty:
+            field_rows: List[Dict[str, Any]] = []
+            field_groups = {
+                int(num): grp.copy()
+                for num, grp in field_long.groupby('field_lineup_num')
+            }
+            for _, lineup_row in top_entries_df.iterrows():
+                lineup_num = int(lineup_row.get('field_lineup_num') or 0)
+                lineup_players_df = field_groups.get(lineup_num, pd.DataFrame())
+                ordered_players = [
+                    str(lineup_row.get(col) or '').strip()
+                    for col in pos_cols
+                    if str(lineup_row.get(col) or '').strip()
+                ]
+                team_count, top_stack_size, stack_shape = _stack_shape_from_teams(
+                    lineup_players_df.get('team', pd.Series(dtype=object)).dropna().astype(str).tolist()
+                )
+                proj_vals = pd.to_numeric(lineup_players_df.get('proj_fpts'), errors='coerce').dropna()
+                own_proj_vals = pd.to_numeric(lineup_players_df.get('ownership_proj'), errors='coerce').dropna()
+                own_actual_vals = pd.to_numeric(lineup_players_df.get('actual_ownership'), errors='coerce').dropna()
+                field_rows.append({
+                    'field_lineup_num': lineup_num,
+                    'rank': int(lineup_row['rank']) if pd.notna(lineup_row.get('rank')) else None,
+                    'username': str(lineup_row.get('username') or '').strip(),
+                    'contest_points': float(lineup_row['points']) if pd.notna(lineup_row.get('points')) else None,
+                    'total_salary': int(lineup_row['total_salary']) if pd.notna(lineup_row.get('total_salary')) else None,
+                    'total_proj_fpts': float(proj_vals.sum()) if not proj_vals.empty else None,
+                    'avg_proj_ownership': float(own_proj_vals.mean()) if not own_proj_vals.empty else None,
+                    'avg_actual_ownership': float(own_actual_vals.mean()) if not own_actual_vals.empty else None,
+                    'team_count': int(team_count),
+                    'top_stack_size': int(top_stack_size),
+                    'stack_shape': stack_shape,
+                    'players': ' | '.join(ordered_players),
+                })
+            field_lineup_structures_df = pd.DataFrame(field_rows)
+
+        our_lineup_structures_df = pd.DataFrame()
+        if not our_lineups_df.empty:
+            our_rows: List[Dict[str, Any]] = []
+            our_groups = {
+                int(num): grp.copy()
+                for num, grp in our_long.groupby('lineup_num')
+            } if not our_long.empty else {}
+            for _, lineup_row in our_lineups_df.iterrows():
+                lineup_num = int(lineup_row.get('lineup_num') or 0)
+                lineup_players_df = our_groups.get(lineup_num, pd.DataFrame())
+                ordered_players = [
+                    str(lineup_row.get(col) or '').strip()
+                    for col in our_name_cols
+                    if str(lineup_row.get(col) or '').strip()
+                ]
+                team_count, top_stack_size, stack_shape = _stack_shape_from_teams(
+                    lineup_players_df.get('team', pd.Series(dtype=object)).dropna().astype(str).tolist()
+                )
+                own_proj_vals = pd.to_numeric(lineup_players_df.get('ownership_proj'), errors='coerce').dropna()
+                own_actual_vals = pd.to_numeric(lineup_players_df.get('actual_ownership'), errors='coerce').dropna()
+                our_rows.append({
+                    'lineup_num': lineup_num,
+                    'model_key': str(lineup_row.get('model_key') or 'standard_v1'),
+                    'model_label': str(lineup_row.get('model_label') or lineup_row.get('model_key') or 'standard_v1'),
+                    'generation_strategy': str(lineup_row.get('generation_strategy') or ''),
+                    'total_proj_fpts': float(lineup_row['total_proj_fpts']) if pd.notna(lineup_row.get('total_proj_fpts')) else None,
+                    'total_actual_fpts': float(lineup_row['total_actual_fpts']) if pd.notna(lineup_row.get('total_actual_fpts')) else None,
+                    'total_salary': int(lineup_row['total_salary']) if pd.notna(lineup_row.get('total_salary')) else None,
+                    'avg_proj_ownership': float(own_proj_vals.mean()) if not own_proj_vals.empty else None,
+                    'avg_actual_ownership': float(own_actual_vals.mean()) if not own_actual_vals.empty else None,
+                    'team_count': int(team_count),
+                    'top_stack_size': int(top_stack_size),
+                    'stack_shape': stack_shape,
+                    'players': ' | '.join(ordered_players),
+                })
+            our_lineup_structures_df = pd.DataFrame(our_rows)
 
         # 4b) Additional postmortem diagnostics
         for num_col in ['salary', 'proj_fpts', 'actual_fpts', 'actual_minus_proj', 'ownership_proj', 'actual_ownership']:
@@ -1893,7 +2091,7 @@ def build_tournament_postmortem(
                 ascending=[False, False, False, False],
             ).head(60)
 
-        team_lookup_df = perf_agg[['name_key', 'team']].dropna(subset=['name_key']).copy()
+        team_lookup_df = player_context_agg[['name_key', 'team']].dropna(subset=['name_key']).copy()
         if not team_lookup_df.empty:
             team_lookup_df['team'] = team_lookup_df['team'].astype(str).str.strip()
             team_lookup_df = team_lookup_df[
@@ -2065,6 +2263,7 @@ def build_tournament_postmortem(
         top3_target_count = 0
         top3_covered_count = 0
         top3_all_in_single = None
+        top3_keys: List[str] = []
         if not top_actual_df.empty:
             top_scorer_name = str(top_actual_df.iloc[0].get('display_name') or "")
             top_scorer_actual = pd.to_numeric(top_actual_df.iloc[0].get('actual_fpts'), errors='coerce')
@@ -2079,6 +2278,286 @@ def build_tournament_postmortem(
                     top3_all_in_single = any(set(top3_keys).issubset(s) for s in lineup_name_sets)
                 else:
                     top3_all_in_single = False
+
+        core_signal_keys = set(
+            top_field_players_df[
+                pd.to_numeric(top_field_players_df['field_exposure_pct'], errors='coerce') >= core_field_exposure_pct
+            ]['name_key'].dropna().astype(str).tolist()
+        )
+        standout_signal_keys = set(
+            missed_standouts_df['name_key'].dropna().astype(str).tolist()
+        )
+        missed_core_keys = set(missed_core_df['name_key'].dropna().astype(str).tolist())
+        top3_signal_keys = set(top3_keys)
+        high_signal_keys = core_signal_keys | standout_signal_keys | top3_signal_keys
+
+        exposure_df['is_field_core'] = exposure_df['name_key'].astype(str).isin(core_signal_keys)
+        exposure_df['is_missed_core'] = exposure_df['name_key'].astype(str).isin(missed_core_keys)
+        exposure_df['is_standout'] = (
+            pd.to_numeric(exposure_df['actual_minus_proj'], errors='coerce') >= standout_min_error
+        ) & (pd.to_numeric(exposure_df['field_exposure_pct'], errors='coerce') >= 10.0)
+        exposure_df['is_top3_actual'] = exposure_df['name_key'].astype(str).isin(top3_signal_keys)
+        exposure_df['is_value_tier'] = (
+            pd.to_numeric(exposure_df['salary'], errors='coerce').between(4000, 5000, inclusive='both')
+        )
+
+        def _build_signal_tags(row: pd.Series) -> str:
+            tags: List[str] = []
+            if bool(row.get('is_field_core')):
+                tags.append('core')
+            if bool(row.get('is_missed_core')):
+                tags.append('missed-core')
+            if bool(row.get('is_standout')):
+                tags.append('standout')
+            if bool(row.get('is_top3_actual')):
+                tags.append('top3-actual')
+            if bool(row.get('is_value_tier')):
+                tags.append('value-tier')
+            return ', '.join(tags)
+
+        exposure_df['signal_tags'] = exposure_df.apply(_build_signal_tags, axis=1)
+        top_field_players_df = exposure_df[exposure_df['field_slots'] > 0].copy()
+
+        field_overlap = _pairwise_overlap_summary(field_lineup_name_sets)
+        our_overlap = _pairwise_overlap_summary(lineup_name_sets)
+        field_entropy = _normalized_entropy(
+            pd.to_numeric(field_exposure_df.get('field_slots'), errors='coerce').fillna(0.0).tolist()
+        )
+        our_entropy = _normalized_entropy(
+            pd.to_numeric(our_exposure_df.get('our_slots'), errors='coerce').fillna(0.0).tolist()
+        )
+        field_top5_slot_share = None
+        if not field_exposure_df.empty:
+            field_total_slots = float(max(1, field_lineups * 8))
+            field_top5_slot_share = 100.0 * float(
+                pd.to_numeric(field_exposure_df['field_slots'], errors='coerce').fillna(0.0).nlargest(5).sum()
+            ) / field_total_slots
+        our_top5_slot_share = None
+        if not our_exposure_df.empty:
+            our_total_slots = float(max(1, our_lineups * 8))
+            our_top5_slot_share = 100.0 * float(
+                pd.to_numeric(our_exposure_df['our_slots'], errors='coerce').fillna(0.0).nlargest(5).sum()
+            ) / our_total_slots
+
+        portfolio_diagnostics_df = pd.DataFrame([
+            {
+                'metric': 'Avg Pairwise Overlap',
+                'field_value': field_overlap.get('avg'),
+                'our_value': our_overlap.get('avg'),
+                'delta_our_minus_field': (
+                    None
+                    if field_overlap.get('avg') is None or our_overlap.get('avg') is None
+                    else float(our_overlap['avg'] - field_overlap['avg'])
+                ),
+            },
+            {
+                'metric': 'Max Pairwise Overlap',
+                'field_value': field_overlap.get('max'),
+                'our_value': our_overlap.get('max'),
+                'delta_our_minus_field': (
+                    None
+                    if field_overlap.get('max') is None or our_overlap.get('max') is None
+                    else float(our_overlap['max'] - field_overlap['max'])
+                ),
+            },
+            {
+                'metric': 'Exposure Entropy (Normalized)',
+                'field_value': field_entropy,
+                'our_value': our_entropy,
+                'delta_our_minus_field': (
+                    None
+                    if field_entropy is None or our_entropy is None
+                    else float(our_entropy - field_entropy)
+                ),
+            },
+            {
+                'metric': 'Top Player Exposure %',
+                'field_value': (
+                    float(pd.to_numeric(field_exposure_df['field_exposure_pct'], errors='coerce').max())
+                    if not field_exposure_df.empty
+                    else None
+                ),
+                'our_value': (
+                    float(pd.to_numeric(our_exposure_df['our_exposure_pct'], errors='coerce').max())
+                    if not our_exposure_df.empty
+                    else None
+                ),
+                'delta_our_minus_field': (
+                    None
+                    if field_exposure_df.empty or our_exposure_df.empty
+                    else float(
+                        pd.to_numeric(our_exposure_df['our_exposure_pct'], errors='coerce').max()
+                        - pd.to_numeric(field_exposure_df['field_exposure_pct'], errors='coerce').max()
+                    )
+                ),
+            },
+            {
+                'metric': 'Top-5 Slot Share %',
+                'field_value': field_top5_slot_share,
+                'our_value': our_top5_slot_share,
+                'delta_our_minus_field': (
+                    None
+                    if field_top5_slot_share is None or our_top5_slot_share is None
+                    else float(our_top5_slot_share - field_top5_slot_share)
+                ),
+            },
+        ])
+        overlap_gap_avg = (
+            None
+            if field_overlap.get('avg') is None or our_overlap.get('avg') is None
+            else float(our_overlap['avg'] - field_overlap['avg'])
+        )
+
+        field_exposure_lookup = {
+            str(k): float(v)
+            for k, v in exposure_df.set_index('name_key')['field_exposure_pct'].dropna().items()
+        }
+        actual_fpts_lookup = {
+            str(k): float(v)
+            for k, v in exposure_df.set_index('name_key')['actual_fpts'].dropna().items()
+        }
+        actual_error_lookup = {
+            str(k): float(v)
+            for k, v in exposure_df.set_index('name_key')['actual_minus_proj'].dropna().items()
+        }
+        display_lookup = {
+            str(k): str(v)
+            for k, v in exposure_df.set_index('name_key')['display_name'].fillna('').items()
+            if str(k).strip()
+        }
+
+        model_strategy_breakdown_df = pd.DataFrame()
+        model_signal_coverage_df = pd.DataFrame()
+        if not our_lineups_df.empty:
+            model_rows: List[Dict[str, Any]] = []
+            signal_rows: List[Dict[str, Any]] = []
+            signal_key_order = sorted(
+                high_signal_keys,
+                key=lambda key: (
+                    -field_exposure_lookup.get(key, 0.0),
+                    -actual_error_lookup.get(key, -9999.0),
+                    display_lookup.get(key, key),
+                ),
+            )
+            model_group_cols = ['model_key', 'model_label', 'generation_strategy']
+            for group_vals, group_lineups_df in our_lineups_df.groupby(model_group_cols, dropna=False):
+                model_key, model_label, generation_strategy = group_vals
+                group_lineup_nums = group_lineups_df['lineup_num'].tolist()
+                group_size = int(len(group_lineups_df))
+                group_long_df = our_long[our_long['lineup_num'].isin(group_lineup_nums)].copy()
+                group_lineup_sets = (
+                    group_long_df.groupby('lineup_num')['name_key']
+                    .apply(lambda s: {x for x in s.tolist() if x})
+                    .tolist()
+                    if not group_long_df.empty
+                    else []
+                )
+                group_overlap = _pairwise_overlap_summary(group_lineup_sets)
+                group_structures_df = our_lineup_structures_df[
+                    our_lineup_structures_df['lineup_num'].isin(group_lineup_nums)
+                ].copy()
+                model_exp_counts = (
+                    group_long_df.groupby('name_key').size()
+                    if not group_long_df.empty
+                    else pd.Series(dtype=float)
+                )
+                model_exp_pct = (
+                    100.0 * model_exp_counts / float(max(1, group_size))
+                    if not model_exp_counts.empty
+                    else pd.Series(dtype=float)
+                )
+
+                core_gap_values: List[float] = []
+                core_hit_count = 0
+                standout_hit_count = 0
+                high_signal_hit_count = 0
+                for name_key in signal_key_order:
+                    model_pct = float(model_exp_pct.get(name_key, 0.0))
+                    field_pct = float(field_exposure_lookup.get(name_key, 0.0))
+                    signal_type_parts: List[str] = []
+                    if name_key in core_signal_keys:
+                        signal_type_parts.append('Core')
+                        core_gap_values.append(field_pct - model_pct)
+                        if model_pct > 0:
+                            core_hit_count += 1
+                    if name_key in standout_signal_keys:
+                        signal_type_parts.append('Standout')
+                        if model_pct > 0:
+                            standout_hit_count += 1
+                    if name_key in top3_signal_keys:
+                        signal_type_parts.append('Top-3 Actual')
+                    if model_pct > 0:
+                        high_signal_hit_count += 1
+
+                    signal_rows.append({
+                        'model_key': str(model_key or 'standard_v1'),
+                        'model_label': str(model_label or model_key or 'standard_v1'),
+                        'generation_strategy': str(generation_strategy or ''),
+                        'player': display_lookup.get(name_key, name_key),
+                        'signal_type': ', '.join(signal_type_parts) or 'Signal',
+                        'field_exposure_pct': field_pct,
+                        'model_exposure_pct': model_pct,
+                        'gap_vs_field_pct': field_pct - model_pct,
+                        'actual_fpts': actual_fpts_lookup.get(name_key),
+                        'actual_minus_proj': actual_error_lookup.get(name_key),
+                    })
+
+                avg_top_stack_size = pd.to_numeric(
+                    group_structures_df.get('top_stack_size'),
+                    errors='coerce',
+                ).dropna()
+                model_rows.append({
+                    'model_key': str(model_key or 'standard_v1'),
+                    'model_label': str(model_label or model_key or 'standard_v1'),
+                    'generation_strategy': str(generation_strategy or ''),
+                    'lineups': group_size,
+                    'avg_proj_fpts': float(pd.to_numeric(group_lineups_df['total_proj_fpts'], errors='coerce').mean())
+                    if group_size > 0 else None,
+                    'avg_actual_fpts': float(pd.to_numeric(group_lineups_df['total_actual_fpts'], errors='coerce').mean())
+                    if group_size > 0 else None,
+                    'best_actual_fpts': float(pd.to_numeric(group_lineups_df['total_actual_fpts'], errors='coerce').max())
+                    if group_size > 0 else None,
+                    'avg_salary': float(pd.to_numeric(group_lineups_df['total_salary'], errors='coerce').mean())
+                    if group_size > 0 else None,
+                    'avg_top_stack_size': float(avg_top_stack_size.mean()) if not avg_top_stack_size.empty else None,
+                    'avg_pairwise_overlap': group_overlap.get('avg'),
+                    'core_players_hit_pct': (
+                        100.0 * float(core_hit_count) / float(max(1, len(core_signal_keys)))
+                        if core_signal_keys else None
+                    ),
+                    'standout_players_hit_pct': (
+                        100.0 * float(standout_hit_count) / float(max(1, len(standout_signal_keys)))
+                        if standout_signal_keys else None
+                    ),
+                    'high_signal_players_hit_pct': (
+                        100.0 * float(high_signal_hit_count) / float(max(1, len(high_signal_keys)))
+                        if high_signal_keys else None
+                    ),
+                    'avg_core_gap_pct': (
+                        float(np.mean(core_gap_values))
+                        if core_gap_values else None
+                    ),
+                    'captured_top3_in_single_lineup': (
+                        any(set(top3_keys).issubset(s) for s in group_lineup_sets)
+                        if top3_keys and group_lineup_sets
+                        else False
+                    ),
+                })
+
+            model_strategy_breakdown_df = (
+                pd.DataFrame(model_rows).sort_values(
+                    ['best_actual_fpts', 'avg_actual_fpts', 'lineups'],
+                    ascending=[False, False, False],
+                )
+                if model_rows else pd.DataFrame()
+            )
+            model_signal_coverage_df = (
+                pd.DataFrame(signal_rows).sort_values(
+                    ['field_exposure_pct', 'actual_minus_proj', 'gap_vs_field_pct'],
+                    ascending=[False, False, False],
+                )
+                if signal_rows else pd.DataFrame()
+            )
 
         result['metrics'] = {
             'field_lineups_analyzed': field_lineups,
@@ -2111,6 +2590,18 @@ def build_tournament_postmortem(
             'top3_target_count': int(top3_target_count),
             'top3_covered_count': int(top3_covered_count),
             'top3_all_in_single_lineup': top3_all_in_single,
+            'field_avg_pairwise_overlap': field_overlap.get('avg'),
+            'our_avg_pairwise_overlap': our_overlap.get('avg'),
+            'field_max_pairwise_overlap': field_overlap.get('max'),
+            'our_max_pairwise_overlap': our_overlap.get('max'),
+            'field_exposure_entropy': field_entropy,
+            'our_exposure_entropy': our_entropy,
+            'field_top5_slot_share_pct': field_top5_slot_share,
+            'our_top5_slot_share_pct': our_top5_slot_share,
+            'model_group_count': int(model_strategy_breakdown_df['model_key'].nunique())
+            if isinstance(model_strategy_breakdown_df, pd.DataFrame) and not model_strategy_breakdown_df.empty
+            else 0,
+            'high_signal_player_count': int(len(high_signal_keys)),
         }
 
         # 6) What went right / wrong notes
@@ -2195,6 +2686,18 @@ def build_tournament_postmortem(
                 )
             else:
                 wrong_notes.append("Team concentration mismatch detected between field and our builds.")
+
+        if overlap_gap_avg is not None:
+            if overlap_gap_avg <= -1.0:
+                wrong_notes.append(
+                    f"Portfolio overlap ran {abs(overlap_gap_avg):.2f} players below the field average, suggesting over-diversification."
+                )
+            elif overlap_gap_avg >= 1.0:
+                wrong_notes.append(
+                    f"Portfolio overlap ran {overlap_gap_avg:.2f} players above the field average, suggesting over-concentration."
+                )
+            else:
+                right_notes.append("Portfolio overlap tracked close to field average.")
 
         result['right_notes'] = right_notes
         result['wrong_notes'] = wrong_notes
@@ -2336,6 +2839,16 @@ def build_tournament_postmortem(
                 'next_slate_change': 'Constrain team slot-share drift vs top-field concentration patterns.',
                 'success_metric': 'Shrink team concentration gap on heavily targeted games/teams.',
             })
+            priority += 1
+
+        if overlap_gap_avg is not None and abs(overlap_gap_avg) >= 1.0:
+            improvement_rows.append({
+                'priority': priority,
+                'area': 'Portfolio Concentration',
+                'why': f"avg_overlap_gap={overlap_gap_avg:+.2f} players vs field",
+                'next_slate_change': 'Tune lineup uniqueness / overlap targets so portfolio concentration stays closer to field-winning structure.',
+                'success_metric': 'Reduce pairwise overlap gap while preserving best-lineup ceiling.',
+            })
 
         result['improvements_df'] = (
             pd.DataFrame(improvement_rows).sort_values('priority')
@@ -2352,6 +2865,11 @@ def build_tournament_postmortem(
         result['value_tier_misses_df'] = value_tier_misses_df.reset_index(drop=True)
         result['combo_capture_misses_df'] = combo_capture_misses_df.reset_index(drop=True)
         result['team_concentration_mismatch_df'] = team_concentration_mismatch_df.reset_index(drop=True)
+        result['field_lineup_structures_df'] = field_lineup_structures_df.reset_index(drop=True)
+        result['our_lineup_structures_df'] = our_lineup_structures_df.reset_index(drop=True)
+        result['portfolio_diagnostics_df'] = portfolio_diagnostics_df.reset_index(drop=True)
+        result['model_strategy_breakdown_df'] = model_strategy_breakdown_df.reset_index(drop=True)
+        result['model_signal_coverage_df'] = model_signal_coverage_df.reset_index(drop=True)
 
     except Exception as e:
         result['errors'].append(f"Postmortem build error: {e}")

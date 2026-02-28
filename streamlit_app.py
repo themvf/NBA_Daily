@@ -15613,7 +15613,7 @@ if selected_page == "DFS Lineup Builder":
 
                         metrics_payload = pm_payload.get("metrics") or {}
                         pm_export_payload = {
-                            "schema_version": "dfs_tournament_postmortem_v1",
+                            "schema_version": "dfs_tournament_postmortem_v2",
                             "generated_at": datetime.now(EASTERN_TZ).isoformat(),
                             "context": {
                                 "slate_date": selected_postmortem_slate,
@@ -15662,6 +15662,21 @@ if selected_page == "DFS Lineup Builder":
                                 ),
                                 "team_concentration_mismatch": _df_records_safe(
                                     pm_payload.get("team_concentration_mismatch_df")
+                                ),
+                                "field_lineup_structures": _df_records_safe(
+                                    pm_payload.get("field_lineup_structures_df")
+                                ),
+                                "our_lineup_structures": _df_records_safe(
+                                    pm_payload.get("our_lineup_structures_df")
+                                ),
+                                "portfolio_diagnostics": _df_records_safe(
+                                    pm_payload.get("portfolio_diagnostics_df")
+                                ),
+                                "model_strategy_breakdown": _df_records_safe(
+                                    pm_payload.get("model_strategy_breakdown_df")
+                                ),
+                                "model_signal_coverage": _df_records_safe(
+                                    pm_payload.get("model_signal_coverage_df")
                                 ),
                                 "improvements": _df_records_safe(
                                     pm_payload.get("improvements_df")
@@ -16867,6 +16882,44 @@ if selected_page == "DFS Lineup Builder":
                             pm_m13.metric("Combo Misses (Raw)", int(pm_metrics.get('combo_capture_miss_count') or 0))
                             pm_m14.metric("Team Mismatch", int(pm_metrics.get('team_concentration_mismatch_count') or 0))
 
+                            pm_m15, pm_m16, pm_m17, pm_m18 = st.columns(4)
+                            pm_m15.metric(
+                                "Avg Overlap",
+                                (
+                                    f"{float(pm_metrics.get('our_avg_pairwise_overlap')):.2f}"
+                                    if pm_metrics.get('our_avg_pairwise_overlap') is not None
+                                    else "—"
+                                ),
+                                delta=(
+                                    f"{float(pm_metrics.get('our_avg_pairwise_overlap') - pm_metrics.get('field_avg_pairwise_overlap')):+.2f} vs field"
+                                    if pm_metrics.get('our_avg_pairwise_overlap') is not None
+                                    and pm_metrics.get('field_avg_pairwise_overlap') is not None
+                                    else None
+                                ),
+                            )
+                            pm_m16.metric(
+                                "Exposure Entropy",
+                                (
+                                    f"{float(pm_metrics.get('our_exposure_entropy')):.3f}"
+                                    if pm_metrics.get('our_exposure_entropy') is not None
+                                    else "—"
+                                ),
+                                delta=(
+                                    f"{float(pm_metrics.get('our_exposure_entropy') - pm_metrics.get('field_exposure_entropy')):+.3f} vs field"
+                                    if pm_metrics.get('our_exposure_entropy') is not None
+                                    and pm_metrics.get('field_exposure_entropy') is not None
+                                    else None
+                                ),
+                            )
+                            pm_m17.metric(
+                                "Model Groups",
+                                int(pm_metrics.get('model_group_count') or 0),
+                            )
+                            pm_m18.metric(
+                                "High-Signal Players",
+                                int(pm_metrics.get('high_signal_player_count') or 0),
+                            )
+
                             top_scorer_name = str(pm_metrics.get('top_scorer_name') or "").strip()
                             top_scorer_actual = pm_metrics.get('top_scorer_actual')
                             if top_scorer_name and top_scorer_actual is not None:
@@ -16874,6 +16927,128 @@ if selected_page == "DFS Lineup Builder":
                                     f"Top scorer in top-{pm_top_n} field lineups: "
                                     f"`{top_scorer_name}` ({float(top_scorer_actual):.1f} DK points)."
                                 )
+
+                            portfolio_diag_df = pm_payload.get('portfolio_diagnostics_df')
+                            if isinstance(portfolio_diag_df, pd.DataFrame) and not portfolio_diag_df.empty:
+                                st.markdown("**Portfolio Diagnostics**")
+
+                                def _format_diag_value(metric_name: str, value: Any, is_delta: bool = False) -> str:
+                                    if pd.isna(value):
+                                        return "—"
+                                    val = float(value)
+                                    if 'Entropy' in metric_name:
+                                        return f"{val:+.3f}" if is_delta else f"{val:.3f}"
+                                    if 'Share' in metric_name or 'Exposure' in metric_name:
+                                        return f"{val:+.1f}pp" if is_delta else f"{val:.1f}%"
+                                    return f"{val:+.2f}" if is_delta else f"{val:.2f}"
+
+                                diag_view = portfolio_diag_df.copy()
+                                diag_view.columns = ['Metric', 'Field', 'Our', 'Delta (Our-Field)']
+                                diag_view['Field'] = diag_view.apply(
+                                    lambda row: _format_diag_value(str(row['Metric']), row['Field']),
+                                    axis=1,
+                                )
+                                diag_view['Our'] = diag_view.apply(
+                                    lambda row: _format_diag_value(str(row['Metric']), row['Our']),
+                                    axis=1,
+                                )
+                                diag_view['Delta (Our-Field)'] = diag_view.apply(
+                                    lambda row: _format_diag_value(
+                                        str(row['Metric']),
+                                        row['Delta (Our-Field)'],
+                                        is_delta=True,
+                                    ),
+                                    axis=1,
+                                )
+                                st.dataframe(diag_view, use_container_width=True, hide_index=True)
+
+                            model_breakdown_df = pm_payload.get('model_strategy_breakdown_df')
+                            if isinstance(model_breakdown_df, pd.DataFrame) and not model_breakdown_df.empty:
+                                st.markdown("**Model / Strategy Breakdown**")
+                                model_view = model_breakdown_df[
+                                    [
+                                        'model_label',
+                                        'generation_strategy',
+                                        'lineups',
+                                        'avg_actual_fpts',
+                                        'best_actual_fpts',
+                                        'avg_proj_fpts',
+                                        'avg_salary',
+                                        'avg_top_stack_size',
+                                        'avg_pairwise_overlap',
+                                        'core_players_hit_pct',
+                                        'standout_players_hit_pct',
+                                        'avg_core_gap_pct',
+                                        'captured_top3_in_single_lineup',
+                                    ]
+                                ].copy()
+                                model_view.columns = [
+                                    'Model',
+                                    'Strategy',
+                                    'Lineups',
+                                    'Avg Actual',
+                                    'Best Actual',
+                                    'Avg Proj',
+                                    'Avg Salary',
+                                    'Avg Top Stack',
+                                    'Avg Overlap',
+                                    'Core Hit %',
+                                    'Standout Hit %',
+                                    'Avg Core Gap',
+                                    'Top-3 In One Lineup',
+                                ]
+                                for c in ['Avg Actual', 'Best Actual', 'Avg Proj', 'Avg Top Stack', 'Avg Overlap', 'Avg Core Gap']:
+                                    model_view[c] = model_view[c].apply(
+                                        lambda x: f"{x:.2f}" if pd.notna(x) else "—"
+                                    )
+                                for c in ['Core Hit %', 'Standout Hit %']:
+                                    model_view[c] = model_view[c].apply(
+                                        lambda x: f"{x:.1f}%" if pd.notna(x) else "—"
+                                    )
+                                model_view['Avg Salary'] = model_view['Avg Salary'].apply(
+                                    lambda x: f"${int(round(x)):,.0f}" if pd.notna(x) else "—"
+                                )
+                                model_view['Top-3 In One Lineup'] = model_view['Top-3 In One Lineup'].apply(
+                                    lambda x: "Yes" if bool(x) else "No"
+                                )
+                                st.dataframe(model_view, use_container_width=True, hide_index=True)
+
+                            model_signal_df = pm_payload.get('model_signal_coverage_df')
+                            if isinstance(model_signal_df, pd.DataFrame) and not model_signal_df.empty:
+                                st.markdown("**Model Coverage on Core / Standout Signals**")
+                                signal_view = model_signal_df[
+                                    [
+                                        'player',
+                                        'signal_type',
+                                        'model_label',
+                                        'generation_strategy',
+                                        'field_exposure_pct',
+                                        'model_exposure_pct',
+                                        'gap_vs_field_pct',
+                                        'actual_minus_proj',
+                                        'actual_fpts',
+                                    ]
+                                ].copy()
+                                signal_view.columns = [
+                                    'Player',
+                                    'Signal',
+                                    'Model',
+                                    'Strategy',
+                                    'Field Exp %',
+                                    'Model Exp %',
+                                    'Gap (Field-Model)',
+                                    'Actual-Proj',
+                                    'Actual FPTS',
+                                ]
+                                for c in ['Field Exp %', 'Model Exp %', 'Gap (Field-Model)']:
+                                    signal_view[c] = signal_view[c].apply(
+                                        lambda x: f"{x:.1f}%" if pd.notna(x) else "—"
+                                    )
+                                for c in ['Actual-Proj', 'Actual FPTS']:
+                                    signal_view[c] = signal_view[c].apply(
+                                        lambda x: f"{x:.1f}" if pd.notna(x) else "—"
+                                    )
+                                st.dataframe(signal_view.head(60), use_container_width=True, hide_index=True)
 
                             exp_df = pm_payload.get('top_field_players_df')
                             if isinstance(exp_df, pd.DataFrame) and not exp_df.empty:
@@ -17180,6 +17355,66 @@ if selected_page == "DFS Lineup Builder":
                                 st.dataframe(improvements_df, use_container_width=True, hide_index=True)
                             else:
                                 st.info("No improvement actions generated for this sample.")
+
+                            with st.expander("Raw Lineup Structures"):
+                                field_struct_df = pm_payload.get('field_lineup_structures_df')
+                                if isinstance(field_struct_df, pd.DataFrame) and not field_struct_df.empty:
+                                    st.markdown("**Top Field Lineup Structures**")
+                                    field_struct_view = field_struct_df.copy()
+                                    for c in ['contest_points', 'total_proj_fpts', 'avg_proj_ownership', 'avg_actual_ownership']:
+                                        if c in field_struct_view.columns:
+                                            field_struct_view[c] = field_struct_view[c].apply(
+                                                lambda x: f"{x:.1f}" if pd.notna(x) else "—"
+                                            )
+                                    if 'total_salary' in field_struct_view.columns:
+                                        field_struct_view['total_salary'] = field_struct_view['total_salary'].apply(
+                                            lambda x: f"${int(x):,}" if pd.notna(x) else "—"
+                                        )
+                                    field_struct_view.columns = [
+                                        'Field Lineup #',
+                                        'Rank',
+                                        'Username',
+                                        'Contest Points',
+                                        'Total Salary',
+                                        'Total Proj FPTS',
+                                        'Avg Proj Own%',
+                                        'Avg Actual Own%',
+                                        'Team Count',
+                                        'Top Stack Size',
+                                        'Stack Shape',
+                                        'Players',
+                                    ]
+                                    st.dataframe(field_struct_view, use_container_width=True, hide_index=True)
+
+                                our_struct_df = pm_payload.get('our_lineup_structures_df')
+                                if isinstance(our_struct_df, pd.DataFrame) and not our_struct_df.empty:
+                                    st.markdown("**Our Lineup Structures**")
+                                    our_struct_view = our_struct_df.copy()
+                                    for c in ['total_proj_fpts', 'total_actual_fpts', 'avg_proj_ownership', 'avg_actual_ownership']:
+                                        if c in our_struct_view.columns:
+                                            our_struct_view[c] = our_struct_view[c].apply(
+                                                lambda x: f"{x:.1f}" if pd.notna(x) else "—"
+                                            )
+                                    if 'total_salary' in our_struct_view.columns:
+                                        our_struct_view['total_salary'] = our_struct_view['total_salary'].apply(
+                                            lambda x: f"${int(x):,}" if pd.notna(x) else "—"
+                                        )
+                                    our_struct_view.columns = [
+                                        'Lineup #',
+                                        'Model Key',
+                                        'Model',
+                                        'Strategy',
+                                        'Total Proj FPTS',
+                                        'Total Actual FPTS',
+                                        'Total Salary',
+                                        'Avg Proj Own%',
+                                        'Avg Actual Own%',
+                                        'Team Count',
+                                        'Top Stack Size',
+                                        'Stack Shape',
+                                        'Players',
+                                    ]
+                                    st.dataframe(our_struct_view, use_container_width=True, hide_index=True)
                     else:
                         st.info(
                             "No tournament postmortem loaded yet. Use `Tournament Postmortem Actions` "
