@@ -13574,6 +13574,9 @@ DFS_SUPPLEMENT_STATUS_TOKENS = {
 DFS_SUPPLEMENT_NONE_OPTION = "— None —"
 DFS_SUPPLEMENT_ROTOWIRE_DERIVED_FPTS = "__rotowire_derived_fpts__"
 DFS_SUPPLEMENT_ROTOWIRE_DERIVED_LABEL = "Derived FPTS (SAL x VAL / 1000)"
+ROTOWIRE_PRE_RUN_OWNERSHIP_WEIGHT = 0.75
+ROTOWIRE_PRE_RUN_MODEL_OWNERSHIP_WEIGHT = 0.25
+ROTOWIRE_PRE_RUN_MATCH_SCORE_MIN = 0.90
 
 
 def _clean_dfs_supplement_player_name(value: object) -> str:
@@ -14601,12 +14604,18 @@ def _apply_supplement_profile_blend(
             proj_adjusted += 1
 
         supplement_own = supplement_info.get("supplement_ownership")
-        if own_weight > 0 and supplement_own is not None:
+        effective_own_weight = 0.0 if bool(
+            getattr(player, "rotowire_ownership_blend_active", False)
+        ) else own_weight
+        if effective_own_weight > 0 and supplement_own is not None:
             raw_own_delta = float(supplement_own) - base_own
             capped_own_delta = raw_own_delta
             if own_delta_cap > 0:
                 capped_own_delta = max(-own_delta_cap, min(own_delta_cap, raw_own_delta))
-            player.ownership_proj = round(max(0.0, base_own + (capped_own_delta * own_weight)), 3)
+            player.ownership_proj = round(
+                max(0.0, base_own + (capped_own_delta * effective_own_weight)),
+                3,
+            )
             player.supplement_own_delta_applied = round(player.ownership_proj - base_own, 3)
             own_adjusted += 1
 
@@ -14621,6 +14630,91 @@ def _apply_supplement_profile_blend(
         "proj_adjusted": proj_adjusted,
         "own_adjusted": own_adjusted,
     }
+
+
+def _recalculate_player_leverage(player: Any) -> None:
+    """Recompute leverage from the player's current projection and ownership state."""
+    proj_fpts = float(getattr(player, "proj_fpts", 0.0) or 0.0)
+    proj_ceiling = float(getattr(player, "proj_ceiling", 0.0) or 0.0)
+    ownership = float(getattr(player, "ownership_proj", 0.0) or 0.0)
+    upside = max(0.0, proj_ceiling - proj_fpts)
+    player.leverage_score = (
+        (proj_fpts + upside * 1.5) / max(1.0, ownership)
+        if proj_fpts > 0
+        else 0.0
+    )
+
+
+def _apply_rotowire_pre_run_ownership_blend(
+    players: List[Any],
+    supplement_state: Mapping[str, Any],
+    slate_date: str,
+) -> Dict[str, Any]:
+    """Blend active RotoWire ownership into the base player pool before generation."""
+    stats = {
+        "active": False,
+        "matched_players": 0,
+        "adjusted_players": 0,
+        "weight_rotowire": ROTOWIRE_PRE_RUN_OWNERSHIP_WEIGHT,
+        "weight_model": ROTOWIRE_PRE_RUN_MODEL_OWNERSHIP_WEIGHT,
+    }
+
+    for player in players:
+        if not hasattr(player, "_model_ownership_proj"):
+            player._model_ownership_proj = float(
+                getattr(player, "ownership_proj", 0.0) or 0.0
+            )
+        player.ownership_proj = float(getattr(player, "_model_ownership_proj", 0.0) or 0.0)
+        player.rotowire_ownership_blend_active = False
+        player.rotowire_ownership_delta_applied = 0.0
+        _recalculate_player_leverage(player)
+
+    if not supplement_state:
+        return stats
+
+    source_name = str(supplement_state.get("source_name") or "")
+    supplement_slate_date = str(supplement_state.get("slate_date") or "")
+    player_map = supplement_state.get("player_map") or {}
+    is_rotowire_source = bool(supplement_state.get("is_rotowire_source")) or (
+        "rotowire" in source_name.lower()
+    )
+    if (
+        not is_rotowire_source
+        or supplement_slate_date != str(slate_date or "")
+        or not player_map
+    ):
+        return stats
+
+    stats["active"] = True
+    for player in players:
+        try:
+            player_id = int(getattr(player, "player_id", 0) or 0)
+        except (TypeError, ValueError):
+            player_id = 0
+        supplement_info = player_map.get(player_id) or {}
+        if not supplement_info:
+            continue
+        stats["matched_players"] += 1
+        match_score = float(supplement_info.get("match_score") or 0.0)
+        supplement_own = supplement_info.get("supplement_ownership")
+        if supplement_own is None or match_score < ROTOWIRE_PRE_RUN_MATCH_SCORE_MIN:
+            continue
+
+        base_own = float(getattr(player, "_model_ownership_proj", 0.0) or 0.0)
+        blended_own = (
+            base_own * ROTOWIRE_PRE_RUN_MODEL_OWNERSHIP_WEIGHT
+            + float(supplement_own) * ROTOWIRE_PRE_RUN_OWNERSHIP_WEIGHT
+        )
+        player.ownership_proj = round(max(0.0, blended_own), 3)
+        player.rotowire_ownership_blend_active = True
+        player.rotowire_ownership_delta_applied = round(
+            player.ownership_proj - base_own,
+            3,
+        )
+        _recalculate_player_leverage(player)
+        stats["adjusted_players"] += 1
+
+    return stats
 
 
 # DFS Lineup Builder tab ---------------------------------------------------
@@ -15115,6 +15209,24 @@ if selected_page == "DFS Lineup Builder":
         if not st.session_state.dfs_player_pool:
             st.info("📤 Upload a DraftKings CSV in the first tab to populate the player pool.")
         else:
+            current_slate_date = (
+                st.session_state.get("dfs_projection_date")
+                or str(datetime.now(EASTERN_TZ).date())
+            )
+            supplement_state = st.session_state.get("dfs_supplement_state", {}) or {}
+            if (
+                (not supplement_state)
+                or str(supplement_state.get("slate_date") or "") != current_slate_date
+                or not (supplement_state.get("player_map") or {})
+            ):
+                saved_supplement_state = _load_saved_dfs_supplement_state(
+                    dfs_conn,
+                    current_slate_date,
+                )
+                if saved_supplement_state:
+                    st.session_state.dfs_supplement_state = saved_supplement_state
+                    supplement_state = saved_supplement_state
+
             players = st.session_state.dfs_player_pool
 
             # Always rebuild from model baseline each rerun so blend/AI deltas
@@ -15123,11 +15235,16 @@ if selected_page == "DFS Lineup Builder":
                 if not hasattr(p, '_model_proj_fpts'):
                     p._model_proj_fpts = p.proj_fpts
                     p._model_fpts_per_dollar = p.fpts_per_dollar
+                if not hasattr(p, '_model_ownership_proj'):
+                    p._model_ownership_proj = p.ownership_proj
                 p.proj_fpts = p._model_proj_fpts
                 p.fpts_per_dollar = p._model_fpts_per_dollar
+                p.ownership_proj = p._model_ownership_proj
                 p.ai_adjustment_delta = 0.0
                 p.ai_adjustment_action = ""
                 p.ai_adjustment_reason = ""
+                p.rotowire_ownership_blend_active = False
+                p.rotowire_ownership_delta_applied = 0.0
 
             # Filters
             col1, col2, col3 = st.columns(3)
@@ -15228,6 +15345,19 @@ if selected_page == "DFS Lineup Builder":
                 st.caption(
                     f"AI adjustments active - {ai_adjusted_players} players, "
                     f"total projection shift {ai_total_delta:+.1f} FPTS."
+                )
+
+            rotowire_ownership_stats = _apply_rotowire_pre_run_ownership_blend(
+                players,
+                supplement_state,
+                current_slate_date,
+            )
+            if rotowire_ownership_stats.get("active"):
+                st.caption(
+                    "RotoWire ownership consensus active - "
+                    f"{rotowire_ownership_stats.get('adjusted_players', 0)} players blended "
+                    f"({int(ROTOWIRE_PRE_RUN_OWNERSHIP_WEIGHT * 100)}% RotoWire / "
+                    f"{int(ROTOWIRE_PRE_RUN_MODEL_OWNERSHIP_WEIGHT * 100)}% model)."
                 )
 
             # Sort options
@@ -15874,6 +16004,11 @@ if selected_page == "DFS Lineup Builder":
                 if saved_supplement_state:
                     st.session_state.dfs_supplement_state = saved_supplement_state
                     supplement_state = saved_supplement_state
+            rotowire_ownership_stats = _apply_rotowire_pre_run_ownership_blend(
+                players,
+                supplement_state,
+                current_slate_date,
+            )
             if ai_adjustments:
                 total_ai_delta = sum(float(v.get("delta_fpts", 0.0) or 0.0) for v in ai_adjustments.values())
                 st.info(
@@ -15900,6 +16035,13 @@ if selected_page == "DFS Lineup Builder":
                         f"Loaded saved supplement snapshot for {current_slate_date}. "
                         "Open `DFS Supplement` to refresh from the latest source."
                     )
+            if rotowire_ownership_stats.get("active"):
+                st.caption(
+                    "RotoWire ownership consensus is feeding lineup generation: "
+                    f"{rotowire_ownership_stats.get('adjusted_players', 0)} matched players "
+                    f"at {int(ROTOWIRE_PRE_RUN_OWNERSHIP_WEIGHT * 100)}% RotoWire / "
+                    f"{int(ROTOWIRE_PRE_RUN_MODEL_OWNERSHIP_WEIGHT * 100)}% model."
+                )
 
             model_profiles = dfs.get_lineup_model_profiles()
             supplement_required_models = {
@@ -16246,6 +16388,11 @@ if selected_page == "DFS Lineup Builder":
                             if auto_supplement_state:
                                 st.session_state.dfs_supplement_state = auto_supplement_state
                                 supplement_state = auto_supplement_state
+                                rotowire_ownership_stats = _apply_rotowire_pre_run_ownership_blend(
+                                    players,
+                                    supplement_state,
+                                    current_slate_date,
+                                )
                                 st.info(auto_supplement_msg)
                             elif auto_supplement_msg:
                                 st.warning(
