@@ -16379,7 +16379,7 @@ if selected_page == "DFS Lineup Builder":
                             and str(supplement_state.get("slate_date") or "") == current_slate_date
                             and (supplement_state.get("player_map") or {})
                         )
-                        if requested_supplement_models and not current_supplement_loaded:
+                        if not current_supplement_loaded:
                             auto_supplement_state, auto_supplement_msg = _autofetch_rotowire_supplement_state(
                                 dfs_conn,
                                 players,
