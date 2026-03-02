@@ -24,7 +24,14 @@ from typing import Any, List, Optional, Dict, Tuple
 from pathlib import Path
 
 # Import DFS types and scoring from the optimizer
-from dfs_optimizer import DFSPlayer, DFSLineup, calculate_dk_fantasy_points
+from dfs_optimizer import (
+    DFSPlayer,
+    DFSLineup,
+    _build_cheap_core_context,
+    build_player_selection_diagnostics,
+    calculate_dk_fantasy_points,
+    get_lineup_model_profiles,
+)
 
 
 # =============================================================================
@@ -1213,6 +1220,14 @@ def _normalize_name(name: str) -> str:
     return n
 
 
+def _parse_positions(raw_positions: Any) -> List[str]:
+    """Parse DraftKings-style positions text into a clean list."""
+    if raw_positions is None or (isinstance(raw_positions, float) and pd.isna(raw_positions)):
+        return []
+    pos_text = str(raw_positions).replace("/", ",")
+    return [p.strip().upper() for p in pos_text.split(",") if p.strip()]
+
+
 def _stack_shape_from_teams(teams: List[str]) -> Tuple[int, int, str]:
     """Summarize lineup team concentration as distinct teams, max stack, and shape."""
     clean_teams = [str(team).strip() for team in teams if str(team).strip()]
@@ -1823,6 +1838,10 @@ def build_tournament_postmortem(
         'portfolio_diagnostics_df': pd.DataFrame(),
         'model_strategy_breakdown_df': pd.DataFrame(),
         'model_signal_coverage_df': pd.DataFrame(),
+        'cheap_core_candidates_df': pd.DataFrame(),
+        'cheap_core_combo_coverage_df': pd.DataFrame(),
+        'cheap_core_model_coverage_df': pd.DataFrame(),
+        'selection_reason_snapshot_df': pd.DataFrame(),
         'improvements_df': pd.DataFrame(),
         'right_notes': [],
         'wrong_notes': [],
@@ -1975,8 +1994,9 @@ def build_tournament_postmortem(
         # 3) Player context (projection, actuals, ownership) for enrichment + metrics
         player_context_df = pd.read_sql_query(
             """
-            SELECT player_name, team, salary, proj_fpts, actual_fpts,
-                   ownership_proj, actual_ownership, did_play
+            SELECT player_id, player_name, team, opponent, salary, positions,
+                   proj_fpts, proj_floor, proj_ceiling, fpts_per_dollar,
+                   actual_fpts, ownership_proj, actual_ownership, did_play
             FROM dfs_slate_projections
             WHERE slate_date = ?
             """,
@@ -1985,7 +2005,8 @@ def build_tournament_postmortem(
         )
         player_context_agg = pd.DataFrame(
             columns=[
-                'name_key', 'player_name', 'team', 'salary',
+                'name_key', 'player_id', 'player_name', 'team', 'opponent', 'salary',
+                'positions', 'proj_floor', 'proj_ceiling', 'fpts_per_dollar',
                 'proj_fpts', 'actual_fpts', 'actual_minus_proj',
                 'ownership_proj', 'actual_ownership',
             ]
@@ -1993,7 +2014,8 @@ def build_tournament_postmortem(
         perf_df = pd.DataFrame()
         perf_agg = pd.DataFrame(
             columns=[
-                'name_key', 'player_name', 'team', 'salary',
+                'name_key', 'player_id', 'player_name', 'team', 'opponent', 'salary',
+                'positions', 'proj_floor', 'proj_ceiling', 'fpts_per_dollar',
                 'proj_fpts', 'actual_fpts', 'actual_minus_proj',
                 'ownership_proj', 'actual_ownership',
             ]
@@ -2007,9 +2029,15 @@ def build_tournament_postmortem(
             player_context_agg = (
                 player_context_df.groupby('name_key', as_index=False)
                 .agg(
+                    player_id=('player_id', 'first'),
                     player_name=('player_name', 'first'),
                     team=('team', 'first'),
+                    opponent=('opponent', 'first'),
                     salary=('salary', 'first'),
+                    positions=('positions', 'first'),
+                    proj_floor=('proj_floor', 'first'),
+                    proj_ceiling=('proj_ceiling', 'first'),
+                    fpts_per_dollar=('fpts_per_dollar', 'first'),
                     proj_fpts=('proj_fpts', 'first'),
                     actual_fpts=('actual_fpts', 'first'),
                     actual_minus_proj=('actual_minus_proj', 'first'),
@@ -2025,15 +2053,74 @@ def build_tournament_postmortem(
                 perf_agg = (
                     perf_df.groupby('name_key', as_index=False)
                     .agg(
+                        player_id=('player_id', 'first'),
                         player_name=('player_name', 'first'),
                         team=('team', 'first'),
+                        opponent=('opponent', 'first'),
                         salary=('salary', 'first'),
+                        positions=('positions', 'first'),
+                        proj_floor=('proj_floor', 'first'),
+                        proj_ceiling=('proj_ceiling', 'first'),
+                        fpts_per_dollar=('fpts_per_dollar', 'first'),
                         proj_fpts=('proj_fpts', 'first'),
                         actual_fpts=('actual_fpts', 'first'),
                         actual_minus_proj=('actual_minus_proj', 'first'),
                         ownership_proj=('ownership_proj', 'first'),
                         actual_ownership=('actual_ownership', 'first'),
                     )
+            )
+
+        supplement_run_df = pd.read_sql_query(
+            """
+            SELECT run_key, source_name, source_filename, created_at
+            FROM dfs_supplement_runs
+            WHERE slate_date = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            conn,
+            params=[slate_date],
+        )
+        supplement_source_name = ""
+        supplement_source_filename = ""
+        supplement_run_key = ""
+        supplement_player_deltas_df = pd.DataFrame(
+            columns=[
+                'player_id',
+                'supplement_player',
+                'supplement_team',
+                'supplement_proj_fpts',
+                'proj_delta',
+                'supplement_own_pct',
+                'own_delta_pp',
+                'match_method',
+                'match_score',
+            ]
+        )
+        if not supplement_run_df.empty:
+            supplement_run_key = str(supplement_run_df.iloc[0].get('run_key') or '')
+            supplement_source_name = str(supplement_run_df.iloc[0].get('source_name') or '')
+            supplement_source_filename = str(
+                supplement_run_df.iloc[0].get('source_filename') or ''
+            )
+            if supplement_run_key:
+                supplement_player_deltas_df = pd.read_sql_query(
+                    """
+                    SELECT
+                        player_id,
+                        supplement_player,
+                        supplement_team,
+                        supplement_proj_fpts,
+                        proj_delta,
+                        supplement_own_pct,
+                        own_delta_pp,
+                        match_method,
+                        match_score
+                    FROM dfs_supplement_player_deltas
+                    WHERE run_key = ?
+                    """,
+                    conn,
+                    params=[supplement_run_key],
                 )
 
         context_cols = [
@@ -2548,6 +2635,448 @@ def build_tournament_postmortem(
         exposure_df['signal_tags'] = exposure_df.apply(_build_signal_tags, axis=1)
         top_field_players_df = exposure_df[exposure_df['field_slots'] > 0].copy()
 
+        cheap_core_candidates_df = pd.DataFrame()
+        cheap_core_combo_coverage_df = pd.DataFrame()
+        cheap_core_model_coverage_df = pd.DataFrame()
+        selection_reason_snapshot_df = pd.DataFrame()
+        cheap_core_candidate_keys: set[str] = set()
+        cheap_core_field_lineup_share = None
+        cheap_core_our_lineup_share = None
+        cheap_core_field_pair_share = None
+        cheap_core_our_pair_share = None
+        cheap_core_field_triple_share = None
+        cheap_core_our_triple_share = None
+        cheap_core_pair_gap = None
+        cheap_core_triple_gap = None
+        cheap_core_missed_core_count = 0
+
+        cheap_core_profile_cfg = get_lineup_model_profiles().get('cheap_core_v1', {})
+        cheap_core_min_salary = int(
+            cheap_core_profile_cfg.get('cheap_core_min_salary', 3500) or 3500
+        )
+        cheap_core_max_salary = int(
+            cheap_core_profile_cfg.get('cheap_core_max_salary', 5000) or 5000
+        )
+        cheap_core_eval_df = exposure_df.copy()
+        cheap_core_eval_df = cheap_core_eval_df.merge(
+            player_context_agg[
+                [
+                    'name_key',
+                    'player_id',
+                    'opponent',
+                    'positions',
+                    'proj_floor',
+                    'proj_ceiling',
+                    'fpts_per_dollar',
+                    'proj_fpts',
+                    'ownership_proj',
+                    'salary',
+                ]
+            ],
+            on='name_key',
+            how='left',
+            suffixes=('', '_ctx'),
+        )
+        for base_col in [
+            'player_id',
+            'opponent',
+            'positions',
+            'proj_floor',
+            'proj_ceiling',
+            'fpts_per_dollar',
+            'proj_fpts',
+            'ownership_proj',
+            'salary',
+        ]:
+            ctx_col = f'{base_col}_ctx'
+            if ctx_col not in cheap_core_eval_df.columns:
+                continue
+            if base_col not in cheap_core_eval_df.columns:
+                cheap_core_eval_df[base_col] = np.nan
+            cheap_core_eval_df[base_col] = cheap_core_eval_df[base_col].where(
+                cheap_core_eval_df[base_col].notna(),
+                cheap_core_eval_df[ctx_col],
+            )
+            cheap_core_eval_df = cheap_core_eval_df.drop(columns=[ctx_col])
+        if not supplement_player_deltas_df.empty and not cheap_core_eval_df.empty:
+            supp_eval_df = supplement_player_deltas_df.copy()
+            supp_eval_df['player_id'] = pd.to_numeric(
+                supp_eval_df.get('player_id'),
+                errors='coerce',
+            )
+            cheap_core_eval_df['player_id'] = pd.to_numeric(
+                cheap_core_eval_df.get('player_id'),
+                errors='coerce',
+            )
+            cheap_core_eval_df = cheap_core_eval_df.merge(
+                supp_eval_df,
+                on='player_id',
+                how='left',
+            )
+        for col in [
+            'supplement_proj_fpts',
+            'supplement_own_pct',
+            'match_method',
+            'match_score',
+            'proj_delta',
+            'own_delta_pp',
+        ]:
+            if col not in cheap_core_eval_df.columns:
+                cheap_core_eval_df[col] = np.nan
+
+        cheap_core_players: List[DFSPlayer] = []
+        if not cheap_core_eval_df.empty:
+            for row in cheap_core_eval_df.to_dict('records'):
+                player_id = pd.to_numeric(row.get('player_id'), errors='coerce')
+                salary = pd.to_numeric(row.get('salary'), errors='coerce')
+                proj_fpts = pd.to_numeric(row.get('proj_fpts'), errors='coerce')
+                if pd.isna(player_id) or pd.isna(salary) or pd.isna(proj_fpts):
+                    continue
+
+                proj_ceiling = pd.to_numeric(row.get('proj_ceiling'), errors='coerce')
+                proj_floor = pd.to_numeric(row.get('proj_floor'), errors='coerce')
+                fpts_per_dollar = pd.to_numeric(row.get('fpts_per_dollar'), errors='coerce')
+                ownership_proj = pd.to_numeric(row.get('ownership_proj'), errors='coerce')
+                proj_delta = pd.to_numeric(row.get('proj_delta'), errors='coerce')
+                own_delta = pd.to_numeric(row.get('own_delta_pp'), errors='coerce')
+                positions = _parse_positions(row.get('positions'))
+                if not positions:
+                    positions = ['UTIL']
+
+                player = DFSPlayer(
+                    player_id=int(player_id),
+                    name=str(row.get('display_name') or row.get('player_name') or '').strip(),
+                    team=str(row.get('team') or '').strip(),
+                    opponent=str(row.get('opponent') or '').strip(),
+                    game_id="",
+                    positions=positions,
+                    salary=int(salary),
+                    proj_fpts=float(proj_fpts),
+                    proj_ceiling=(
+                        float(proj_ceiling)
+                        if pd.notna(proj_ceiling)
+                        else float(proj_fpts) + 7.0
+                    ),
+                    proj_floor=(
+                        float(proj_floor)
+                        if pd.notna(proj_floor)
+                        else max(0.0, float(proj_fpts) - 7.0)
+                    ),
+                    fpts_per_dollar=(
+                        float(fpts_per_dollar)
+                        if pd.notna(fpts_per_dollar)
+                        else (float(proj_fpts) / float(salary) * 1000.0 if float(salary) > 0 else 0.0)
+                    ),
+                    ownership_proj=float(ownership_proj) if pd.notna(ownership_proj) else 0.0,
+                )
+                player.supplement_proj_delta_applied = (
+                    float(proj_delta) if pd.notna(proj_delta) else 0.0
+                )
+                if 'rotowire' in supplement_source_name.lower():
+                    player.rotowire_ownership_delta_applied = (
+                        float(own_delta) if pd.notna(own_delta) else 0.0
+                    )
+                else:
+                    player.supplement_own_delta_applied = (
+                        float(own_delta) if pd.notna(own_delta) else 0.0
+                    )
+                cheap_core_players.append(player)
+
+        cheap_core_context = {
+            'candidate_ids': set(),
+            'candidate_count': 0,
+            'single_pool': [],
+            'pair_pool': [],
+            'triple_pool': [],
+        }
+        if cheap_core_players:
+            cheap_core_context = _build_cheap_core_context(
+                cheap_core_players,
+                cheap_core_profile_cfg,
+            )
+
+            selection_reason_snapshot_df = build_player_selection_diagnostics(
+                cheap_core_players,
+                model_key='cheap_core_v1',
+            )
+            if not selection_reason_snapshot_df.empty:
+                selection_reason_snapshot_df['name_key'] = (
+                    selection_reason_snapshot_df['Name'].astype(str).map(_normalize_name)
+                )
+                selection_reason_snapshot_df = selection_reason_snapshot_df.merge(
+                    cheap_core_eval_df[
+                        [
+                            'name_key',
+                            'display_name',
+                            'supplement_proj_fpts',
+                            'supplement_own_pct',
+                            'match_method',
+                            'match_score',
+                            'field_exposure_pct',
+                            'our_exposure_pct',
+                            'exposure_gap_pct',
+                            'actual_fpts',
+                            'actual_minus_proj',
+                            'actual_ownership',
+                            'signal_tags',
+                        ]
+                    ].drop_duplicates(subset=['name_key']),
+                    on='name_key',
+                    how='left',
+                )
+                selection_reason_snapshot_df = selection_reason_snapshot_df[
+                    (
+                        selection_reason_snapshot_df['Cheap Core'].astype(bool)
+                        | selection_reason_snapshot_df['Salary'].between(
+                            cheap_core_min_salary, cheap_core_max_salary
+                        )
+                        | (
+                            pd.to_numeric(
+                                selection_reason_snapshot_df['field_exposure_pct'],
+                                errors='coerce',
+                            ).fillna(0.0)
+                            >= 10.0
+                        )
+                    )
+                ].copy()
+                selection_reason_snapshot_df = selection_reason_snapshot_df.sort_values(
+                    [
+                        'Cheap Core',
+                        'field_exposure_pct',
+                        'Cheap Core Score',
+                        'Eff Proj FPTS',
+                    ],
+                    ascending=[False, False, False, False],
+                ).reset_index(drop=True)
+
+            cheap_core_candidate_rows: List[Dict[str, Any]] = []
+            name_display_lookup = {
+                str(row.get('name_key') or ''): str(row.get('display_name') or row.get('player_name') or '')
+                for row in cheap_core_eval_df.to_dict('records')
+                if str(row.get('name_key') or '').strip()
+            }
+            actual_fpts_lookup = {
+                str(row.get('name_key') or ''): float(row.get('actual_fpts'))
+                for row in cheap_core_eval_df.to_dict('records')
+                if str(row.get('name_key') or '').strip() and pd.notna(row.get('actual_fpts'))
+            }
+
+            for player in cheap_core_players:
+                if not bool(getattr(player, 'cheap_core_signal', False)):
+                    continue
+                name_key = _normalize_name(player.name)
+                cheap_core_candidate_keys.add(name_key)
+                match_row = cheap_core_eval_df[
+                    cheap_core_eval_df['name_key'].astype(str) == name_key
+                ].head(1)
+                match_data = match_row.iloc[0].to_dict() if not match_row.empty else {}
+                cheap_core_candidate_rows.append({
+                    'player': player.name,
+                    'team': player.team,
+                    'positions': '/'.join(player.positions),
+                    'salary': player.salary,
+                    'proj_fpts': float(getattr(player, 'proj_fpts', 0.0) or 0.0),
+                    'ownership_proj': float(getattr(player, 'ownership_proj', 0.0) or 0.0),
+                    'supplement_proj_fpts': match_data.get('supplement_proj_fpts'),
+                    'supplement_own_pct': match_data.get('supplement_own_pct'),
+                    'field_exposure_pct': match_data.get('field_exposure_pct'),
+                    'our_exposure_pct': match_data.get('our_exposure_pct'),
+                    'exposure_gap_pct': match_data.get('exposure_gap_pct'),
+                    'actual_fpts': match_data.get('actual_fpts'),
+                    'actual_minus_proj': match_data.get('actual_minus_proj'),
+                    'actual_ownership': match_data.get('actual_ownership'),
+                    'cheap_core_score': float(getattr(player, 'cheap_core_strength', 0.0) or 0.0),
+                    'cheap_core_reasons': str(getattr(player, 'cheap_core_reason_tags', '') or ''),
+                    'signal_tags': match_data.get('signal_tags'),
+                })
+
+            if cheap_core_candidate_rows:
+                cheap_core_candidates_df = pd.DataFrame(cheap_core_candidate_rows).sort_values(
+                    ['cheap_core_score', 'field_exposure_pct', 'actual_minus_proj'],
+                    ascending=[False, False, False],
+                ).reset_index(drop=True)
+                cheap_core_missed_core_count = int(
+                    cheap_core_candidates_df['player'].astype(str).map(_normalize_name).isin(
+                        missed_core_keys
+                    ).sum()
+                )
+
+                cheap_core_field_hits = int(
+                    sum(1 for s in field_lineup_name_sets if s & cheap_core_candidate_keys)
+                )
+                cheap_core_field_lineup_share = (
+                    100.0 * float(cheap_core_field_hits) / float(max(1, field_lineups))
+                    if field_lineups > 0
+                    else None
+                )
+                cheap_core_our_hits = int(
+                    sum(1 for s in lineup_name_sets if s & cheap_core_candidate_keys)
+                )
+                cheap_core_our_lineup_share = (
+                    100.0 * float(cheap_core_our_hits) / float(max(1, our_lineups))
+                    if our_lineups > 0
+                    else None
+                )
+
+                pair_combo_keys: List[Tuple[str, ...]] = []
+                pair_combo_rows: List[Dict[str, Any]] = []
+                for combo_players, combo_strength in cheap_core_context.get('pair_pool', []):
+                    combo_keys = tuple(sorted(_normalize_name(p.name) for p in combo_players))
+                    if combo_keys in pair_combo_keys:
+                        continue
+                    pair_combo_keys.append(combo_keys)
+                    field_count = int(
+                        sum(1 for s in field_lineup_name_sets if set(combo_keys).issubset(s))
+                    )
+                    our_count = int(
+                        sum(1 for s in lineup_name_sets if set(combo_keys).issubset(s))
+                    )
+                    field_pct = 100.0 * float(field_count) / float(max(1, field_lineups))
+                    our_pct = 100.0 * float(our_count) / float(max(1, our_lineups)) if our_lineups > 0 else 0.0
+                    pair_combo_rows.append({
+                        'combo_size': 2,
+                        'combo_players': ' + '.join(name_display_lookup.get(k, k) for k in combo_keys),
+                        'combo_strength': float(combo_strength),
+                        'field_combo_count': field_count,
+                        'field_combo_pct': field_pct,
+                        'our_combo_count': our_count,
+                        'our_combo_pct': our_pct,
+                        'combo_gap_pct': field_pct - our_pct,
+                        'combo_actual_fpts_sum': float(
+                            sum(actual_fpts_lookup.get(k, 0.0) for k in combo_keys)
+                        ) if combo_keys else None,
+                    })
+
+                triple_combo_keys: List[Tuple[str, ...]] = []
+                triple_combo_rows: List[Dict[str, Any]] = []
+                for combo_players, combo_strength in cheap_core_context.get('triple_pool', []):
+                    combo_keys = tuple(sorted(_normalize_name(p.name) for p in combo_players))
+                    if combo_keys in triple_combo_keys:
+                        continue
+                    triple_combo_keys.append(combo_keys)
+                    field_count = int(
+                        sum(1 for s in field_lineup_name_sets if set(combo_keys).issubset(s))
+                    )
+                    our_count = int(
+                        sum(1 for s in lineup_name_sets if set(combo_keys).issubset(s))
+                    )
+                    field_pct = 100.0 * float(field_count) / float(max(1, field_lineups))
+                    our_pct = 100.0 * float(our_count) / float(max(1, our_lineups)) if our_lineups > 0 else 0.0
+                    triple_combo_rows.append({
+                        'combo_size': 3,
+                        'combo_players': ' + '.join(name_display_lookup.get(k, k) for k in combo_keys),
+                        'combo_strength': float(combo_strength),
+                        'field_combo_count': field_count,
+                        'field_combo_pct': field_pct,
+                        'our_combo_count': our_count,
+                        'our_combo_pct': our_pct,
+                        'combo_gap_pct': field_pct - our_pct,
+                        'combo_actual_fpts_sum': float(
+                            sum(actual_fpts_lookup.get(k, 0.0) for k in combo_keys)
+                        ) if combo_keys else None,
+                    })
+
+                combo_coverage_rows = pair_combo_rows + triple_combo_rows
+                if combo_coverage_rows:
+                    cheap_core_combo_coverage_df = pd.DataFrame(combo_coverage_rows).sort_values(
+                        ['combo_gap_pct', 'field_combo_pct', 'combo_strength'],
+                        ascending=[False, False, False],
+                    ).reset_index(drop=True)
+
+                pair_combo_sets = [set(combo) for combo in pair_combo_keys]
+                triple_combo_sets = [set(combo) for combo in triple_combo_keys]
+                if pair_combo_sets:
+                    cheap_core_field_pair_share = 100.0 * float(
+                        sum(1 for s in field_lineup_name_sets if any(combo.issubset(s) for combo in pair_combo_sets))
+                    ) / float(max(1, field_lineups))
+                    cheap_core_our_pair_share = 100.0 * float(
+                        sum(1 for s in lineup_name_sets if any(combo.issubset(s) for combo in pair_combo_sets))
+                    ) / float(max(1, our_lineups)) if our_lineups > 0 else 0.0
+                    cheap_core_pair_gap = (
+                        float(cheap_core_field_pair_share - cheap_core_our_pair_share)
+                        if cheap_core_field_pair_share is not None and cheap_core_our_pair_share is not None
+                        else None
+                    )
+
+                if triple_combo_sets:
+                    cheap_core_field_triple_share = 100.0 * float(
+                        sum(1 for s in field_lineup_name_sets if any(combo.issubset(s) for combo in triple_combo_sets))
+                    ) / float(max(1, field_lineups))
+                    cheap_core_our_triple_share = 100.0 * float(
+                        sum(1 for s in lineup_name_sets if any(combo.issubset(s) for combo in triple_combo_sets))
+                    ) / float(max(1, our_lineups)) if our_lineups > 0 else 0.0
+                    cheap_core_triple_gap = (
+                        float(cheap_core_field_triple_share - cheap_core_our_triple_share)
+                        if cheap_core_field_triple_share is not None and cheap_core_our_triple_share is not None
+                        else None
+                    )
+
+                if not our_lineups_df.empty:
+                    model_rows: List[Dict[str, Any]] = []
+                    model_group_cols = ['model_key', 'model_label', 'generation_strategy']
+                    for group_vals, group_lineups_df in our_lineups_df.groupby(model_group_cols, dropna=False):
+                        model_key, model_label, generation_strategy = group_vals
+                        group_lineup_nums = group_lineups_df['lineup_num'].tolist()
+                        group_long_df = our_long[our_long['lineup_num'].isin(group_lineup_nums)].copy()
+                        group_sets = (
+                            group_long_df.groupby('lineup_num')['name_key']
+                            .apply(lambda s: {x for x in s.tolist() if x})
+                            .tolist()
+                            if not group_long_df.empty
+                            else []
+                        )
+                        if not group_sets:
+                            continue
+
+                        lineups_with_candidates = int(
+                            sum(1 for s in group_sets if s & cheap_core_candidate_keys)
+                        )
+                        lineups_with_pair = int(
+                            sum(
+                                1
+                                for s in group_sets
+                                if pair_combo_sets and any(combo.issubset(s) for combo in pair_combo_sets)
+                            )
+                        )
+                        lineups_with_triple = int(
+                            sum(
+                                1
+                                for s in group_sets
+                                if triple_combo_sets and any(combo.issubset(s) for combo in triple_combo_sets)
+                            )
+                        )
+                        model_hit_keys = set().union(*group_sets) & cheap_core_candidate_keys
+                        model_rows.append({
+                            'model_key': str(model_key or 'standard_v1'),
+                            'model_label': str(model_label or model_key or 'standard_v1'),
+                            'generation_strategy': str(generation_strategy or ''),
+                            'lineups': int(len(group_sets)),
+                            'cheap_core_players_hit_pct': (
+                                100.0 * float(len(model_hit_keys)) / float(max(1, len(cheap_core_candidate_keys)))
+                            ),
+                            'lineups_with_cheap_core_pct': (
+                                100.0 * float(lineups_with_candidates) / float(max(1, len(group_sets)))
+                            ),
+                            'lineups_with_cheap_core_pair_pct': (
+                                100.0 * float(lineups_with_pair) / float(max(1, len(group_sets)))
+                            ),
+                            'lineups_with_cheap_core_triple_pct': (
+                                100.0 * float(lineups_with_triple) / float(max(1, len(group_sets)))
+                            ),
+                            'avg_cheap_core_per_lineup': float(
+                                np.mean([len(s & cheap_core_candidate_keys) for s in group_sets])
+                            ),
+                            'best_actual_fpts': float(
+                                pd.to_numeric(group_lineups_df['total_actual_fpts'], errors='coerce').max()
+                            ) if not group_lineups_df.empty else None,
+                        })
+
+                    if model_rows:
+                        cheap_core_model_coverage_df = pd.DataFrame(model_rows).sort_values(
+                            ['lineups_with_cheap_core_triple_pct', 'lineups_with_cheap_core_pair_pct', 'best_actual_fpts'],
+                            ascending=[False, False, False],
+                        ).reset_index(drop=True)
+
         field_overlap = _pairwise_overlap_summary(field_lineup_name_sets)
         our_overlap = _pairwise_overlap_summary(lineup_name_sets)
         field_entropy = _normalized_entropy(
@@ -2832,6 +3361,19 @@ def build_tournament_postmortem(
             if isinstance(model_strategy_breakdown_df, pd.DataFrame) and not model_strategy_breakdown_df.empty
             else 0,
             'high_signal_player_count': int(len(high_signal_keys)),
+            'supplement_snapshot_available': bool(supplement_run_key),
+            'supplement_source_name': supplement_source_name,
+            'supplement_source_filename': supplement_source_filename,
+            'cheap_core_candidate_count': int(len(cheap_core_candidates_df)),
+            'cheap_core_missed_core_count': int(cheap_core_missed_core_count),
+            'cheap_core_field_lineup_share_pct': cheap_core_field_lineup_share,
+            'cheap_core_our_lineup_share_pct': cheap_core_our_lineup_share,
+            'cheap_core_field_pair_share_pct': cheap_core_field_pair_share,
+            'cheap_core_our_pair_share_pct': cheap_core_our_pair_share,
+            'cheap_core_field_triple_share_pct': cheap_core_field_triple_share,
+            'cheap_core_our_triple_share_pct': cheap_core_our_triple_share,
+            'cheap_core_pair_gap_pct': cheap_core_pair_gap,
+            'cheap_core_triple_gap_pct': cheap_core_triple_gap,
         }
 
         # 6) What went right / wrong notes
@@ -2928,6 +3470,40 @@ def build_tournament_postmortem(
                 )
             else:
                 right_notes.append("Portfolio overlap tracked close to field average.")
+
+        if supplement_run_key:
+            right_notes.append(
+                f"Supplement snapshot available from `{supplement_source_name or 'supplement'}` for cheap-core review."
+            )
+        else:
+            wrong_notes.append(
+                "No supplement snapshot was saved for this slate, limiting cheap-core evaluation."
+            )
+
+        if len(cheap_core_candidates_df) > 0:
+            if (
+                cheap_core_field_lineup_share is not None
+                and cheap_core_our_lineup_share is not None
+                and (cheap_core_field_lineup_share - cheap_core_our_lineup_share) >= 15.0
+            ):
+                wrong_notes.append(
+                    "Cheap-core candidates showed up in field lineups materially more often than in our portfolio."
+                )
+            elif (
+                cheap_core_field_lineup_share is not None
+                and cheap_core_our_lineup_share is not None
+                and abs(cheap_core_field_lineup_share - cheap_core_our_lineup_share) <= 10.0
+            ):
+                right_notes.append("Cheap-core lineup coverage tracked reasonably close to the field.")
+
+            if cheap_core_pair_gap is not None and cheap_core_pair_gap >= 15.0:
+                wrong_notes.append(
+                    f"Cheap-core pairs lagged the field by {cheap_core_pair_gap:.1f}pp."
+                )
+            if cheap_core_triple_gap is not None and cheap_core_triple_gap >= 10.0:
+                wrong_notes.append(
+                    f"Cheap-core triples lagged the field by {cheap_core_triple_gap:.1f}pp."
+                )
 
         result['right_notes'] = right_notes
         result['wrong_notes'] = wrong_notes
@@ -3056,6 +3632,30 @@ def build_tournament_postmortem(
             })
             priority += 1
 
+        if len(cheap_core_candidates_df) > 0:
+            why_parts: List[str] = [
+                f"candidates={len(cheap_core_candidates_df)}",
+            ]
+            if cheap_core_missed_core_count > 0:
+                why_parts.append(f"missed_core_overlap={cheap_core_missed_core_count}")
+            if cheap_core_pair_gap is not None:
+                why_parts.append(f"pair_gap={cheap_core_pair_gap:.1f}pp")
+            if cheap_core_triple_gap is not None:
+                why_parts.append(f"triple_gap={cheap_core_triple_gap:.1f}pp")
+            improvement_rows.append({
+                'priority': priority,
+                'area': 'Cheap-Core Capture',
+                'why': ', '.join(why_parts),
+                'next_slate_change': (
+                    'Review cheap-core candidates, pair coverage, and blocker reasons before build lock; '
+                    'increase cheap-core combo concentration only when field support is broad.'
+                ),
+                'success_metric': (
+                    'Raise cheap-core lineup/pair/triple coverage toward field levels without inflating dud exposure.'
+                ),
+            })
+            priority += 1
+
         if team_concentration_mismatch_count > 0:
             improvement_rows.append({
                 'priority': priority,
@@ -3100,6 +3700,10 @@ def build_tournament_postmortem(
         result['portfolio_diagnostics_df'] = portfolio_diagnostics_df.reset_index(drop=True)
         result['model_strategy_breakdown_df'] = model_strategy_breakdown_df.reset_index(drop=True)
         result['model_signal_coverage_df'] = model_signal_coverage_df.reset_index(drop=True)
+        result['cheap_core_candidates_df'] = cheap_core_candidates_df.reset_index(drop=True)
+        result['cheap_core_combo_coverage_df'] = cheap_core_combo_coverage_df.reset_index(drop=True)
+        result['cheap_core_model_coverage_df'] = cheap_core_model_coverage_df.reset_index(drop=True)
+        result['selection_reason_snapshot_df'] = selection_reason_snapshot_df.reset_index(drop=True)
 
     except Exception as e:
         result['errors'].append(f"Postmortem build error: {e}")

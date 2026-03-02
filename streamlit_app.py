@@ -17618,6 +17618,18 @@ if selected_page == "DFS Lineup Builder":
                                 "model_signal_coverage": _df_records_safe(
                                     pm_payload.get("model_signal_coverage_df")
                                 ),
+                                "cheap_core_candidates": _df_records_safe(
+                                    pm_payload.get("cheap_core_candidates_df")
+                                ),
+                                "cheap_core_combo_coverage": _df_records_safe(
+                                    pm_payload.get("cheap_core_combo_coverage_df")
+                                ),
+                                "cheap_core_model_coverage": _df_records_safe(
+                                    pm_payload.get("cheap_core_model_coverage_df")
+                                ),
+                                "selection_reason_snapshot": _df_records_safe(
+                                    pm_payload.get("selection_reason_snapshot_df")
+                                ),
                                 "improvements": _df_records_safe(
                                     pm_payload.get("improvements_df")
                                 ),
@@ -18989,6 +19001,244 @@ if selected_page == "DFS Lineup Builder":
                                         lambda x: f"{x:.1f}" if pd.notna(x) else "—"
                                     )
                                 st.dataframe(signal_view.head(60), use_container_width=True, hide_index=True)
+
+                            cheap_core_candidates_df = pm_payload.get('cheap_core_candidates_df')
+                            cheap_core_combo_df = pm_payload.get('cheap_core_combo_coverage_df')
+                            cheap_core_model_df = pm_payload.get('cheap_core_model_coverage_df')
+                            selection_reason_df = pm_payload.get('selection_reason_snapshot_df')
+                            if (
+                                (isinstance(cheap_core_candidates_df, pd.DataFrame) and not cheap_core_candidates_df.empty)
+                                or (isinstance(cheap_core_combo_df, pd.DataFrame) and not cheap_core_combo_df.empty)
+                                or (isinstance(cheap_core_model_df, pd.DataFrame) and not cheap_core_model_df.empty)
+                                or (isinstance(selection_reason_df, pd.DataFrame) and not selection_reason_df.empty)
+                            ):
+                                st.markdown("**Cheap-Core Evaluation**")
+                                cc_m1, cc_m2, cc_m3, cc_m4 = st.columns(4)
+                                cc_m1.metric(
+                                    "Candidates",
+                                    int(pm_metrics.get('cheap_core_candidate_count') or 0),
+                                )
+                                cc_m2.metric(
+                                    "Field Lineup Share",
+                                    (
+                                        f"{float(pm_metrics.get('cheap_core_field_lineup_share_pct')):.1f}%"
+                                        if pm_metrics.get('cheap_core_field_lineup_share_pct') is not None
+                                        else "—"
+                                    ),
+                                )
+                                cc_m3.metric(
+                                    "Our Lineup Share",
+                                    (
+                                        f"{float(pm_metrics.get('cheap_core_our_lineup_share_pct')):.1f}%"
+                                        if pm_metrics.get('cheap_core_our_lineup_share_pct') is not None
+                                        else "—"
+                                    ),
+                                    delta=(
+                                        f"{float(pm_metrics.get('cheap_core_our_lineup_share_pct') - pm_metrics.get('cheap_core_field_lineup_share_pct')):+.1f}pp vs field"
+                                        if pm_metrics.get('cheap_core_field_lineup_share_pct') is not None
+                                        and pm_metrics.get('cheap_core_our_lineup_share_pct') is not None
+                                        else None
+                                    ),
+                                )
+                                cc_m4.metric(
+                                    "Pair Gap",
+                                    (
+                                        f"{float(pm_metrics.get('cheap_core_pair_gap_pct')):.1f}pp"
+                                        if pm_metrics.get('cheap_core_pair_gap_pct') is not None
+                                        else "—"
+                                    ),
+                                    delta=(
+                                        f"Triple gap {float(pm_metrics.get('cheap_core_triple_gap_pct')):.1f}pp"
+                                        if pm_metrics.get('cheap_core_triple_gap_pct') is not None
+                                        else None
+                                    ),
+                                )
+
+                                if pm_metrics.get('supplement_snapshot_available'):
+                                    st.caption(
+                                        "Cheap-core review is using the latest supplement snapshot"
+                                        + (
+                                            f" from `{pm_metrics.get('supplement_source_name')}`."
+                                            if pm_metrics.get('supplement_source_name')
+                                            else "."
+                                        )
+                                    )
+
+                                if isinstance(cheap_core_candidates_df, pd.DataFrame) and not cheap_core_candidates_df.empty:
+                                    st.markdown("**Cheap-Core Candidates**")
+                                    candidate_view = cheap_core_candidates_df[
+                                        [
+                                            'player',
+                                            'team',
+                                            'positions',
+                                            'salary',
+                                            'proj_fpts',
+                                            'ownership_proj',
+                                            'supplement_own_pct',
+                                            'field_exposure_pct',
+                                            'our_exposure_pct',
+                                            'exposure_gap_pct',
+                                            'actual_minus_proj',
+                                            'cheap_core_score',
+                                            'cheap_core_reasons',
+                                            'signal_tags',
+                                        ]
+                                    ].copy()
+                                    candidate_view.columns = [
+                                        'Player',
+                                        'Team',
+                                        'Pos',
+                                        'Salary',
+                                        'Proj FPTS',
+                                        'Proj Own%',
+                                        'Supp Own%',
+                                        'Field Exp %',
+                                        'Our Exp %',
+                                        'Gap (Field-Our)',
+                                        'Actual-Proj',
+                                        'Cheap-Core Score',
+                                        'Reasons',
+                                        'Signals',
+                                    ]
+                                    candidate_view['Salary'] = candidate_view['Salary'].apply(
+                                        lambda x: f"${int(x):,}" if pd.notna(x) else "—"
+                                    )
+                                    for c in ['Proj FPTS', 'Actual-Proj', 'Cheap-Core Score']:
+                                        candidate_view[c] = candidate_view[c].apply(
+                                            lambda x: f"{x:.2f}" if pd.notna(x) else "—"
+                                        )
+                                    for c in ['Proj Own%', 'Supp Own%', 'Field Exp %', 'Our Exp %', 'Gap (Field-Our)']:
+                                        candidate_view[c] = candidate_view[c].apply(
+                                            lambda x: f"{x:.1f}%" if pd.notna(x) else "—"
+                                        )
+                                    st.dataframe(candidate_view, use_container_width=True, hide_index=True)
+
+                                if isinstance(cheap_core_combo_df, pd.DataFrame) and not cheap_core_combo_df.empty:
+                                    st.markdown("**Cheap-Core Combo Coverage**")
+                                    combo_view = cheap_core_combo_df[
+                                        [
+                                            'combo_size',
+                                            'combo_players',
+                                            'combo_strength',
+                                            'field_combo_pct',
+                                            'our_combo_pct',
+                                            'combo_gap_pct',
+                                            'combo_actual_fpts_sum',
+                                        ]
+                                    ].copy()
+                                    combo_view.columns = [
+                                        'Combo Size',
+                                        'Players',
+                                        'Strength',
+                                        'Field Combo %',
+                                        'Our Combo %',
+                                        'Gap (Field-Our)',
+                                        'Actual FPTS Sum',
+                                    ]
+                                    for c in ['Strength', 'Actual FPTS Sum']:
+                                        combo_view[c] = combo_view[c].apply(
+                                            lambda x: f"{x:.2f}" if pd.notna(x) else "—"
+                                        )
+                                    for c in ['Field Combo %', 'Our Combo %', 'Gap (Field-Our)']:
+                                        combo_view[c] = combo_view[c].apply(
+                                            lambda x: f"{x:.1f}%" if pd.notna(x) else "—"
+                                        )
+                                    st.dataframe(combo_view.head(20), use_container_width=True, hide_index=True)
+
+                                if isinstance(cheap_core_model_df, pd.DataFrame) and not cheap_core_model_df.empty:
+                                    st.markdown("**Cheap-Core Model Coverage**")
+                                    model_core_view = cheap_core_model_df[
+                                        [
+                                            'model_label',
+                                            'generation_strategy',
+                                            'lineups',
+                                            'cheap_core_players_hit_pct',
+                                            'lineups_with_cheap_core_pct',
+                                            'lineups_with_cheap_core_pair_pct',
+                                            'lineups_with_cheap_core_triple_pct',
+                                            'avg_cheap_core_per_lineup',
+                                            'best_actual_fpts',
+                                        ]
+                                    ].copy()
+                                    model_core_view.columns = [
+                                        'Model',
+                                        'Strategy',
+                                        'Lineups',
+                                        'Player Hit %',
+                                        'Lineups w/ Cheap Core',
+                                        'Lineups w/ Pair',
+                                        'Lineups w/ Triple',
+                                        'Avg Cheap-Core / Lineup',
+                                        'Best Actual',
+                                    ]
+                                    for c in ['Player Hit %', 'Lineups w/ Cheap Core', 'Lineups w/ Pair', 'Lineups w/ Triple']:
+                                        model_core_view[c] = model_core_view[c].apply(
+                                            lambda x: f"{x:.1f}%" if pd.notna(x) else "—"
+                                        )
+                                    for c in ['Avg Cheap-Core / Lineup', 'Best Actual']:
+                                        model_core_view[c] = model_core_view[c].apply(
+                                            lambda x: f"{x:.2f}" if pd.notna(x) else "—"
+                                        )
+                                    st.dataframe(model_core_view, use_container_width=True, hide_index=True)
+
+                                if isinstance(selection_reason_df, pd.DataFrame) and not selection_reason_df.empty:
+                                    with st.expander("Selection Reason Snapshot"):
+                                        reason_view = selection_reason_df[
+                                            [
+                                                'Name',
+                                                'Team',
+                                                'Pos',
+                                                'Salary',
+                                                'Selection Path',
+                                                'Cheap Core',
+                                                'Cheap Core Score',
+                                                'Cheap Core Reasons',
+                                                'Core Gate',
+                                                'Low Own Gate',
+                                                'Standout Gate',
+                                                'Own Delta',
+                                                'Proj Delta',
+                                                'field_exposure_pct',
+                                                'our_exposure_pct',
+                                                'actual_minus_proj',
+                                                'Likely Blocker',
+                                            ]
+                                        ].copy()
+                                        reason_view.columns = [
+                                            'Player',
+                                            'Team',
+                                            'Pos',
+                                            'Salary',
+                                            'Selection Path',
+                                            'Cheap Core',
+                                            'Cheap-Core Score',
+                                            'Reasons',
+                                            'Core Gate',
+                                            'Low Own Gate',
+                                            'Standout Gate',
+                                            'Own Delta',
+                                            'Proj Delta',
+                                            'Field Exp %',
+                                            'Our Exp %',
+                                            'Actual-Proj',
+                                            'Likely Blocker',
+                                        ]
+                                        reason_view['Salary'] = reason_view['Salary'].apply(
+                                            lambda x: f"${int(x):,}" if pd.notna(x) else "—"
+                                        )
+                                        for c in ['Cheap-Core Score', 'Own Delta', 'Proj Delta', 'Actual-Proj']:
+                                            reason_view[c] = reason_view[c].apply(
+                                                lambda x: f"{x:.2f}" if pd.notna(x) else "—"
+                                            )
+                                        for c in ['Field Exp %', 'Our Exp %']:
+                                            reason_view[c] = reason_view[c].apply(
+                                                lambda x: f"{x:.1f}%" if pd.notna(x) else "—"
+                                            )
+                                        for c in ['Cheap Core', 'Core Gate', 'Low Own Gate', 'Standout Gate']:
+                                            reason_view[c] = reason_view[c].apply(
+                                                lambda x: "Yes" if bool(x) else "No"
+                                            )
+                                        st.dataframe(reason_view.head(60), use_container_width=True, hide_index=True)
 
                             exp_df = pm_payload.get('top_field_players_df')
                             if isinstance(exp_df, pd.DataFrame) and not exp_df.empty:
