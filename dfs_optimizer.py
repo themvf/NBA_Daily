@@ -23,6 +23,7 @@ import sqlite3
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import date
+from itertools import combinations
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
@@ -530,6 +531,10 @@ class DFSPlayer:
     vegas_implied_fpts: float = 0.0  # Vegas-implied fantasy points from props feed
     vegas_edge_pct: float = 0.0      # (Vegas implied - model proj) / model proj
     vegas_signal: str = ""           # BOOST / WATCH / FADE guidance from props edge
+    supplement_proj_delta_applied: float = 0.0
+    supplement_own_delta_applied: float = 0.0
+    rotowire_ownership_blend_active: bool = False
+    rotowire_ownership_delta_applied: float = 0.0
 
     # Status flags
     is_locked: bool = False      # Force include in all lineups
@@ -586,6 +591,12 @@ class DFSPlayer:
     risk_adjusted_proj_fpts: float = 0.0
     segment_exposure_cap: float = 1.0
     is_overproj_redflag: bool = False
+    cheap_core_signal: bool = False
+    cheap_core_external_confirmation: bool = False
+    cheap_core_strength: float = 0.0
+    cheap_core_reason_tags: str = ""
+    cheap_core_effective_exposure_cap: float = 1.0
+    cheap_core_effective_risk_fpts: float = 0.0
 
     def calculate_projections(self) -> None:
         """Calculate derived projection values."""
@@ -814,6 +825,49 @@ LINEUP_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
             ("ceiling", 0.24, 0.14),
             ("leverage", 0.30, 0.12),
             ("projection", 0.58, 0.12),
+        ],
+    },
+    "cheap_core_v1": {
+        "label": "Cheap Core v1",
+        "description": (
+            "Slate-concentration profile that prioritizes cheap field-core values "
+            "and their key 2-player/3-player combinations."
+        ),
+        "aggressive_ceiling_stack": False,
+        "overlap_cap": 6,
+        "core_play_inject_prob": 0.18,
+        "core_play_min_own_pct": 14.0,
+        "core_play_max_own_pct": 60.0,
+        "core_play_min_projection": 22.0,
+        "low_own_inject_prob": 0.08,
+        "low_own_max_own_pct": 9.0,
+        "low_own_min_projection": 21.0,
+        "standout_lock_prob": 0.12,
+        "standout_min_ceiling_gap": 7.0,
+        "cheap_core_enabled": True,
+        "cheap_core_min_salary": 3500,
+        "cheap_core_max_salary": 5200,
+        "cheap_core_min_projection": 21.5,
+        "cheap_core_min_own_pct": 13.0,
+        "cheap_core_min_value": 4.6,
+        "cheap_core_min_recent_minutes": 18.0,
+        "cheap_core_external_own_delta_min": 4.0,
+        "cheap_core_external_proj_delta_min": 2.0,
+        "cheap_core_score_weight": 0.018,
+        "cheap_core_score_cap": 0.16,
+        "cheap_core_risk_penalty_relief": 0.80,
+        "cheap_core_min_exposure_cap": 0.50,
+        "cheap_core_inject_prob": 0.28,
+        "cheap_core_pair_inject_prob": 0.48,
+        "cheap_core_triple_inject_prob": 0.18,
+        "cheap_core_combo_pool_size": 8,
+        "cheap_core_overlap_discount": 3,
+        "strategy_mix": [
+            ("projection", 0.24, 0.24),
+            ("ceiling", 0.28, 0.24),
+            ("value", 0.22, 0.22),
+            ("projection", 0.52, 0.18),
+            ("leverage", 0.34, 0.12),
         ],
     },
     "supp_proj_v1_blend": {
@@ -1196,6 +1250,228 @@ def _midrange_minutes_vegas_signal_score(
         + (minutes_excess * 0.60)
         + (vegas_edge * 0.12),
     )
+
+
+def _build_cheap_core_context(
+    player_pool: List[DFSPlayer],
+    profile_cfg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Annotate low-salary field-core candidates and precompute combo pools."""
+    profile_cfg = profile_cfg or {}
+    for player in player_pool:
+        player.cheap_core_signal = False
+        player.cheap_core_external_confirmation = False
+        player.cheap_core_strength = 0.0
+        player.cheap_core_reason_tags = ""
+        player.cheap_core_effective_exposure_cap = float(
+            getattr(player, "segment_exposure_cap", 1.0) or 1.0
+        )
+        player.cheap_core_effective_risk_fpts = float(
+            getattr(player, "risk_adjusted_proj_fpts", 0.0)
+            or getattr(player, "proj_fpts", 0.0)
+            or 0.0
+        )
+
+    if not bool(profile_cfg.get("cheap_core_enabled", True)):
+        return {
+            "candidate_ids": set(),
+            "candidate_count": 0,
+            "single_pool": [],
+            "pair_pool": [],
+            "triple_pool": [],
+        }
+
+    min_salary = int(profile_cfg.get("cheap_core_min_salary", 3500) or 3500)
+    max_salary = int(profile_cfg.get("cheap_core_max_salary", 5000) or 5000)
+    min_projection = float(profile_cfg.get("cheap_core_min_projection", 22.0) or 22.0)
+    min_own_pct = float(profile_cfg.get("cheap_core_min_own_pct", 14.0) or 14.0)
+    min_value = float(profile_cfg.get("cheap_core_min_value", 4.5) or 4.5)
+    min_recent_minutes = float(
+        profile_cfg.get("cheap_core_min_recent_minutes", 18.0) or 18.0
+    )
+    own_delta_min = float(
+        profile_cfg.get("cheap_core_external_own_delta_min", 5.0) or 5.0
+    )
+    proj_delta_min = float(
+        profile_cfg.get("cheap_core_external_proj_delta_min", 2.0) or 2.0
+    )
+    risk_penalty_relief = max(
+        0.0, min(1.0, float(profile_cfg.get("cheap_core_risk_penalty_relief", 0.75) or 0.75))
+    )
+    cap_floor = float(profile_cfg.get("cheap_core_min_exposure_cap", 0.50) or 0.50)
+    combo_pool_size = int(profile_cfg.get("cheap_core_combo_pool_size", 8) or 8)
+
+    candidates: List[Tuple[DFSPlayer, float]] = []
+    for player in player_pool:
+        if bool(getattr(player, "is_excluded", False)) or bool(
+            getattr(player, "is_injured", False)
+        ):
+            continue
+
+        salary = int(getattr(player, "salary", 0) or 0)
+        proj_fpts = float(getattr(player, "proj_fpts", 0.0) or 0.0)
+        own_pct = float(getattr(player, "ownership_proj", 0.0) or 0.0)
+        value_score = float(getattr(player, "fpts_per_dollar", 0.0) or 0.0)
+        recent_minutes = float(getattr(player, "recent_minutes_avg", 0.0) or 0.0)
+        minutes_validated = bool(getattr(player, "minutes_validated", False))
+        own_delta = max(
+            0.0,
+            float(getattr(player, "supplement_own_delta_applied", 0.0) or 0.0),
+            float(getattr(player, "rotowire_ownership_delta_applied", 0.0) or 0.0),
+        )
+        proj_delta = max(
+            0.0,
+            float(getattr(player, "supplement_proj_delta_applied", 0.0) or 0.0),
+        )
+        vegas_signal = str(getattr(player, "vegas_signal", "") or "").strip().upper()
+        external_confirmation = (
+            own_delta >= own_delta_min
+            or proj_delta >= proj_delta_min
+            or vegas_signal == "BOOST"
+            or (minutes_validated and recent_minutes >= min_recent_minutes)
+        )
+
+        risk_penalty = float(getattr(player, "segment_risk_penalty", 0.0) or 0.0)
+        base_risk_fpts = float(
+            getattr(player, "risk_adjusted_proj_fpts", 0.0) or proj_fpts
+        )
+        effective_risk_fpts = max(
+            0.0,
+            base_risk_fpts + (risk_penalty * risk_penalty_relief)
+            if external_confirmation
+            else base_risk_fpts,
+        )
+        player.cheap_core_effective_risk_fpts = effective_risk_fpts
+        player.cheap_core_effective_exposure_cap = max(
+            float(getattr(player, "segment_exposure_cap", 1.0) or 1.0),
+            cap_floor if external_confirmation else 0.0,
+        )
+
+        if salary < min_salary or salary > max_salary:
+            continue
+        if proj_fpts < min_projection or own_pct < min_own_pct or value_score < min_value:
+            continue
+        if not external_confirmation:
+            continue
+
+        strength = (
+            (proj_fpts - min_projection) * 0.70
+            + (own_pct - min_own_pct) * 0.18
+            + (value_score - min_value) * 2.0
+            + min(14.0, own_delta) * 0.18
+            + min(8.0, proj_delta) * 0.35
+            + max(0.0, recent_minutes - min_recent_minutes) * 0.08
+        )
+        reason_tags: List[str] = [
+            f"own {own_pct:.1f}%",
+            f"value {value_score:.2f}",
+        ]
+        if own_delta > 0:
+            reason_tags.append(f"own+{own_delta:.1f}")
+        if proj_delta > 0:
+            reason_tags.append(f"proj+{proj_delta:.1f}")
+        if minutes_validated and recent_minutes > 0:
+            reason_tags.append(f"min {recent_minutes:.1f}")
+        if vegas_signal == "BOOST":
+            reason_tags.append("vegas")
+
+        player.cheap_core_signal = True
+        player.cheap_core_external_confirmation = external_confirmation
+        player.cheap_core_strength = round(max(0.0, strength), 3)
+        player.cheap_core_reason_tags = ", ".join(reason_tags)
+        candidates.append((player, player.cheap_core_strength))
+
+    candidates.sort(key=lambda item: item[1], reverse=True)
+    candidates = candidates[: max(3, combo_pool_size)]
+    top_players = [player for player, _ in candidates]
+
+    pair_pool: List[Tuple[Tuple[DFSPlayer, ...], float]] = []
+    for combo in combinations(top_players, 2):
+        combo_score = sum(float(getattr(p, "cheap_core_strength", 0.0) or 0.0) for p in combo)
+        teams = {p.team for p in combo}
+        combo_score += 0.40 if len(teams) > 1 else 0.10
+        pair_pool.append((combo, combo_score))
+    pair_pool.sort(key=lambda item: item[1], reverse=True)
+    pair_pool = pair_pool[:12]
+
+    triple_pool: List[Tuple[Tuple[DFSPlayer, ...], float]] = []
+    if len(top_players) >= 3:
+        for combo in combinations(top_players, 3):
+            combo_score = sum(
+                float(getattr(p, "cheap_core_strength", 0.0) or 0.0) for p in combo
+            )
+            teams = {p.team for p in combo}
+            combo_score += 0.70 if len(teams) > 1 else 0.20
+            triple_pool.append((combo, combo_score))
+        triple_pool.sort(key=lambda item: item[1], reverse=True)
+        triple_pool = triple_pool[:8]
+
+    return {
+        "candidate_ids": {player.player_id for player, _ in candidates},
+        "candidate_count": len(candidates),
+        "single_pool": candidates,
+        "pair_pool": pair_pool,
+        "triple_pool": triple_pool,
+    }
+
+
+def _effective_risk_adjusted_fpts(
+    player: DFSPlayer,
+    profile_cfg: Optional[Dict[str, Any]] = None,
+) -> float:
+    """Return slate-aware risk-adjusted projection with cheap-core relief when warranted."""
+    base_value = float(
+        getattr(player, "cheap_core_effective_risk_fpts", 0.0)
+        or getattr(player, "risk_adjusted_proj_fpts", 0.0)
+        or getattr(player, "proj_fpts", 0.0)
+        or 0.0
+    )
+    return max(0.0, base_value)
+
+
+def _effective_segment_exposure_cap(
+    player: DFSPlayer,
+    profile_cfg: Optional[Dict[str, Any]] = None,
+) -> float:
+    """Return the effective exposure cap after cheap-core relief."""
+    base_cap = float(getattr(player, "segment_exposure_cap", 1.0) or 1.0)
+    if bool(getattr(player, "cheap_core_signal", False)) and bool(
+        getattr(player, "cheap_core_external_confirmation", False)
+    ):
+        return max(
+            base_cap,
+            float(
+                getattr(player, "cheap_core_effective_exposure_cap", base_cap) or base_cap
+            ),
+        )
+    return base_cap
+
+
+def _cheap_core_score_multiplier(
+    player: DFSPlayer,
+    strategy: str = "projection",
+    profile_cfg: Optional[Dict[str, Any]] = None,
+) -> float:
+    """Apply a bounded cheap-core boost without turning it into a hard lock."""
+    if not bool(getattr(player, "cheap_core_signal", False)):
+        return 1.0
+
+    profile_cfg = profile_cfg or {}
+    strength = float(getattr(player, "cheap_core_strength", 0.0) or 0.0)
+    if strength <= 0:
+        return 1.0
+
+    base_adjustment = min(
+        float(profile_cfg.get("cheap_core_score_cap", 0.12) or 0.12),
+        strength * float(profile_cfg.get("cheap_core_score_weight", 0.015) or 0.015),
+    )
+    strategy_scale = {
+        "projection": 1.00,
+        "value": 1.10,
+        "ceiling": 0.80,
+        "leverage": 0.70,
+    }.get(strategy, 1.0)
+    return max(1.0, 1.0 + (base_adjustment * strategy_scale))
 
 
 def _vegas_signal_score_multiplier(
@@ -2756,11 +3032,14 @@ def _select_stack_players(
         if strategy == "ceiling":
             base_score = p.proj_ceiling
         elif strategy == "value":
-            base_score = p.fpts_per_dollar
+            if p.salary <= 0:
+                base_score = 0.1
+            else:
+                base_score = (_effective_risk_adjusted_fpts(p, model_profile) / p.salary) * 1000
         elif strategy == "leverage":
             base_score = p.leverage_score
         else:
-            base_score = p.proj_fpts
+            base_score = _effective_risk_adjusted_fpts(p, model_profile)
         return max(
             0.1,
             float(base_score or 0.0)
@@ -2769,6 +3048,11 @@ def _select_stack_players(
                 strategy=strategy,
                 model_key=model_key,
                 model_profile=model_profile,
+            )
+            * _cheap_core_score_multiplier(
+                p,
+                strategy=strategy,
+                profile_cfg=model_profile,
             ),
         )
 
@@ -2976,7 +3260,7 @@ def optimize_lineup_randomized(
     def get_score(p: DFSPlayer) -> float:
         risk_penalty = float(getattr(p, "segment_risk_penalty", 0.0) or 0.0)
         proj_for_scoring = float(
-            getattr(p, "risk_adjusted_proj_fpts", 0.0)
+            _effective_risk_adjusted_fpts(p, model_profile)
             or (float(getattr(p, "proj_fpts", 0.0) or 0.0) - risk_penalty)
         )
         proj_for_scoring = max(0.0, proj_for_scoring)
@@ -3006,6 +3290,12 @@ def optimize_lineup_randomized(
             base_score *= _midrange_minutes_vegas_multiplier(
                 p, model_profile, model_context
             )
+
+        base_score *= _cheap_core_score_multiplier(
+            p,
+            strategy=strategy,
+            profile_cfg=model_profile,
+        )
 
         return max(0.1, base_score)
 
@@ -3319,14 +3609,20 @@ def generate_diversified_lineups(
     for pid, info in target_player_map.items():
         max_exp[pid] = max(max_player_exposure, info['target'])
 
+    profile_cfg = LINEUP_MODEL_PROFILES.get(model_key, {}) if model_key else {}
+    cheap_core_context = _build_cheap_core_context(filtered_pool, profile_cfg)
+    cheap_core_player_ids = set(cheap_core_context.get("candidate_ids", set()) or set())
+
     # Segment-aware safety caps from calibration diagnostics.
-    # These caps are intentionally stricter for historically problematic buckets.
+    # Cheap-core confirmation can relax the historical cap when external signals align.
     for p in filtered_pool:
-        segment_cap = float(getattr(p, "segment_exposure_cap", 1.0) or 1.0)
+        segment_cap = _effective_segment_exposure_cap(p, profile_cfg)
         max_exp[p.player_id] = min(max_exp.get(p.player_id, max_player_exposure), segment_cap)
 
-    profile_cfg = LINEUP_MODEL_PROFILES.get(model_key, {}) if model_key else {}
     overlap_cap = int(profile_cfg.get("overlap_cap", 8) or 8)
+    cheap_core_overlap_discount = int(
+        profile_cfg.get("cheap_core_overlap_discount", 0) or 0
+    )
     core_play_inject_prob = float(profile_cfg.get("core_play_inject_prob", 0.0) or 0.0)
     core_play_min_own_pct = float(profile_cfg.get("core_play_min_own_pct", 14.0) or 14.0)
     core_play_max_own_pct = float(profile_cfg.get("core_play_max_own_pct", 60.0) or 60.0)
@@ -3339,7 +3635,19 @@ def generate_diversified_lineups(
     midrange_signal_inject_prob = float(
         profile_cfg.get("midrange_signal_inject_prob", 0.0) or 0.0
     )
+    cheap_core_inject_prob = float(
+        profile_cfg.get("cheap_core_inject_prob", 0.14) or 0.14
+    )
+    cheap_core_pair_inject_prob = float(
+        profile_cfg.get("cheap_core_pair_inject_prob", 0.22) or 0.22
+    )
+    cheap_core_triple_inject_prob = float(
+        profile_cfg.get("cheap_core_triple_inject_prob", 0.08) or 0.08
+    )
     model_context = _build_midrange_minutes_vegas_context(filtered_pool, profile_cfg)
+    _dbg("cheap_core_candidates", int(cheap_core_context.get("candidate_count", 0) or 0))
+    _dbg("cheap_core_pairs", len(cheap_core_context.get("pair_pool", []) or []))
+    _dbg("cheap_core_triples", len(cheap_core_context.get("triple_pool", []) or []))
 
     lineup_player_sets: List[Set[int]] = []
 
@@ -3357,16 +3665,16 @@ def generate_diversified_lineups(
             return True
         candidate_set = set(lineup_key)
         for existing in lineup_player_sets:
-            if len(candidate_set & existing) > overlap_cap:
+            overlap_size = len(candidate_set & existing)
+            if cheap_core_overlap_discount > 0 and cheap_core_player_ids:
+                cheap_core_shared = len((candidate_set & existing) & cheap_core_player_ids)
+                overlap_size -= min(cheap_core_overlap_discount, cheap_core_shared)
+            if overlap_size > overlap_cap:
                 return False
         return True
 
     def _risk_adjusted_fpts(player: DFSPlayer) -> float:
-        return float(
-            getattr(player, "risk_adjusted_proj_fpts", 0.0)
-            or getattr(player, "proj_fpts", 0.0)
-            or 0.0
-        )
+        return _effective_risk_adjusted_fpts(player, profile_cfg)
 
     core_play_candidates = [
         p for p in filtered_pool
@@ -3422,6 +3730,16 @@ def generate_diversified_lineups(
         standout_scored.append((p, standout_score))
     standout_scored.sort(key=lambda x: x[1], reverse=True)
     standout_scored = standout_scored[:40]
+
+    cheap_core_scored: List[Tuple[DFSPlayer, float]] = list(
+        cheap_core_context.get("single_pool", []) or []
+    )
+    cheap_core_pair_scored: List[Tuple[Tuple[DFSPlayer, ...], float]] = list(
+        cheap_core_context.get("pair_pool", []) or []
+    )
+    cheap_core_triple_scored: List[Tuple[Tuple[DFSPlayer, ...], float]] = list(
+        cheap_core_context.get("triple_pool", []) or []
+    )
 
     midrange_signal_scored: List[Tuple[DFSPlayer, float]] = []
     if bool(profile_cfg.get("midrange_focus_enabled", False)):
@@ -3520,6 +3838,72 @@ def generate_diversified_lineups(
                     lock_prob = min(1.0, needed / remaining_lineups)
                     if random.random() < lock_prob:
                         _add_lock_candidate(attempt_locked, info['player'])
+
+            cheap_core_locked = False
+            if cheap_core_triple_scored and random.random() < cheap_core_triple_inject_prob:
+                available_triples = [
+                    (combo, score)
+                    for combo, score in cheap_core_triple_scored
+                    if all(
+                        _can_use_for_lock(player)
+                        and player.player_id not in {lp.player_id for lp in attempt_locked}
+                        for player in combo
+                    )
+                ]
+                if available_triples:
+                    weighted_pool = available_triples[:8]
+                    chosen_combo = random.choices(
+                        [combo for combo, _ in weighted_pool],
+                        weights=[max(0.05, score) for _, score in weighted_pool],
+                        k=1,
+                    )[0]
+                    for player in chosen_combo:
+                        _add_lock_candidate(attempt_locked, player)
+                    cheap_core_locked = True
+                    _dbg("cheap_core_injected_triple")
+
+            if (
+                not cheap_core_locked
+                and cheap_core_pair_scored
+                and random.random() < cheap_core_pair_inject_prob
+            ):
+                available_pairs = [
+                    (combo, score)
+                    for combo, score in cheap_core_pair_scored
+                    if all(
+                        _can_use_for_lock(player)
+                        and player.player_id not in {lp.player_id for lp in attempt_locked}
+                        for player in combo
+                    )
+                ]
+                if available_pairs:
+                    weighted_pool = available_pairs[:10]
+                    chosen_combo = random.choices(
+                        [combo for combo, _ in weighted_pool],
+                        weights=[max(0.05, score) for _, score in weighted_pool],
+                        k=1,
+                    )[0]
+                    for player in chosen_combo:
+                        _add_lock_candidate(attempt_locked, player)
+                    cheap_core_locked = True
+                    _dbg("cheap_core_injected_pair")
+
+            if not cheap_core_locked and cheap_core_scored and random.random() < cheap_core_inject_prob:
+                available_cheap_core = [
+                    (p, score)
+                    for p, score in cheap_core_scored
+                    if _can_use_for_lock(p)
+                    and p.player_id not in {lp.player_id for lp in attempt_locked}
+                ]
+                if available_cheap_core:
+                    weighted_pool = available_cheap_core[:12]
+                    lock_choice = random.choices(
+                        [p for p, _ in weighted_pool],
+                        weights=[max(0.05, score) for _, score in weighted_pool],
+                        k=1,
+                    )[0]
+                    _add_lock_candidate(attempt_locked, lock_choice)
+                    _dbg("cheap_core_injected_single")
 
             # Profile: inject core-play anchors to reduce missed high-field outcomes.
             if core_play_candidates and random.random() < core_play_inject_prob:
@@ -3710,6 +4094,181 @@ def generate_diversified_lineups(
     _dbg("lineups_returned", len(lineups))
 
     return lineups
+
+
+def build_player_selection_diagnostics(
+    player_pool: List[DFSPlayer],
+    model_key: str = "",
+) -> pd.DataFrame:
+    """Summarize how the active model classifies players before lineup generation."""
+    if not player_pool:
+        return pd.DataFrame()
+
+    profile_cfg = LINEUP_MODEL_PROFILES.get(model_key, {}) if model_key else {}
+    _build_cheap_core_context(player_pool, profile_cfg)
+
+    core_play_min_own_pct = float(profile_cfg.get("core_play_min_own_pct", 14.0) or 14.0)
+    core_play_max_own_pct = float(profile_cfg.get("core_play_max_own_pct", 60.0) or 60.0)
+    core_play_min_projection = float(
+        profile_cfg.get("core_play_min_projection", 24.0) or 24.0
+    )
+    low_own_max_own_pct = float(profile_cfg.get("low_own_max_own_pct", 12.0) or 12.0)
+    low_own_min_projection = float(
+        profile_cfg.get("low_own_min_projection", 20.0) or 20.0
+    )
+    standout_min_ceiling_gap = float(
+        profile_cfg.get("standout_min_ceiling_gap", 8.0) or 8.0
+    )
+
+    active_players = [
+        p for p in player_pool if not bool(getattr(p, "is_injured", False))
+    ]
+    if not active_players:
+        return pd.DataFrame()
+
+    def _rank_map(metric_name: str, reverse: bool = True) -> Dict[int, int]:
+        sorted_players = sorted(
+            active_players,
+            key=lambda p: float(getattr(p, metric_name, 0.0) or 0.0),
+            reverse=reverse,
+        )
+        return {player.player_id: idx + 1 for idx, player in enumerate(sorted_players)}
+
+    eff_proj_map = {
+        p.player_id: _effective_risk_adjusted_fpts(p, profile_cfg) for p in active_players
+    }
+    eff_value_map = {
+        p.player_id: (
+            eff_proj_map[p.player_id] / p.salary * 1000 if p.salary > 0 else 0.0
+        )
+        for p in active_players
+    }
+    eff_proj_rank = {
+        player_id: idx + 1
+        for idx, (player_id, _) in enumerate(
+            sorted(eff_proj_map.items(), key=lambda item: item[1], reverse=True)
+        )
+    }
+    eff_value_rank = {
+        player_id: idx + 1
+        for idx, (player_id, _) in enumerate(
+            sorted(eff_value_map.items(), key=lambda item: item[1], reverse=True)
+        )
+    }
+    leverage_rank = _rank_map("leverage_score", reverse=True)
+    ceiling_rank = _rank_map("proj_ceiling", reverse=True)
+
+    rows: List[Dict[str, Any]] = []
+    for player in active_players:
+        eff_proj = eff_proj_map[player.player_id]
+        own_pct = float(getattr(player, "ownership_proj", 0.0) or 0.0)
+        core_gate = (
+            core_play_min_own_pct <= own_pct <= core_play_max_own_pct
+            and eff_proj >= core_play_min_projection
+        )
+        low_own_gate = own_pct <= low_own_max_own_pct and eff_proj >= low_own_min_projection
+        standout_gap = float(getattr(player, "proj_ceiling", 0.0) or 0.0) - eff_proj
+        standout_gate = standout_gap >= standout_min_ceiling_gap
+
+        paths: List[str] = []
+        if bool(getattr(player, "cheap_core_signal", False)):
+            paths.append("cheap_core")
+        if core_gate:
+            paths.append("core_play")
+        if low_own_gate:
+            paths.append("low_own")
+        if standout_gate:
+            paths.append("standout")
+        if not paths:
+            paths.append("passive_pool")
+
+        blockers: List[str] = []
+        if not core_gate:
+            if own_pct < core_play_min_own_pct:
+                blockers.append("core own low")
+            elif own_pct > core_play_max_own_pct:
+                blockers.append("core own high")
+            if eff_proj < core_play_min_projection:
+                blockers.append("core proj low")
+        if not low_own_gate and own_pct > low_own_max_own_pct:
+            blockers.append("not low-own")
+        if float(getattr(player, "segment_exposure_cap", 1.0) or 1.0) < 1.0:
+            blockers.append(
+                f"segment cap {float(getattr(player, 'segment_exposure_cap', 1.0) or 1.0):.0%}"
+            )
+        if float(getattr(player, "segment_risk_penalty", 0.0) or 0.0) > 0:
+            blockers.append(
+                f"risk -{float(getattr(player, 'segment_risk_penalty', 0.0) or 0.0):.1f}"
+            )
+        if bool(getattr(player, "cheap_core_signal", False)):
+            blockers = [b for b in blockers if not b.startswith("segment cap")]
+
+        rows.append(
+            {
+                "player_id": player.player_id,
+                "Name": player.name,
+                "Team": player.team,
+                "Pos": "/".join(player.positions),
+                "Salary": player.salary,
+                "Proj FPTS": round(float(getattr(player, "proj_fpts", 0.0) or 0.0), 2),
+                "Eff Proj FPTS": round(eff_proj, 2),
+                "Own %": round(own_pct, 2),
+                "Value": round(eff_value_map[player.player_id], 3),
+                "Selection Path": ", ".join(paths),
+                "Cheap Core": bool(getattr(player, "cheap_core_signal", False)),
+                "Cheap Core Score": round(
+                    float(getattr(player, "cheap_core_strength", 0.0) or 0.0),
+                    3,
+                ),
+                "Cheap Core Reasons": str(
+                    getattr(player, "cheap_core_reason_tags", "") or ""
+                ),
+                "Core Gate": core_gate,
+                "Low Own Gate": low_own_gate,
+                "Standout Gate": standout_gate,
+                "Segment Cap": round(
+                    _effective_segment_exposure_cap(player, profile_cfg) * 100.0,
+                    1,
+                ),
+                "Risk Penalty": round(
+                    float(getattr(player, "segment_risk_penalty", 0.0) or 0.0),
+                    3,
+                ),
+                "Own Delta": round(
+                    max(
+                        0.0,
+                        float(getattr(player, "supplement_own_delta_applied", 0.0) or 0.0),
+                        float(
+                            getattr(player, "rotowire_ownership_delta_applied", 0.0) or 0.0
+                        ),
+                    ),
+                    3,
+                ),
+                "Proj Delta": round(
+                    float(getattr(player, "supplement_proj_delta_applied", 0.0) or 0.0),
+                    3,
+                ),
+                "Proj Rank": eff_proj_rank.get(player.player_id, 0),
+                "Value Rank": eff_value_rank.get(player.player_id, 0),
+                "Leverage Rank": leverage_rank.get(player.player_id, 0),
+                "Ceiling Rank": ceiling_rank.get(player.player_id, 0),
+                "Likely Blocker": "; ".join(dict.fromkeys(blockers)) if blockers else "",
+            }
+        )
+
+    diag_df = pd.DataFrame(rows)
+    if diag_df.empty:
+        return diag_df
+    return diag_df.sort_values(
+        by=[
+            "Cheap Core",
+            "Core Gate",
+            "Low Own Gate",
+            "Cheap Core Score",
+            "Eff Proj FPTS",
+        ],
+        ascending=[False, False, False, False, False],
+    ).reset_index(drop=True)
 
 
 # =============================================================================

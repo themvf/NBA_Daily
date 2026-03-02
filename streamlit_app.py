@@ -14781,6 +14781,7 @@ if selected_page == "DFS Lineup Builder":
             "cluster_v1_experimental": "Cluster v1 (Experimental)",
             "standout_v1_capture": "Standout v1 (Missed-Capture)",
             "midrange_v1_minutes_vegas": "Midrange v1 (Minutes+Vegas Test)",
+            "cheap_core_v1": "Cheap Core v1",
             "supp_proj_v1_blend": "Supplement v1 (Proj Blend)",
             "supp_own_v1_blend": "Supplement v1 (Own Blend)",
             "supp_both_v1_blend": "Supplement v1 (Proj+Own Blend)",
@@ -15905,6 +15906,126 @@ if selected_page == "DFS Lineup Builder":
                     mime="text/csv",
                     help="Download player pool with projections"
                 )
+
+            st.divider()
+            with st.expander("Selection Diagnostics", expanded=False):
+                if run_mode == "All Versions":
+                    diagnostic_model_key = st.selectbox(
+                        "Diagnostic Model",
+                        options=model_keys,
+                        index=model_keys.index(st.session_state.get("dfs_lineup_model_key", selected_model_key))
+                        if st.session_state.get("dfs_lineup_model_key", selected_model_key) in model_keys
+                        else 0,
+                        format_func=lambda key: model_profiles.get(key, {}).get("label", key),
+                        key="dfs_selection_diag_model",
+                        help="Inspect how a specific lineup profile is classifying the active player pool.",
+                    )
+                else:
+                    diagnostic_model_key = selected_model_key
+
+                diagnostic_df = dfs.build_player_selection_diagnostics(
+                    filtered,
+                    model_key=diagnostic_model_key,
+                )
+                if diagnostic_df.empty:
+                    st.info("No active players available for diagnostics.")
+                else:
+                    lineup_exposure_counts: Dict[int, int] = {}
+                    active_lineups = st.session_state.get("dfs_lineups", []) or []
+                    if active_lineups:
+                        relevant_lineups = [
+                            lineup
+                            for lineup in active_lineups
+                            if run_mode != "All Versions"
+                            or getattr(lineup, "model_key", "") == diagnostic_model_key
+                        ]
+                        if not relevant_lineups and run_mode == "All Versions":
+                            relevant_lineups = list(active_lineups)
+                        for lineup in relevant_lineups:
+                            for player in lineup.players.values():
+                                pid = int(getattr(player, "player_id", 0) or 0)
+                                lineup_exposure_counts[pid] = lineup_exposure_counts.get(pid, 0) + 1
+                        lineup_count = len(relevant_lineups)
+                        diagnostic_df["Lineup Exp%"] = diagnostic_df["player_id"].map(
+                            lambda pid: round(
+                                (lineup_exposure_counts.get(int(pid), 0) / lineup_count) * 100,
+                                1,
+                            )
+                            if lineup_count > 0
+                            else 0.0
+                        )
+                    else:
+                        diagnostic_df["Lineup Exp%"] = 0.0
+
+                    metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+                    metric_col1.metric(
+                        "Cheap Core",
+                        int(diagnostic_df["Cheap Core"].sum()),
+                    )
+                    metric_col2.metric(
+                        "Core Eligible",
+                        int(diagnostic_df["Core Gate"].sum()),
+                    )
+                    metric_col3.metric(
+                        "Low Own Eligible",
+                        int(diagnostic_df["Low Own Gate"].sum()),
+                    )
+                    metric_col4.metric(
+                        "Standout Eligible",
+                        int(diagnostic_df["Standout Gate"].sum()),
+                    )
+
+                    st.caption(
+                        f"Diagnostics for {model_profiles.get(diagnostic_model_key, {}).get('label', diagnostic_model_key)}. "
+                        "Cheap-core signals and likely blockers update from the current player-pool state."
+                    )
+
+                    display_diag = diagnostic_df.copy()
+                    display_diag = display_diag.drop(columns=["player_id"], errors="ignore")
+                    st.dataframe(
+                        display_diag[
+                            [
+                                "Name",
+                                "Team",
+                                "Pos",
+                                "Salary",
+                                "Proj FPTS",
+                                "Eff Proj FPTS",
+                                "Own %",
+                                "Lineup Exp%",
+                                "Selection Path",
+                                "Cheap Core",
+                                "Cheap Core Score",
+                                "Cheap Core Reasons",
+                                "Core Gate",
+                                "Low Own Gate",
+                                "Standout Gate",
+                                "Segment Cap",
+                                "Risk Penalty",
+                                "Own Delta",
+                                "Proj Delta",
+                                "Proj Rank",
+                                "Value Rank",
+                                "Leverage Rank",
+                                "Ceiling Rank",
+                                "Likely Blocker",
+                            ]
+                        ],
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Salary": st.column_config.NumberColumn(format="$%d"),
+                            "Proj FPTS": st.column_config.NumberColumn(format="%.1f"),
+                            "Eff Proj FPTS": st.column_config.NumberColumn(format="%.1f"),
+                            "Own %": st.column_config.NumberColumn(format="%.1f%%"),
+                            "Lineup Exp%": st.column_config.NumberColumn(format="%.1f%%"),
+                            "Cheap Core Score": st.column_config.NumberColumn(format="%.2f"),
+                            "Segment Cap": st.column_config.NumberColumn(format="%.0f%%"),
+                            "Risk Penalty": st.column_config.NumberColumn(format="%.2f"),
+                            "Own Delta": st.column_config.NumberColumn(format="%+.1f"),
+                            "Proj Delta": st.column_config.NumberColumn(format="%+.1f"),
+                        },
+                    )
 
             # Lock/Exclude controls
             st.divider()
