@@ -158,6 +158,22 @@ def create_dfs_tracking_tables(conn: sqlite3.Connection) -> None:
             created_at TEXT,
             PRIMARY KEY (run_key, player_id)
         );
+
+        CREATE TABLE IF NOT EXISTS dfs_dk_slate_player_cache (
+            slate_date TEXT NOT NULL,
+            player_id INTEGER NOT NULL,
+            player_name TEXT,
+            team TEXT,
+            opponent TEXT,
+            salary INTEGER,
+            positions TEXT,
+            game_id TEXT,
+            dk_id TEXT,
+            dk_avg_pts REAL,
+            source_filename TEXT,
+            created_at TEXT,
+            PRIMARY KEY (slate_date, player_id, salary, positions)
+        );
     """)
 
     # Migration-safe column additions (check first, then add if missing)
@@ -191,6 +207,10 @@ def create_dfs_tracking_tables(conn: sqlite3.Connection) -> None:
             ON dfs_supplement_player_deltas(slate_date);
         CREATE INDEX IF NOT EXISTS idx_dspd_player
             ON dfs_supplement_player_deltas(player_id);
+        CREATE INDEX IF NOT EXISTS idx_ddspc_slate
+            ON dfs_dk_slate_player_cache(slate_date);
+        CREATE INDEX IF NOT EXISTS idx_ddspc_player
+            ON dfs_dk_slate_player_cache(player_id);
     """)
 
     # --- Opponent tracking tables ---
@@ -315,6 +335,143 @@ def save_slate_lineups(
 
     conn.commit()
     return len(sorted_lineups)
+
+
+def save_dk_slate_player_cache(
+    conn: sqlite3.Connection,
+    slate_date: str,
+    players: List[DFSPlayer],
+    source_filename: str = "",
+) -> int:
+    """Persist DK export identifiers for a slate so future runs can reuse them."""
+    if not slate_date:
+        return 0
+
+    cursor = conn.cursor()
+    saved = 0
+    created_at = datetime.now().isoformat(timespec="seconds")
+    for player in players:
+        dk_id = str(getattr(player, "dk_id", "") or "").strip()
+        player_id = int(getattr(player, "player_id", 0) or 0)
+        if not dk_id or player_id <= 0:
+            continue
+        positions = ",".join(getattr(player, "positions", []) or [])
+        cursor.execute(
+            """
+            INSERT OR REPLACE INTO dfs_dk_slate_player_cache (
+                slate_date, player_id, player_name, team, opponent,
+                salary, positions, game_id, dk_id, dk_avg_pts,
+                source_filename, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(slate_date),
+                player_id,
+                str(getattr(player, "name", "") or ""),
+                str(getattr(player, "team", "") or ""),
+                str(getattr(player, "opponent", "") or ""),
+                int(getattr(player, "salary", 0) or 0),
+                positions,
+                str(getattr(player, "game_id", "") or ""),
+                dk_id,
+                float(getattr(player, "dk_avg_pts", 0.0) or 0.0),
+                str(source_filename or ""),
+                created_at,
+            ),
+        )
+        saved += 1
+
+    conn.commit()
+    return saved
+
+
+def resolve_dk_slate_player_cache(
+    conn: sqlite3.Connection,
+    slate_date: str,
+    players: List[DFSPlayer],
+) -> Dict[str, Any]:
+    """Fill missing `dk_id` fields from cached slate mappings and report readiness."""
+    stats = {
+        "slate_date": str(slate_date or ""),
+        "total_players": 0,
+        "players_with_ids": 0,
+        "missing_ids": 0,
+        "resolved_from_cache": 0,
+        "already_present": 0,
+        "ready_for_export": False,
+        "cached_rows": 0,
+    }
+    if not slate_date or not players:
+        return stats
+
+    cache_df = pd.read_sql_query(
+        """
+        SELECT slate_date, player_id, player_name, team, opponent, salary,
+               positions, game_id, dk_id, dk_avg_pts, source_filename, created_at
+        FROM dfs_dk_slate_player_cache
+        WHERE slate_date = ?
+        ORDER BY created_at DESC
+        """,
+        conn,
+        params=[str(slate_date)],
+    )
+    stats["cached_rows"] = int(len(cache_df))
+
+    exact_lookup: Dict[Tuple[int, int, str], Dict[str, Any]] = {}
+    fallback_lookup: Dict[int, List[Dict[str, Any]]] = {}
+    if not cache_df.empty:
+        for row in cache_df.to_dict("records"):
+            try:
+                player_id = int(row.get("player_id") or 0)
+                salary = int(row.get("salary") or 0)
+            except (TypeError, ValueError):
+                continue
+            positions = ",".join(
+                sorted([p.strip().upper() for p in str(row.get("positions") or "").split(",") if p.strip()])
+            )
+            key = (player_id, salary, positions)
+            exact_lookup.setdefault(key, row)
+            fallback_lookup.setdefault(player_id, []).append(row)
+
+    for player in players:
+        player_id = int(getattr(player, "player_id", 0) or 0)
+        if player_id <= 0 or bool(getattr(player, "is_injured", False)):
+            continue
+        stats["total_players"] += 1
+
+        current_dk_id = str(getattr(player, "dk_id", "") or "").strip()
+        if current_dk_id:
+            stats["already_present"] += 1
+            stats["players_with_ids"] += 1
+            continue
+
+        positions = ",".join(sorted([p.strip().upper() for p in (getattr(player, "positions", []) or []) if p.strip()]))
+        salary = int(getattr(player, "salary", 0) or 0)
+        cache_row = exact_lookup.get((player_id, salary, positions))
+        if cache_row is None:
+            candidates = fallback_lookup.get(player_id, [])
+            if salary > 0:
+                same_salary = [row for row in candidates if int(row.get("salary") or 0) == salary]
+                if len(same_salary) == 1:
+                    cache_row = same_salary[0]
+            if cache_row is None and len(candidates) == 1:
+                cache_row = candidates[0]
+
+        if cache_row is not None:
+            player.dk_id = str(cache_row.get("dk_id") or "")
+            if float(getattr(player, "dk_avg_pts", 0.0) or 0.0) <= 0:
+                player.dk_avg_pts = float(cache_row.get("dk_avg_pts") or 0.0)
+            if player.dk_id:
+                stats["resolved_from_cache"] += 1
+                stats["players_with_ids"] += 1
+                continue
+
+        stats["missing_ids"] += 1
+
+    stats["ready_for_export"] = bool(
+        stats["total_players"] > 0 and stats["missing_ids"] == 0
+    )
+    return stats
 
 
 def save_supplement_snapshot(

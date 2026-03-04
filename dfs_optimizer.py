@@ -426,6 +426,44 @@ def find_best_player_match(
     return None
 
 
+def _build_db_player_match_lookup(
+    conn: sqlite3.Connection,
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, List[str]]]:
+    """Build normalized player-name lookup tables from local game logs."""
+    players_query = """
+        SELECT DISTINCT player_id, player_name, team_abbreviation
+        FROM player_game_logs
+        WHERE season = '2025-26'
+    """
+    db_players = pd.read_sql_query(players_query, conn)
+
+    name_to_id: Dict[str, Dict[str, Any]] = {}
+    team_to_players: Dict[str, List[str]] = {}
+    for _, row in db_players.iterrows():
+        player_name = str(row['player_name'])
+        normalized = normalize_name(player_name)
+        team_abbrev = str(row['team_abbreviation']).upper() if row['team_abbreviation'] else ''
+
+        name_to_id[normalized] = {
+            'player_id': row['player_id'],
+            'team': team_abbrev,
+            'original_name': player_name,
+        }
+
+        for variant in generate_name_variants(player_name):
+            if variant not in name_to_id:
+                name_to_id[variant] = {
+                    'player_id': row['player_id'],
+                    'team': team_abbrev,
+                    'original_name': player_name,
+                }
+
+        if team_abbrev:
+            team_to_players.setdefault(team_abbrev, []).append(normalized)
+
+    return name_to_id, team_to_players
+
+
 # =============================================================================
 # DraftKings Fantasy Point Calculator
 # =============================================================================
@@ -2637,42 +2675,7 @@ def parse_dk_csv(
     injured_player_info = get_injured_player_names(conn)
 
     # Build lookup from database
-    players_query = """
-        SELECT DISTINCT player_id, player_name, team_abbreviation
-        FROM player_game_logs
-        WHERE season = '2025-26'
-    """
-    db_players = pd.read_sql_query(players_query, conn)
-
-    # Create normalized name->id lookup
-    name_to_id = {}
-    team_to_players: Dict[str, List[str]] = {}  # team -> list of normalized names
-
-    for _, row in db_players.iterrows():
-        player_name = str(row['player_name'])
-        normalized = normalize_name(player_name)
-        team_abbrev = str(row['team_abbreviation']).upper() if row['team_abbreviation'] else ''
-
-        name_to_id[normalized] = {
-            'player_id': row['player_id'],
-            'team': team_abbrev,
-            'original_name': player_name
-        }
-
-        # Also add all variants of the DB name
-        for variant in generate_name_variants(player_name):
-            if variant not in name_to_id:
-                name_to_id[variant] = {
-                    'player_id': row['player_id'],
-                    'team': team_abbrev,
-                    'original_name': player_name
-                }
-
-        # Build team lookup
-        if team_abbrev:
-            if team_abbrev not in team_to_players:
-                team_to_players[team_abbrev] = []
-            team_to_players[team_abbrev].append(normalized)
+    name_to_id, team_to_players = _build_db_player_match_lookup(conn)
 
     players = []
     unmatched = []
@@ -2777,6 +2780,149 @@ def parse_dk_csv(
         'injured_count': len(injured_players),
         'dk_detected_out': [(p.name, p.team) for p in dk_detected_out],
         'dk_detected_out_count': len(dk_detected_out),
+    }
+
+    return players, metadata
+
+
+def parse_rotowire_slate_df(
+    rotowire_df: pd.DataFrame,
+    conn: sqlite3.Connection,
+    slate_context: Optional[Dict[str, Any]] = None,
+) -> Tuple[List[DFSPlayer], Dict[str, Any]]:
+    """
+    Parse a normalized RotoWire slate into DFSPlayer objects.
+
+    Expected columns are produced by `nba_rotowire.normalize_players`, including:
+    `player_name`, `site_positions`, `team_abbr`, `opp_abbr`, `salary`,
+    `proj_fantasy_points`, `avg_fpts_last7`, `avg_fpts_season`, `injury_status`.
+    """
+    slate_context = slate_context or {}
+    if rotowire_df is None or rotowire_df.empty:
+        return [], {
+            'total_players': 0,
+            'matched_players': 0,
+            'fallback_players': [],
+            'fallback_count': 0,
+            'unmatched_players': [],
+            'unique_games': 0,
+            'salary_range': (0, 0),
+            'match_rate': 0.0,
+            'injured_players': [],
+            'injured_count': 0,
+            'dk_detected_out': [],
+            'dk_detected_out_count': 0,
+            'source': 'rotowire',
+        }
+
+    injured_player_ids = get_injured_player_ids(conn)
+    injured_player_info = get_injured_player_names(conn)
+    name_to_id, team_to_players = _build_db_player_match_lookup(conn)
+
+    players: List[DFSPlayer] = []
+    unmatched: List[str] = []
+    fallback_players_meta: List[Tuple[str, str, float]] = []
+
+    for _, row in rotowire_df.iterrows():
+        name = str(row.get('player_name', '') or '').strip()
+        if not name or name.lower() == 'nan':
+            continue
+
+        team = str(row.get('team_abbr', '') or '').strip().upper()
+        opponent = str(row.get('opp_abbr', '') or '').strip().upper()
+        positions = [
+            p.strip().upper()
+            for p in str(row.get('site_positions', '') or '').split('/')
+            if p.strip()
+        ]
+        if not positions:
+            fallback_pos = str(row.get('roto_position', '') or '').strip().upper()
+            positions = [fallback_pos] if fallback_pos else ['UTIL']
+
+        game_parts = sorted({abbr for abbr in [team, opponent] if abbr})
+        game_id = "_".join(game_parts) if game_parts else f"game_{team or 'unk'}"
+        salary = int(pd.to_numeric(row.get('salary'), errors='coerce') or 0)
+        base_proj = pd.to_numeric(row.get('proj_fantasy_points'), errors='coerce')
+        avg_last7 = pd.to_numeric(row.get('avg_fpts_last7'), errors='coerce')
+        avg_season = pd.to_numeric(row.get('avg_fpts_season'), errors='coerce')
+        fallback_proj = (
+            float(base_proj)
+            if pd.notna(base_proj) and float(base_proj) > 0
+            else float(avg_last7)
+            if pd.notna(avg_last7) and float(avg_last7) > 0
+            else float(avg_season)
+            if pd.notna(avg_season) and float(avg_season) > 0
+            else 0.0
+        )
+
+        player_id = find_best_player_match(
+            dk_name=name,
+            dk_team=team,
+            db_lookup=name_to_id,
+            team_lookup=team_to_players,
+        )
+
+        is_fallback = False
+        if player_id is None:
+            unmatched.append(name)
+            player_id = -abs(hash(f"{name}|{team}|{salary}")) % 1000000
+            is_fallback = True
+
+        is_injured = player_id in injured_player_ids if not is_fallback else False
+        injury_status = ""
+        if is_injured and player_id in injured_player_info:
+            info = injured_player_info[player_id]
+            if '(' in info and ')' in info:
+                injury_status = info.split('(')[-1].rstrip(')')
+
+        rw_injury_status = str(row.get('injury_status', '') or '').strip().upper()
+        if rw_injury_status in {'OUT', 'DOUBTFUL'} and not is_injured:
+            is_injured = True
+            injury_status = rw_injury_status
+
+        player = DFSPlayer(
+            player_id=player_id,
+            name=name,
+            team=team,
+            opponent=opponent,
+            game_id=game_id,
+            positions=positions,
+            salary=salary,
+            dk_id="",
+            dk_avg_pts=fallback_proj,
+            is_injured=is_injured,
+            injury_status=injury_status.upper() if injury_status else "",
+            is_fallback=is_fallback,
+        )
+        players.append(player)
+
+        if is_fallback:
+            fallback_players_meta.append((player.name, player.team, float(fallback_proj or 0.0)))
+
+    injured_players = [p for p in players if p.is_injured]
+    fallback_players = [p for p in players if p.is_fallback]
+
+    metadata = {
+        'total_players': int(len(rotowire_df)),
+        'matched_players': len(players) - len(fallback_players),
+        'fallback_players': fallback_players_meta,
+        'fallback_count': len(fallback_players),
+        'unmatched_players': unmatched,
+        'unique_games': len(set(p.game_id for p in players)),
+        'salary_range': (
+            min((p.salary for p in players), default=0),
+            max((p.salary for p in players), default=0),
+        ),
+        'match_rate': (len(players) / len(rotowire_df) * 100.0) if len(rotowire_df) > 0 else 0.0,
+        'injured_players': [(p.name, p.injury_status) for p in injured_players],
+        'injured_count': len(injured_players),
+        'dk_detected_out': [],
+        'dk_detected_out_count': 0,
+        'source': 'rotowire',
+        'slate_id': slate_context.get('slate_id'),
+        'slate_name': slate_context.get('slate_name'),
+        'contest_type': slate_context.get('contest_type'),
+        'slate_date': slate_context.get('slate_date'),
     }
 
     return players, metadata

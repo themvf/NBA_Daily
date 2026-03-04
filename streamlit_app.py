@@ -750,6 +750,170 @@ def _persist_dfs_backtest_bundle(
         return False, str(exc)
 
 
+def _upload_dfs_slate_frame(df: pd.DataFrame, slate_date: str, filename: str) -> None:
+    """Best-effort upload of a normalized DFS slate frame to cloud storage."""
+    if df is None or df.empty or not slate_date:
+        return
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".csv",
+            delete=False,
+            encoding="utf-8",
+            newline="",
+        ) as tmp_csv:
+            df.to_csv(tmp_csv, index=False)
+            tmp_path = Path(tmp_csv.name)
+        try:
+            _s3_upload_slate_file(tmp_path, slate_date, filename)
+        finally:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
+def _build_dfs_slate_readiness(
+    players: List[Any],
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Summarize whether the active slate is ready for DK export."""
+    metadata = dict(metadata or {})
+    active_players = [
+        p for p in (players or [])
+        if not bool(getattr(p, "is_injured", False)) and not bool(getattr(p, "is_excluded", False))
+    ]
+    players_with_ids = [
+        p for p in active_players if str(getattr(p, "dk_id", "") or "").strip()
+    ]
+    missing_players = [
+        p for p in active_players if not str(getattr(p, "dk_id", "") or "").strip()
+    ]
+    return {
+        "source": str(metadata.get("source") or metadata.get("source_mode") or ""),
+        "active_players": int(len(active_players)),
+        "players_with_dk_id": int(len(players_with_ids)),
+        "missing_dk_ids": int(len(missing_players)),
+        "missing_player_names": [str(getattr(p, "name", "") or "") for p in missing_players[:20]],
+        "ready_for_export": bool(active_players) and len(missing_players) == 0,
+        "resolved_from_cache": int(metadata.get("resolved_from_cache") or 0),
+        "already_present_ids": int(metadata.get("already_present_ids") or 0),
+        "cached_id_rows": int(metadata.get("cached_id_rows") or 0),
+        "fallback_count": int(metadata.get("fallback_count") or 0),
+    }
+
+
+def _render_dfs_slate_readiness(readiness: Mapping[str, Any]) -> None:
+    """Render DK export readiness for the active slate source."""
+    st.markdown("**Slate Readiness**")
+    r1, r2, r3, r4 = st.columns(4)
+    with r1:
+        st.metric("Active Players", int(readiness.get("active_players") or 0))
+    with r2:
+        st.metric("DK IDs Ready", int(readiness.get("players_with_dk_id") or 0))
+    with r3:
+        st.metric("Missing DK IDs", int(readiness.get("missing_dk_ids") or 0))
+    with r4:
+        st.metric(
+            "Export Ready",
+            "Yes" if bool(readiness.get("ready_for_export")) else "No",
+        )
+
+    source_label = str(readiness.get("source") or "").strip()
+    if source_label:
+        st.caption(f"Active slate source: `{source_label}`")
+    cache_bits: List[str] = []
+    if int(readiness.get("resolved_from_cache") or 0) > 0:
+        cache_bits.append(
+            f"{int(readiness.get('resolved_from_cache') or 0)} DK IDs resolved from cache"
+        )
+    if int(readiness.get("cached_id_rows") or 0) > 0:
+        cache_bits.append(f"{int(readiness.get('cached_id_rows') or 0)} cached ID rows available")
+    if cache_bits:
+        st.caption(" | ".join(cache_bits))
+
+    if not bool(readiness.get("ready_for_export")):
+        missing_names = readiness.get("missing_player_names") or []
+        st.warning(
+            "This slate is not fully DraftKings-export ready yet. "
+            "Use the DK fallback upload only if you need to repair missing IDs."
+        )
+        if missing_names:
+            st.caption("Missing DK IDs: " + ", ".join(missing_names[:10]))
+    elif int(readiness.get("fallback_count") or 0) > 0:
+        st.info(
+            f"{int(readiness.get('fallback_count') or 0)} fallback player(s) are present. "
+            "Export is ready, but projection quality for those names depends on fallback assumptions."
+        )
+
+
+def _apply_dk_id_repair_to_players(
+    current_players: List[Any],
+    dk_players: List[Any],
+) -> int:
+    """Update the active player pool with DK identifiers from a fallback CSV load."""
+    if not current_players or not dk_players:
+        return 0
+
+    id_lookup: Dict[Tuple[int, int], Any] = {}
+    name_lookup: Dict[Tuple[str, str, int], Any] = {}
+    for player in dk_players:
+        player_id = int(getattr(player, "player_id", 0) or 0)
+        salary = int(getattr(player, "salary", 0) or 0)
+        if player_id > 0 and salary > 0:
+            id_lookup[(player_id, salary)] = player
+        name_key = dfs.normalize_name(str(getattr(player, "name", "") or ""))
+        team = str(getattr(player, "team", "") or "").strip().upper()
+        if name_key and team and salary > 0:
+            name_lookup[(name_key, team, salary)] = player
+
+    updated = 0
+    for player in current_players:
+        if str(getattr(player, "dk_id", "") or "").strip():
+            continue
+        salary = int(getattr(player, "salary", 0) or 0)
+        player_id = int(getattr(player, "player_id", 0) or 0)
+        matched = id_lookup.get((player_id, salary)) if player_id > 0 and salary > 0 else None
+        if matched is None:
+            name_key = dfs.normalize_name(str(getattr(player, "name", "") or ""))
+            team = str(getattr(player, "team", "") or "").strip().upper()
+            matched = name_lookup.get((name_key, team, salary))
+        if matched is None:
+            continue
+        dk_id = str(getattr(matched, "dk_id", "") or "").strip()
+        if not dk_id:
+            continue
+        player.dk_id = dk_id
+        if float(getattr(player, "dk_avg_pts", 0.0) or 0.0) <= 0:
+            player.dk_avg_pts = float(getattr(matched, "dk_avg_pts", 0.0) or 0.0)
+        updated += 1
+
+    return updated
+
+
+def _apply_dk_id_repair_to_lineups(
+    lineups: List[Any],
+    dk_players: List[Any],
+) -> int:
+    """Update existing generated lineups with repaired DK identifiers."""
+    if not lineups:
+        return 0
+    unique_players: Dict[Tuple[int, str, int], Any] = {}
+    for lineup in lineups:
+        for player in (getattr(lineup, "players", {}) or {}).values():
+            if not player:
+                continue
+            key = (
+                int(getattr(player, "player_id", 0) or 0),
+                str(getattr(player, "team", "") or "").strip().upper(),
+                int(getattr(player, "salary", 0) or 0),
+            )
+            unique_players[key] = player
+    return _apply_dk_id_repair_to_players(list(unique_players.values()), dk_players)
+
+
 def normalize_weight_map(weight_map: Dict[str, float]) -> Dict[str, float]:
     sanitized = {k: max(0.0, float(v)) for k, v in weight_map.items()}
     total = sum(sanitized.values())
@@ -14723,12 +14887,16 @@ if selected_page == "DFS Lineup Builder":
     st.caption("Generate optimized DraftKings NBA Classic lineups for GPP tournaments")
 
     # Initialize session state for DFS
+    if 'dfs_loaded_slate_players' not in st.session_state:
+        st.session_state.dfs_loaded_slate_players = []
     if 'dfs_player_pool' not in st.session_state:
         st.session_state.dfs_player_pool = []
     if 'dfs_lineups' not in st.session_state:
         st.session_state.dfs_lineups = []
     if 'dfs_upload_metadata' not in st.session_state:
         st.session_state.dfs_upload_metadata = {}
+    if 'dfs_slate_context' not in st.session_state:
+        st.session_state.dfs_slate_context = {}
     if 'dfs_supplement_state' not in st.session_state:
         st.session_state.dfs_supplement_state = {}
     if 'dfs_supplement_saved_run_key' not in st.session_state:
@@ -14907,299 +15075,590 @@ if selected_page == "DFS Lineup Builder":
     # TAB 1: Upload & Configure
     # ==========================================================================
     with builder_tabs[0]:
-        st.subheader("Upload DraftKings CSV")
-        st.markdown("""
-        Download your contest CSV from DraftKings and upload it here.
-        The file should contain player names, positions, salaries, and game information.
-        """)
-
-        uploaded_file = st.file_uploader(
-            "Choose DraftKings CSV file",
-            type=['csv'],
-            help="Export from DraftKings contest lobby"
+        st.subheader("Load Slate")
+        st.markdown(
+            "Use RotoWire as the primary slate source. "
+            "Only upload a DraftKings CSV if you need to repair missing DK IDs for export."
         )
 
-        if uploaded_file is not None:
-            # Save uploaded file
-            csv_path = persist_uploaded_file(uploaded_file, ".csv")
+        active_loaded_players = st.session_state.get("dfs_loaded_slate_players", []) or []
+        active_upload_metadata = st.session_state.get("dfs_upload_metadata", {}) or {}
+        active_slate_context = st.session_state.get("dfs_slate_context", {}) or {}
+        active_projection_date = (
+            st.session_state.get("dfs_projection_date")
+            or active_slate_context.get("slate_date")
+            or str(datetime.now(EASTERN_TZ).date())
+        )
 
-            with st.spinner("Parsing DraftKings CSV..."):
+        source_mode = st.radio(
+            "Slate Source",
+            options=["Fetch RotoWire (Recommended)", "Upload DraftKings CSV (Fallback)"],
+            horizontal=True,
+            key="dfs_primary_slate_source_mode",
+        )
+
+        if source_mode == "Fetch RotoWire (Recommended)":
+            st.caption(
+                "Fetch directly from [RotoWire NBA Optimizer](https://www.rotowire.com/daily/nba/optimizer.php), "
+                "then resolve any cached DraftKings IDs automatically."
+            )
+            rw1, rw2, rw3 = st.columns([1.2, 1, 1.4])
+            default_rotowire_date = datetime.now(EASTERN_TZ).date()
+            if active_slate_context.get("slate_date"):
                 try:
-                    players, metadata = dfs.parse_dk_csv(csv_path, dfs_conn)
+                    default_rotowire_date = datetime.strptime(
+                        str(active_slate_context.get("slate_date")),
+                        "%Y-%m-%d",
+                    ).date()
+                except Exception:
+                    pass
+            with rw1:
+                rotowire_selected_date = st.date_input(
+                    "RotoWire Slate Date",
+                    value=default_rotowire_date,
+                    key="dfs_primary_rotowire_date",
+                )
+            with rw2:
+                rotowire_contest_type = st.selectbox(
+                    "Contest Type",
+                    options=["Classic", "All", "Showdown", "Single Entry", "Turbo", "Express"],
+                    index=0,
+                    key="dfs_primary_rotowire_contest_type",
+                )
+            with rw3:
+                rotowire_name_filter = st.text_input(
+                    "Slate Name Filter",
+                    value="main",
+                    key="dfs_primary_rotowire_name_filter",
+                    help="Optional filter to prefer a specific slate name.",
+                )
+            rotowire_cookie_header = st.text_input(
+                "RotoWire Cookie Header (optional)",
+                value=(_resolve_rotowire_cookie() or "").strip(),
+                key="dfs_primary_rotowire_cookie_header",
+                help="Leave blank unless your RotoWire access requires authenticated requests.",
+            )
+            if st.button("Refresh RotoWire Catalog", key="dfs_primary_refresh_rotowire"):
+                load_nba_rotowire_slates_frame.clear()
+                load_nba_rotowire_players_frame.clear()
 
-                    # Save raw DK CSV to cloud storage (preserves salary/player data).
-                    _s3_upload_slate_file(
-                        csv_path, str(datetime.now(EASTERN_TZ).date()),
-                        "dk_salaries.csv",
-                        f"☁️ DK CSV saved to cloud storage for {datetime.now(EASTERN_TZ).date()}"
+            try:
+                rotowire_slates_df = load_nba_rotowire_slates_frame(
+                    site_id=1,
+                    cookie_header=(rotowire_cookie_header.strip() or None),
+                )
+                candidate_slates = rotowire_slates_df.loc[
+                    rotowire_slates_df["slate_date"].astype(str)
+                    == rotowire_selected_date.isoformat()
+                ].copy()
+                if rotowire_contest_type != "All":
+                    candidate_slates = candidate_slates.loc[
+                        candidate_slates["contest_type"].astype(str).str.lower()
+                        == rotowire_contest_type.strip().lower()
+                    ].copy()
+                if rotowire_name_filter.strip():
+                    candidate_slates = candidate_slates.loc[
+                        candidate_slates["slate_name"].astype(str).str.contains(
+                            rotowire_name_filter.strip(),
+                            case=False,
+                            na=False,
+                        )
+                    ].copy()
+
+                if candidate_slates.empty:
+                    st.info("No matching RotoWire slates found for the selected filters.")
+                else:
+                    slate_labels = {
+                        int(row["slate_id"]): (
+                            f"{row.get('contest_type') or 'Unknown'} | "
+                            f"{row.get('slate_name') or 'Unnamed'} | "
+                            f"{int(row.get('game_count') or 0)} games"
+                        )
+                        for _, row in candidate_slates.iterrows()
+                    }
+                    default_index = 0
+                    active_slate_id = active_slate_context.get("slate_id")
+                    if active_slate_id in slate_labels:
+                        default_index = list(slate_labels.keys()).index(active_slate_id)
+                    selected_rotowire_slate_id = st.selectbox(
+                        "Selected RotoWire Slate",
+                        options=list(slate_labels.keys()),
+                        index=default_index,
+                        format_func=lambda slate_id: slate_labels.get(int(slate_id), str(slate_id)),
+                        key="dfs_primary_rotowire_slate_id",
+                    )
+                    selected_rotowire_slate = candidate_slates.loc[
+                        candidate_slates["slate_id"] == int(selected_rotowire_slate_id)
+                    ].iloc[0]
+
+                    if st.button("Load Slate from RotoWire", type="primary", key="dfs_primary_load_rotowire"):
+                        try:
+                            from dfs_tracking import (
+                                create_dfs_tracking_tables as _create_dfs_tracking_tables,
+                                resolve_dk_slate_player_cache as _resolve_dk_slate_player_cache,
+                            )
+
+                            rotowire_player_df = load_nba_rotowire_players_frame(
+                                site_id=1,
+                                slate_id=int(selected_rotowire_slate_id),
+                                slate_date=str(selected_rotowire_slate.get("slate_date") or ""),
+                                contest_type=str(selected_rotowire_slate.get("contest_type") or ""),
+                                slate_name=str(selected_rotowire_slate.get("slate_name") or ""),
+                                cookie_header=(rotowire_cookie_header.strip() or None),
+                            )
+                            players, metadata = dfs.parse_rotowire_slate_df(
+                                rotowire_player_df,
+                                dfs_conn,
+                                slate_context={
+                                    "slate_id": int(selected_rotowire_slate_id),
+                                    "slate_date": str(selected_rotowire_slate.get("slate_date") or ""),
+                                    "contest_type": str(selected_rotowire_slate.get("contest_type") or ""),
+                                    "slate_name": str(selected_rotowire_slate.get("slate_name") or ""),
+                                },
+                            )
+                            slate_date_str = str(
+                                selected_rotowire_slate.get("slate_date") or rotowire_selected_date.isoformat()
+                            )
+                            _create_dfs_tracking_tables(dfs_conn)
+                            cache_stats = _resolve_dk_slate_player_cache(
+                                dfs_conn,
+                                slate_date_str,
+                                players,
+                            )
+                            metadata.update(
+                                {
+                                    "source": "RotoWire NBA Optimizer",
+                                    "source_mode": "rotowire",
+                                    "resolved_from_cache": cache_stats.get("resolved_from_cache", 0),
+                                    "already_present_ids": cache_stats.get("already_present", 0),
+                                    "cached_id_rows": cache_stats.get("cached_rows", 0),
+                                }
+                            )
+                            st.session_state.dfs_loaded_slate_players = players
+                            st.session_state.dfs_player_pool = []
+                            st.session_state.dfs_lineups = []
+                            st.session_state.dfs_supplement_state = {}
+                            st.session_state.dfs_upload_metadata = metadata
+                            st.session_state.dfs_slate_context = {
+                                "source_mode": "rotowire",
+                                "source_name": "RotoWire NBA Optimizer",
+                                "slate_id": int(selected_rotowire_slate_id),
+                                "slate_date": slate_date_str,
+                                "contest_type": str(selected_rotowire_slate.get("contest_type") or ""),
+                                "slate_name": str(selected_rotowire_slate.get("slate_name") or ""),
+                            }
+                            st.session_state.dfs_projection_date = slate_date_str
+                            st.session_state.dfs_ai_review = {}
+                            st.session_state.dfs_ai_adjustments = {}
+                            st.session_state.dfs_excluded_games = set()
+                            st.session_state.dfs_all_games = sorted(set(p.game_id for p in players))
+                            _upload_dfs_slate_frame(
+                                rotowire_player_df,
+                                slate_date_str,
+                                f"rotowire_primary_slate_{int(selected_rotowire_slate_id)}.csv",
+                            )
+                            st.success(
+                                f"Loaded {metadata.get('matched_players', 0)} matched players from RotoWire "
+                                f"for {metadata.get('unique_games', 0)} games."
+                            )
+                        except Exception as exc:
+                            st.error(f"Could not load RotoWire slate: {exc}")
+            except Exception as exc:
+                st.error(f"Could not fetch RotoWire slate catalog: {exc}")
+        else:
+            st.caption(
+                "Upload a DraftKings salary CSV only when you need to repair missing DK IDs "
+                "or load a slate manually."
+            )
+            default_dk_slate_date = datetime.now(EASTERN_TZ).date()
+            try:
+                if active_projection_date:
+                    default_dk_slate_date = datetime.strptime(
+                        str(active_projection_date),
+                        "%Y-%m-%d",
+                    ).date()
+            except Exception:
+                pass
+            dk_slate_date = st.date_input(
+                "DK Slate Date",
+                value=default_dk_slate_date,
+                key="dfs_primary_dk_slate_date",
+            )
+            uploaded_file = st.file_uploader(
+                "Choose DraftKings CSV file",
+                type=['csv'],
+                help="Export from DraftKings contest lobby",
+                key="dfs_primary_dk_upload",
+            )
+            use_as_id_repair = st.checkbox(
+                "Use upload as DK ID repair for the current loaded slate",
+                value=bool(active_loaded_players),
+                key="dfs_primary_dk_repair_mode",
+            )
+
+            if uploaded_file is not None:
+                csv_path = persist_uploaded_file(uploaded_file, ".csv")
+                with st.spinner("Parsing DraftKings CSV..."):
+                    try:
+                        from dfs_tracking import (
+                            create_dfs_tracking_tables as _create_dfs_tracking_tables,
+                            resolve_dk_slate_player_cache as _resolve_dk_slate_player_cache,
+                            save_dk_slate_player_cache as _save_dk_slate_player_cache,
+                        )
+
+                        dk_players, metadata = dfs.parse_dk_csv(csv_path, dfs_conn)
+                        active_slate_date = str(dk_slate_date or default_dk_slate_date)
+                        _create_dfs_tracking_tables(dfs_conn)
+                        cached_count = _save_dk_slate_player_cache(
+                            dfs_conn,
+                            str(active_slate_date),
+                            dk_players,
+                            source_filename=uploaded_file.name,
+                        )
+                        _s3_upload_slate_file(
+                            csv_path,
+                            str(active_slate_date),
+                            "dk_salaries.csv",
+                            f"DK CSV saved to cloud storage for {active_slate_date}",
+                        )
+
+                        if use_as_id_repair and active_loaded_players:
+                            updated_loaded = _apply_dk_id_repair_to_players(
+                                active_loaded_players,
+                                dk_players,
+                            )
+                            projected_pool = st.session_state.get("dfs_player_pool", []) or []
+                            updated_projected = _apply_dk_id_repair_to_players(
+                                projected_pool,
+                                dk_players,
+                            ) if projected_pool else 0
+                            lineups = st.session_state.get("dfs_lineups", []) or []
+                            updated_lineups = _apply_dk_id_repair_to_lineups(
+                                lineups,
+                                dk_players,
+                            ) if lineups else 0
+                            cache_stats = _resolve_dk_slate_player_cache(
+                                dfs_conn,
+                                str(active_slate_date),
+                                active_loaded_players,
+                            )
+                            active_upload_metadata.update(
+                                {
+                                    "resolved_from_cache": cache_stats.get("resolved_from_cache", 0),
+                                    "already_present_ids": cache_stats.get("already_present", 0),
+                                    "cached_id_rows": cache_stats.get("cached_rows", 0),
+                                    "source": active_upload_metadata.get("source") or "RotoWire NBA Optimizer",
+                                    "source_mode": active_upload_metadata.get("source_mode") or "rotowire",
+                                }
+                            )
+                            st.session_state.dfs_upload_metadata = active_upload_metadata
+                            st.success(
+                                f"Applied DK ID repair to the active slate: {updated_loaded} loaded players updated"
+                                + (
+                                    f", {updated_projected} projected players updated."
+                                    if projected_pool
+                                    else "."
+                                )
+                            )
+                            if updated_lineups:
+                                st.caption(f"Updated {updated_lineups} player reference(s) across existing lineups.")
+                            st.caption(
+                                f"Cached {cached_count} DK ID rows for {active_slate_date}. "
+                                "Re-run lineup generation if lineups were already built before the repair."
+                            )
+                        else:
+                            cache_stats = _resolve_dk_slate_player_cache(
+                                dfs_conn,
+                                str(active_slate_date),
+                                dk_players,
+                            )
+                            metadata.update(
+                                {
+                                    "source": "DraftKings CSV",
+                                    "source_mode": "draftkings_csv",
+                                    "resolved_from_cache": cache_stats.get("resolved_from_cache", 0),
+                                    "already_present_ids": cache_stats.get("already_present", 0),
+                                    "cached_id_rows": cache_stats.get("cached_rows", 0),
+                                }
+                            )
+                            st.session_state.dfs_loaded_slate_players = dk_players
+                            st.session_state.dfs_player_pool = []
+                            st.session_state.dfs_lineups = []
+                            st.session_state.dfs_supplement_state = {}
+                            st.session_state.dfs_upload_metadata = metadata
+                            st.session_state.dfs_slate_context = {
+                                "source_mode": "draftkings_csv",
+                                "source_name": "DraftKings CSV",
+                                "slate_id": None,
+                                "slate_date": str(active_slate_date),
+                                "contest_type": "Classic",
+                                "slate_name": uploaded_file.name,
+                            }
+                            st.session_state.dfs_projection_date = str(active_slate_date)
+                            st.session_state.dfs_ai_review = {}
+                            st.session_state.dfs_ai_adjustments = {}
+                            st.session_state.dfs_excluded_games = set()
+                            st.session_state.dfs_all_games = sorted(set(p.game_id for p in dk_players))
+                            st.success(
+                                f"Loaded {metadata['matched_players']} players from {metadata['unique_games']} games."
+                            )
+                            st.caption(f"Cached {cached_count} DK ID rows for {active_slate_date}.")
+
+                    except Exception as e:
+                        st.error(f"Error parsing CSV: {str(e)}")
+                        import traceback
+                        st.code(traceback.format_exc())
+
+        loaded_players = st.session_state.get("dfs_loaded_slate_players", []) or []
+        loaded_metadata = st.session_state.get("dfs_upload_metadata", {}) or {}
+        if loaded_players:
+            readiness = _build_dfs_slate_readiness(loaded_players, loaded_metadata)
+            _render_dfs_slate_readiness(readiness)
+
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Players Matched", int(loaded_metadata.get("matched_players", 0)))
+            with col2:
+                st.metric("Unique Games", int(loaded_metadata.get("unique_games", 0)))
+            with col3:
+                low, high = loaded_metadata.get("salary_range", (0, 0))
+                st.metric("Salary Range", f"${int(low):,} - ${int(high):,}")
+
+            if loaded_metadata.get('fallback_players'):
+                fallback_count = loaded_metadata.get('fallback_count', 0)
+                with st.expander(f"{fallback_count} Fallback Players", expanded=False):
+                    st.write("These players were not matched cleanly in the database and use fallback assumptions:")
+                    for name, team, fallback_avg in loaded_metadata['fallback_players'][:20]:
+                        st.caption(f"{name} ({team}) - fallback baseline {fallback_avg:.1f} FPTS")
+                    if len(loaded_metadata['fallback_players']) > 20:
+                        st.caption(f"...and {len(loaded_metadata['fallback_players']) - 20} more")
+
+            if loaded_metadata.get('injured_players'):
+                with st.expander(f"{loaded_metadata.get('injured_count', 0)} Injured Players (Auto-Excluded)", expanded=False):
+                    st.write("These players are OUT/DOUBTFUL and will be excluded from lineups:")
+                    for name, status in loaded_metadata['injured_players']:
+                        st.caption(f"{name} - {status}")
+
+            st.divider()
+            st.subheader("Select Games to Include")
+            st.caption("Uncheck any postponed or cancelled games.")
+
+            all_games = sorted(set(p.game_id for p in loaded_players))
+            st.session_state.dfs_all_games = all_games
+            if all_games:
+                game_cols = st.columns(min(3, len(all_games)))
+                included_games = set()
+                for i, game_id in enumerate(all_games):
+                    col_idx = i % len(game_cols)
+                    game_teams = set(p.team for p in loaded_players if p.game_id == game_id)
+                    game_label = ' vs '.join(sorted(game_teams)) if game_teams else game_id
+                    with game_cols[col_idx]:
+                        is_included = st.checkbox(
+                            game_label,
+                            value=game_id not in st.session_state.dfs_excluded_games,
+                            key=f"game_{game_id}",
+                        )
+                        if is_included:
+                            included_games.add(game_id)
+
+                st.session_state.dfs_excluded_games = set(all_games) - included_games
+                if st.session_state.dfs_excluded_games:
+                    st.warning(
+                        f"{len(st.session_state.dfs_excluded_games)} game(s) excluded from lineup generation."
                     )
 
-                    st.success(f"✅ Loaded {metadata['matched_players']} players from {metadata['unique_games']} games")
+            st.divider()
+            st.subheader("Generate Projections")
+            game_date_col1, game_date_col2 = st.columns([2, 1])
+            default_projection_date = datetime.now(EASTERN_TZ).date()
+            try:
+                if active_projection_date:
+                    default_projection_date = datetime.strptime(
+                        str(active_projection_date),
+                        "%Y-%m-%d",
+                    ).date()
+            except Exception:
+                pass
+            with game_date_col1:
+                projection_date = st.date_input(
+                    "Projection Date (for rest day calculations)",
+                    value=default_projection_date,
+                    help="Select the slate date so rest-day logic lines up correctly.",
+                    key="dfs_primary_projection_date_input",
+                )
+            with game_date_col2:
+                use_sophisticated = st.checkbox(
+                    "Use Sophisticated Model",
+                    value=True,
+                    help="Enable advanced projections with rest days, PPM stats, and uncertainty.",
+                    key="dfs_primary_use_sophisticated",
+                )
 
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.metric("Players Matched", metadata['matched_players'])
-                    with col2:
-                        st.metric("Unique Games", metadata['unique_games'])
-                    with col3:
-                        low, high = metadata['salary_range']
-                        st.metric("Salary Range", f"${low:,} - ${high:,}")
+            if st.button("Generate Player Projections", type="primary", key="dfs_primary_generate_projections"):
+                progress_bar = st.progress(0)
+                status_text = st.empty()
 
-                    # Show fallback players (using DK avg instead of our projection)
-                    if metadata.get('fallback_players'):
-                        fallback_count = metadata.get('fallback_count', 0)
-                        with st.expander(f"📊 {fallback_count} Fallback Players (using DK average)", expanded=False):
-                            st.write("These players aren't in our database - using DraftKings average as projection:")
-                            for name, team, dk_avg in metadata['fallback_players'][:20]:
-                                st.caption(f"• {name} ({team}) — DK Avg: {dk_avg:.1f} FPTS")
-                            if len(metadata['fallback_players']) > 20:
-                                st.caption(f"...and {len(metadata['fallback_players']) - 20} more")
-                            st.info("💡 Fallback players are typically two-way players, recent call-ups, or name mismatches.")
+                defense_map = None
+                def_style_map = None
+                def_ppm_df = None
+                league_avg_ppm = 0.462
+                injury_status_map = {}
+                teammate_injury_map = {}
 
-                    # Show injured players that will be auto-excluded
-                    if metadata.get('injured_players'):
-                        with st.expander(f"🏥 {metadata['injured_count']} Injured Players (Auto-Excluded)", expanded=True):
-                            st.write("These players are OUT/DOUBTFUL and will be excluded from lineups:")
-                            for name, status in metadata['injured_players']:
-                                if 'DK' in status:
-                                    status_emoji = "🟡"  # DK-detected (not in our API)
-                                elif status.upper() == "OUT":
-                                    status_emoji = "🔴"
-                                else:
-                                    status_emoji = "🟠"
-                                st.caption(f"{status_emoji} {name} - {status}")
-
-                            dk_count = metadata.get('dk_detected_out_count', 0)
-                            if dk_count > 0:
-                                st.info(f"🟡 {dk_count} player(s) detected as OUT from DraftKings CSV (not in our injury API)")
-
-                    # Game selection - exclude postponed/cancelled games
-                    st.divider()
-                    st.subheader("🏟️ Select Games to Include")
-                    st.caption("Uncheck any postponed or cancelled games")
-
-                    # Get unique games from players
-                    all_games = sorted(set(p.game_id for p in players))
-                    st.session_state.dfs_all_games = all_games
-
-                    # Display games as checkboxes in columns
-                    game_cols = st.columns(min(3, len(all_games)))
-                    included_games = set()
-
-                    for i, game_id in enumerate(all_games):
-                        col_idx = i % len(game_cols)
-                        # Get teams in this game
-                        game_teams = set(p.team for p in players if p.game_id == game_id)
-                        game_label = ' vs '.join(sorted(game_teams)) if game_teams else game_id
-
-                        with game_cols[col_idx]:
-                            is_included = st.checkbox(
-                                game_label,
-                                value=game_id not in st.session_state.dfs_excluded_games,
-                                key=f"game_{game_id}"
-                            )
-                            if is_included:
-                                included_games.add(game_id)
-
-                    # Update excluded games
-                    st.session_state.dfs_excluded_games = set(all_games) - included_games
-
-                    if st.session_state.dfs_excluded_games:
-                        st.warning(f"⚠️ {len(st.session_state.dfs_excluded_games)} game(s) excluded from lineup generation")
-
-                    # Generate projections
-                    st.divider()
-                    st.subheader("Generate Projections")
-
-                    # Game date selector for rest day calculations
-                    game_date_col1, game_date_col2 = st.columns([2, 1])
-                    with game_date_col1:
-                        projection_date = st.date_input(
-                            "Projection Date (for rest day calculations)",
-                            value=datetime.now(EASTERN_TZ).date(),
-                            help="Select the date of the games to calculate rest days correctly"
+                if use_sophisticated:
+                    status_text.text("Loading sophisticated prediction data...")
+                    try:
+                        defense_stats = load_team_defense_stats(
+                            str(db_path), DEFAULT_SEASON, DEFAULT_SEASON_TYPE
                         )
-                    with game_date_col2:
-                        use_sophisticated = st.checkbox(
-                            "Use Sophisticated Model",
-                            value=True,
-                            help="Enable advanced projections with rest days, PPM stats, and uncertainty"
-                        )
+                        defense_map = {
+                            int(row["team_id"]): row.to_dict()
+                            for _, row in defense_stats.iterrows()
+                        }
+                        def_style_map = {
+                            int(row["team_id"]): str(row.get("defense_style") or "Neutral")
+                            for _, row in defense_stats.iterrows()
+                        }
 
-                    if st.button("🔄 Generate Player Projections", type="primary"):
-                        progress_bar = st.progress(0)
-                        status_text = st.empty()
-
-                        # Load sophisticated prediction data if enabled
-                        defense_map = None
-                        def_style_map = None
-                        def_ppm_df = None
-                        league_avg_ppm = 0.462
-                        injury_status_map = {}
-                        teammate_injury_map = {}
-
-                        if use_sophisticated:
-                            status_text.text("Loading sophisticated prediction data...")
-                            try:
-                                # Load defense stats
-                                defense_stats = load_team_defense_stats(
-                                    str(db_path), DEFAULT_SEASON, DEFAULT_SEASON_TYPE
-                                )
-                                defense_map = {
-                                    int(row["team_id"]): row.to_dict()
-                                    for _, row in defense_stats.iterrows()
-                                }
-                                def_style_map = {
-                                    int(row["team_id"]): str(row.get("defense_style") or "Neutral")
-                                    for _, row in defense_stats.iterrows()
-                                }
-
-                                # Load PPM stats
-                                try:
-                                    _, def_ppm_df, league_avg_ppm = load_ppm_stats(
-                                        str(db_path), DEFAULT_SEASON
-                                    )
-                                except Exception:
-                                    pass
-
-                                # Load injury data
-                                try:
-                                    active_injuries = ia.get_active_injuries(
-                                        dfs_conn, check_return_dates=True
-                                    )
-                                    injury_status_map = {
-                                        inj['player_id']: inj.get('status', 'unknown').lower()
-                                        for inj in active_injuries
-                                    }
-                                    # Build teammate injury map
-                                    for inj in active_injuries:
-                                        team_id = inj.get('team_id')
-                                        status = injury_status_map.get(inj['player_id'])
-                                        if team_id and status in ('questionable', 'out', 'doubtful'):
-                                            if team_id not in teammate_injury_map:
-                                                teammate_injury_map[team_id] = []
-                                            teammate_injury_map[team_id].append(inj['player_id'])
-                                except Exception:
-                                    pass
-
-                                status_text.text("Sophisticated prediction data loaded ✓")
-                            except Exception as e:
-                                st.warning(f"Could not load sophisticated data: {e}. Using simple model.")
-                                use_sophisticated = False
-
-                        projected_players = []
-                        game_date_str = str(projection_date) if projection_date else None
-
-                        for i, player in enumerate(players):
-                            progress = (i + 1) / len(players)
-                            progress_bar.progress(progress)
-                            status_text.text(f"Projecting {player.name}...")
-
-                            player = dfs.generate_player_projections(
-                                dfs_conn, player,
-                                season=DEFAULT_SEASON,
-                                season_type=DEFAULT_SEASON_TYPE,
-                                game_date=game_date_str,
-                                defense_map=defense_map if use_sophisticated else None,
-                                def_style_map=def_style_map,
-                                def_ppm_df=def_ppm_df,
-                                league_avg_ppm=league_avg_ppm,
-                                injury_status_map=injury_status_map,
-                                teammate_injury_map=teammate_injury_map,
-                                num_games=metadata.get('unique_games'),
-                            )
-                            projected_players.append(player)
-
-                        progress_bar.empty()
-                        status_text.empty()
-
-                        st.session_state.dfs_player_pool = projected_players
-                        st.session_state.dfs_upload_metadata = metadata
-                        st.session_state.dfs_projection_date = str(projection_date) if projection_date else None
-                        st.session_state.dfs_ai_review = {}
-                        st.session_state.dfs_ai_adjustments = {}
-
-                        # Enrich with Vegas signals if props exist
                         try:
-                            vegas_signals = _enrich_players_with_vegas_signals(
-                                dfs_conn, projected_players,
-                                str(projection_date) if projection_date else str(datetime.now(EASTERN_TZ).date())
+                            _, def_ppm_df, league_avg_ppm = load_ppm_stats(
+                                str(db_path), DEFAULT_SEASON
                             )
-                            st.session_state.dfs_vegas_signals = vegas_signals
-                            if vegas_signals:
-                                boost_count = sum(1 for s in vegas_signals.values() if s['signal'] == 'BOOST')
-                                if boost_count:
-                                    st.info(f"🎰 Found {boost_count} Vegas BOOST candidate(s) — see Player Pool tab")
-                        except Exception:
-                            st.session_state.dfs_vegas_signals = {}
-
-                        # Enrich with game environment correlation data
-                        try:
-                            game_date_for_enrich = str(projection_date) if projection_date else str(datetime.now(EASTERN_TZ).date())
-                            projected_players = dfs.enrich_players_with_correlation_model(
-                                projected_players, dfs_conn, game_date_for_enrich
-                            )
-                            projected_players = dfs.apply_correlation_ceiling_boost(projected_players)
                         except Exception:
                             pass
 
-                        # Count minutes-validated players
-                        no_minutes = sum(1 for p in projected_players if not p.minutes_validated)
-                        if no_minutes:
-                            st.warning(f"⚠️ {no_minutes} player(s) flagged with no recent minutes")
-
-                        # Show projection summary
-                        b2b_count = sum(1 for p in projected_players if getattr(p, 'days_rest', None) == 1)
-                        rested_count = sum(1 for p in projected_players if (getattr(p, 'days_rest', None) or 0) >= 3)
-
-                        st.success(f"✅ Generated projections for {len(projected_players)} players")
-                        if use_sophisticated and (b2b_count > 0 or rested_count > 0):
-                            st.info(f"📊 Rest analysis: **{b2b_count}** players on B2B (-8%), **{rested_count}** well-rested (+5%)")
-                        st.info("Switch to the **Player Pool** tab to review and adjust projections.")
-
-                        # Save projections to cloud storage (latest overrides earlier for same day).
                         try:
-                            slate_date = str(projection_date) if projection_date else str(datetime.now(EASTERN_TZ).date())
-                            proj_rows = []
-                            for p in projected_players:
-                                if p.is_injured or p.is_excluded:
-                                    continue
-                                proj_rows.append({
-                                    'player_id': p.player_id, 'name': p.name,
-                                    'team': p.team, 'opponent': p.opponent,
-                                    'salary': p.salary, 'positions': ','.join(p.positions),
-                                    'proj_fpts': p.proj_fpts, 'proj_points': p.proj_points,
-                                    'proj_rebounds': p.proj_rebounds, 'proj_assists': p.proj_assists,
-                                    'proj_steals': p.proj_steals, 'proj_blocks': p.proj_blocks,
-                                    'proj_turnovers': p.proj_turnovers, 'proj_fg3m': p.proj_fg3m,
-                                    'proj_floor': p.proj_floor, 'proj_ceiling': p.proj_ceiling,
-                                    'fpts_per_dollar': p.fpts_per_dollar,
-                                })
-                            if proj_rows:
-                                proj_df = pd.DataFrame(proj_rows)
-                                with tempfile.NamedTemporaryFile(
-                                    mode='w', suffix='.csv', delete=False
-                                ) as tmp:
-                                    proj_df.to_csv(tmp, index=False)
-                                    tmp_path = Path(tmp.name)
-                                _s3_upload_slate_file(
-                                    tmp_path, slate_date,
-                                    "projections.csv",
-                                    f"☁️ Projections saved to cloud storage for {slate_date}"
-                                )
-                                try:
-                                    tmp_path.unlink()
-                                except OSError:
-                                    pass
-                            # Also backup DB (projections are now in tracking tables too)
-                            _s3_backup_db(db_path, toast=False)
+                            active_injuries = ia.get_active_injuries(
+                                dfs_conn, check_return_dates=True
+                            )
+                            injury_status_map = {
+                                inj['player_id']: inj.get('status', 'unknown').lower()
+                                for inj in active_injuries
+                            }
+                            for inj in active_injuries:
+                                team_id = inj.get('team_id')
+                                status = injury_status_map.get(inj['player_id'])
+                                if team_id and status in ('questionable', 'out', 'doubtful'):
+                                    teammate_injury_map.setdefault(team_id, []).append(inj['player_id'])
                         except Exception:
-                            pass  # Best-effort cloud save
+                            pass
 
-                except Exception as e:
-                    st.error(f"❌ Error parsing CSV: {str(e)}")
-                    import traceback
-                    st.code(traceback.format_exc())
+                        status_text.text("Sophisticated prediction data loaded")
+                    except Exception as e:
+                        st.warning(f"Could not load sophisticated data: {e}. Using simple model.")
+                        use_sophisticated = False
+
+                projected_players = []
+                source_players = deepcopy(loaded_players)
+                game_date_str = str(projection_date) if projection_date else None
+
+                for i, player in enumerate(source_players):
+                    progress = (i + 1) / len(source_players)
+                    progress_bar.progress(progress)
+                    status_text.text(f"Projecting {player.name}...")
+                    player = dfs.generate_player_projections(
+                        dfs_conn,
+                        player,
+                        season=DEFAULT_SEASON,
+                        season_type=DEFAULT_SEASON_TYPE,
+                        game_date=game_date_str,
+                        defense_map=defense_map if use_sophisticated else None,
+                        def_style_map=def_style_map,
+                        def_ppm_df=def_ppm_df,
+                        league_avg_ppm=league_avg_ppm,
+                        injury_status_map=injury_status_map,
+                        teammate_injury_map=teammate_injury_map,
+                        num_games=loaded_metadata.get('unique_games'),
+                    )
+                    projected_players.append(player)
+
+                progress_bar.empty()
+                status_text.empty()
+
+                st.session_state.dfs_player_pool = projected_players
+                st.session_state.dfs_projection_date = str(projection_date) if projection_date else None
+                st.session_state.dfs_ai_review = {}
+                st.session_state.dfs_ai_adjustments = {}
+
+                try:
+                    vegas_signals = _enrich_players_with_vegas_signals(
+                        dfs_conn,
+                        projected_players,
+                        str(projection_date) if projection_date else str(datetime.now(EASTERN_TZ).date()),
+                    )
+                    st.session_state.dfs_vegas_signals = vegas_signals
+                    if vegas_signals:
+                        boost_count = sum(1 for s in vegas_signals.values() if s['signal'] == 'BOOST')
+                        if boost_count:
+                            st.info(f"Found {boost_count} Vegas BOOST candidate(s) - see Player Pool tab.")
+                except Exception:
+                    st.session_state.dfs_vegas_signals = {}
+
+                try:
+                    game_date_for_enrich = str(projection_date) if projection_date else str(datetime.now(EASTERN_TZ).date())
+                    projected_players = dfs.enrich_players_with_correlation_model(
+                        projected_players,
+                        dfs_conn,
+                        game_date_for_enrich,
+                    )
+                    projected_players = dfs.apply_correlation_ceiling_boost(projected_players)
+                    st.session_state.dfs_player_pool = projected_players
+                except Exception:
+                    pass
+
+                no_minutes = sum(1 for p in projected_players if not p.minutes_validated)
+                if no_minutes:
+                    st.warning(f"{no_minutes} player(s) flagged with no recent minutes.")
+
+                b2b_count = sum(1 for p in projected_players if getattr(p, 'days_rest', None) == 1)
+                rested_count = sum(
+                    1 for p in projected_players if (getattr(p, 'days_rest', None) or 0) >= 3
+                )
+
+                st.success(f"Generated projections for {len(projected_players)} players.")
+                if use_sophisticated and (b2b_count > 0 or rested_count > 0):
+                    st.info(
+                        f"Rest analysis: {b2b_count} players on B2B (-8%), "
+                        f"{rested_count} well-rested (+5%)."
+                    )
+                st.info("Switch to the Player Pool tab to review and adjust projections.")
+
+                try:
+                    slate_date = str(projection_date) if projection_date else str(datetime.now(EASTERN_TZ).date())
+                    proj_rows = []
+                    for p in projected_players:
+                        if p.is_injured or p.is_excluded:
+                            continue
+                        proj_rows.append({
+                            'player_id': p.player_id,
+                            'name': p.name,
+                            'team': p.team,
+                            'opponent': p.opponent,
+                            'salary': p.salary,
+                            'positions': ','.join(p.positions),
+                            'proj_fpts': p.proj_fpts,
+                            'proj_points': p.proj_points,
+                            'proj_rebounds': p.proj_rebounds,
+                            'proj_assists': p.proj_assists,
+                            'proj_steals': p.proj_steals,
+                            'proj_blocks': p.proj_blocks,
+                            'proj_turnovers': p.proj_turnovers,
+                            'proj_fg3m': p.proj_fg3m,
+                            'proj_floor': p.proj_floor,
+                            'proj_ceiling': p.proj_ceiling,
+                            'fpts_per_dollar': p.fpts_per_dollar,
+                        })
+                    if proj_rows:
+                        _upload_dfs_slate_frame(
+                            pd.DataFrame(proj_rows),
+                            slate_date,
+                            "projections.csv",
+                        )
+                    _s3_backup_db(db_path, toast=False)
+                except Exception:
+                    pass
+        else:
+            st.info("Load a slate from RotoWire or upload a DK CSV fallback to begin.")
 
     # ==========================================================================
     # TAB 2: Player Pool
@@ -15208,7 +15667,7 @@ if selected_page == "DFS Lineup Builder":
         st.subheader("Player Pool & Projections")
 
         if not st.session_state.dfs_player_pool:
-            st.info("📤 Upload a DraftKings CSV in the first tab to populate the player pool.")
+            st.info("Load a slate in the first tab and generate projections to populate the player pool.")
         else:
             current_slate_date = (
                 st.session_state.get("dfs_projection_date")
@@ -16109,9 +16568,18 @@ if selected_page == "DFS Lineup Builder":
         st.subheader("Generated Lineups")
 
         if not st.session_state.dfs_player_pool:
-            st.info("📤 Upload a DraftKings CSV and generate projections first.")
+            st.info("Load a slate and generate projections first.")
         else:
             players = st.session_state.dfs_player_pool
+            lineup_export_readiness = _build_dfs_slate_readiness(
+                players,
+                st.session_state.get("dfs_upload_metadata", {}) or {},
+            )
+            if not bool(lineup_export_readiness.get("ready_for_export")):
+                st.warning(
+                    "Lineup generation can run, but DraftKings export is not fully ready yet. "
+                    "Repair the missing DK IDs in Upload & Configure if you need upload-ready CSVs."
+                )
             ai_adjustments = st.session_state.get("dfs_ai_adjustments", {}) or {}
             current_slate_date = (
                 st.session_state.get("dfs_projection_date") or str(datetime.now(EASTERN_TZ).date())
@@ -16779,8 +17247,14 @@ if selected_page == "DFS Lineup Builder":
                         data=csv_data,
                         file_name="dk_lineups.csv",
                         mime="text/csv",
-                        use_container_width=True
+                        use_container_width=True,
+                        disabled=not bool(lineup_export_readiness.get("ready_for_export")),
                     )
+                    if not bool(lineup_export_readiness.get("ready_for_export")):
+                        st.caption(
+                            f"Export disabled: {int(lineup_export_readiness.get('missing_dk_ids') or 0)} "
+                            "active player(s) still need DK IDs."
+                        )
 
             def _render_optimizer_debug_panel() -> None:
                 optimizer_debug_stats = (
@@ -20270,7 +20744,7 @@ if selected_page == "DFS Lineup Builder":
         supplement_players = st.session_state.get("dfs_player_pool", []) or []
         if not supplement_players:
             st.info(
-                "Load a DraftKings slate and generate projections first. "
+                "Load a slate and generate projections first. "
                 "This tab compares the uploaded supplement against the active builder player pool."
             )
         else:
