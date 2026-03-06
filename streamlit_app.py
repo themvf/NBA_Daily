@@ -914,6 +914,225 @@ def _apply_dk_id_repair_to_lineups(
     return _apply_dk_id_repair_to_players(list(unique_players.values()), dk_players)
 
 
+def _load_cached_dk_slate_players(
+    conn: sqlite3.Connection,
+    slate_date: str,
+    min_players: int = 40,
+) -> Tuple[List[Any], Dict[str, Any]]:
+    """Rehydrate a DK slate from the persistent ID cache for session recovery."""
+    if not slate_date:
+        return [], {}
+
+    try:
+        cache_df = pd.read_sql_query(
+            """
+            SELECT
+                slate_date,
+                player_id,
+                player_name,
+                team,
+                opponent,
+                salary,
+                positions,
+                game_id,
+                dk_id,
+                dk_avg_pts,
+                source_filename,
+                created_at
+            FROM dfs_dk_slate_player_cache
+            WHERE slate_date = ?
+            ORDER BY created_at DESC
+            """,
+            conn,
+            params=[str(slate_date)],
+        )
+    except Exception:
+        return [], {}
+
+    if cache_df.empty:
+        return [], {}
+
+    latest_by_player: Dict[int, Dict[str, Any]] = {}
+    for row in cache_df.to_dict("records"):
+        try:
+            player_id = int(row.get("player_id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if player_id <= 0 or player_id in latest_by_player:
+            continue
+        latest_by_player[player_id] = row
+
+    recovered_players: List[Any] = []
+    for player_id, row in latest_by_player.items():
+        salary_val = pd.to_numeric(row.get("salary"), errors="coerce")
+        salary = int(salary_val) if pd.notna(salary_val) else 0
+        if salary <= 0:
+            continue
+
+        positions = [
+            pos.strip().upper()
+            for pos in str(row.get("positions") or "").split(",")
+            if pos and pos.strip()
+        ]
+        if not positions:
+            positions = ["UTIL"]
+
+        team = str(row.get("team") or "").strip().upper()
+        opponent = str(row.get("opponent") or "").strip().upper()
+        game_id = str(row.get("game_id") or "").strip()
+        if not game_id:
+            parts = sorted({abbr for abbr in [team, opponent] if abbr})
+            game_id = "_".join(parts) if parts else f"game_{team or 'UNK'}"
+
+        dk_avg_pts_val = pd.to_numeric(row.get("dk_avg_pts"), errors="coerce")
+        recovered_players.append(
+            dfs.DFSPlayer(
+                player_id=int(player_id),
+                name=str(row.get("player_name") or "").strip(),
+                team=team,
+                opponent=opponent,
+                game_id=game_id,
+                positions=positions,
+                salary=salary,
+                dk_id=str(row.get("dk_id") or "").strip(),
+                dk_avg_pts=float(dk_avg_pts_val) if pd.notna(dk_avg_pts_val) else 0.0,
+                is_injured=False,
+                injury_status="",
+                is_fallback=False,
+            )
+        )
+
+    if len(recovered_players) < int(min_players):
+        return [], {}
+
+    source_filename = ""
+    for row in cache_df.to_dict("records"):
+        candidate = str(row.get("source_filename") or "").strip()
+        if candidate:
+            source_filename = candidate
+            break
+
+    salaries = [int(getattr(p, "salary", 0) or 0) for p in recovered_players]
+    players_with_ids = [
+        p for p in recovered_players if str(getattr(p, "dk_id", "") or "").strip()
+    ]
+    metadata = {
+        "total_players": int(len(recovered_players)),
+        "matched_players": int(len(recovered_players)),
+        "fallback_players": [],
+        "fallback_count": 0,
+        "unmatched_players": [],
+        "unique_games": int(len(set(str(getattr(p, "game_id", "") or "") for p in recovered_players))),
+        "salary_range": (
+            int(min(salaries)) if salaries else 0,
+            int(max(salaries)) if salaries else 0,
+        ),
+        "match_rate": 100.0,
+        "injured_players": [],
+        "injured_count": 0,
+        "dk_detected_out": [],
+        "dk_detected_out_count": 0,
+        "source": "DraftKings Cache Recovery",
+        "source_mode": "draftkings_cache_recovery",
+        "resolved_from_cache": int(len(players_with_ids)),
+        "already_present_ids": int(len(players_with_ids)),
+        "cached_id_rows": int(len(cache_df)),
+        "source_filename": source_filename,
+        "recovered_from_cache": True,
+    }
+    return recovered_players, metadata
+
+
+def _load_cached_projection_player_pool(
+    conn: sqlite3.Connection,
+    slate_date: str,
+    loaded_players: List[Any],
+    min_players: int = 20,
+) -> List[Any]:
+    """Rehydrate projected player pool from saved slate projections."""
+    if not slate_date or not loaded_players:
+        return []
+
+    try:
+        proj_df = pd.read_sql_query(
+            """
+            SELECT
+                player_id,
+                proj_fpts,
+                proj_points,
+                proj_rebounds,
+                proj_assists,
+                proj_steals,
+                proj_blocks,
+                proj_turnovers,
+                proj_fg3m,
+                proj_floor,
+                proj_ceiling,
+                fpts_per_dollar,
+                ownership_proj
+            FROM dfs_slate_projections
+            WHERE slate_date = ?
+            ORDER BY player_id
+            """,
+            conn,
+            params=[str(slate_date)],
+        )
+    except Exception:
+        return []
+
+    if proj_df.empty:
+        return []
+
+    row_by_player: Dict[int, Dict[str, Any]] = {}
+    for row in proj_df.to_dict("records"):
+        try:
+            player_id = int(row.get("player_id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if player_id <= 0:
+            continue
+        row_by_player[player_id] = row
+
+    def _num(value: Any, default: float = 0.0) -> float:
+        numeric = pd.to_numeric(value, errors="coerce")
+        return float(numeric) if pd.notna(numeric) else float(default)
+
+    restored_pool: List[Any] = []
+    for player in deepcopy(loaded_players):
+        try:
+            player_id = int(getattr(player, "player_id", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if player_id <= 0:
+            continue
+        row = row_by_player.get(player_id)
+        if not row:
+            continue
+
+        player.proj_fpts = _num(row.get("proj_fpts"))
+        player.proj_points = _num(row.get("proj_points"))
+        player.proj_rebounds = _num(row.get("proj_rebounds"))
+        player.proj_assists = _num(row.get("proj_assists"))
+        player.proj_steals = _num(row.get("proj_steals"))
+        player.proj_blocks = _num(row.get("proj_blocks"))
+        player.proj_turnovers = _num(row.get("proj_turnovers"))
+        player.proj_fg3m = _num(row.get("proj_fg3m"))
+        player.proj_floor = _num(row.get("proj_floor"))
+        player.proj_ceiling = max(player.proj_fpts, _num(row.get("proj_ceiling")))
+        player.fpts_per_dollar = _num(row.get("fpts_per_dollar"))
+        player.ownership_proj = max(0.0, _num(row.get("ownership_proj")))
+        player._model_proj_fpts = float(player.proj_fpts)
+        player._model_fpts_per_dollar = float(player.fpts_per_dollar)
+        player._model_ownership_proj = float(player.ownership_proj)
+        player.rotowire_ownership_blend_active = False
+        player.rotowire_ownership_delta_applied = 0.0
+        restored_pool.append(player)
+
+    if len(restored_pool) < int(min_players):
+        return []
+    return restored_pool
+
+
 def normalize_weight_map(weight_map: Dict[str, float]) -> Dict[str, float]:
     sanitized = {k: max(0.0, float(v)) for k, v in weight_map.items()}
     total = sum(sanitized.values())
@@ -15681,6 +15900,57 @@ if selected_page == "DFS Lineup Builder":
             or active_slate_context.get("slate_date")
             or str(datetime.now(EASTERN_TZ).date())
         )
+        if not active_loaded_players:
+            recovered_players, recovered_metadata = _load_cached_dk_slate_players(
+                dfs_conn,
+                str(active_projection_date),
+            )
+            if recovered_players:
+                recovered_slate_date = str(active_projection_date)
+                recovered_source_file = str(
+                    recovered_metadata.get("source_filename") or "dk_salaries.csv"
+                )
+                st.session_state.dfs_loaded_slate_players = recovered_players
+                st.session_state.dfs_player_pool = []
+                st.session_state.dfs_lineups = []
+                st.session_state.dfs_supplement_state = {}
+                st.session_state.dfs_upload_metadata = recovered_metadata
+                st.session_state.dfs_slate_context = {
+                    "source_mode": "draftkings_cache_recovery",
+                    "source_name": "DraftKings Cache Recovery",
+                    "slate_id": None,
+                    "slate_date": recovered_slate_date,
+                    "contest_type": "Classic",
+                    "slate_name": recovered_source_file,
+                }
+                st.session_state.dfs_projection_date = recovered_slate_date
+                st.session_state.dfs_ai_review = {}
+                st.session_state.dfs_ai_adjustments = {}
+                st.session_state.dfs_excluded_games = set()
+                st.session_state.dfs_all_games = sorted(set(p.game_id for p in recovered_players))
+
+                recovered_pool = _load_cached_projection_player_pool(
+                    dfs_conn,
+                    recovered_slate_date,
+                    recovered_players,
+                )
+                if recovered_pool:
+                    st.session_state.dfs_player_pool = recovered_pool
+                    st.info(
+                        f"Recovered {len(recovered_players)} cached DK slate players and "
+                        f"{len(recovered_pool)} saved projections for {recovered_slate_date}. "
+                        "You can continue without re-uploading."
+                    )
+                else:
+                    st.info(
+                        f"Recovered {len(recovered_players)} cached DK slate players for "
+                        f"{recovered_slate_date}. Generate projections to continue."
+                    )
+
+                active_loaded_players = recovered_players
+                active_upload_metadata = recovered_metadata
+                active_slate_context = st.session_state.get("dfs_slate_context", {}) or {}
+                active_projection_date = recovered_slate_date
 
         source_mode = st.radio(
             "Slate Source",
@@ -16217,6 +16487,17 @@ if selected_page == "DFS Lineup Builder":
 
                 try:
                     slate_date = str(projection_date) if projection_date else str(datetime.now(EASTERN_TZ).date())
+                    try:
+                        from dfs_tracking import (
+                            create_dfs_tracking_tables as _create_dfs_tracking_tables,
+                            save_slate_projections as _save_slate_projections,
+                        )
+
+                        _create_dfs_tracking_tables(dfs_conn)
+                        _save_slate_projections(dfs_conn, slate_date, projected_players)
+                    except Exception:
+                        pass
+
                     proj_rows = []
                     for p in projected_players:
                         if p.is_injured or p.is_excluded:
