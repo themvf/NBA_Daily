@@ -1133,6 +1133,147 @@ def _load_cached_projection_player_pool(
     return restored_pool
 
 
+def _get_recent_slate_dates_from_tracking(
+    conn: sqlite3.Connection,
+    limit: int = 7,
+) -> List[str]:
+    """Return recent slate dates from tracking/cache tables."""
+    dates: List[str] = []
+    for table_name in ("dfs_dk_slate_player_cache", "dfs_slate_projections"):
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT DISTINCT slate_date
+                FROM {table_name}
+                WHERE slate_date IS NOT NULL AND TRIM(slate_date) != ''
+                ORDER BY slate_date DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+        except Exception:
+            rows = []
+        for row in rows:
+            slate_date = str(row[0] or "").strip()
+            if slate_date and slate_date not in dates:
+                dates.append(slate_date)
+    return dates
+
+
+def _recover_dfs_session_from_cache(
+    conn: sqlite3.Connection,
+    preferred_slate_date: str = "",
+    min_cached_players: int = 40,
+) -> Dict[str, Any]:
+    """Best-effort recovery of loaded slate + player pool after session resets."""
+    result = {
+        "recovered_loaded": False,
+        "recovered_pool": False,
+        "slate_date": "",
+        "loaded_count": 0,
+        "pool_count": 0,
+    }
+
+    slate_context = st.session_state.get("dfs_slate_context", {}) or {}
+    projection_date = str(st.session_state.get("dfs_projection_date") or "").strip()
+    preferred_date = str(preferred_slate_date or "").strip()
+    today_date = str(datetime.now(EASTERN_TZ).date())
+
+    candidate_dates: List[str] = []
+    for candidate in [
+        preferred_date,
+        projection_date,
+        str(slate_context.get("slate_date") or "").strip(),
+        today_date,
+    ]:
+        if candidate and candidate not in candidate_dates:
+            candidate_dates.append(candidate)
+    for candidate in _get_recent_slate_dates_from_tracking(conn, limit=7):
+        if candidate and candidate not in candidate_dates:
+            candidate_dates.append(candidate)
+
+    loaded_players = st.session_state.get("dfs_loaded_slate_players", []) or []
+    recovered_metadata: Dict[str, Any] = {}
+    recovered_date = ""
+
+    if not loaded_players:
+        for candidate_date in candidate_dates:
+            rec_players, rec_metadata = _load_cached_dk_slate_players(
+                conn,
+                candidate_date,
+                min_players=min_cached_players,
+            )
+            if rec_players:
+                loaded_players = rec_players
+                recovered_metadata = rec_metadata
+                recovered_date = str(candidate_date)
+                break
+
+        if loaded_players:
+            recovered_source_file = str(
+                recovered_metadata.get("source_filename") or "dk_salaries.csv"
+            )
+            st.session_state.dfs_loaded_slate_players = loaded_players
+            st.session_state.dfs_player_pool = []
+            st.session_state.dfs_lineups = []
+            st.session_state.dfs_supplement_state = {}
+            st.session_state.dfs_upload_metadata = recovered_metadata
+            st.session_state.dfs_slate_context = {
+                "source_mode": "draftkings_cache_recovery",
+                "source_name": "DraftKings Cache Recovery",
+                "slate_id": None,
+                "slate_date": recovered_date or today_date,
+                "contest_type": "Classic",
+                "slate_name": recovered_source_file,
+            }
+            st.session_state.dfs_projection_date = recovered_date or today_date
+            st.session_state.dfs_ai_review = {}
+            st.session_state.dfs_ai_adjustments = {}
+            st.session_state.dfs_excluded_games = set()
+            st.session_state.dfs_all_games = sorted(set(p.game_id for p in loaded_players))
+            result["recovered_loaded"] = True
+            result["loaded_count"] = int(len(loaded_players))
+            result["slate_date"] = str(recovered_date or today_date)
+    else:
+        result["loaded_count"] = int(len(loaded_players))
+        inferred_date = projection_date or str(slate_context.get("slate_date") or "").strip()
+        if not inferred_date and candidate_dates:
+            inferred_date = str(candidate_dates[0])
+        result["slate_date"] = inferred_date
+
+    player_pool = st.session_state.get("dfs_player_pool", []) or []
+    if not player_pool and loaded_players:
+        pool_candidate_dates: List[str] = []
+        for candidate in [result.get("slate_date", ""), *candidate_dates]:
+            candidate = str(candidate or "").strip()
+            if candidate and candidate not in pool_candidate_dates:
+                pool_candidate_dates.append(candidate)
+
+        for candidate_date in pool_candidate_dates:
+            restored_pool = _load_cached_projection_player_pool(
+                conn,
+                candidate_date,
+                loaded_players,
+            )
+            if restored_pool:
+                st.session_state.dfs_player_pool = restored_pool
+                st.session_state.dfs_projection_date = str(candidate_date)
+                result["recovered_pool"] = True
+                result["pool_count"] = int(len(restored_pool))
+                result["slate_date"] = str(candidate_date)
+                break
+
+    if not result["loaded_count"]:
+        result["loaded_count"] = int(
+            len(st.session_state.get("dfs_loaded_slate_players", []) or [])
+        )
+    if not result["pool_count"]:
+        result["pool_count"] = int(len(st.session_state.get("dfs_player_pool", []) or []))
+    if not result["slate_date"]:
+        result["slate_date"] = str(st.session_state.get("dfs_projection_date") or "").strip()
+    return result
+
+
 def normalize_weight_map(weight_map: Dict[str, float]) -> Dict[str, float]:
     sanitized = {k: max(0.0, float(v)) for k, v in weight_map.items()}
     total = sum(sanitized.values())
@@ -15737,6 +15878,8 @@ if selected_page == "DFS Lineup Builder":
         st.session_state.dfs_last_calibration_corrected_rows = 0
     if 'dfs_last_calibration_total_rows' not in st.session_state:
         st.session_state.dfs_last_calibration_total_rows = 0
+    if 'dfs_last_recovery_notice_key' not in st.session_state:
+        st.session_state.dfs_last_recovery_notice_key = ""
 
     # Get database connection
     dfs_conn = get_connection(str(db_path))
@@ -15900,57 +16043,41 @@ if selected_page == "DFS Lineup Builder":
             or active_slate_context.get("slate_date")
             or str(datetime.now(EASTERN_TZ).date())
         )
-        if not active_loaded_players:
-            recovered_players, recovered_metadata = _load_cached_dk_slate_players(
-                dfs_conn,
-                str(active_projection_date),
+        recovery_result = _recover_dfs_session_from_cache(
+            dfs_conn,
+            str(active_projection_date),
+        )
+        if recovery_result.get("recovered_loaded") or recovery_result.get("recovered_pool"):
+            notice_key = (
+                f"{recovery_result.get('slate_date','')}|"
+                f"{int(recovery_result.get('loaded_count', 0) or 0)}|"
+                f"{int(recovery_result.get('pool_count', 0) or 0)}"
             )
-            if recovered_players:
-                recovered_slate_date = str(active_projection_date)
-                recovered_source_file = str(
-                    recovered_metadata.get("source_filename") or "dk_salaries.csv"
-                )
-                st.session_state.dfs_loaded_slate_players = recovered_players
-                st.session_state.dfs_player_pool = []
-                st.session_state.dfs_lineups = []
-                st.session_state.dfs_supplement_state = {}
-                st.session_state.dfs_upload_metadata = recovered_metadata
-                st.session_state.dfs_slate_context = {
-                    "source_mode": "draftkings_cache_recovery",
-                    "source_name": "DraftKings Cache Recovery",
-                    "slate_id": None,
-                    "slate_date": recovered_slate_date,
-                    "contest_type": "Classic",
-                    "slate_name": recovered_source_file,
-                }
-                st.session_state.dfs_projection_date = recovered_slate_date
-                st.session_state.dfs_ai_review = {}
-                st.session_state.dfs_ai_adjustments = {}
-                st.session_state.dfs_excluded_games = set()
-                st.session_state.dfs_all_games = sorted(set(p.game_id for p in recovered_players))
-
-                recovered_pool = _load_cached_projection_player_pool(
-                    dfs_conn,
-                    recovered_slate_date,
-                    recovered_players,
-                )
-                if recovered_pool:
-                    st.session_state.dfs_player_pool = recovered_pool
+            if notice_key != str(st.session_state.get("dfs_last_recovery_notice_key") or ""):
+                st.session_state.dfs_last_recovery_notice_key = notice_key
+                slate_date_label = str(recovery_result.get("slate_date") or "current slate")
+                loaded_count = int(recovery_result.get("loaded_count", 0) or 0)
+                pool_count = int(recovery_result.get("pool_count", 0) or 0)
+                if pool_count > 0:
                     st.info(
-                        f"Recovered {len(recovered_players)} cached DK slate players and "
-                        f"{len(recovered_pool)} saved projections for {recovered_slate_date}. "
+                        f"Recovered {loaded_count} cached DK slate players and {pool_count} "
+                        f"saved projections for {slate_date_label}. "
                         "You can continue without re-uploading."
                     )
                 else:
                     st.info(
-                        f"Recovered {len(recovered_players)} cached DK slate players for "
-                        f"{recovered_slate_date}. Generate projections to continue."
+                        f"Recovered {loaded_count} cached DK slate players for {slate_date_label}. "
+                        "Generate projections to continue."
                     )
 
-                active_loaded_players = recovered_players
-                active_upload_metadata = recovered_metadata
-                active_slate_context = st.session_state.get("dfs_slate_context", {}) or {}
-                active_projection_date = recovered_slate_date
+        active_loaded_players = st.session_state.get("dfs_loaded_slate_players", []) or []
+        active_upload_metadata = st.session_state.get("dfs_upload_metadata", {}) or {}
+        active_slate_context = st.session_state.get("dfs_slate_context", {}) or {}
+        active_projection_date = (
+            st.session_state.get("dfs_projection_date")
+            or active_slate_context.get("slate_date")
+            or active_projection_date
+        )
 
         source_mode = st.radio(
             "Slate Source",
@@ -21847,6 +21974,10 @@ if selected_page == "DFS Lineup Builder":
                             },
                         )
 
+        _recover_dfs_session_from_cache(
+            dfs_conn,
+            str(st.session_state.get("dfs_projection_date") or ""),
+        )
         supplement_players = st.session_state.get("dfs_player_pool", []) or []
         if not supplement_players:
             st.info(
