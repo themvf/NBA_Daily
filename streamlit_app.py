@@ -14536,14 +14536,35 @@ def _compute_dfs_supplement_run_key(
 def _load_saved_dfs_supplement_state(
     conn: sqlite3.Connection,
     slate_date: str,
+    source_filter: str = "",
+    run_key: str = "",
 ) -> Dict[str, Any]:
-    """Rehydrate the latest saved supplement snapshot for a slate."""
-    if not slate_date:
+    """Rehydrate a saved supplement snapshot (optionally filtered by source/run)."""
+    if not slate_date and not run_key:
         return {}
 
+    source_filter_value = str(source_filter or "").strip().lower()
+    where_clauses: List[str] = []
+    params: List[Any] = []
+    if run_key:
+        where_clauses.append("run_key = ?")
+        params.append(str(run_key))
+    else:
+        where_clauses.append("slate_date = ?")
+        params.append(str(slate_date))
+        if source_filter_value == "rotowire":
+            where_clauses.append("lower(source_name) LIKE '%rotowire%'")
+        elif source_filter_value in {"lineupstarter", "lineup_starter", "lineup-starter"}:
+            where_clauses.append(
+                "(lower(source_name) LIKE '%lineupstarter%' OR lower(source_name) LIKE '%lineup starter%')"
+            )
+        elif source_filter_value == "non_rotowire":
+            where_clauses.append("lower(source_name) NOT LIKE '%rotowire%'")
+
+    where_sql = " AND ".join(where_clauses) if where_clauses else "1=1"
     try:
         summary_df = pd.read_sql_query(
-            """
+            f"""
             SELECT
                 run_key,
                 slate_date,
@@ -14561,12 +14582,12 @@ def _load_saved_dfs_supplement_state(
                 avg_own_delta,
                 created_at
             FROM dfs_supplement_runs
-            WHERE slate_date = ?
+            WHERE {where_sql}
             ORDER BY created_at DESC
             LIMIT 1
             """,
             conn,
-            params=[str(slate_date)],
+            params=params,
         )
     except Exception:
         return {}
@@ -14825,6 +14846,215 @@ def _build_rotowire_pre_screen_df(
     ) & df["Supplement Own %"].notna()
 
     return df
+
+
+def _is_lineupstarter_source_name(source_name: object) -> bool:
+    normalized = str(source_name or "").strip().lower()
+    return "lineupstarter" in normalized or "lineup starter" in normalized
+
+
+def _canonicalize_uploaded_supplement_source_name(
+    raw_source_name: object,
+    uploaded_filename: object = "",
+    upload_provider: object = "",
+) -> str:
+    """Normalize uploaded supplement source names to stable provider labels."""
+    raw_name = str(raw_source_name or "").strip()
+    file_name = str(uploaded_filename or "").strip()
+    provider = str(upload_provider or "").strip().lower()
+    haystack = f"{raw_name} {file_name}".strip().lower()
+
+    if provider == "lineupstarter" or _is_lineupstarter_source_name(provider):
+        return "LineupStarter CSV"
+    if provider == "rotowire" or "rotowire" in provider:
+        return "RotoWire CSV"
+    if _is_lineupstarter_source_name(haystack):
+        return "LineupStarter CSV"
+    if "rotowire" in haystack:
+        return "RotoWire CSV"
+    if raw_name:
+        return raw_name
+    if file_name:
+        return Path(file_name).stem
+    return "supplement"
+
+
+def _resolve_ownership_source_states(
+    conn: sqlite3.Connection,
+    slate_date: str,
+    active_supplement_state: Mapping[str, Any],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Resolve latest RotoWire and LineupStarter supplement states for a slate."""
+    active_state = dict(active_supplement_state or {})
+    active_date = str(active_state.get("slate_date") or "")
+    active_has_map = bool(active_state.get("player_map") or {})
+    active_source_name = str(active_state.get("source_name") or "")
+    active_is_rotowire = bool(active_state.get("is_rotowire_source")) or (
+        "rotowire" in active_source_name.lower()
+    )
+    active_is_lineupstarter = _is_lineupstarter_source_name(active_source_name)
+
+    rotowire_state: Dict[str, Any] = {}
+    lineupstarter_state: Dict[str, Any] = {}
+    if active_has_map and active_date == str(slate_date or "") and active_is_rotowire:
+        rotowire_state = active_state
+    else:
+        rotowire_state = _load_saved_dfs_supplement_state(
+            conn,
+            slate_date,
+            source_filter="rotowire",
+        )
+
+    if active_has_map and active_date == str(slate_date or "") and active_is_lineupstarter:
+        lineupstarter_state = active_state
+    else:
+        lineupstarter_state = _load_saved_dfs_supplement_state(
+            conn,
+            slate_date,
+            source_filter="lineupstarter",
+        )
+
+    return rotowire_state, lineupstarter_state
+
+
+def _build_combined_ownership_supplement_state(
+    rotowire_state: Mapping[str, Any],
+    secondary_state: Mapping[str, Any],
+    rotowire_weight: float,
+    secondary_weight: float,
+    slate_date: str,
+) -> Dict[str, Any]:
+    """Combine ownership fields from RotoWire + secondary supplement by player_id."""
+    rw_state = dict(rotowire_state or {})
+    sec_state = dict(secondary_state or {})
+    if not rw_state:
+        return {}
+
+    rw_map = rw_state.get("player_map") or {}
+    if not rw_map:
+        return {}
+    if str(rw_state.get("slate_date") or "") != str(slate_date or ""):
+        return {}
+
+    sec_map = sec_state.get("player_map") or {}
+    if (
+        not sec_map
+        or str(sec_state.get("slate_date") or "") != str(slate_date or "")
+    ):
+        return rw_state
+
+    rw_w = float(rotowire_weight or 0.0)
+    sec_w = float(secondary_weight or 0.0)
+    if rw_w <= 0 and sec_w <= 0:
+        rw_w = 1.0
+        sec_w = 0.0
+
+    combined_map: Dict[int, Dict[str, Any]] = {}
+    both_count = 0
+    rw_only_count = 0
+    sec_only_count = 0
+    for pid in sorted(set(rw_map.keys()) | set(sec_map.keys())):
+        rw_info = rw_map.get(pid) or {}
+        sec_info = sec_map.get(pid) or {}
+        rw_own = rw_info.get("supplement_ownership")
+        sec_own = sec_info.get("supplement_ownership")
+        if rw_own is None and sec_own is None:
+            continue
+
+        rw_score = float(rw_info.get("match_score") or 0.0)
+        sec_score = float(sec_info.get("match_score") or 0.0)
+        if rw_own is not None and sec_own is not None:
+            both_count += 1
+            denom = max(1e-9, rw_w + sec_w)
+            blended_own = ((float(rw_own) * rw_w) + (float(sec_own) * sec_w)) / denom
+            match_method = "combined_own"
+            match_score = max(rw_score, sec_score)
+        elif rw_own is not None:
+            rw_only_count += 1
+            blended_own = float(rw_own)
+            match_method = str(rw_info.get("match_method") or "rotowire_only")
+            match_score = rw_score
+        else:
+            sec_only_count += 1
+            blended_own = float(sec_own)
+            match_method = "secondary_only"
+            match_score = sec_score
+
+        try:
+            player_id = int(pid)
+        except (TypeError, ValueError):
+            continue
+        if player_id <= 0:
+            continue
+        combined_map[player_id] = {
+            "match_method": match_method,
+            "match_score": float(match_score),
+            "supplement_proj_fpts": rw_info.get("supplement_proj_fpts"),
+            "supplement_ownership": round(max(0.0, float(blended_own)), 3),
+            "proj_delta": rw_info.get("proj_delta"),
+            "own_delta_pp": None,
+        }
+
+    if not combined_map:
+        return rw_state
+
+    row_by_pid: Dict[int, Dict[str, Any]] = {}
+    for row in (sec_state.get("comparison_records") or []):
+        try:
+            pid = int(row.get("Our Player ID") or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        if pid > 0 and pid not in row_by_pid:
+            row_by_pid[pid] = dict(row)
+    for row in (rw_state.get("comparison_records") or []):
+        try:
+            pid = int(row.get("Our Player ID") or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        if pid > 0:
+            row_by_pid[pid] = dict(row)
+
+    combined_records: List[Dict[str, Any]] = []
+    for pid, info in combined_map.items():
+        row = dict(row_by_pid.get(pid, {}))
+        row["Our Player ID"] = pid
+        row["Match Method"] = info.get("match_method")
+        row["Match Score"] = info.get("match_score")
+        row["Supplement Own %"] = info.get("supplement_ownership")
+        our_own = pd.to_numeric(row.get("Our Own %"), errors="coerce")
+        row["Own Delta (pp)"] = (
+            float(info.get("supplement_ownership")) - float(our_own)
+            if pd.notna(our_own)
+            else np.nan
+        )
+        combined_records.append(row)
+
+    combined_state = dict(rw_state)
+    rw_name = str(rw_state.get("source_name") or "RotoWire")
+    sec_name = str(sec_state.get("source_name") or "Secondary")
+    combined_state["source_name"] = f"{rw_name} + {sec_name} (Ownership Blend)"
+    combined_state["source_mode"] = "Combined Ownership"
+    combined_state["is_rotowire_source"] = True
+    combined_state["player_map"] = combined_map
+    combined_state["comparison_records"] = combined_records
+    summary = dict(rw_state.get("summary", {}) or {})
+    summary["matched_rows"] = int(len(combined_map))
+    summary["ownership_mix"] = {
+        "enabled": True,
+        "rotowire_weight": float(rw_w),
+        "secondary_weight": float(sec_w),
+        "secondary_source_name": sec_name,
+        "combined_players": int(both_count),
+        "rotowire_only_players": int(rw_only_count),
+        "secondary_only_players": int(sec_only_count),
+    }
+    combined_state["summary"] = summary
+    combined_state["run_key"] = (
+        f"{str(rw_state.get('run_key') or '')[:8]}_"
+        f"{str(sec_state.get('run_key') or '')[:8]}_"
+        f"ownmix_{int(round(sec_w * 100))}"
+    )
+    return combined_state
 
 
 def _save_dfs_supplement_state(
@@ -16959,9 +17189,62 @@ if selected_page == "DFS Lineup Builder":
                 if saved_supplement_state:
                     st.session_state.dfs_supplement_state = saved_supplement_state
                     supplement_state = saved_supplement_state
+            rotowire_own_state, lineupstarter_own_state = _resolve_ownership_source_states(
+                dfs_conn,
+                current_slate_date,
+                supplement_state,
+            )
+            dual_own_available = bool(
+                rotowire_own_state
+                and (rotowire_own_state.get("player_map") or {})
+                and lineupstarter_own_state
+                and (lineupstarter_own_state.get("player_map") or {})
+            )
+            default_dual_own = bool(
+                st.session_state.get("dfs_dual_own_blend_enabled", dual_own_available)
+            )
+            use_dual_own = False
+            lineupstarter_own_weight = float(
+                st.session_state.get("dfs_dual_own_weight", 0.35)
+            )
+            if dual_own_available:
+                own_blend_col1, own_blend_col2 = st.columns([1, 2])
+                with own_blend_col1:
+                    use_dual_own = st.toggle(
+                        "Blend RotoWire + LineupStarter Ownership",
+                        value=default_dual_own,
+                        key="dfs_dual_own_blend_enabled",
+                    )
+                with own_blend_col2:
+                    if use_dual_own:
+                        lineupstarter_own_weight = (
+                            st.slider(
+                                "LineupStarter ownership weight",
+                                min_value=10,
+                                max_value=90,
+                                value=int(round(lineupstarter_own_weight * 100)),
+                                step=5,
+                                format="%d%%",
+                                key="dfs_dual_own_weight_pct",
+                            )
+                            / 100.0
+                        )
+                        st.session_state.dfs_dual_own_weight = float(
+                            lineupstarter_own_weight
+                        )
+
+            ownership_supplement_state = dict(rotowire_own_state or {})
+            if use_dual_own and dual_own_available:
+                ownership_supplement_state = _build_combined_ownership_supplement_state(
+                    rotowire_state=rotowire_own_state,
+                    secondary_state=lineupstarter_own_state,
+                    rotowire_weight=max(0.0, 1.0 - float(lineupstarter_own_weight)),
+                    secondary_weight=float(lineupstarter_own_weight),
+                    slate_date=current_slate_date,
+                )
             rotowire_ownership_stats = _apply_rotowire_pre_run_ownership_blend(
                 players,
-                supplement_state,
+                ownership_supplement_state,
                 current_slate_date,
             )
             if ai_adjustments:
@@ -16997,11 +17280,25 @@ if selected_page == "DFS Lineup Builder":
                     f"at {int(ROTOWIRE_PRE_RUN_OWNERSHIP_WEIGHT * 100)}% RotoWire / "
                     f"{int(ROTOWIRE_PRE_RUN_MODEL_OWNERSHIP_WEIGHT * 100)}% model."
                 )
+                own_mix = (
+                    ownership_supplement_state.get("summary", {}).get("ownership_mix", {})
+                    if ownership_supplement_state
+                    else {}
+                )
+                if own_mix.get("enabled"):
+                    st.caption(
+                        "Ownership source blend active: "
+                        f"RotoWire {int(round(float(own_mix.get('rotowire_weight', 0.0)) * 100))}% + "
+                        f"{str(own_mix.get('secondary_source_name') or 'secondary source')} "
+                        f"{int(round(float(own_mix.get('secondary_weight', 0.0)) * 100))}%."
+                    )
             if (
-                bool(supplement_state.get("is_rotowire_source"))
-                and str(supplement_state.get("slate_date") or "") == current_slate_date
+                bool(ownership_supplement_state.get("is_rotowire_source"))
+                and str(ownership_supplement_state.get("slate_date") or "") == current_slate_date
             ):
-                rotowire_prescreen_df = _build_rotowire_pre_screen_df(supplement_state)
+                rotowire_prescreen_df = _build_rotowire_pre_screen_df(
+                    ownership_supplement_state
+                )
                 if not rotowire_prescreen_df.empty:
                     with st.expander("RotoWire vs Model Pre-Screen", expanded=True):
                         screen_threshold_pct = st.slider(
@@ -17478,9 +17775,36 @@ if selected_page == "DFS Lineup Builder":
                             if auto_supplement_state:
                                 st.session_state.dfs_supplement_state = auto_supplement_state
                                 supplement_state = auto_supplement_state
+                                runtime_rotowire_state, runtime_lineupstarter_state = (
+                                    _resolve_ownership_source_states(
+                                        dfs_conn,
+                                        current_slate_date,
+                                        supplement_state,
+                                    )
+                                )
+                                runtime_ownership_state = dict(runtime_rotowire_state or {})
+                                if (
+                                    use_dual_own
+                                    and runtime_rotowire_state
+                                    and (runtime_rotowire_state.get("player_map") or {})
+                                    and runtime_lineupstarter_state
+                                    and (runtime_lineupstarter_state.get("player_map") or {})
+                                ):
+                                    runtime_ownership_state = (
+                                        _build_combined_ownership_supplement_state(
+                                            rotowire_state=runtime_rotowire_state,
+                                            secondary_state=runtime_lineupstarter_state,
+                                            rotowire_weight=max(
+                                                0.0,
+                                                1.0 - float(lineupstarter_own_weight),
+                                            ),
+                                            secondary_weight=float(lineupstarter_own_weight),
+                                            slate_date=current_slate_date,
+                                        )
+                                    )
                                 rotowire_ownership_stats = _apply_rotowire_pre_run_ownership_blend(
                                     players,
-                                    supplement_state,
+                                    runtime_ownership_state,
                                     current_slate_date,
                                 )
                                 st.info(auto_supplement_msg)
@@ -21273,11 +21597,33 @@ if selected_page == "DFS Lineup Builder":
             rotowire_layout = None
             supplement_source_name = ""
             supplement_source_filename = ""
+            upload_provider = ""
+            custom_source_name = ""
             known_mapping: Dict[str, Optional[str]] | None = None
             supplement_file = None
             supplement_path: Optional[Path] = None
 
             if source_mode == "Upload CSV":
+                upload_provider = st.selectbox(
+                    "CSV Provider",
+                    options=["Auto-detect", "LineupStarter", "Other / Custom"],
+                    index=0,
+                    key="dfs_supplement_csv_provider",
+                    help=(
+                        "Tag the upload source used for persistent match mapping and "
+                        "ownership source blending."
+                    ),
+                )
+                if upload_provider == "Other / Custom":
+                    custom_source_name = st.text_input(
+                        "Custom source label",
+                        value="",
+                        key="dfs_supplement_custom_source_name",
+                        help=(
+                            "Use a stable label to keep a persistent match map across "
+                            "future uploads from the same provider."
+                        ),
+                    )
                 supplement_file = st.file_uploader(
                     "Upload supplement CSV",
                     type=["csv"],
@@ -21298,7 +21644,22 @@ if selected_page == "DFS Lineup Builder":
                         supplement_source_filename = str(
                             getattr(supplement_file, "name", supplement_path.name)
                         )
-                        supplement_source_name = Path(supplement_source_filename).stem
+                        default_source_name = Path(supplement_source_filename).stem
+                        if upload_provider == "LineupStarter":
+                            selected_source_name = "LineupStarter CSV"
+                        elif upload_provider == "Other / Custom":
+                            selected_source_name = str(custom_source_name or "").strip()
+                        else:
+                            selected_source_name = default_source_name
+                        supplement_source_name = _canonicalize_uploaded_supplement_source_name(
+                            selected_source_name,
+                            uploaded_filename=supplement_source_filename,
+                            upload_provider=upload_provider,
+                        )
+                        st.caption(
+                            f"Upload source tag: `{supplement_source_name}` "
+                            "(used for persistent match mapping)."
+                        )
             else:
                 st.caption(
                     "Fetch directly from [RotoWire NBA Optimizer](https://www.rotowire.com/daily/nba/optimizer.php) "
