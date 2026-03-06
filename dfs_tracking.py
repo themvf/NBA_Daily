@@ -11,6 +11,7 @@ Tables:
     dfs_slate_results     — Aggregate accuracy metrics per slate
     dfs_supplement_runs   — Saved third-party supplement snapshot summaries
     dfs_supplement_player_deltas — Per-player supplement comparison rows
+    dfs_supplement_player_aliases — Persistent supplement-to-player mappings
 """
 
 import sqlite3
@@ -159,6 +160,22 @@ def create_dfs_tracking_tables(conn: sqlite3.Connection) -> None:
             PRIMARY KEY (run_key, player_id)
         );
 
+        CREATE TABLE IF NOT EXISTS dfs_supplement_player_aliases (
+            source_name TEXT NOT NULL,
+            supplement_player_key TEXT NOT NULL,
+            supplement_team_key TEXT NOT NULL DEFAULT '',
+            supplement_player_raw TEXT,
+            supplement_team_raw TEXT,
+            player_id INTEGER NOT NULL,
+            our_player_name TEXT,
+            our_team TEXT,
+            mapping_origin TEXT,
+            match_score REAL,
+            created_at TEXT,
+            updated_at TEXT,
+            PRIMARY KEY (source_name, supplement_player_key, supplement_team_key)
+        );
+
         CREATE TABLE IF NOT EXISTS dfs_dk_slate_player_cache (
             slate_date TEXT NOT NULL,
             player_id INTEGER NOT NULL,
@@ -207,6 +224,10 @@ def create_dfs_tracking_tables(conn: sqlite3.Connection) -> None:
             ON dfs_supplement_player_deltas(slate_date);
         CREATE INDEX IF NOT EXISTS idx_dspd_player
             ON dfs_supplement_player_deltas(player_id);
+        CREATE INDEX IF NOT EXISTS idx_dspa_source
+            ON dfs_supplement_player_aliases(source_name);
+        CREATE INDEX IF NOT EXISTS idx_dspa_player
+            ON dfs_supplement_player_aliases(player_id);
         CREATE INDEX IF NOT EXISTS idx_ddspc_slate
             ON dfs_dk_slate_player_cache(slate_date);
         CREATE INDEX IF NOT EXISTS idx_ddspc_player

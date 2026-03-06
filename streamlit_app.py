@@ -13738,8 +13738,8 @@ DFS_SUPPLEMENT_STATUS_TOKENS = {
 DFS_SUPPLEMENT_NONE_OPTION = "— None —"
 DFS_SUPPLEMENT_ROTOWIRE_DERIVED_FPTS = "__rotowire_derived_fpts__"
 DFS_SUPPLEMENT_ROTOWIRE_DERIVED_LABEL = "Derived FPTS (SAL x VAL / 1000)"
-ROTOWIRE_PRE_RUN_OWNERSHIP_WEIGHT = 0.75
-ROTOWIRE_PRE_RUN_MODEL_OWNERSHIP_WEIGHT = 0.25
+ROTOWIRE_PRE_RUN_OWNERSHIP_WEIGHT = 1.0
+ROTOWIRE_PRE_RUN_MODEL_OWNERSHIP_WEIGHT = 0.0
 ROTOWIRE_PRE_RUN_MATCH_SCORE_MIN = 0.90
 
 
@@ -14027,10 +14027,259 @@ def _coerce_supplement_numeric(series: pd.Series) -> pd.Series:
     return pd.to_numeric(extracted, errors="coerce")
 
 
+def _ensure_dfs_supplement_alias_table(conn: sqlite3.Connection) -> None:
+    """Best-effort creation of persistent supplement alias mappings."""
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS dfs_supplement_player_aliases (
+                source_name TEXT NOT NULL,
+                supplement_player_key TEXT NOT NULL,
+                supplement_team_key TEXT NOT NULL DEFAULT '',
+                supplement_player_raw TEXT,
+                supplement_team_raw TEXT,
+                player_id INTEGER NOT NULL,
+                our_player_name TEXT,
+                our_team TEXT,
+                mapping_origin TEXT,
+                match_score REAL,
+                created_at TEXT,
+                updated_at TEXT,
+                PRIMARY KEY (source_name, supplement_player_key, supplement_team_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_dspa_source
+                ON dfs_supplement_player_aliases(source_name);
+            CREATE INDEX IF NOT EXISTS idx_dspa_player
+                ON dfs_supplement_player_aliases(player_id);
+            """
+        )
+        conn.commit()
+    except Exception:
+        pass
+
+
+def _normalize_dfs_supplement_alias_name_key(value: object) -> str:
+    cleaned = _clean_dfs_supplement_player_name(value)
+    return dfs.normalize_name(cleaned) if cleaned else ""
+
+
+def _normalize_dfs_supplement_alias_team_key(value: object) -> str:
+    return _normalize_dfs_supplement_team(value) or ""
+
+
+def _load_dfs_supplement_alias_lookup(
+    conn: sqlite3.Connection,
+    source_name: str,
+) -> Dict[str, Dict[Any, int]]:
+    """Load persisted supplement->our player mappings for a source."""
+    source = str(source_name or "").strip()
+    if not source:
+        return {"team_name_to_player_id": {}, "name_to_player_id": {}}
+
+    _ensure_dfs_supplement_alias_table(conn)
+    try:
+        alias_df = pd.read_sql_query(
+            """
+            SELECT supplement_player_key, supplement_team_key, player_id
+            FROM dfs_supplement_player_aliases
+            WHERE lower(source_name) = lower(?)
+            """,
+            conn,
+            params=[source],
+        )
+    except Exception:
+        return {"team_name_to_player_id": {}, "name_to_player_id": {}}
+
+    team_name_to_player_id: Dict[Tuple[str, str], int] = {}
+    name_to_candidates: Dict[str, set[int]] = {}
+    for row in alias_df.to_dict("records"):
+        name_key = str(row.get("supplement_player_key") or "").strip()
+        team_key = str(row.get("supplement_team_key") or "").strip().upper()
+        try:
+            player_id = int(row.get("player_id") or 0)
+        except (TypeError, ValueError):
+            player_id = 0
+        if not name_key or player_id <= 0:
+            continue
+        team_name_to_player_id[(team_key, name_key)] = player_id
+        name_to_candidates.setdefault(name_key, set()).add(player_id)
+
+    # Name-only fallback is only safe when it maps to exactly one player.
+    name_to_player_id: Dict[str, int] = {}
+    for name_key, candidates in name_to_candidates.items():
+        if len(candidates) == 1:
+            name_to_player_id[name_key] = next(iter(candidates))
+
+    return {
+        "team_name_to_player_id": team_name_to_player_id,
+        "name_to_player_id": name_to_player_id,
+    }
+
+
+def _save_dfs_supplement_player_alias(
+    conn: sqlite3.Connection,
+    source_name: str,
+    supplement_player: object,
+    supplement_team: object,
+    our_player_id: int,
+    our_player_name: str,
+    our_team: str,
+    mapping_origin: str = "manual",
+    match_score: float = 1.0,
+) -> bool:
+    """Persist a supplement player alias mapping for future slates/runs."""
+    source = str(source_name or "").strip()
+    name_key = _normalize_dfs_supplement_alias_name_key(supplement_player)
+    team_key = _normalize_dfs_supplement_alias_team_key(supplement_team)
+    try:
+        player_id = int(our_player_id or 0)
+    except (TypeError, ValueError):
+        player_id = 0
+    if not source or not name_key or player_id <= 0:
+        return False
+
+    _ensure_dfs_supplement_alias_table(conn)
+    now = datetime.now().isoformat(timespec="seconds")
+    try:
+        existing = conn.execute(
+            """
+            SELECT created_at
+            FROM dfs_supplement_player_aliases
+            WHERE lower(source_name) = lower(?)
+              AND supplement_player_key = ?
+              AND supplement_team_key = ?
+            """,
+            (source, name_key, team_key),
+        ).fetchone()
+        created_at = (
+            str(existing[0]).strip()
+            if existing and existing[0]
+            else now
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO dfs_supplement_player_aliases (
+                source_name,
+                supplement_player_key,
+                supplement_team_key,
+                supplement_player_raw,
+                supplement_team_raw,
+                player_id,
+                our_player_name,
+                our_team,
+                mapping_origin,
+                match_score,
+                created_at,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                source,
+                name_key,
+                team_key,
+                _clean_dfs_supplement_player_name(supplement_player),
+                _normalize_dfs_supplement_team(supplement_team) or str(supplement_team or "").strip(),
+                player_id,
+                str(our_player_name or "").strip(),
+                str(our_team or "").strip().upper(),
+                str(mapping_origin or "manual").strip().lower(),
+                float(match_score or 0.0),
+                created_at,
+                now,
+            ),
+        )
+        conn.commit()
+        return True
+    except Exception:
+        return False
+
+
+def _persist_auto_dfs_supplement_aliases(
+    conn: sqlite3.Connection,
+    source_name: str,
+    comparison_df: pd.DataFrame,
+) -> int:
+    """Persist high-confidence auto matches to improve future matching."""
+    if comparison_df is None or comparison_df.empty:
+        return 0
+
+    saved = 0
+    safe_methods = {
+        "alias_map",
+        "manual_map",
+        "exact_team",
+        "variant_team",
+        "exact_name",
+        "variant_name",
+    }
+    for row in comparison_df.to_dict("records"):
+        method = str(row.get("Match Method") or "").strip().lower()
+        score = float(row.get("Match Score") or 0.0)
+        if method not in safe_methods and not (method == "fuzzy" and score >= 0.98):
+            continue
+
+        try:
+            our_player_id = int(row.get("Our Player ID") or 0)
+        except (TypeError, ValueError):
+            our_player_id = 0
+        if our_player_id <= 0:
+            continue
+
+        if _save_dfs_supplement_player_alias(
+            conn=conn,
+            source_name=source_name,
+            supplement_player=row.get("Supplement Player"),
+            supplement_team=row.get("Supplement Team"),
+            our_player_id=our_player_id,
+            our_player_name=str(row.get("Our Player") or ""),
+            our_team=str(row.get("Our Team") or ""),
+            mapping_origin="auto",
+            match_score=score,
+        ):
+            saved += 1
+    return saved
+
+
+def _get_dfs_supplement_aliases_df(
+    conn: sqlite3.Connection,
+    source_name: str,
+    limit: int = 200,
+) -> pd.DataFrame:
+    source = str(source_name or "").strip()
+    if not source:
+        return pd.DataFrame()
+    _ensure_dfs_supplement_alias_table(conn)
+    try:
+        return pd.read_sql_query(
+            """
+            SELECT
+                source_name,
+                supplement_player_raw,
+                supplement_team_raw,
+                player_id,
+                our_player_name,
+                our_team,
+                mapping_origin,
+                match_score,
+                created_at,
+                updated_at
+            FROM dfs_supplement_player_aliases
+            WHERE lower(source_name) = lower(?)
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            conn,
+            params=[source, int(limit)],
+        )
+    except Exception:
+        return pd.DataFrame()
+
+
 def _build_dfs_supplement_player_lookup(players: List[Any]) -> Dict[str, Any]:
     records: List[Dict[str, Any]] = []
     name_to_records: Dict[str, List[Dict[str, Any]]] = {}
     team_name_to_records: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    records_by_id: Dict[int, Dict[str, Any]] = {}
 
     for player in players:
         record = {
@@ -14045,6 +14294,12 @@ def _build_dfs_supplement_player_lookup(players: List[Any]) -> Dict[str, Any]:
         variants = dfs.generate_name_variants(record["name"]) or {dfs.normalize_name(record["name"])}
         record["name_variants"] = sorted(v for v in variants if v)
         records.append(record)
+        try:
+            player_id = int(record.get("player_id") or 0)
+        except (TypeError, ValueError):
+            player_id = 0
+        if player_id > 0:
+            records_by_id[player_id] = record
 
         for variant in record["name_variants"]:
             name_to_records.setdefault(variant, []).append(record)
@@ -14053,6 +14308,7 @@ def _build_dfs_supplement_player_lookup(players: List[Any]) -> Dict[str, Any]:
 
     return {
         "records": records,
+        "records_by_id": records_by_id,
         "name_to_records": name_to_records,
         "team_name_to_records": team_name_to_records,
         "all_name_keys": sorted(name_to_records.keys()),
@@ -14063,12 +14319,14 @@ def _match_dfs_supplement_player(
     raw_name: object,
     raw_team: object,
     lookup: Dict[str, Any],
+    alias_lookup: Optional[Mapping[str, Any]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], str, Optional[float]]:
     player_name = _clean_dfs_supplement_player_name(raw_name)
     if not player_name:
         return None, "unmatched", None
 
     normalized_team = _normalize_dfs_supplement_team(raw_team)
+    normalized_name = dfs.normalize_name(player_name)
     variants = sorted(
         {v for v in (dfs.generate_name_variants(player_name) or {dfs.normalize_name(player_name)}) if v},
         key=lambda value: (value != dfs.normalize_name(player_name), value),
@@ -14079,6 +14337,23 @@ def _match_dfs_supplement_player(
         for rec in records:
             unique[rec.get("player_id")] = rec
         return list(unique.values())
+
+    if alias_lookup:
+        team_name_to_player_id = alias_lookup.get("team_name_to_player_id", {}) or {}
+        name_to_player_id = alias_lookup.get("name_to_player_id", {}) or {}
+        alias_player_id = None
+        if normalized_team:
+            alias_player_id = team_name_to_player_id.get((normalized_team, normalized_name))
+        if alias_player_id is None:
+            alias_player_id = team_name_to_player_id.get(("", normalized_name))
+        if alias_player_id is None:
+            alias_player_id = name_to_player_id.get(normalized_name)
+        if alias_player_id is not None:
+            mapped_record = (
+                lookup.get("records_by_id", {}) or {}
+            ).get(int(alias_player_id))
+            if mapped_record:
+                return mapped_record, "alias_map", 1.0
 
     for variant in variants:
         if normalized_team:
@@ -14128,6 +14403,7 @@ def _build_dfs_supplement_comparison(
     team_col: Optional[str],
     projection_col: Optional[str],
     ownership_col: Optional[str],
+    alias_lookup: Optional[Mapping[str, Any]] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     lookup = _build_dfs_supplement_player_lookup(players)
     comparison_rows: List[Dict[str, Any]] = []
@@ -14148,6 +14424,7 @@ def _build_dfs_supplement_comparison(
             player_name,
             team_value,
             lookup,
+            alias_lookup=alias_lookup,
         )
         supp_proj = (
             float(row.get("_supplement_proj_fpts"))
@@ -14483,6 +14760,73 @@ def _build_dfs_supplement_state(
     }
 
 
+def _build_rotowire_pre_screen_df(
+    supplement_state: Mapping[str, Any],
+) -> pd.DataFrame:
+    """Build per-player RotoWire vs model comparison rows for pre-run screening."""
+    comparison_records = supplement_state.get("comparison_records") or []
+    if not comparison_records:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(comparison_records).copy()
+    required_cols = [
+        "Supplement Player",
+        "Our Player",
+        "Our Team",
+        "Pos",
+        "Salary",
+        "Match Method",
+        "Match Score",
+        "Our Proj FPTS",
+        "Supplement Proj FPTS",
+        "Proj Delta",
+        "Our Own %",
+        "Supplement Own %",
+        "Own Delta (pp)",
+    ]
+    for col in required_cols:
+        if col not in df.columns:
+            df[col] = np.nan
+
+    for num_col in [
+        "Salary",
+        "Match Score",
+        "Our Proj FPTS",
+        "Supplement Proj FPTS",
+        "Proj Delta",
+        "Our Own %",
+        "Supplement Own %",
+        "Own Delta (pp)",
+    ]:
+        df[num_col] = pd.to_numeric(df[num_col], errors="coerce")
+
+    # Backfill deltas if older snapshots are missing derived columns.
+    if "Proj Delta" in df.columns:
+        missing_proj_delta = df["Proj Delta"].isna()
+        df.loc[missing_proj_delta, "Proj Delta"] = (
+            df.loc[missing_proj_delta, "Supplement Proj FPTS"]
+            - df.loc[missing_proj_delta, "Our Proj FPTS"]
+        )
+    if "Own Delta (pp)" in df.columns:
+        missing_own_delta = df["Own Delta (pp)"].isna()
+        df.loc[missing_own_delta, "Own Delta (pp)"] = (
+            df.loc[missing_own_delta, "Supplement Own %"]
+            - df.loc[missing_own_delta, "Our Own %"]
+        )
+
+    proj_base = df["Our Proj FPTS"].abs().replace(0, np.nan)
+    own_base = df["Our Own %"].abs().clip(lower=1.0)
+    df["Proj Delta %"] = (df["Proj Delta"] / proj_base) * 100.0
+    df["Own Delta %"] = (df["Own Delta (pp)"] / own_base) * 100.0
+    df["Abs Proj Delta %"] = df["Proj Delta %"].abs()
+    df["Abs Own Delta %"] = df["Own Delta %"].abs()
+    df["Own Blend Eligible"] = (
+        df["Match Score"].fillna(0.0) >= ROTOWIRE_PRE_RUN_MATCH_SCORE_MIN
+    ) & df["Supplement Own %"].notna()
+
+    return df
+
+
 def _save_dfs_supplement_state(
     conn: sqlite3.Connection,
     supplement_state: Mapping[str, Any],
@@ -14663,18 +15007,31 @@ def _autofetch_rotowire_supplement_state(
     if supplement_df.empty:
         return {}, "RotoWire returned no player rows for the selected slate."
 
+    # Populate internal numeric helper columns so auto-fetch uses the same
+    # comparison pipeline as manual DFS Supplement uploads.
+    working_df = supplement_df.copy()
+    working_df["_supplement_proj_fpts"] = _coerce_supplement_numeric(
+        working_df["proj_fantasy_points"]
+    ) if "proj_fantasy_points" in working_df.columns else np.nan
+    working_df["_supplement_ownership"] = _coerce_supplement_numeric(
+        working_df["proj_ownership"]
+    ) if "proj_ownership" in working_df.columns else np.nan
+
+    source_name = "RotoWire NBA Optimizer"
+    alias_lookup = _load_dfs_supplement_alias_lookup(conn, source_name)
     comparison_df, unmatched_df = _build_dfs_supplement_comparison(
-        supplement_df=supplement_df,
+        supplement_df=working_df,
         players=players,
         player_col="player_name",
         team_col="team_abbr",
         projection_col="proj_fantasy_points",
         ownership_col="proj_ownership",
+        alias_lookup=alias_lookup,
     )
     if comparison_df.empty:
         return {}, "RotoWire data fetched but matched zero players in the active pool."
 
-    source_name = "RotoWire NBA Optimizer"
+    _persist_auto_dfs_supplement_aliases(conn, source_name, comparison_df)
     source_filename = f"rotowire_nba_{int(selected_rotowire_slate.get('slate_id'))}.csv"
     supplement_state = _build_dfs_supplement_state(
         slate_date=str(slate_date),
@@ -14684,7 +15041,7 @@ def _autofetch_rotowire_supplement_state(
         is_rotowire_source=True,
         projection_col="proj_fantasy_points",
         ownership_col="proj_ownership",
-        supplement_df=supplement_df,
+        supplement_df=working_df,
         comparison_df=comparison_df,
         unmatched_df=unmatched_df,
     )
@@ -15022,9 +15379,14 @@ if selected_page == "DFS Lineup Builder":
             "Min player salary",
             min_value=3000,
             max_value=5000,
-            value=3000,
+            value=3100,
             step=100,
-            help="Filter out players below this salary. Set to $3,100+ to exclude cheap $3K players that may be inactive."
+            help="Filter out players below this salary. Default is $3,100 to avoid $3K punt/DNP risk."
+        )
+        allow_min_salary_punts = st.checkbox(
+            "Allow $3K punt plays",
+            value=False,
+            help="When off, $3,000 players are excluded unless manually locked.",
         )
 
         max_remaining_salary = st.slider(
@@ -16585,7 +16947,11 @@ if selected_page == "DFS Lineup Builder":
                 st.session_state.get("dfs_projection_date") or str(datetime.now(EASTERN_TZ).date())
             )
             supplement_state = st.session_state.get("dfs_supplement_state", {}) or {}
-            if str(supplement_state.get("slate_date") or "") != current_slate_date:
+            if (
+                (not supplement_state)
+                or str(supplement_state.get("slate_date") or "") != current_slate_date
+                or not (supplement_state.get("player_map") or {})
+            ):
                 saved_supplement_state = _load_saved_dfs_supplement_state(
                     dfs_conn,
                     current_slate_date,
@@ -16631,6 +16997,127 @@ if selected_page == "DFS Lineup Builder":
                     f"at {int(ROTOWIRE_PRE_RUN_OWNERSHIP_WEIGHT * 100)}% RotoWire / "
                     f"{int(ROTOWIRE_PRE_RUN_MODEL_OWNERSHIP_WEIGHT * 100)}% model."
                 )
+            if (
+                bool(supplement_state.get("is_rotowire_source"))
+                and str(supplement_state.get("slate_date") or "") == current_slate_date
+            ):
+                rotowire_prescreen_df = _build_rotowire_pre_screen_df(supplement_state)
+                if not rotowire_prescreen_df.empty:
+                    with st.expander("RotoWire vs Model Pre-Screen", expanded=True):
+                        screen_threshold_pct = st.slider(
+                            "Flag threshold (% difference)",
+                            min_value=5,
+                            max_value=60,
+                            value=20,
+                            step=5,
+                            key="dfs_rotowire_prescreen_threshold_pct",
+                            help=(
+                                "Flag a player when projected FPTS or ownership differs "
+                                "from our model by at least this percentage."
+                            ),
+                        )
+                        prescreen_view_df = rotowire_prescreen_df.copy()
+                        prescreen_view_df["Proj Outlier"] = (
+                            prescreen_view_df["Abs Proj Delta %"].fillna(0.0)
+                            >= float(screen_threshold_pct)
+                        )
+                        prescreen_view_df["Own Outlier"] = (
+                            prescreen_view_df["Abs Own Delta %"].fillna(0.0)
+                            >= float(screen_threshold_pct)
+                        )
+                        prescreen_view_df["Outside Range"] = (
+                            prescreen_view_df["Proj Outlier"]
+                            | prescreen_view_df["Own Outlier"]
+                        )
+                        prescreen_view_df["Flag"] = np.select(
+                            [
+                                prescreen_view_df["Proj Outlier"]
+                                & prescreen_view_df["Own Outlier"],
+                                prescreen_view_df["Proj Outlier"],
+                                prescreen_view_df["Own Outlier"],
+                            ],
+                            ["Proj + Own", "Proj", "Own"],
+                            default="",
+                        )
+
+                        flagged_count = int(
+                            prescreen_view_df["Outside Range"].fillna(False).sum()
+                        )
+                        flagged_proj = int(
+                            prescreen_view_df["Proj Outlier"].fillna(False).sum()
+                        )
+                        flagged_own = int(
+                            prescreen_view_df["Own Outlier"].fillna(False).sum()
+                        )
+                        eligible_count = int(
+                            prescreen_view_df["Own Blend Eligible"].fillna(False).sum()
+                        )
+                        ps_m1, ps_m2, ps_m3, ps_m4 = st.columns(4)
+                        ps_m1.metric("Matched", int(len(prescreen_view_df)))
+                        ps_m2.metric("Flagged", flagged_count)
+                        ps_m3.metric("Proj Outliers", flagged_proj)
+                        ps_m4.metric("Own Outliers", flagged_own)
+                        st.caption(
+                            f"Ownership blend eligible players: {eligible_count}/"
+                            f"{int(len(prescreen_view_df))}."
+                        )
+
+                        show_flagged_only = st.toggle(
+                            "Show flagged players only",
+                            value=True,
+                            key="dfs_rotowire_prescreen_show_flagged",
+                        )
+                        if show_flagged_only:
+                            prescreen_view_df = prescreen_view_df[
+                                prescreen_view_df["Outside Range"]
+                            ].copy()
+
+                        if prescreen_view_df.empty:
+                            st.success(
+                                f"No players exceeded the {int(screen_threshold_pct)}% threshold."
+                            )
+                        else:
+                            prescreen_view_df = prescreen_view_df.sort_values(
+                                ["Outside Range", "Abs Proj Delta %", "Abs Own Delta %"],
+                                ascending=[False, False, False],
+                            )
+                            st.dataframe(
+                                prescreen_view_df[
+                                    [
+                                        "Our Player",
+                                        "Our Team",
+                                        "Pos",
+                                        "Salary",
+                                        "Our Proj FPTS",
+                                        "Supplement Proj FPTS",
+                                        "Proj Delta",
+                                        "Proj Delta %",
+                                        "Our Own %",
+                                        "Supplement Own %",
+                                        "Own Delta (pp)",
+                                        "Own Delta %",
+                                        "Flag",
+                                        "Own Blend Eligible",
+                                        "Match Method",
+                                        "Match Score",
+                                    ]
+                                ],
+                                use_container_width=True,
+                                hide_index=True,
+                                column_config={
+                                    "Salary": st.column_config.NumberColumn(format="$%d"),
+                                    "Our Proj FPTS": st.column_config.NumberColumn(format="%.1f"),
+                                    "Supplement Proj FPTS": st.column_config.NumberColumn(format="%.1f"),
+                                    "Proj Delta": st.column_config.NumberColumn(format="%+.1f"),
+                                    "Proj Delta %": st.column_config.NumberColumn(format="%+.1f%%"),
+                                    "Our Own %": st.column_config.NumberColumn(format="%.1f%%"),
+                                    "Supplement Own %": st.column_config.NumberColumn(format="%.1f%%"),
+                                    "Own Delta (pp)": st.column_config.NumberColumn(format="%+.1f"),
+                                    "Own Delta %": st.column_config.NumberColumn(format="%+.1f%%"),
+                                    "Match Score": st.column_config.NumberColumn(format="%.2f"),
+                                    "Own Blend Eligible": st.column_config.CheckboxColumn(),
+                                },
+                            )
 
             model_profiles = dfs.get_lineup_model_profiles()
             supplement_required_models = {
@@ -16853,6 +17340,20 @@ if selected_page == "DFS Lineup Builder":
                     salary_filtered_count = len(players) - len(filtered_players)
                     if salary_filtered_count > 0:
                         st.info(f"💰 Filtered out {salary_filtered_count} players below ${min_salary:,} salary")
+
+                    if not allow_min_salary_punts:
+                        min_player_salary = int(getattr(dfs, "MIN_PLAYER_SALARY", 3000) or 3000)
+                        before_punt_filter = len(filtered_players)
+                        filtered_players = [
+                            p for p in filtered_players
+                            if p.salary > min_player_salary or bool(getattr(p, "is_locked", False))
+                        ]
+                        punt_filtered_count = before_punt_filter - len(filtered_players)
+                        if punt_filtered_count > 0:
+                            st.info(
+                                f"🚫 Excluded {punt_filtered_count} $3K punt player(s). "
+                                "Enable `Allow $3K punt plays` to include them."
+                            )
 
                     # Snapshot calibration coverage in the active pool so we can flag
                     # low-coverage slates before trusting corrected projections.
@@ -21094,60 +21595,71 @@ if selected_page == "DFS Lineup Builder":
                     else:
                         working_df["_supplement_proj_fpts"] = np.nan
 
-                        if resolved_own_col:
-                            working_df["_supplement_ownership"] = _coerce_supplement_numeric(
-                                working_df[resolved_own_col]
-                            )
-                        else:
-                            working_df["_supplement_ownership"] = np.nan
+                    if resolved_own_col:
+                        working_df["_supplement_ownership"] = _coerce_supplement_numeric(
+                            working_df[resolved_own_col]
+                        )
+                    else:
+                        working_df["_supplement_ownership"] = np.nan
 
-                        comparison_df, unmatched_df = _build_dfs_supplement_comparison(
-                            supplement_df=working_df,
-                            players=supplement_players,
-                            player_col=player_col,
-                            team_col=resolved_team_col,
-                            projection_col=resolved_proj_col,
-                            ownership_col=resolved_own_col,
-                        )
+                    source_name = str(
+                        supplement_source_name
+                        or (rotowire_layout or {}).get("layout_name")
+                        or "supplement"
+                    )
+                    alias_lookup = _load_dfs_supplement_alias_lookup(
+                        dfs_conn,
+                        source_name,
+                    )
+                    comparison_df, unmatched_df = _build_dfs_supplement_comparison(
+                        supplement_df=working_df,
+                        players=supplement_players,
+                        player_col=player_col,
+                        team_col=resolved_team_col,
+                        projection_col=resolved_proj_col,
+                        ownership_col=resolved_own_col,
+                        alias_lookup=alias_lookup,
+                    )
+                    _persist_auto_dfs_supplement_aliases(
+                        dfs_conn,
+                        source_name,
+                        comparison_df,
+                    )
 
-                        total_rows = int(
-                            working_df[player_col].map(_clean_dfs_supplement_player_name).ne("").sum()
+                    total_rows = int(
+                        working_df[player_col].map(_clean_dfs_supplement_player_name).ne("").sum()
+                    )
+                    matched_rows = int(len(comparison_df))
+                    match_rate = (matched_rows / total_rows * 100.0) if total_rows > 0 else 0.0
+                    slate_date = (
+                        st.session_state.get("dfs_projection_date")
+                        or str(datetime.now(EASTERN_TZ).date())
+                    )
+                    source_filename = str(
+                        supplement_source_filename
+                        or (
+                            str(getattr(supplement_file, "name", ""))
+                            if supplement_file is not None
+                            else ""
                         )
-                        matched_rows = int(len(comparison_df))
-                        match_rate = (matched_rows / total_rows * 100.0) if total_rows > 0 else 0.0
-                        slate_date = (
-                            st.session_state.get("dfs_projection_date")
-                            or str(datetime.now(EASTERN_TZ).date())
-                        )
-                        source_name = str(
-                            supplement_source_name
-                            or (rotowire_layout or {}).get("layout_name")
-                            or "supplement"
-                        )
-                        source_filename = str(
-                            supplement_source_filename
-                            or (
-                                str(getattr(supplement_file, "name", ""))
-                                if supplement_file is not None
-                                else ""
-                            )
-                            or (str(supplement_path.name) if supplement_path else "")
-                            or "supplement.csv"
-                        )
+                        or (str(supplement_path.name) if supplement_path else "")
+                        or "supplement.csv"
+                    )
 
-                        method_counts = (
-                            comparison_df["Match Method"].value_counts().to_dict()
-                            if not comparison_df.empty else {}
-                        )
-                        fuzzy_count = int(method_counts.get("fuzzy", 0))
+                    method_counts = (
+                        comparison_df["Match Method"].value_counts().to_dict()
+                        if not comparison_df.empty else {}
+                    )
+                    fuzzy_count = int(method_counts.get("fuzzy", 0))
 
-                        proj_comp_df = comparison_df.dropna(
-                            subset=["Supplement Proj FPTS", "Our Proj FPTS"]
-                        ).copy()
-                        own_comp_df = comparison_df.dropna(
-                            subset=["Supplement Own %", "Our Own %"]
-                        ).copy()
+                    proj_comp_df = comparison_df.dropna(
+                        subset=["Supplement Proj FPTS", "Our Proj FPTS"]
+                    ).copy()
+                    own_comp_df = comparison_df.dropna(
+                        subset=["Supplement Own %", "Our Own %"]
+                    ).copy()
 
+                    with st.container():
                         metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
                         metric_col1.metric("Supplement Rows", total_rows)
                         metric_col2.metric("Matched Players", matched_rows, f"{match_rate:.1f}%")
@@ -21426,6 +21938,22 @@ if selected_page == "DFS Lineup Builder":
                                 "Adjust the player/team column mapping or review naming differences."
                             )
 
+                        alias_view_df = _get_dfs_supplement_aliases_df(
+                            dfs_conn,
+                            source_name,
+                            limit=200,
+                        )
+                        if not alias_view_df.empty:
+                            with st.expander("Persistent Match Map", expanded=False):
+                                st.dataframe(
+                                    alias_view_df,
+                                    use_container_width=True,
+                                    hide_index=True,
+                                    column_config={
+                                        "match_score": st.column_config.NumberColumn(format="%.2f"),
+                                    },
+                                )
+
                         if not unmatched_df.empty:
                             st.markdown("**Unmatched Supplement Rows**")
                             st.dataframe(
@@ -21437,6 +21965,85 @@ if selected_page == "DFS Lineup Builder":
                                     "Ownership %": st.column_config.NumberColumn(format="%.1f%%"),
                                 },
                             )
+
+                            if supplement_players:
+                                st.markdown("**Add Persistent Mapping**")
+                                unmatched_rows = unmatched_df.head(200).to_dict("records")
+                                unmatched_options: Dict[str, Dict[str, Any]] = {}
+                                for row in unmatched_rows:
+                                    supp_player = str(row.get("Supplement Player") or "").strip()
+                                    supp_team = str(row.get("Supplement Team") or "").strip()
+                                    if not supp_player:
+                                        continue
+                                    option_label = (
+                                        f"{supp_player} ({supp_team or 'TEAM ?'})"
+                                    )
+                                    if option_label not in unmatched_options:
+                                        unmatched_options[option_label] = row
+
+                                player_options: Dict[str, Any] = {}
+                                for p in supplement_players:
+                                    label = (
+                                        f"{str(getattr(p, 'name', '') or '').strip()} "
+                                        f"({str(getattr(p, 'team', '') or '').strip()}) | "
+                                        f"${int(getattr(p, 'salary', 0) or 0):,}"
+                                    )
+                                    player_options[label] = p
+
+                                if unmatched_options and player_options:
+                                    map_col1, map_col2 = st.columns(2)
+                                    with map_col1:
+                                        selected_unmatched_label = st.selectbox(
+                                            "Unmatched supplement player",
+                                            options=list(unmatched_options.keys()),
+                                            key="dfs_supp_alias_unmatched_select",
+                                        )
+                                    with map_col2:
+                                        selected_target_label = st.selectbox(
+                                            "Map to our player",
+                                            options=sorted(player_options.keys()),
+                                            key="dfs_supp_alias_target_select",
+                                        )
+
+                                    if st.button(
+                                        "Save Mapping",
+                                        key="dfs_supp_alias_save_btn",
+                                        use_container_width=False,
+                                    ):
+                                        unmatched_row = unmatched_options.get(
+                                            selected_unmatched_label,
+                                            {},
+                                        )
+                                        target_player = player_options.get(
+                                            selected_target_label,
+                                        )
+                                        save_ok = _save_dfs_supplement_player_alias(
+                                            conn=dfs_conn,
+                                            source_name=source_name,
+                                            supplement_player=unmatched_row.get("Supplement Player"),
+                                            supplement_team=unmatched_row.get("Supplement Team"),
+                                            our_player_id=int(
+                                                getattr(target_player, "player_id", 0) or 0
+                                            ),
+                                            our_player_name=str(
+                                                getattr(target_player, "name", "") or ""
+                                            ),
+                                            our_team=str(
+                                                getattr(target_player, "team", "") or ""
+                                            ),
+                                            mapping_origin="manual",
+                                            match_score=1.0,
+                                        )
+                                        if save_ok:
+                                            _s3_backup_db(db_path, toast=False)
+                                            st.success(
+                                                "Persistent mapping saved. Re-running comparison..."
+                                            )
+                                            st.rerun()
+                                        else:
+                                            st.error(
+                                                "Could not save mapping. Check source/player values."
+                                            )
 
 if selected_page == "DFS Player Review":
     st.title("DFS Player Review")
