@@ -21997,8 +21997,43 @@ if selected_page == "DFS Lineup Builder":
                     + "."
                 )
 
+            current_slate_date = (
+                st.session_state.get("dfs_projection_date")
+                or str(datetime.now(EASTERN_TZ).date())
+            )
+            st.caption(
+                "RotoWire and CSV are distinct supplement sources. "
+                "Run both each slate: load RotoWire snapshot, then upload CSV. "
+                "Both are saved and used for ownership blending/tracking."
+            )
+            quick_rw_col1, quick_rw_col2 = st.columns([1.4, 2.6])
+            with quick_rw_col1:
+                refresh_rw_snapshot = st.button(
+                    "Refresh RotoWire Snapshot",
+                    key="dfs_supplement_quick_rotowire_snapshot",
+                    help=(
+                        "Fetch/save the latest RotoWire supplement for the current slate "
+                        "without changing the CSV upload flow."
+                    ),
+                )
+            with quick_rw_col2:
+                st.caption(f"Current slate date: `{current_slate_date}`")
+            if refresh_rw_snapshot:
+                with st.spinner(f"Refreshing RotoWire supplement for {current_slate_date}..."):
+                    rw_state, rw_message = _auto_load_rotowire_supplement(
+                        dfs_conn,
+                        str(current_slate_date),
+                        (_resolve_rotowire_cookie() or "").strip(),
+                    )
+                if rw_state:
+                    st.success(rw_message)
+                elif rw_message:
+                    st.warning(rw_message)
+                else:
+                    st.warning("Could not refresh RotoWire supplement snapshot.")
+
             source_mode = st.radio(
-                "Supplement Source",
+                "Supplement Import Source (current action)",
                 options=["Upload CSV", "Fetch RotoWire"],
                 horizontal=True,
                 key="dfs_supplement_source_mode",
