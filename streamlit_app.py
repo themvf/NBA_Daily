@@ -18198,7 +18198,10 @@ if selected_page == "DFS Lineup Builder":
                 and _supplement_state_has_signal(lineupstarter_own_state, "projection")
             )
             default_dual_proj = bool(
-                st.session_state.get("dfs_dual_proj_blend_enabled", dual_proj_available)
+                st.session_state.get(
+                    "dfs_dual_proj_blend_enabled_state",
+                    st.session_state.get("dfs_dual_proj_blend_enabled", dual_proj_available),
+                )
             )
             use_dual_proj = False
             lineupstarter_proj_weight = float(
@@ -18212,6 +18215,7 @@ if selected_page == "DFS Lineup Builder":
                         value=default_dual_proj,
                         key="dfs_dual_proj_blend_enabled",
                     )
+                    st.session_state["dfs_dual_proj_blend_enabled_state"] = bool(use_dual_proj)
                 with proj_blend_col2:
                     if use_dual_proj:
                         lineupstarter_proj_weight = (
@@ -18236,7 +18240,10 @@ if selected_page == "DFS Lineup Builder":
                 and (lineupstarter_own_state.get("player_map") or {})
             )
             default_dual_own = bool(
-                st.session_state.get("dfs_dual_own_blend_enabled", dual_own_available)
+                st.session_state.get(
+                    "dfs_dual_own_blend_enabled_state",
+                    st.session_state.get("dfs_dual_own_blend_enabled", dual_own_available),
+                )
             )
             use_dual_own = False
             lineupstarter_own_weight = float(
@@ -18250,6 +18257,7 @@ if selected_page == "DFS Lineup Builder":
                         value=default_dual_own,
                         key="dfs_dual_own_blend_enabled",
                     )
+                    st.session_state["dfs_dual_own_blend_enabled_state"] = bool(use_dual_own)
                 with own_blend_col2:
                     if use_dual_own:
                         lineupstarter_own_weight = (
@@ -22714,13 +22722,19 @@ if selected_page == "DFS Lineup Builder":
                 and _supplement_state_has_signal(lineupstarter_source_state, "ownership")
             )
             matrix_use_dual_proj = bool(
-                st.session_state.get("dfs_dual_proj_blend_enabled", dual_proj_available)
+                st.session_state.get(
+                    "dfs_dual_proj_blend_enabled_state",
+                    st.session_state.get("dfs_dual_proj_blend_enabled", dual_proj_available),
+                )
             )
             matrix_lineupstarter_proj_weight = float(
                 st.session_state.get("dfs_dual_proj_weight", 0.35)
             )
             matrix_use_dual_own = bool(
-                st.session_state.get("dfs_dual_own_blend_enabled", dual_own_available)
+                st.session_state.get(
+                    "dfs_dual_own_blend_enabled_state",
+                    st.session_state.get("dfs_dual_own_blend_enabled", dual_own_available),
+                )
             )
             matrix_lineupstarter_own_weight = float(
                 st.session_state.get("dfs_dual_own_weight", 0.35)
@@ -22804,9 +22818,9 @@ if selected_page == "DFS Lineup Builder":
                         / 100.0
                     )
 
-            st.session_state.dfs_dual_proj_blend_enabled = bool(matrix_use_dual_proj)
+            st.session_state["dfs_dual_proj_blend_enabled_state"] = bool(matrix_use_dual_proj)
             st.session_state.dfs_dual_proj_weight = float(matrix_lineupstarter_proj_weight)
-            st.session_state.dfs_dual_own_blend_enabled = bool(matrix_use_dual_own)
+            st.session_state["dfs_dual_own_blend_enabled_state"] = bool(matrix_use_dual_own)
             st.session_state.dfs_dual_own_weight = float(matrix_lineupstarter_own_weight)
 
             matrix_projection_state: Dict[str, Any] = {}
