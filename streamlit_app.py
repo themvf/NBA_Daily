@@ -16272,10 +16272,14 @@ if selected_page == "DFS Lineup Builder":
             step=1,
             key="dfs_builder_num_lineups",
         )
+        run_mode_options = ["Single Version", "All Versions"]
+        default_run_mode = st.session_state.get("dfs_builder_run_mode", "All Versions")
+        if default_run_mode not in run_mode_options:
+            default_run_mode = "All Versions"
         run_mode = st.selectbox(
             "Run Mode",
-            options=["Single Version", "All Versions"],
-            index=0,
+            options=run_mode_options,
+            index=run_mode_options.index(default_run_mode),
             key="dfs_builder_run_mode",
             help=(
                 "Single Version builds one model profile. "
