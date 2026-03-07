@@ -16232,67 +16232,68 @@ if selected_page == "DFS Lineup Builder":
     # Get database connection
     dfs_conn = get_connection(str(db_path))
 
-    # Sidebar configuration
-    with st.sidebar:
-        st.subheader("⚙️ Builder Settings")
-        num_lineups = st.slider("Number of lineups", 1, 100, 20, step=1)
-        model_profiles = dfs.get_lineup_model_profiles()
+    # Builder configuration
+    model_profiles = dfs.get_lineup_model_profiles()
 
-        # Ensure expected model catalog is always present in UI order.
-        expected_model_labels = {
-            "standard_v1": "Standard v1",
-            "spike_v1_legacy": "Spike v1 (Legacy)",
-            "spike_v2_tail": "Spike v2 (Tail)",
-            "cluster_v1_experimental": "Cluster v1 (Experimental)",
-            "standout_v1_capture": "Standout v1 (Missed-Capture)",
-            "midrange_v1_minutes_vegas": "Midrange v1 (Minutes+Vegas Test)",
-            "cheap_core_v1": "Cheap Core v1",
-            "supp_proj_v1_blend": "Supplement v1 (Proj Blend)",
-            "supp_own_v1_blend": "Supplement v1 (Own Blend)",
-            "supp_both_v1_blend": "Supplement v1 (Proj+Own Blend)",
-            "rotowire_both_v1_blend": "RotoWire v1 (Proj+Own Blend)",
-        }
-        for key, label in expected_model_labels.items():
-            if key not in model_profiles:
-                model_profiles[key] = {"label": label}
+    # Ensure expected model catalog is always present in UI order.
+    expected_model_labels = {
+        "standard_v1": "Standard v1",
+        "spike_v1_legacy": "Spike v1 (Legacy)",
+        "spike_v2_tail": "Spike v2 (Tail)",
+        "cluster_v1_experimental": "Cluster v1 (Experimental)",
+        "standout_v1_capture": "Standout v1 (Missed-Capture)",
+        "midrange_v1_minutes_vegas": "Midrange v1 (Minutes+Vegas Test)",
+        "cheap_core_v1": "Cheap Core v1",
+        "supp_proj_v1_blend": "Supplement v1 (Proj Blend)",
+        "supp_own_v1_blend": "Supplement v1 (Own Blend)",
+        "supp_both_v1_blend": "Supplement v1 (Proj+Own Blend)",
+        "rotowire_both_v1_blend": "RotoWire v1 (Proj+Own Blend)",
+    }
+    for key, label in expected_model_labels.items():
+        if key not in model_profiles:
+            model_profiles[key] = {"label": label}
 
-        extra_model_keys = [k for k in model_profiles.keys() if k not in expected_model_labels]
-        model_keys = list(expected_model_labels.keys()) + sorted(extra_model_keys)
-        all_versions_model_keys = list(model_keys)
+    extra_model_keys = [k for k in model_profiles.keys() if k not in expected_model_labels]
+    model_keys = list(expected_model_labels.keys()) + sorted(extra_model_keys)
+    all_versions_model_keys = list(model_keys)
 
+    default_model_key = st.session_state.get("dfs_lineup_model_key", "standout_v1_capture")
+    if default_model_key not in model_keys:
+        default_model_key = model_keys[0]
+
+    st.subheader("Builder Settings")
+    settings_col1, settings_col2 = st.columns(2)
+    with settings_col1:
+        num_lineups = st.slider(
+            "Number of lineups",
+            1,
+            100,
+            20,
+            step=1,
+            key="dfs_builder_num_lineups",
+        )
         run_mode = st.selectbox(
             "Run Mode",
             options=["Single Version", "All Versions"],
             index=0,
+            key="dfs_builder_run_mode",
             help=(
                 "Single Version builds one model profile. "
                 "All Versions runs all model profiles for a broader portfolio."
             ),
         )
-
-        default_model_key = st.session_state.get("dfs_lineup_model_key", "standout_v1_capture")
-        if default_model_key not in model_keys:
-            default_model_key = model_keys[0]
-
         if run_mode == "Single Version":
             selected_model_key = st.selectbox(
                 "Lineup Model",
                 options=model_keys,
                 index=model_keys.index(default_model_key),
                 format_func=lambda key: model_profiles[key]["label"],
+                key="dfs_builder_selected_model_key",
                 help="Choose the lineup-generation profile for this run.",
             )
             st.session_state.dfs_lineup_model_key = selected_model_key
-            st.caption(
-                "Available models: "
-                + ", ".join(model_profiles[k].get("label", k) for k in model_keys)
-            )
         else:
             selected_model_key = default_model_key
-            st.caption(
-                "All Versions enabled: "
-                + ", ".join(model_profiles[k].get("label", k) for k in all_versions_model_keys)
-            )
 
         ceiling_focus_pct = st.slider(
             "Ceiling Focus %",
@@ -16300,6 +16301,7 @@ if selected_page == "DFS Lineup Builder":
             max_value=100,
             value=70,
             step=5,
+            key="dfs_builder_ceiling_focus_pct",
             help=(
                 "Pushes lineup generation toward ceiling and leverage at the "
                 "expense of pure median projection."
@@ -16308,34 +16310,45 @@ if selected_page == "DFS Lineup Builder":
         aggressive_ceiling_stacks = st.checkbox(
             "Aggressive Ceiling Stack Bias",
             value=True,
+            key="dfs_builder_aggressive_ceiling_stacks",
             help=(
                 "Keeps stacking active in ceiling/leverage builds to maximize "
                 "correlated upside."
             ),
         )
 
-        max_exposure = st.slider("Max player exposure %", 20, 60, 40, step=5) / 100
+    with settings_col2:
+        max_exposure = st.slider(
+            "Max player exposure %",
+            20,
+            60,
+            40,
+            step=5,
+            key="dfs_builder_max_exposure_pct",
+        ) / 100
         min_salary = st.slider(
             "Min player salary",
             min_value=3000,
             max_value=5000,
             value=3100,
             step=100,
-            help="Filter out players below this salary. Default is $3,100 to avoid $3K punt/DNP risk."
+            key="dfs_builder_min_salary",
+            help="Filter out players below this salary. Default is $3,100 to avoid $3K punt/DNP risk.",
         )
         allow_min_salary_punts = st.checkbox(
             "Allow $3K punt plays",
             value=False,
+            key="dfs_builder_allow_min_salary_punts",
             help="When off, $3,000 players are excluded unless manually locked.",
         )
-
         max_remaining_salary = st.slider(
             "Max remaining salary",
             min_value=0,
             max_value=3000,
             value=1000,
             step=100,
-            help="Maximum unused salary allowed per lineup. Lower values force fuller salary usage. $0 = must use exactly $50,000."
+            key="dfs_builder_max_remaining_salary",
+            help="Maximum unused salary allowed per lineup. Lower values force fuller salary usage. $0 = must use exactly $50,000.",
         )
         st.caption(
             "Minutes auto-filter is disabled, but high minutes-variance plays are now trimmed in the "
@@ -16343,8 +16356,18 @@ if selected_page == "DFS Lineup Builder":
             "still removed."
         )
 
-        st.divider()
-        st.subheader("📋 DraftKings Rules")
+    if run_mode == "Single Version":
+        st.caption(
+            "Available models: "
+            + ", ".join(model_profiles[k].get("label", k) for k in model_keys)
+        )
+    else:
+        st.caption(
+            "All Versions enabled: "
+            + ", ".join(model_profiles[k].get("label", k) for k in all_versions_model_keys)
+        )
+
+    with st.expander("DraftKings Rules", expanded=False):
         st.markdown("""
         - **Salary Cap**: $50,000
         - **Roster**: 8 positions
@@ -16359,6 +16382,8 @@ if selected_page == "DFS Lineup Builder":
           - Double-Double: +1.5
           - Triple-Double: +3.0
         """)
+
+    st.divider()
 
     # Main content with tabs
     builder_tabs = st.tabs([
