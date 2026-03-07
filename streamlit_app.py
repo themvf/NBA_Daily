@@ -4064,7 +4064,7 @@ if selected_page == "Today's Games":
             FROM predictions p
             INNER JOIN injury_list i ON p.player_id = i.player_id
             WHERE p.game_date = ?
-              AND i.status IN ('out', 'doubtful')
+              AND (LOWER(i.status) LIKE 'out%' OR i.status = 'doubtful')
         """
         cursor = games_conn.cursor()
         cursor.execute(out_players_query, (selected_date_str,))
@@ -8108,7 +8108,7 @@ if selected_page == "Tournament Strategy":
             ROUND((p.proj_ceiling - p.proj_floor) / p.projected_ppg, 2) as variance_ratio
         FROM predictions p
         LEFT JOIN injury_list il ON p.player_id = il.player_id
-            AND il.status IN ('out', 'doubtful')
+            AND (LOWER(il.status) LIKE 'out%' OR il.status = 'doubtful')
             AND (il.expected_return_date IS NULL OR il.expected_return_date >= DATE('now'))
         WHERE p.game_date = ?
           AND p.proj_ceiling >= ?
@@ -8175,7 +8175,7 @@ if selected_page == "Tournament Strategy":
                 il.source
             FROM predictions p
             INNER JOIN injury_list il ON p.player_id = il.player_id
-                AND il.status IN ('out', 'doubtful')
+                AND (LOWER(il.status) LIKE 'out%' OR il.status = 'doubtful')
                 AND (il.expected_return_date IS NULL OR il.expected_return_date >= DATE('now'))
             WHERE p.game_date = ?
                 AND p.proj_ceiling >= ?
@@ -15948,6 +15948,257 @@ def _build_supplement_source_matrix_df(
     return df
 
 
+def _aggregate_optional_numeric(values: Iterable[Any], mode: str = "sum") -> float:
+    """Aggregate numeric values while ignoring missing entries."""
+    series = pd.to_numeric(pd.Series(list(values), dtype="object"), errors="coerce")
+    valid = series.dropna()
+    if valid.empty:
+        return np.nan
+    if mode == "avg":
+        return float(valid.mean())
+    return float(valid.sum())
+
+
+def _build_lineup_signal_view_frames(
+    lineups: List[Any],
+    rotowire_state: Mapping[str, Any],
+    lineupstarter_state: Mapping[str, Any],
+    combined_state: Mapping[str, Any],
+    vegas_props_lookup: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    vegas_sigs: Optional[Mapping[int, Mapping[str, Any]]] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Return lineup summary and per-player lineup tables with supplement signals."""
+    if not lineups:
+        return pd.DataFrame(), pd.DataFrame()
+
+    rw_map = dict(rotowire_state or {}).get("player_map") or {}
+    ls_map = dict(lineupstarter_state or {}).get("player_map") or {}
+    combo_map = dict(combined_state or {}).get("player_map") or {}
+    vegas_lookup = dict(vegas_props_lookup or {})
+    vegas_signal_map = dict(vegas_sigs or {})
+    summary_rows: List[Dict[str, Any]] = []
+    detail_rows: List[Dict[str, Any]] = []
+
+    for lineup_idx, lineup in enumerate(lineups, start=1):
+        lineup_model = (
+            getattr(lineup, "model_label", "")
+            or getattr(lineup, "model_key", "")
+            or "Standard"
+        )
+        lineup_strategy = str(getattr(lineup, "generation_strategy", "") or "").strip()
+        stack_info = [
+            f"{game}: {len(players)} players"
+            for game, players in (getattr(lineup, "game_stacks", {}) or {}).items()
+            if len(players) >= 2
+        ]
+        player_names: List[str] = []
+        model_proj_vals: List[float] = []
+        active_proj_vals: List[float] = []
+        rw_proj_vals: List[Any] = []
+        ls_proj_vals: List[Any] = []
+        blend_proj_vals: List[Any] = []
+        model_own_vals: List[float] = []
+        active_own_vals: List[float] = []
+        rw_own_vals: List[Any] = []
+        ls_own_vals: List[Any] = []
+        blend_own_vals: List[Any] = []
+        rw_signal_count = 0
+        ls_signal_count = 0
+        blend_signal_count = 0
+
+        for slot in dfs.ROSTER_SLOTS:
+            player = lineup.players.get(slot)
+            if not player:
+                continue
+
+            player_names.append(str(getattr(player, "name", "") or "").strip())
+            try:
+                player_id = int(getattr(player, "player_id", 0) or 0)
+            except (TypeError, ValueError):
+                player_id = 0
+
+            base_proj = float(
+                getattr(player, "_model_proj_fpts", getattr(player, "proj_fpts", 0.0))
+                or 0.0
+            )
+            active_proj = float(getattr(player, "proj_fpts", 0.0) or 0.0)
+            base_own = float(
+                getattr(
+                    player,
+                    "_model_ownership_proj",
+                    getattr(player, "ownership_proj", 0.0),
+                )
+                or 0.0
+            )
+            active_own = float(getattr(player, "ownership_proj", 0.0) or 0.0)
+
+            rw_info = rw_map.get(player_id) or {}
+            ls_info = ls_map.get(player_id) or {}
+            combo_info = combo_map.get(player_id) or {}
+            rw_proj = pd.to_numeric(rw_info.get("supplement_proj_fpts"), errors="coerce")
+            ls_proj = pd.to_numeric(ls_info.get("supplement_proj_fpts"), errors="coerce")
+            combo_proj = pd.to_numeric(
+                combo_info.get("supplement_proj_fpts"), errors="coerce"
+            )
+            rw_own = pd.to_numeric(rw_info.get("supplement_ownership"), errors="coerce")
+            ls_own = pd.to_numeric(ls_info.get("supplement_ownership"), errors="coerce")
+            combo_own = pd.to_numeric(
+                combo_info.get("supplement_ownership"), errors="coerce"
+            )
+
+            if pd.notna(rw_proj) or pd.notna(rw_own):
+                rw_signal_count += 1
+            if pd.notna(ls_proj) or pd.notna(ls_own):
+                ls_signal_count += 1
+            if pd.notna(combo_proj) or pd.notna(combo_own):
+                blend_signal_count += 1
+
+            model_proj_vals.append(base_proj)
+            active_proj_vals.append(active_proj)
+            rw_proj_vals.append(rw_proj)
+            ls_proj_vals.append(ls_proj)
+            blend_proj_vals.append(combo_proj)
+            model_own_vals.append(base_own)
+            active_own_vals.append(active_own)
+            rw_own_vals.append(rw_own)
+            ls_own_vals.append(ls_own)
+            blend_own_vals.append(combo_own)
+
+            props = vegas_lookup.get(
+                str(getattr(player, "name", "") or "").strip().lower(),
+                {},
+            )
+            vegas_fpts = props.get("vegas_fpts")
+            signal_label = str(
+                (vegas_signal_map.get(player_id) or {}).get("signal", "") or ""
+            ).strip()
+            boost = ""
+            if signal_label == "BOOST":
+                boost = "BOOST"
+            elif "💉" in str(getattr(player, "analytics_used", "") or ""):
+                boost = "INJ+"
+
+            detail_rows.append(
+                {
+                    "Lineup #": lineup_idx,
+                    "Model": lineup_model,
+                    "Strategy": lineup_strategy or "standard",
+                    "Lineup Salary": int(getattr(lineup, "total_salary", 0) or 0),
+                    "Lineup Active Proj FPTS": round(
+                        float(getattr(lineup, "total_proj_fpts", 0.0) or 0.0), 3
+                    ),
+                    "Lineup Ceiling": round(
+                        float(getattr(lineup, "total_ceiling", 0.0) or 0.0), 3
+                    ),
+                    "Slot": slot,
+                    "Player": str(getattr(player, "name", "") or "").strip(),
+                    "Team": str(getattr(player, "team", "") or "").strip(),
+                    "Pos": "/".join(getattr(player, "positions", []) or []),
+                    "Salary": int(getattr(player, "salary", 0) or 0),
+                    "Model Proj FPTS": round(base_proj, 3),
+                    "Active Proj FPTS": round(active_proj, 3),
+                    "RotoWire Proj FPTS": (
+                        float(rw_proj) if pd.notna(rw_proj) else np.nan
+                    ),
+                    "LineupStarter Proj FPTS": (
+                        float(ls_proj) if pd.notna(ls_proj) else np.nan
+                    ),
+                    "Blend Proj FPTS": (
+                        float(combo_proj) if pd.notna(combo_proj) else np.nan
+                    ),
+                    "Ceiling": round(
+                        float(getattr(player, "proj_ceiling", 0.0) or 0.0), 3
+                    ),
+                    "Model Own %": round(base_own, 3),
+                    "Active Own %": round(active_own, 3),
+                    "RotoWire Own %": (
+                        float(rw_own) if pd.notna(rw_own) else np.nan
+                    ),
+                    "LineupStarter Own %": (
+                        float(ls_own) if pd.notna(ls_own) else np.nan
+                    ),
+                    "Blend Own %": (
+                        float(combo_own) if pd.notna(combo_own) else np.nan
+                    ),
+                    "Vegas FPTS": (
+                        float(vegas_fpts) if pd.notna(vegas_fpts) else np.nan
+                    ),
+                    "Supplement Proj Delta Applied": round(
+                        float(
+                            getattr(player, "supplement_proj_delta_applied", 0.0) or 0.0
+                        ),
+                        3,
+                    ),
+                    "Supplement Own Delta Applied": round(
+                        float(
+                            getattr(player, "supplement_own_delta_applied", 0.0) or 0.0
+                        ),
+                        3,
+                    ),
+                    "RotoWire Own Delta Applied": round(
+                        float(
+                            getattr(
+                                player,
+                                "rotowire_ownership_delta_applied",
+                                0.0,
+                            )
+                            or 0.0
+                        ),
+                        3,
+                    ),
+                    "Boost": boost,
+                    "Game": str(getattr(player, "game_id", "") or "").strip(),
+                }
+            )
+
+        summary_rows.append(
+            {
+                "Lineup #": lineup_idx,
+                "Model": lineup_model,
+                "Strategy": lineup_strategy or "standard",
+                "Salary": int(getattr(lineup, "total_salary", 0) or 0),
+                "Model Proj FPTS": round(
+                    _aggregate_optional_numeric(model_proj_vals, mode="sum"), 3
+                ),
+                "Active Proj FPTS": round(
+                    float(getattr(lineup, "total_proj_fpts", 0.0) or 0.0), 3
+                ),
+                "RotoWire Proj FPTS": round(
+                    _aggregate_optional_numeric(rw_proj_vals, mode="sum"), 3
+                ),
+                "LineupStarter Proj FPTS": round(
+                    _aggregate_optional_numeric(ls_proj_vals, mode="sum"), 3
+                ),
+                "Blend Proj FPTS": round(
+                    _aggregate_optional_numeric(blend_proj_vals, mode="sum"), 3
+                ),
+                "Ceiling": round(float(getattr(lineup, "total_ceiling", 0.0) or 0.0), 3),
+                "Model Avg Own %": round(
+                    _aggregate_optional_numeric(model_own_vals, mode="avg"), 3
+                ),
+                "Active Avg Own %": round(
+                    _aggregate_optional_numeric(active_own_vals, mode="avg"), 3
+                ),
+                "RotoWire Avg Own %": round(
+                    _aggregate_optional_numeric(rw_own_vals, mode="avg"), 3
+                ),
+                "LineupStarter Avg Own %": round(
+                    _aggregate_optional_numeric(ls_own_vals, mode="avg"), 3
+                ),
+                "Blend Avg Own %": round(
+                    _aggregate_optional_numeric(blend_own_vals, mode="avg"), 3
+                ),
+                "RotoWire Signals": int(rw_signal_count),
+                "LineupStarter Signals": int(ls_signal_count),
+                "Blend Signals": int(blend_signal_count),
+                "Stacks": ", ".join(stack_info),
+                "Players": ", ".join(player_names),
+            }
+        )
+
+    return pd.DataFrame(summary_rows), pd.DataFrame(detail_rows)
+
+
 def _build_combined_ownership_supplement_state(
     rotowire_state: Mapping[str, Any],
     secondary_state: Mapping[str, Any],
@@ -16622,8 +16873,8 @@ if selected_page == "DFS Lineup Builder":
     with builder_tabs[0]:
         st.subheader("Load Slate")
         st.markdown(
-            "Use RotoWire as the primary slate source. "
-            "Only upload a DraftKings CSV if you need to repair missing DK IDs for export."
+            "Use the DraftKings salary CSV as the primary slate source. "
+            "RotoWire remains available as an optional alternate load path."
         )
 
         active_loaded_players = st.session_state.get("dfs_loaded_slate_players", []) or []
@@ -16670,14 +16921,163 @@ if selected_page == "DFS Lineup Builder":
             or active_projection_date
         )
 
+        source_mode_options = [
+            "Upload DraftKings CSV (Legacy)",
+            "Fetch RotoWire (Optional)",
+        ]
+        current_source_mode = str(st.session_state.get("dfs_primary_slate_source_mode") or "")
+        if current_source_mode not in source_mode_options:
+            st.session_state.dfs_primary_slate_source_mode = source_mode_options[0]
         source_mode = st.radio(
             "Slate Source",
-            options=["Fetch RotoWire (Recommended)", "Upload DraftKings CSV (Fallback)"],
+            options=source_mode_options,
             horizontal=True,
             key="dfs_primary_slate_source_mode",
         )
 
-        if source_mode == "Fetch RotoWire (Recommended)":
+        if source_mode == "Upload DraftKings CSV (Legacy)":
+            st.caption(
+                "Upload the DraftKings salary CSV to load the slate with the legacy workflow."
+            )
+            default_dk_slate_date = datetime.now(EASTERN_TZ).date()
+            try:
+                if active_projection_date:
+                    default_dk_slate_date = datetime.strptime(
+                        str(active_projection_date),
+                        "%Y-%m-%d",
+                    ).date()
+            except Exception:
+                pass
+            dk_slate_date = st.date_input(
+                "DK Slate Date",
+                value=default_dk_slate_date,
+                key="dfs_primary_dk_slate_date",
+            )
+            uploaded_file = st.file_uploader(
+                "Choose DraftKings CSV file",
+                type=['csv'],
+                help="Export from DraftKings contest lobby",
+                key="dfs_primary_dk_upload",
+            )
+            use_as_id_repair = st.checkbox(
+                "Use upload as DK ID repair for the current loaded slate",
+                value=bool(active_loaded_players),
+                key="dfs_primary_dk_repair_mode",
+            )
+
+            if uploaded_file is not None:
+                csv_path = persist_uploaded_file(uploaded_file, ".csv")
+                with st.spinner("Parsing DraftKings CSV..."):
+                    try:
+                        from dfs_tracking import (
+                            create_dfs_tracking_tables as _create_dfs_tracking_tables,
+                            resolve_dk_slate_player_cache as _resolve_dk_slate_player_cache,
+                            save_dk_slate_player_cache as _save_dk_slate_player_cache,
+                        )
+
+                        dk_players, metadata = dfs.parse_dk_csv(csv_path, dfs_conn)
+                        active_slate_date = str(dk_slate_date or default_dk_slate_date)
+                        _create_dfs_tracking_tables(dfs_conn)
+                        cached_count = _save_dk_slate_player_cache(
+                            dfs_conn,
+                            str(active_slate_date),
+                            dk_players,
+                            source_filename=uploaded_file.name,
+                        )
+                        _s3_upload_slate_file(
+                            csv_path,
+                            str(active_slate_date),
+                            "dk_salaries.csv",
+                            f"DK CSV saved to cloud storage for {active_slate_date}",
+                        )
+
+                        if use_as_id_repair and active_loaded_players:
+                            updated_loaded = _apply_dk_id_repair_to_players(
+                                active_loaded_players,
+                                dk_players,
+                            )
+                            projected_pool = st.session_state.get("dfs_player_pool", []) or []
+                            updated_projected = _apply_dk_id_repair_to_players(
+                                projected_pool,
+                                dk_players,
+                            ) if projected_pool else 0
+                            lineups = st.session_state.get("dfs_lineups", []) or []
+                            updated_lineups = _apply_dk_id_repair_to_lineups(
+                                lineups,
+                                dk_players,
+                            ) if lineups else 0
+                            cache_stats = _resolve_dk_slate_player_cache(
+                                dfs_conn,
+                                str(active_slate_date),
+                                active_loaded_players,
+                            )
+                            active_upload_metadata.update(
+                                {
+                                    "resolved_from_cache": cache_stats.get("resolved_from_cache", 0),
+                                    "already_present_ids": cache_stats.get("already_present", 0),
+                                    "cached_id_rows": cache_stats.get("cached_rows", 0),
+                                    "source": active_upload_metadata.get("source") or "RotoWire NBA Optimizer",
+                                    "source_mode": active_upload_metadata.get("source_mode") or "rotowire",
+                                }
+                            )
+                            st.session_state.dfs_upload_metadata = active_upload_metadata
+                            st.success(
+                                f"Applied DK ID repair to the active slate: {updated_loaded} loaded players updated"
+                                + (
+                                    f", {updated_projected} projected players updated."
+                                    if projected_pool
+                                    else "."
+                                )
+                            )
+                            if updated_lineups:
+                                st.caption(f"Updated {updated_lineups} player reference(s) across existing lineups.")
+                            st.caption(
+                                f"Cached {cached_count} DK ID rows for {active_slate_date}. "
+                                "Re-run lineup generation if lineups were already built before the repair."
+                            )
+                        else:
+                            cache_stats = _resolve_dk_slate_player_cache(
+                                dfs_conn,
+                                str(active_slate_date),
+                                dk_players,
+                            )
+                            metadata.update(
+                                {
+                                    "source": "DraftKings CSV",
+                                    "source_mode": "draftkings_csv",
+                                    "resolved_from_cache": cache_stats.get("resolved_from_cache", 0),
+                                    "already_present_ids": cache_stats.get("already_present", 0),
+                                    "cached_id_rows": cache_stats.get("cached_rows", 0),
+                                }
+                            )
+                            st.session_state.dfs_loaded_slate_players = dk_players
+                            st.session_state.dfs_player_pool = []
+                            st.session_state.dfs_lineups = []
+                            st.session_state.dfs_supplement_state = {}
+                            st.session_state.dfs_upload_metadata = metadata
+                            st.session_state.dfs_slate_context = {
+                                "source_mode": "draftkings_csv",
+                                "source_name": "DraftKings CSV",
+                                "slate_id": None,
+                                "slate_date": str(active_slate_date),
+                                "contest_type": "Classic",
+                                "slate_name": uploaded_file.name,
+                            }
+                            st.session_state.dfs_projection_date = str(active_slate_date)
+                            st.session_state.dfs_ai_review = {}
+                            st.session_state.dfs_ai_adjustments = {}
+                            st.session_state.dfs_excluded_games = set()
+                            st.session_state.dfs_all_games = sorted(set(p.game_id for p in dk_players))
+                            st.success(
+                                f"Loaded {metadata['matched_players']} players from {metadata['unique_games']} games."
+                            )
+                            st.caption(f"Cached {cached_count} DK ID rows for {active_slate_date}.")
+
+                    except Exception as e:
+                        st.error(f"Error parsing CSV: {str(e)}")
+                        import traceback
+                        st.code(traceback.format_exc())
+        else:
             st.caption(
                 "Fetch directly from [RotoWire NBA Optimizer](https://www.rotowire.com/daily/nba/optimizer.php), "
                 "then resolve any cached DraftKings IDs automatically."
@@ -16845,149 +17245,6 @@ if selected_page == "DFS Lineup Builder":
                             st.error(f"Could not load RotoWire slate: {exc}")
             except Exception as exc:
                 st.error(f"Could not fetch RotoWire slate catalog: {exc}")
-        else:
-            st.caption(
-                "Upload a DraftKings salary CSV only when you need to repair missing DK IDs "
-                "or load a slate manually."
-            )
-            default_dk_slate_date = datetime.now(EASTERN_TZ).date()
-            try:
-                if active_projection_date:
-                    default_dk_slate_date = datetime.strptime(
-                        str(active_projection_date),
-                        "%Y-%m-%d",
-                    ).date()
-            except Exception:
-                pass
-            dk_slate_date = st.date_input(
-                "DK Slate Date",
-                value=default_dk_slate_date,
-                key="dfs_primary_dk_slate_date",
-            )
-            uploaded_file = st.file_uploader(
-                "Choose DraftKings CSV file",
-                type=['csv'],
-                help="Export from DraftKings contest lobby",
-                key="dfs_primary_dk_upload",
-            )
-            use_as_id_repair = st.checkbox(
-                "Use upload as DK ID repair for the current loaded slate",
-                value=bool(active_loaded_players),
-                key="dfs_primary_dk_repair_mode",
-            )
-
-            if uploaded_file is not None:
-                csv_path = persist_uploaded_file(uploaded_file, ".csv")
-                with st.spinner("Parsing DraftKings CSV..."):
-                    try:
-                        from dfs_tracking import (
-                            create_dfs_tracking_tables as _create_dfs_tracking_tables,
-                            resolve_dk_slate_player_cache as _resolve_dk_slate_player_cache,
-                            save_dk_slate_player_cache as _save_dk_slate_player_cache,
-                        )
-
-                        dk_players, metadata = dfs.parse_dk_csv(csv_path, dfs_conn)
-                        active_slate_date = str(dk_slate_date or default_dk_slate_date)
-                        _create_dfs_tracking_tables(dfs_conn)
-                        cached_count = _save_dk_slate_player_cache(
-                            dfs_conn,
-                            str(active_slate_date),
-                            dk_players,
-                            source_filename=uploaded_file.name,
-                        )
-                        _s3_upload_slate_file(
-                            csv_path,
-                            str(active_slate_date),
-                            "dk_salaries.csv",
-                            f"DK CSV saved to cloud storage for {active_slate_date}",
-                        )
-
-                        if use_as_id_repair and active_loaded_players:
-                            updated_loaded = _apply_dk_id_repair_to_players(
-                                active_loaded_players,
-                                dk_players,
-                            )
-                            projected_pool = st.session_state.get("dfs_player_pool", []) or []
-                            updated_projected = _apply_dk_id_repair_to_players(
-                                projected_pool,
-                                dk_players,
-                            ) if projected_pool else 0
-                            lineups = st.session_state.get("dfs_lineups", []) or []
-                            updated_lineups = _apply_dk_id_repair_to_lineups(
-                                lineups,
-                                dk_players,
-                            ) if lineups else 0
-                            cache_stats = _resolve_dk_slate_player_cache(
-                                dfs_conn,
-                                str(active_slate_date),
-                                active_loaded_players,
-                            )
-                            active_upload_metadata.update(
-                                {
-                                    "resolved_from_cache": cache_stats.get("resolved_from_cache", 0),
-                                    "already_present_ids": cache_stats.get("already_present", 0),
-                                    "cached_id_rows": cache_stats.get("cached_rows", 0),
-                                    "source": active_upload_metadata.get("source") or "RotoWire NBA Optimizer",
-                                    "source_mode": active_upload_metadata.get("source_mode") or "rotowire",
-                                }
-                            )
-                            st.session_state.dfs_upload_metadata = active_upload_metadata
-                            st.success(
-                                f"Applied DK ID repair to the active slate: {updated_loaded} loaded players updated"
-                                + (
-                                    f", {updated_projected} projected players updated."
-                                    if projected_pool
-                                    else "."
-                                )
-                            )
-                            if updated_lineups:
-                                st.caption(f"Updated {updated_lineups} player reference(s) across existing lineups.")
-                            st.caption(
-                                f"Cached {cached_count} DK ID rows for {active_slate_date}. "
-                                "Re-run lineup generation if lineups were already built before the repair."
-                            )
-                        else:
-                            cache_stats = _resolve_dk_slate_player_cache(
-                                dfs_conn,
-                                str(active_slate_date),
-                                dk_players,
-                            )
-                            metadata.update(
-                                {
-                                    "source": "DraftKings CSV",
-                                    "source_mode": "draftkings_csv",
-                                    "resolved_from_cache": cache_stats.get("resolved_from_cache", 0),
-                                    "already_present_ids": cache_stats.get("already_present", 0),
-                                    "cached_id_rows": cache_stats.get("cached_rows", 0),
-                                }
-                            )
-                            st.session_state.dfs_loaded_slate_players = dk_players
-                            st.session_state.dfs_player_pool = []
-                            st.session_state.dfs_lineups = []
-                            st.session_state.dfs_supplement_state = {}
-                            st.session_state.dfs_upload_metadata = metadata
-                            st.session_state.dfs_slate_context = {
-                                "source_mode": "draftkings_csv",
-                                "source_name": "DraftKings CSV",
-                                "slate_id": None,
-                                "slate_date": str(active_slate_date),
-                                "contest_type": "Classic",
-                                "slate_name": uploaded_file.name,
-                            }
-                            st.session_state.dfs_projection_date = str(active_slate_date)
-                            st.session_state.dfs_ai_review = {}
-                            st.session_state.dfs_ai_adjustments = {}
-                            st.session_state.dfs_excluded_games = set()
-                            st.session_state.dfs_all_games = sorted(set(p.game_id for p in dk_players))
-                            st.success(
-                                f"Loaded {metadata['matched_players']} players from {metadata['unique_games']} games."
-                            )
-                            st.caption(f"Cached {cached_count} DK ID rows for {active_slate_date}.")
-
-                    except Exception as e:
-                        st.error(f"Error parsing CSV: {str(e)}")
-                        import traceback
-                        st.code(traceback.format_exc())
 
         loaded_players = st.session_state.get("dfs_loaded_slate_players", []) or []
         loaded_metadata = st.session_state.get("dfs_upload_metadata", {}) or {}
@@ -18375,15 +18632,29 @@ if selected_page == "DFS Lineup Builder":
                         f"{str(own_mix.get('secondary_source_name') or 'secondary source')} "
                         f"{int(round(float(own_mix.get('secondary_weight', 0.0)) * 100))}%."
                     )
+            prescreen_state = dict(lineup_generation_supplement_state or {})
+            prescreen_source_name = str(prescreen_state.get("source_name") or "")
+            prescreen_label = "RotoWire vs Model Pre-Screen"
             if (
-                bool(ownership_supplement_state.get("is_rotowire_source"))
-                and str(ownership_supplement_state.get("slate_date") or "") == current_slate_date
+                prescreen_source_name
+                and (
+                    "signal matrix" in prescreen_source_name.lower()
+                    or "lineupstarter" in prescreen_source_name.lower()
+                    or "proj:" in prescreen_source_name.lower()
+                )
+            ):
+                prescreen_label = "Supplement vs Model Pre-Screen"
+            if (
+                bool(prescreen_state.get("is_rotowire_source"))
+                and str(prescreen_state.get("slate_date") or "") == current_slate_date
             ):
                 rotowire_prescreen_df = _build_rotowire_pre_screen_df(
-                    ownership_supplement_state
+                    prescreen_state
                 )
                 if not rotowire_prescreen_df.empty:
-                    with st.expander("RotoWire vs Model Pre-Screen", expanded=True):
+                    with st.expander(prescreen_label, expanded=True):
+                        if prescreen_source_name:
+                            st.caption(f"Pre-screen source: {prescreen_source_name}")
                         screen_threshold_pct = st.slider(
                             "Flag threshold (% difference)",
                             min_value=5,
@@ -19444,10 +19715,225 @@ if selected_page == "DFS Lineup Builder":
 
                 vegas_sigs = st.session_state.get('dfs_vegas_signals', {})
 
+                st.subheader("Lineup Tables")
+                lineup_summary_df, lineup_player_df = _build_lineup_signal_view_frames(
+                    lineups,
+                    rotowire_own_state,
+                    lineupstarter_own_state,
+                    lineup_generation_supplement_state,
+                    vegas_props_lookup=vegas_props_lookup,
+                    vegas_sigs=vegas_sigs,
+                )
+
+                model_options = sorted(
+                    str(model)
+                    for model in lineup_summary_df.get("Model", pd.Series(dtype="object"))
+                    .dropna()
+                    .unique()
+                    .tolist()
+                )
+                default_model_filter = model_options
+                table_limit_options: List[Any] = ["All"]
+                for option in [25, 50, 100, 150, 250]:
+                    if len(lineups) > option:
+                        table_limit_options.append(option)
+                if len(lineups) not in table_limit_options:
+                    table_limit_options.append(len(lineups))
+
+                default_table_limit: Any = "All" if len(lineups) <= 100 else 100
+                if default_table_limit not in table_limit_options:
+                    default_table_limit = table_limit_options[-1]
+
+                filter_col1, filter_col2, filter_col3 = st.columns([1.3, 0.9, 1.1])
+                with filter_col1:
+                    selected_lineup_models = st.multiselect(
+                        "Model filter",
+                        options=model_options,
+                        default=default_model_filter,
+                        key="dfs_lineup_view_model_filter",
+                    )
+                with filter_col2:
+                    selected_table_limit = st.selectbox(
+                        "Lineups in tables",
+                        options=table_limit_options,
+                        index=table_limit_options.index(default_table_limit),
+                        key="dfs_lineup_view_table_limit",
+                    )
+                with filter_col3:
+                    lineup_player_search = st.text_input(
+                        "Player search",
+                        value="",
+                        key="dfs_lineup_view_player_search",
+                        help="Filter the tables to lineups containing this player name.",
+                    )
+
+                filtered_summary_df = lineup_summary_df.copy()
+                if selected_lineup_models:
+                    filtered_summary_df = filtered_summary_df[
+                        filtered_summary_df["Model"].isin(selected_lineup_models)
+                    ].copy()
+                else:
+                    filtered_summary_df = filtered_summary_df.iloc[0:0].copy()
+
+                if selected_table_limit != "All":
+                    filtered_summary_df = filtered_summary_df.head(
+                        int(selected_table_limit)
+                    ).copy()
+
+                filtered_lineup_numbers = (
+                    filtered_summary_df["Lineup #"].astype(int).tolist()
+                    if not filtered_summary_df.empty
+                    else []
+                )
+                filtered_player_df = lineup_player_df[
+                    lineup_player_df["Lineup #"].isin(filtered_lineup_numbers)
+                ].copy()
+
+                if lineup_player_search.strip():
+                    search_mask = filtered_player_df["Player"].astype(str).str.contains(
+                        lineup_player_search.strip(),
+                        case=False,
+                        na=False,
+                    )
+                    matching_lineups = (
+                        filtered_player_df.loc[search_mask, "Lineup #"]
+                        .astype(int)
+                        .drop_duplicates()
+                        .tolist()
+                    )
+                    filtered_summary_df = filtered_summary_df[
+                        filtered_summary_df["Lineup #"].isin(matching_lineups)
+                    ].copy()
+                    filtered_player_df = lineup_player_df[
+                        lineup_player_df["Lineup #"].isin(matching_lineups)
+                    ].copy()
+
+                if filtered_summary_df.empty:
+                    st.info("No lineups match the current table filters.")
+                else:
+                    st.caption(
+                        f"Table view: {len(filtered_summary_df)} lineups | "
+                        f"{len(filtered_player_df)} lineup-player rows."
+                    )
+                    lineup_table_tabs = st.tabs(["Summary Table", "Player Table"])
+
+                    with lineup_table_tabs[0]:
+                        st.dataframe(
+                            filtered_summary_df[
+                                [
+                                    "Lineup #",
+                                    "Model",
+                                    "Strategy",
+                                    "Salary",
+                                    "Model Proj FPTS",
+                                    "Active Proj FPTS",
+                                    "RotoWire Proj FPTS",
+                                    "LineupStarter Proj FPTS",
+                                    "Blend Proj FPTS",
+                                    "Ceiling",
+                                    "Model Avg Own %",
+                                    "Active Avg Own %",
+                                    "RotoWire Avg Own %",
+                                    "LineupStarter Avg Own %",
+                                    "Blend Avg Own %",
+                                    "RotoWire Signals",
+                                    "LineupStarter Signals",
+                                    "Blend Signals",
+                                    "Stacks",
+                                    "Players",
+                                ]
+                            ],
+                            use_container_width=True,
+                            hide_index=True,
+                            height=520,
+                            column_config={
+                                "Salary": st.column_config.NumberColumn(format="$%d"),
+                                "Model Proj FPTS": st.column_config.NumberColumn(format="%.1f"),
+                                "Active Proj FPTS": st.column_config.NumberColumn(format="%.1f"),
+                                "RotoWire Proj FPTS": st.column_config.NumberColumn(format="%.1f"),
+                                "LineupStarter Proj FPTS": st.column_config.NumberColumn(format="%.1f"),
+                                "Blend Proj FPTS": st.column_config.NumberColumn(format="%.1f"),
+                                "Ceiling": st.column_config.NumberColumn(format="%.1f"),
+                                "Model Avg Own %": st.column_config.NumberColumn(format="%.1f%%"),
+                                "Active Avg Own %": st.column_config.NumberColumn(format="%.1f%%"),
+                                "RotoWire Avg Own %": st.column_config.NumberColumn(format="%.1f%%"),
+                                "LineupStarter Avg Own %": st.column_config.NumberColumn(format="%.1f%%"),
+                                "Blend Avg Own %": st.column_config.NumberColumn(format="%.1f%%"),
+                            },
+                        )
+
+                    with lineup_table_tabs[1]:
+                        st.dataframe(
+                            filtered_player_df[
+                                [
+                                    "Lineup #",
+                                    "Model",
+                                    "Strategy",
+                                    "Slot",
+                                    "Player",
+                                    "Team",
+                                    "Pos",
+                                    "Salary",
+                                    "Model Proj FPTS",
+                                    "Active Proj FPTS",
+                                    "RotoWire Proj FPTS",
+                                    "LineupStarter Proj FPTS",
+                                    "Blend Proj FPTS",
+                                    "Ceiling",
+                                    "Model Own %",
+                                    "Active Own %",
+                                    "RotoWire Own %",
+                                    "LineupStarter Own %",
+                                    "Blend Own %",
+                                    "Vegas FPTS",
+                                    "Supplement Proj Delta Applied",
+                                    "Supplement Own Delta Applied",
+                                    "RotoWire Own Delta Applied",
+                                    "Boost",
+                                    "Game",
+                                ]
+                            ],
+                            use_container_width=True,
+                            hide_index=True,
+                            height=760,
+                            column_config={
+                                "Salary": st.column_config.NumberColumn(format="$%d"),
+                                "Model Proj FPTS": st.column_config.NumberColumn(format="%.1f"),
+                                "Active Proj FPTS": st.column_config.NumberColumn(format="%.1f"),
+                                "RotoWire Proj FPTS": st.column_config.NumberColumn(format="%.1f"),
+                                "LineupStarter Proj FPTS": st.column_config.NumberColumn(format="%.1f"),
+                                "Blend Proj FPTS": st.column_config.NumberColumn(format="%.1f"),
+                                "Ceiling": st.column_config.NumberColumn(format="%.1f"),
+                                "Model Own %": st.column_config.NumberColumn(format="%.1f%%"),
+                                "Active Own %": st.column_config.NumberColumn(format="%.1f%%"),
+                                "RotoWire Own %": st.column_config.NumberColumn(format="%.1f%%"),
+                                "LineupStarter Own %": st.column_config.NumberColumn(format="%.1f%%"),
+                                "Blend Own %": st.column_config.NumberColumn(format="%.1f%%"),
+                                "Vegas FPTS": st.column_config.NumberColumn(format="%.1f"),
+                                "Supplement Proj Delta Applied": st.column_config.NumberColumn(format="%+.1f"),
+                                "Supplement Own Delta Applied": st.column_config.NumberColumn(format="%+.1f"),
+                                "RotoWire Own Delta Applied": st.column_config.NumberColumn(format="%+.1f"),
+                            },
+                        )
+
                 # Pagination
-                lineups_per_page = 10
+                detail_page_options = [10, 25, 50, 100]
+                detail_page_default = 25 if len(lineups) >= 25 else 10
+                lineups_per_page = st.selectbox(
+                    "Detail cards per page",
+                    options=[size for size in detail_page_options if size <= max(len(lineups), 10)],
+                    index=[size for size in detail_page_options if size <= max(len(lineups), 10)].index(detail_page_default)
+                    if detail_page_default in [size for size in detail_page_options if size <= max(len(lineups), 10)]
+                    else 0,
+                    key="dfs_lineup_cards_per_page",
+                )
                 total_pages = (len(lineups) + lineups_per_page - 1) // lineups_per_page
-                page = st.selectbox("Page", range(1, total_pages + 1), index=0) - 1
+                page = st.selectbox(
+                    "Detail card page",
+                    range(1, total_pages + 1),
+                    index=0,
+                    key="dfs_lineup_cards_page",
+                ) - 1
 
                 start_idx = page * lineups_per_page
                 end_idx = min(start_idx + lineups_per_page, len(lineups))

@@ -585,7 +585,9 @@ def fetch_current_injuries(conn: sqlite3.Connection) -> Tuple[int, int, int, int
 
             # Map status
             api_status = injury_record.get('status', '')
-            status = config.BALLDONTLIE_STATUS_MAP.get(api_status, api_status.lower())
+            status = config.normalize_injury_status(
+                config.BALLDONTLIE_STATUS_MAP.get(api_status, api_status)
+            )
 
             # Get injury details
             return_date_str = injury_record.get('return_date')

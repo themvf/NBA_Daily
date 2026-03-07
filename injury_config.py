@@ -9,7 +9,8 @@ This module defines all settings for automated injury detection, including:
 - Feature flags and thresholds
 """
 
-from typing import Dict
+import re
+from typing import Dict, Optional
 
 # ==============================================================================
 # PLAY PROBABILITY MODEL - Single Source of Truth
@@ -23,6 +24,46 @@ STATUS_PLAY_PROBABILITY: Dict[str, float] = {
     'probable': 0.8,    # 80% - likely to play (historically plays ~80% of time)
     'day-to-day': 0.6   # 60% - uncertain (better than questionable, worse than probable)
 }
+
+STATUS_NORMALIZATION_ALIASES: Dict[str, str] = {
+    'available': 'returned',
+    'day to day': 'day-to-day',
+    'day-to-day': 'day-to-day',
+    'gtd': 'questionable',
+    'game time decision': 'questionable',
+    'active': 'out',  # legacy schema: active injury row
+}
+
+
+def normalize_injury_status(status: Optional[str]) -> str:
+    """
+    Normalize raw injury status text to the canonical internal schema.
+
+    This keeps downstream exclusion logic stable when sources emit variants
+    like "out for season" or "Day To Day".
+    """
+    raw_status = str(status or "").strip().lower()
+    if not raw_status:
+        return ""
+
+    normalized = re.sub(r"[\s_]+", " ", raw_status).strip()
+    normalized = normalized.replace("day to day", "day-to-day")
+    normalized = STATUS_NORMALIZATION_ALIASES.get(normalized, normalized)
+
+    if normalized.startswith("out"):
+        return "out"
+    if normalized.startswith("doubtful"):
+        return "doubtful"
+    if normalized.startswith("questionable"):
+        return "questionable"
+    if normalized.startswith("probable"):
+        return "probable"
+    if normalized in {"returned", "available"}:
+        return "returned"
+    if normalized == "day-to-day":
+        return "day-to-day"
+
+    return normalized
 
 # ==============================================================================
 # EXCLUSION LOGIC - Derived from Play Probability
@@ -61,7 +102,7 @@ def get_adjustment_multiplier(status: str) -> float:
     Returns:
         Adjustment multiplier (0.0 to 1.0)
     """
-    play_prob = STATUS_PLAY_PROBABILITY.get(status, 1.0)
+    play_prob = STATUS_PLAY_PROBABILITY.get(normalize_injury_status(status), 1.0)
 
     if play_prob < PREDICTION_EXCLUSION_THRESHOLD:
         return 1.0  # Full adjustment (player excluded from predictions)
@@ -159,6 +200,7 @@ API_RETRY_BASE_DELAY: int = 2
 # API may return slightly different status strings than our schema
 BALLDONTLIE_STATUS_MAP: Dict[str, str] = {
     'Out': 'out',
+    'Out For Season': 'out',
     'Doubtful': 'doubtful',
     'Questionable': 'questionable',
     'Probable': 'probable',
@@ -211,7 +253,7 @@ def should_exclude_from_predictions(status: str, confidence: float = 1.0) -> boo
         # Low confidence match - don't auto-exclude (flag for manual review instead)
         return False
 
-    play_prob = STATUS_PLAY_PROBABILITY.get(status, 1.0)
+    play_prob = STATUS_PLAY_PROBABILITY.get(normalize_injury_status(status), 1.0)
     return play_prob < PREDICTION_EXCLUSION_THRESHOLD
 
 def get_status_display_emoji(status: str) -> str:
@@ -232,4 +274,4 @@ def get_status_display_emoji(status: str) -> str:
         'day-to-day': '🔵',
         'returned': '✅'
     }
-    return emoji_map.get(status, '⚪')
+    return emoji_map.get(normalize_injury_status(status), '⚪')

@@ -23,6 +23,7 @@ import json
 
 # Import existing injury impact analytics module
 import injury_impact_analytics as iia
+import injury_config as config
 
 
 @dataclass
@@ -109,7 +110,6 @@ def apply_injury_adjustments(
     # Fetch injury statuses if status_aware mode is enabled
     if status_aware:
         try:
-            import injury_config as config
             # Get statuses for all injured players
             placeholders = ','.join('?' * len(injured_player_ids))
             cursor.execute(f"""
@@ -120,7 +120,9 @@ def apply_injury_adjustments(
 
             for row in cursor.fetchall():
                 player_id, status, confidence = row
-                multiplier = config.get_adjustment_multiplier(status)
+                multiplier = config.get_adjustment_multiplier(
+                    config.normalize_injury_status(status)
+                )
                 injury_status_multipliers[player_id] = multiplier
         except Exception as e:
             print(f"Warning: Could not load injury statuses, using full adjustments: {e}")
@@ -539,6 +541,26 @@ def create_injury_list_table(conn: sqlite3.Connection) -> None:
         ON injury_list(status)
     """)
 
+    # Normalize legacy status variants (for example "out for season" -> "out")
+    # so exact-match filters elsewhere remain reliable.
+    cursor.execute("SELECT injury_id, status FROM injury_list")
+    status_updates = []
+    for injury_id, raw_status in cursor.fetchall():
+        normalized_status = config.normalize_injury_status(raw_status)
+        if normalized_status and normalized_status != raw_status:
+            status_updates.append((normalized_status, injury_id))
+
+    for normalized_status, injury_id in status_updates:
+        cursor.execute(
+            """
+            UPDATE injury_list
+            SET status = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE injury_id = ?
+            """,
+            (normalized_status, injury_id),
+        )
+
     conn.commit()
 
 
@@ -622,6 +644,7 @@ def add_to_injury_list(
     """
     cursor = conn.cursor()
     today = datetime.now(ZoneInfo("America/New_York")).date().strftime('%Y-%m-%d')
+    normalized_status = config.normalize_injury_status(status) or 'out'
 
     # First, check if player already has an injury record
     cursor.execute("SELECT injury_id FROM injury_list WHERE player_id = ?", (player_id,))
@@ -641,7 +664,7 @@ def add_to_injury_list(
                 confidence = 1.0,
                 updated_at = CURRENT_TIMESTAMP
             WHERE player_id = ?
-        """, (player_name, team_name, status, injury_type, expected_return_date,
+        """, (player_name, team_name, normalized_status, injury_type, expected_return_date,
               notes, source, player_id))
         conn.commit()
         return existing[0]
@@ -654,7 +677,7 @@ def add_to_injury_list(
                 source, confidence, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1.0, CURRENT_TIMESTAMP)
         """, (player_id, player_name, team_name, today, expected_return_date,
-              status, injury_type, notes, source))
+              normalized_status, injury_type, notes, source))
         conn.commit()
         return cursor.lastrowid
 
@@ -716,7 +739,6 @@ def get_active_injuries(
     # Default filter: statuses where play probability < 0.3 (out, doubtful)
     if status_filter is None:
         try:
-            import injury_config as config
             # Filter statuses below exclusion threshold
             status_filter = [
                 status for status, prob in config.STATUS_PLAY_PROBABILITY.items()
@@ -730,19 +752,24 @@ def get_active_injuries(
     if not status_filter:
         return []
 
-    # Build query with status filter
-    placeholders = ','.join('?' * len(status_filter))
+    normalized_filter = [
+        config.normalize_injury_status(status)
+        for status in status_filter
+        if config.normalize_injury_status(status)
+    ]
+    normalized_filter = list(dict.fromkeys(normalized_filter))
+    if not normalized_filter:
+        return []
 
     # Try new schema first (with injury_type, source, confidence)
     try:
-        query = f"""
+        query = """
             SELECT injury_id, player_id, player_name, team_name,
                    injury_date, expected_return_date, status,
                    injury_type, source, confidence, notes
             FROM injury_list
-            WHERE status IN ({placeholders})
         """
-        df = pd.read_sql_query(query, conn, params=tuple(status_filter))
+        df = pd.read_sql_query(query, conn)
     except Exception:
         # Fallback to old schema (without new columns and only 'active' status)
         query = """
@@ -757,11 +784,13 @@ def get_active_injuries(
         df['injury_type'] = None
         df['source'] = 'manual'
         df['confidence'] = 1.0
-        # Map old 'active' status to new 'out' status for consistency
         df['status'] = df['status'].replace('active', 'out')
 
     if df.empty:
         return []
+
+    df['status'] = df['status'].map(config.normalize_injury_status)
+    df = df[df['status'].isin(normalized_filter)]
 
     # Filter by return date if requested
     if check_return_dates:

@@ -98,7 +98,8 @@ def get_injured_player_ids(conn: sqlite3.Connection) -> Set[int]:
             query = """
                 SELECT DISTINCT player_id
                 FROM injury_list
-                WHERE LOWER(status) IN ('out', 'doubtful', 'active')
+                WHERE LOWER(status) LIKE 'out%'
+                   OR LOWER(status) IN ('doubtful', 'active')
             """
             df = pd.read_sql_query(query, conn)
             return set(df['player_id'].tolist())
@@ -127,7 +128,8 @@ def get_injured_player_names(conn: sqlite3.Connection) -> Dict[int, str]:
             query = """
                 SELECT player_id, player_name, status
                 FROM injury_list
-                WHERE LOWER(status) IN ('out', 'doubtful', 'questionable', 'active')
+                WHERE LOWER(status) LIKE 'out%'
+                   OR LOWER(status) IN ('doubtful', 'questionable', 'active')
             """
             df = pd.read_sql_query(query, conn)
             return {
@@ -683,6 +685,8 @@ SALARY_CAP = 50000
 MIN_GAMES = 2
 MIN_PLAYER_SALARY = 3000
 MIN_SALARY_PROJ_FPTS_GATE = 12.0
+MIN_SALARY_RECENT_MINUTES_GATE = 16.0
+MIN_SALARY_PROJ_FLOOR_GATE = 6.0
 MAX_MIN_SALARY_PLAYERS_PER_LINEUP = 1
 MINUTES_VARIANCE_FILTER_MIN_SAMPLE = 8
 MINUTES_VARIANCE_FILTER_PERCENTILE = 75.0
@@ -3365,10 +3369,21 @@ def optimize_lineup_randomized(
     def min_salary_player_eligible(player: DFSPlayer) -> bool:
         if not is_min_salary_player(player):
             return True
+        if bool(getattr(player, "is_locked", False)):
+            return True
+        if bool(getattr(player, "is_fallback", False)):
+            return False
         proj_fpts = float(getattr(player, "proj_fpts", 0.0) or 0.0)
         minutes_ok = bool(getattr(player, "minutes_validated", False))
-        # Allow $3K players only if they project well OR pass minutes validation.
-        return proj_fpts >= MIN_SALARY_PROJ_FPTS_GATE or minutes_ok
+        recent_minutes = float(getattr(player, "recent_minutes_avg", 0.0) or 0.0)
+        proj_floor = float(getattr(player, "proj_floor", 0.0) or 0.0)
+        # Keep minimum-salary plays on a tight leash to reduce DNP/zero-point risk.
+        return (
+            proj_fpts >= MIN_SALARY_PROJ_FPTS_GATE
+            and minutes_ok
+            and recent_minutes >= MIN_SALARY_RECENT_MINUTES_GATE
+            and proj_floor >= MIN_SALARY_PROJ_FLOOR_GATE
+        )
 
     # Filter available players (exclude injured, excluded, and specified IDs)
     available = [
