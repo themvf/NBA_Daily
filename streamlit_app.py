@@ -14427,16 +14427,112 @@ def _normalize_dfs_supplement_alias_team_key(value: object) -> str:
     return _normalize_dfs_supplement_team(value) or ""
 
 
+def _migrate_legacy_lineupstarter_aliases(conn: sqlite3.Connection) -> int:
+    """Collapse older file-specific LineupStarter alias sources into one canonical source."""
+    _ensure_dfs_supplement_alias_table(conn)
+    canonical_source = "LineupStarter CSV"
+    try:
+        alias_df = pd.read_sql_query(
+            """
+            SELECT
+                source_name,
+                supplement_player_key,
+                supplement_team_key,
+                supplement_player_raw,
+                supplement_team_raw,
+                player_id,
+                our_player_name,
+                our_team,
+                mapping_origin,
+                match_score,
+                created_at,
+                updated_at
+            FROM dfs_supplement_player_aliases
+            """,
+            conn,
+        )
+    except Exception:
+        return 0
+
+    if alias_df.empty:
+        return 0
+
+    migrated = 0
+    for row in alias_df.to_dict("records"):
+        raw_source = str(row.get("source_name") or "").strip()
+        source = _canonicalize_dfs_supplement_alias_source_name(raw_source)
+        if source != canonical_source or raw_source.lower() == canonical_source.lower():
+            continue
+
+        name_key = str(row.get("supplement_player_key") or "").strip()
+        team_key = str(row.get("supplement_team_key") or "").strip()
+        if not name_key:
+            continue
+
+        existing = conn.execute(
+            """
+            SELECT 1
+            FROM dfs_supplement_player_aliases
+            WHERE lower(source_name) = lower(?)
+              AND supplement_player_key = ?
+              AND supplement_team_key = ?
+            """,
+            (canonical_source, name_key, team_key),
+        ).fetchone()
+        if existing:
+            continue
+
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO dfs_supplement_player_aliases (
+                source_name,
+                supplement_player_key,
+                supplement_team_key,
+                supplement_player_raw,
+                supplement_team_raw,
+                player_id,
+                our_player_name,
+                our_team,
+                mapping_origin,
+                match_score,
+                created_at,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                canonical_source,
+                name_key,
+                team_key,
+                str(row.get("supplement_player_raw") or "").strip(),
+                str(row.get("supplement_team_raw") or "").strip(),
+                int(row.get("player_id") or 0),
+                str(row.get("our_player_name") or "").strip(),
+                str(row.get("our_team") or "").strip(),
+                str(row.get("mapping_origin") or "auto").strip() or "auto",
+                float(row.get("match_score") or 0.0),
+                str(row.get("created_at") or datetime.now().isoformat(timespec="seconds")),
+                str(row.get("updated_at") or datetime.now().isoformat(timespec="seconds")),
+            ),
+        )
+        migrated += 1
+
+    if migrated:
+        conn.commit()
+    return migrated
+
+
 def _load_dfs_supplement_alias_lookup(
     conn: sqlite3.Connection,
     source_name: str,
 ) -> Dict[str, Dict[Any, int]]:
     """Load persisted supplement->our player mappings for a source."""
-    source = str(source_name or "").strip()
+    source = _canonicalize_dfs_supplement_alias_source_name(source_name)
     if not source:
         return {"team_name_to_player_id": {}, "name_to_player_id": {}}
 
     _ensure_dfs_supplement_alias_table(conn)
+    if source == "LineupStarter CSV":
+        _migrate_legacy_lineupstarter_aliases(conn)
     try:
         alias_df = pd.read_sql_query(
             """
@@ -14488,7 +14584,7 @@ def _save_dfs_supplement_player_alias(
     match_score: float = 1.0,
 ) -> bool:
     """Persist a supplement player alias mapping for future slates/runs."""
-    source = str(source_name or "").strip()
+    source = _canonicalize_dfs_supplement_alias_source_name(source_name)
     name_key = _normalize_dfs_supplement_alias_name_key(supplement_player)
     team_key = _normalize_dfs_supplement_alias_team_key(supplement_team)
     try:
@@ -14605,10 +14701,12 @@ def _get_dfs_supplement_aliases_df(
     source_name: str,
     limit: int = 200,
 ) -> pd.DataFrame:
-    source = str(source_name or "").strip()
+    source = _canonicalize_dfs_supplement_alias_source_name(source_name)
     if not source:
         return pd.DataFrame()
     _ensure_dfs_supplement_alias_table(conn)
+    if source == "LineupStarter CSV":
+        _migrate_legacy_lineupstarter_aliases(conn)
     try:
         return pd.read_sql_query(
             """
@@ -14672,6 +14770,55 @@ def _build_dfs_supplement_player_lookup(players: List[Any]) -> Dict[str, Any]:
         "name_to_records": name_to_records,
         "team_name_to_records": team_name_to_records,
         "all_name_keys": sorted(name_to_records.keys()),
+    }
+
+
+def _load_dfs_global_player_name_lookup(conn: sqlite3.Connection) -> Dict[str, Any]:
+    """Build a broad player-name master to classify unmatched supplement rows."""
+    master_df = pd.DataFrame()
+    for query in [
+        """
+        SELECT DISTINCT player_id, full_name AS player_name
+        FROM players
+        WHERE full_name IS NOT NULL AND trim(full_name) != ''
+        """,
+        """
+        SELECT DISTINCT player_id, player_name
+        FROM player_game_logs
+        WHERE player_name IS NOT NULL AND trim(player_name) != ''
+        """,
+        """
+        SELECT DISTINCT player_id, player_name
+        FROM dfs_slate_projections
+        WHERE player_name IS NOT NULL AND trim(player_name) != ''
+        """,
+    ]:
+        try:
+            master_df = pd.read_sql_query(query, conn)
+        except Exception:
+            continue
+        if not master_df.empty:
+            break
+
+    exact_name_to_record: Dict[str, Dict[str, Any]] = {}
+    for row in master_df.to_dict("records"):
+        try:
+            player_id = int(row.get("player_id") or 0)
+        except (TypeError, ValueError):
+            player_id = 0
+        player_name = str(row.get("player_name") or "").strip()
+        normalized_name = dfs.normalize_name(player_name)
+        if not normalized_name or normalized_name in exact_name_to_record:
+            continue
+        exact_name_to_record[normalized_name] = {
+            "player_id": player_id,
+            "player_name": player_name,
+            "normalized_name": normalized_name,
+        }
+
+    return {
+        "exact_name_to_record": exact_name_to_record,
+        "all_name_keys": sorted(exact_name_to_record.keys()),
     }
 
 
@@ -14831,6 +14978,58 @@ def _build_dfs_supplement_comparison(
         )
 
     return pd.DataFrame(comparison_rows), pd.DataFrame(unmatched_rows)
+
+
+def _annotate_dfs_supplement_unmatched_rows(
+    conn: sqlite3.Connection,
+    unmatched_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Explain whether unmatched rows are off-slate names or likely alias problems."""
+    if unmatched_df is None or unmatched_df.empty:
+        return pd.DataFrame() if unmatched_df is None else unmatched_df
+
+    master_lookup = _load_dfs_global_player_name_lookup(conn)
+    exact_name_to_record = master_lookup.get("exact_name_to_record", {}) or {}
+    all_name_keys = master_lookup.get("all_name_keys", []) or []
+
+    annotated_rows: List[Dict[str, Any]] = []
+    for row in unmatched_df.to_dict("records"):
+        player_name = _clean_dfs_supplement_player_name(row.get("Supplement Player", ""))
+        normalized_name = dfs.normalize_name(player_name)
+
+        reason = "Unknown player"
+        candidate_player = ""
+        candidate_score = np.nan
+
+        exact_record = exact_name_to_record.get(normalized_name)
+        if exact_record:
+            reason = "Off-slate player"
+            candidate_player = str(exact_record.get("player_name") or "")
+            candidate_score = 1.0
+        elif normalized_name and all_name_keys:
+            fuzzy_matches = difflib.get_close_matches(
+                normalized_name,
+                all_name_keys,
+                n=1,
+                cutoff=0.90,
+            )
+            if fuzzy_matches:
+                best_key = fuzzy_matches[0]
+                best_record = exact_name_to_record.get(best_key)
+                if best_record:
+                    candidate_player = str(best_record.get("player_name") or "")
+                    candidate_score = float(
+                        difflib.SequenceMatcher(None, normalized_name, best_key).ratio()
+                    )
+                    reason = "Likely alias / typo"
+
+        enriched_row = dict(row)
+        enriched_row["Unmatched Reason"] = reason
+        enriched_row["Candidate Player"] = candidate_player
+        enriched_row["Candidate Score"] = candidate_score
+        annotated_rows.append(enriched_row)
+
+    return pd.DataFrame(annotated_rows)
 
 
 def _sanitize_supplement_artifact_token(value: object) -> str:
@@ -15210,7 +15409,21 @@ def _build_rotowire_pre_screen_df(
 
 def _is_lineupstarter_source_name(source_name: object) -> bool:
     normalized = str(source_name or "").strip().lower()
-    return "lineupstarter" in normalized or "lineup starter" in normalized
+    spaced = re.sub(r"[^a-z0-9]+", " ", normalized).strip()
+    compact = spaced.replace(" ", "")
+    return (
+        "lineupstarter" in compact
+        or "linestarter" in compact
+        or "lineup starter" in spaced
+        or "line starter" in spaced
+    )
+
+
+def _canonicalize_dfs_supplement_alias_source_name(source_name: object) -> str:
+    source = str(source_name or "").strip()
+    if _is_lineupstarter_source_name(source):
+        return "LineupStarter CSV"
+    return source
 
 
 def _canonicalize_uploaded_supplement_source_name(
@@ -15957,6 +16170,7 @@ def _autofetch_rotowire_supplement_state(
         ownership_col="proj_ownership",
         alias_lookup=alias_lookup,
     )
+    unmatched_df = _annotate_dfs_supplement_unmatched_rows(conn, unmatched_df)
     if comparison_df.empty:
         return {}, "RotoWire data fetched but matched zero players in the active pool."
 
@@ -23172,6 +23386,10 @@ if selected_page == "DFS Lineup Builder":
                         ownership_col=resolved_own_col,
                         alias_lookup=alias_lookup,
                     )
+                    unmatched_df = _annotate_dfs_supplement_unmatched_rows(
+                        dfs_conn,
+                        unmatched_df,
+                    )
                     _persist_auto_dfs_supplement_aliases(
                         dfs_conn,
                         source_name,
@@ -23515,6 +23733,7 @@ if selected_page == "DFS Lineup Builder":
                                 column_config={
                                     "Projection": st.column_config.NumberColumn(format="%.1f"),
                                     "Ownership %": st.column_config.NumberColumn(format="%.1f%%"),
+                                    "Candidate Score": st.column_config.NumberColumn(format="%.2f"),
                                 },
                             )
 
