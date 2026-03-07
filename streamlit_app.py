@@ -15846,6 +15846,8 @@ if selected_page == "DFS Lineup Builder":
         st.session_state.dfs_slate_context = {}
     if 'dfs_supplement_state' not in st.session_state:
         st.session_state.dfs_supplement_state = {}
+    if 'dfs_supplement_cached_upload' not in st.session_state:
+        st.session_state.dfs_supplement_cached_upload = {}
     if 'dfs_supplement_saved_run_key' not in st.session_state:
         st.session_state.dfs_supplement_saved_run_key = ""
     if 'dfs_excluded_games' not in st.session_state:
@@ -22049,6 +22051,9 @@ if selected_page == "DFS Lineup Builder":
             known_mapping: Dict[str, Optional[str]] | None = None
             supplement_file = None
             supplement_path: Optional[Path] = None
+            cached_upload_state = (
+                st.session_state.get("dfs_supplement_cached_upload", {}) or {}
+            )
 
             if source_mode == "Upload CSV":
                 upload_provider = st.selectbox(
@@ -22071,6 +22076,13 @@ if selected_page == "DFS Lineup Builder":
                             "future uploads from the same provider."
                         ),
                     )
+                if cached_upload_state:
+                    if st.button(
+                        "Clear Cached CSV Upload",
+                        key="dfs_supplement_clear_cached_upload",
+                    ):
+                        st.session_state.dfs_supplement_cached_upload = {}
+                        st.rerun()
                 supplement_file = st.file_uploader(
                     "Upload supplement CSV",
                     type=["csv"],
@@ -22103,9 +22115,46 @@ if selected_page == "DFS Lineup Builder":
                             uploaded_filename=supplement_source_filename,
                             upload_provider=upload_provider,
                         )
+                        st.session_state.dfs_supplement_cached_upload = {
+                            "raw_records": supplement_df.to_dict("records"),
+                            "columns": supplement_df.columns.tolist(),
+                            "headerless_detected": bool(headerless_detected),
+                            "source_filename": supplement_source_filename,
+                            "source_name": supplement_source_name,
+                            "upload_provider": upload_provider,
+                        }
                         st.caption(
                             f"Upload source tag: `{supplement_source_name}` "
                             "(used for persistent match mapping)."
+                        )
+                elif cached_upload_state:
+                    cached_records = cached_upload_state.get("raw_records") or []
+                    cached_columns = cached_upload_state.get("columns") or []
+                    supplement_df = pd.DataFrame(cached_records)
+                    if supplement_df.empty and cached_columns:
+                        supplement_df = pd.DataFrame(columns=list(cached_columns))
+                    if not supplement_df.empty:
+                        headerless_detected = bool(
+                            cached_upload_state.get("headerless_detected")
+                        )
+                        supplement_source_filename = str(
+                            cached_upload_state.get("source_filename") or "cached_upload.csv"
+                        )
+                        cached_source_name = str(
+                            cached_upload_state.get("source_name") or ""
+                        )
+                        cached_provider = str(
+                            cached_upload_state.get("upload_provider") or upload_provider
+                        )
+                        supplement_source_name = _canonicalize_uploaded_supplement_source_name(
+                            cached_source_name or Path(supplement_source_filename).stem,
+                            uploaded_filename=supplement_source_filename,
+                            upload_provider=cached_provider,
+                        )
+                        st.caption(
+                            "Using cached upload: "
+                            f"`{supplement_source_filename}` "
+                            f"(source tag `{supplement_source_name}`)."
                         )
             else:
                 st.caption(
