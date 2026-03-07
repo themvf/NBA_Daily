@@ -15277,86 +15277,87 @@ def _resolve_ownership_source_states(
     return rotowire_state, lineupstarter_state
 
 
-def _build_combined_ownership_supplement_state(
-    rotowire_state: Mapping[str, Any],
-    secondary_state: Mapping[str, Any],
-    rotowire_weight: float,
+def _supplement_state_has_signal(
+    supplement_state: Mapping[str, Any],
+    signal_name: str,
+) -> bool:
+    """Return True when a supplement state has at least one usable signal value."""
+    player_map = dict(supplement_state or {}).get("player_map") or {}
+    if not player_map:
+        return False
+    signal_key = (
+        "supplement_proj_fpts"
+        if str(signal_name or "").strip().lower().startswith("proj")
+        else "supplement_ownership"
+    )
+    return any(
+        info.get(signal_key) is not None
+        for info in player_map.values()
+        if isinstance(info, Mapping)
+    )
+
+
+def _blend_dual_source_metric(
+    primary_value: Any,
+    secondary_value: Any,
+    primary_weight: float,
     secondary_weight: float,
+) -> Tuple[Optional[float], str]:
+    """Blend a single metric across two sources and describe which source won."""
+    primary_num = pd.to_numeric(primary_value, errors="coerce")
+    secondary_num = pd.to_numeric(secondary_value, errors="coerce")
+    has_primary = pd.notna(primary_num)
+    has_secondary = pd.notna(secondary_num)
+    if not has_primary and not has_secondary:
+        return None, ""
+    if has_primary and not has_secondary:
+        return float(primary_num), "primary_only"
+    if has_secondary and not has_primary:
+        return float(secondary_num), "secondary_only"
+
+    primary_w = max(0.0, float(primary_weight or 0.0))
+    secondary_w = max(0.0, float(secondary_weight or 0.0))
+    if primary_w <= 0 and secondary_w <= 0:
+        return float(primary_num), "primary_only"
+    if primary_w <= 0:
+        return float(secondary_num), "secondary_only"
+    if secondary_w <= 0:
+        return float(primary_num), "primary_only"
+
+    blended = (
+        (float(primary_num) * primary_w) + (float(secondary_num) * secondary_w)
+    ) / max(1e-9, primary_w + secondary_w)
+    return float(blended), "combined"
+
+
+def _build_combined_dual_source_supplement_state(
+    primary_state: Mapping[str, Any],
+    secondary_state: Mapping[str, Any],
+    primary_proj_weight: float,
+    secondary_proj_weight: float,
+    primary_own_weight: float,
+    secondary_own_weight: float,
     slate_date: str,
+    blend_projection: bool = True,
+    blend_ownership: bool = True,
 ) -> Dict[str, Any]:
-    """Combine ownership fields from RotoWire + secondary supplement by player_id."""
-    rw_state = dict(rotowire_state or {})
+    """Blend projection and ownership signals across two supplement sources."""
+    pri_state = dict(primary_state or {})
     sec_state = dict(secondary_state or {})
-    if not rw_state:
+    if not pri_state:
         return {}
 
-    rw_map = rw_state.get("player_map") or {}
-    if not rw_map:
-        return {}
-    if str(rw_state.get("slate_date") or "") != str(slate_date or ""):
+    pri_map = pri_state.get("player_map") or {}
+    if not pri_map or str(pri_state.get("slate_date") or "") != str(slate_date or ""):
         return {}
 
     sec_map = sec_state.get("player_map") or {}
-    if (
-        not sec_map
-        or str(sec_state.get("slate_date") or "") != str(slate_date or "")
-    ):
-        return rw_state
-
-    rw_w = float(rotowire_weight or 0.0)
-    sec_w = float(secondary_weight or 0.0)
-    if rw_w <= 0 and sec_w <= 0:
-        rw_w = 1.0
-        sec_w = 0.0
+    if not sec_map or str(sec_state.get("slate_date") or "") != str(slate_date or ""):
+        return pri_state
 
     combined_map: Dict[int, Dict[str, Any]] = {}
-    both_count = 0
-    rw_only_count = 0
-    sec_only_count = 0
-    for pid in sorted(set(rw_map.keys()) | set(sec_map.keys())):
-        rw_info = rw_map.get(pid) or {}
-        sec_info = sec_map.get(pid) or {}
-        rw_own = rw_info.get("supplement_ownership")
-        sec_own = sec_info.get("supplement_ownership")
-        if rw_own is None and sec_own is None:
-            continue
-
-        rw_score = float(rw_info.get("match_score") or 0.0)
-        sec_score = float(sec_info.get("match_score") or 0.0)
-        if rw_own is not None and sec_own is not None:
-            both_count += 1
-            denom = max(1e-9, rw_w + sec_w)
-            blended_own = ((float(rw_own) * rw_w) + (float(sec_own) * sec_w)) / denom
-            match_method = "combined_own"
-            match_score = max(rw_score, sec_score)
-        elif rw_own is not None:
-            rw_only_count += 1
-            blended_own = float(rw_own)
-            match_method = str(rw_info.get("match_method") or "rotowire_only")
-            match_score = rw_score
-        else:
-            sec_only_count += 1
-            blended_own = float(sec_own)
-            match_method = "secondary_only"
-            match_score = sec_score
-
-        try:
-            player_id = int(pid)
-        except (TypeError, ValueError):
-            continue
-        if player_id <= 0:
-            continue
-        combined_map[player_id] = {
-            "match_method": match_method,
-            "match_score": float(match_score),
-            "supplement_proj_fpts": rw_info.get("supplement_proj_fpts"),
-            "supplement_ownership": round(max(0.0, float(blended_own)), 3),
-            "proj_delta": rw_info.get("proj_delta"),
-            "own_delta_pp": None,
-        }
-
-    if not combined_map:
-        return rw_state
+    proj_counts = {"combined": 0, "primary_only": 0, "secondary_only": 0}
+    own_counts = {"combined": 0, "primary_only": 0, "secondary_only": 0}
 
     row_by_pid: Dict[int, Dict[str, Any]] = {}
     for row in (sec_state.get("comparison_records") or []):
@@ -15366,7 +15367,7 @@ def _build_combined_ownership_supplement_state(
             pid = 0
         if pid > 0 and pid not in row_by_pid:
             row_by_pid[pid] = dict(row)
-    for row in (rw_state.get("comparison_records") or []):
+    for row in (pri_state.get("comparison_records") or []):
         try:
             pid = int(row.get("Our Player ID") or 0)
         except (TypeError, ValueError):
@@ -15375,46 +15376,384 @@ def _build_combined_ownership_supplement_state(
             row_by_pid[pid] = dict(row)
 
     combined_records: List[Dict[str, Any]] = []
-    for pid, info in combined_map.items():
-        row = dict(row_by_pid.get(pid, {}))
-        row["Our Player ID"] = pid
-        row["Match Method"] = info.get("match_method")
-        row["Match Score"] = info.get("match_score")
-        row["Supplement Own %"] = info.get("supplement_ownership")
+    for pid in sorted(set(pri_map.keys()) | set(sec_map.keys())):
+        pri_info = pri_map.get(pid) or {}
+        sec_info = sec_map.get(pid) or {}
+        proj_value: Optional[float] = None
+        own_value: Optional[float] = None
+        proj_mode = ""
+        own_mode = ""
+
+        if blend_projection:
+            proj_value, proj_mode = _blend_dual_source_metric(
+                pri_info.get("supplement_proj_fpts"),
+                sec_info.get("supplement_proj_fpts"),
+                primary_proj_weight,
+                secondary_proj_weight,
+            )
+            if proj_mode:
+                proj_counts[proj_mode] = int(proj_counts.get(proj_mode, 0)) + 1
+
+        if blend_ownership:
+            own_value, own_mode = _blend_dual_source_metric(
+                pri_info.get("supplement_ownership"),
+                sec_info.get("supplement_ownership"),
+                primary_own_weight,
+                secondary_own_weight,
+            )
+            if own_mode:
+                own_counts[own_mode] = int(own_counts.get(own_mode, 0)) + 1
+
+        if proj_value is None and own_value is None:
+            continue
+
+        try:
+            player_id = int(pid)
+        except (TypeError, ValueError):
+            continue
+        if player_id <= 0:
+            continue
+
+        match_score = max(
+            float(pri_info.get("match_score") or 0.0),
+            float(sec_info.get("match_score") or 0.0),
+        )
+        method_tokens = [token for token in [proj_mode, own_mode] if token]
+        match_method = "+".join(method_tokens) if method_tokens else "combined_signal"
+        combined_map[player_id] = {
+            "match_method": match_method,
+            "match_score": float(match_score),
+            "supplement_proj_fpts": (
+                round(float(proj_value), 3) if proj_value is not None else None
+            ),
+            "supplement_ownership": (
+                round(max(0.0, float(own_value)), 3) if own_value is not None else None
+            ),
+            "proj_delta": None,
+            "own_delta_pp": None,
+        }
+
+        row = dict(row_by_pid.get(player_id, {}))
+        row["Our Player ID"] = player_id
+        row["Match Method"] = match_method
+        row["Match Score"] = float(match_score)
+        our_proj = pd.to_numeric(row.get("Our Proj FPTS"), errors="coerce")
         our_own = pd.to_numeric(row.get("Our Own %"), errors="coerce")
+        row["Supplement Proj FPTS"] = (
+            round(float(proj_value), 3) if proj_value is not None else np.nan
+        )
+        row["Proj Delta"] = (
+            float(proj_value) - float(our_proj)
+            if proj_value is not None and pd.notna(our_proj)
+            else np.nan
+        )
+        row["Supplement Own %"] = (
+            round(max(0.0, float(own_value)), 3) if own_value is not None else np.nan
+        )
         row["Own Delta (pp)"] = (
-            float(info.get("supplement_ownership")) - float(our_own)
-            if pd.notna(our_own)
+            float(own_value) - float(our_own)
+            if own_value is not None and pd.notna(our_own)
             else np.nan
         )
         combined_records.append(row)
 
-    combined_state = dict(rw_state)
-    rw_name = str(rw_state.get("source_name") or "RotoWire")
+    if not combined_map:
+        return pri_state
+
+    pri_name = str(pri_state.get("source_name") or "Primary")
     sec_name = str(sec_state.get("source_name") or "Secondary")
-    combined_state["source_name"] = f"{rw_name} + {sec_name} (Ownership Blend)"
-    combined_state["source_mode"] = "Combined Ownership"
-    combined_state["is_rotowire_source"] = True
+    combined_state = dict(pri_state)
+    combined_state["source_name"] = f"{pri_name} + {sec_name} (Signal Matrix)"
+    combined_state["source_mode"] = "Combined Supplement"
+    combined_state["is_rotowire_source"] = bool(pri_state.get("is_rotowire_source")) or bool(
+        sec_state.get("is_rotowire_source")
+    ) or ("rotowire" in f"{pri_name} {sec_name}".lower())
     combined_state["player_map"] = combined_map
     combined_state["comparison_records"] = combined_records
-    summary = dict(rw_state.get("summary", {}) or {})
+    summary = dict(pri_state.get("summary", {}) or {})
     summary["matched_rows"] = int(len(combined_map))
-    summary["ownership_mix"] = {
-        "enabled": True,
-        "rotowire_weight": float(rw_w),
-        "secondary_weight": float(sec_w),
-        "secondary_source_name": sec_name,
-        "combined_players": int(both_count),
-        "rotowire_only_players": int(rw_only_count),
-        "secondary_only_players": int(sec_only_count),
-    }
+    if blend_projection:
+        summary["projection_mix"] = {
+            "enabled": True,
+            "primary_weight": float(primary_proj_weight or 0.0),
+            "secondary_weight": float(secondary_proj_weight or 0.0),
+            "secondary_source_name": sec_name,
+            "combined_players": int(proj_counts.get("combined", 0)),
+            "primary_only_players": int(proj_counts.get("primary_only", 0)),
+            "secondary_only_players": int(proj_counts.get("secondary_only", 0)),
+        }
+    if blend_ownership:
+        summary["ownership_mix"] = {
+            "enabled": True,
+            "rotowire_weight": float(primary_own_weight or 0.0),
+            "secondary_weight": float(secondary_own_weight or 0.0),
+            "secondary_source_name": sec_name,
+            "combined_players": int(own_counts.get("combined", 0)),
+            "rotowire_only_players": int(own_counts.get("primary_only", 0)),
+            "secondary_only_players": int(own_counts.get("secondary_only", 0)),
+        }
     combined_state["summary"] = summary
     combined_state["run_key"] = (
-        f"{str(rw_state.get('run_key') or '')[:8]}_"
+        f"{str(pri_state.get('run_key') or '')[:8]}_"
         f"{str(sec_state.get('run_key') or '')[:8]}_"
-        f"ownmix_{int(round(sec_w * 100))}"
+        f"pmix_{int(round(float(secondary_proj_weight or 0.0) * 100))}_"
+        f"omix_{int(round(float(secondary_own_weight or 0.0) * 100))}"
     )
     return combined_state
+
+
+def _merge_supplement_signal_states(
+    projection_state: Mapping[str, Any],
+    ownership_state: Mapping[str, Any],
+    slate_date: str,
+) -> Dict[str, Any]:
+    """Merge projection and ownership signals from potentially different states."""
+    proj_state = dict(projection_state or {})
+    own_state = dict(ownership_state or {})
+    if not proj_state and not own_state:
+        return {}
+    if not proj_state:
+        return own_state
+    if not own_state:
+        return proj_state
+    if str(proj_state.get("run_key") or "") == str(own_state.get("run_key") or ""):
+        return proj_state
+
+    proj_map = proj_state.get("player_map") or {}
+    own_map = own_state.get("player_map") or {}
+    if not proj_map and not own_map:
+        return {}
+
+    row_by_pid: Dict[int, Dict[str, Any]] = {}
+    for row in (own_state.get("comparison_records") or []):
+        try:
+            pid = int(row.get("Our Player ID") or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        if pid > 0 and pid not in row_by_pid:
+            row_by_pid[pid] = dict(row)
+    for row in (proj_state.get("comparison_records") or []):
+        try:
+            pid = int(row.get("Our Player ID") or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        if pid > 0:
+            row_by_pid[pid] = dict(row)
+
+    merged_map: Dict[int, Dict[str, Any]] = {}
+    merged_records: List[Dict[str, Any]] = []
+    for pid in sorted(set(proj_map.keys()) | set(own_map.keys())):
+        proj_info = proj_map.get(pid) or {}
+        own_info = own_map.get(pid) or {}
+        proj_value = proj_info.get("supplement_proj_fpts")
+        own_value = own_info.get("supplement_ownership")
+        if proj_value is None and own_value is None:
+            continue
+
+        try:
+            player_id = int(pid)
+        except (TypeError, ValueError):
+            continue
+        if player_id <= 0:
+            continue
+
+        match_score = max(
+            float(proj_info.get("match_score") or 0.0),
+            float(own_info.get("match_score") or 0.0),
+        )
+        match_method_parts = []
+        if proj_value is not None:
+            match_method_parts.append(str(proj_info.get("match_method") or "proj"))
+        if own_value is not None:
+            match_method_parts.append(str(own_info.get("match_method") or "own"))
+        match_method = "+".join(match_method_parts[:2]) if match_method_parts else "merged"
+        merged_map[player_id] = {
+            "match_method": match_method,
+            "match_score": float(match_score),
+            "supplement_proj_fpts": (
+                round(float(proj_value), 3) if proj_value is not None else None
+            ),
+            "supplement_ownership": (
+                round(max(0.0, float(own_value)), 3) if own_value is not None else None
+            ),
+            "proj_delta": None,
+            "own_delta_pp": None,
+        }
+
+        row = dict(row_by_pid.get(player_id, {}))
+        row["Our Player ID"] = player_id
+        row["Match Method"] = match_method
+        row["Match Score"] = float(match_score)
+        our_proj = pd.to_numeric(row.get("Our Proj FPTS"), errors="coerce")
+        our_own = pd.to_numeric(row.get("Our Own %"), errors="coerce")
+        row["Supplement Proj FPTS"] = (
+            round(float(proj_value), 3) if proj_value is not None else np.nan
+        )
+        row["Proj Delta"] = (
+            float(proj_value) - float(our_proj)
+            if proj_value is not None and pd.notna(our_proj)
+            else np.nan
+        )
+        row["Supplement Own %"] = (
+            round(max(0.0, float(own_value)), 3) if own_value is not None else np.nan
+        )
+        row["Own Delta (pp)"] = (
+            float(own_value) - float(our_own)
+            if own_value is not None and pd.notna(our_own)
+            else np.nan
+        )
+        merged_records.append(row)
+
+    if not merged_map:
+        return proj_state or own_state
+
+    proj_name = str(proj_state.get("source_name") or "Projection")
+    own_name = str(own_state.get("source_name") or "Ownership")
+    if proj_name == own_name:
+        merged_name = proj_name
+    else:
+        merged_name = f"Proj: {proj_name} | Own: {own_name}"
+    merged_state = dict(proj_state)
+    merged_state["source_name"] = merged_name
+    merged_state["source_mode"] = "Signal Matrix"
+    merged_state["is_rotowire_source"] = bool(proj_state.get("is_rotowire_source")) or bool(
+        own_state.get("is_rotowire_source")
+    ) or ("rotowire" in f"{proj_name} {own_name}".lower())
+    merged_state["player_map"] = merged_map
+    merged_state["comparison_records"] = merged_records
+    summary = dict(proj_state.get("summary", {}) or {})
+    own_summary = dict(own_state.get("summary", {}) or {})
+    summary["matched_rows"] = int(len(merged_map))
+    if "ownership_mix" in own_summary:
+        summary["ownership_mix"] = own_summary.get("ownership_mix", {})
+    if "projection_mix" in proj_state.get("summary", {}):
+        summary["projection_mix"] = proj_state.get("summary", {}).get("projection_mix", {})
+    summary["projection_mae"] = proj_state.get("summary", {}).get("projection_mae", np.nan)
+    summary["projection_mae_display"] = proj_state.get("summary", {}).get(
+        "projection_mae_display", "—"
+    )
+    summary["ownership_mae"] = own_summary.get("ownership_mae", np.nan)
+    summary["ownership_mae_display"] = own_summary.get("ownership_mae_display", "—")
+    merged_state["summary"] = summary
+    merged_state["projection_source_name"] = proj_name
+    merged_state["ownership_source_name"] = own_name
+    merged_state["slate_date"] = str(slate_date or proj_state.get("slate_date") or own_state.get("slate_date") or "")
+    merged_state["run_key"] = (
+        f"{str(proj_state.get('run_key') or '')[:8]}_"
+        f"{str(own_state.get('run_key') or '')[:8]}_"
+        "sigmerge"
+    )
+    return merged_state
+
+
+def _build_supplement_source_matrix_df(
+    players: List[Any],
+    rotowire_state: Mapping[str, Any],
+    lineupstarter_state: Mapping[str, Any],
+    combined_state: Mapping[str, Any],
+) -> pd.DataFrame:
+    """Build a per-player matrix across our model, RotoWire, LineupStarter, and blend."""
+    if not players:
+        return pd.DataFrame()
+
+    rw_map = dict(rotowire_state or {}).get("player_map") or {}
+    ls_map = dict(lineupstarter_state or {}).get("player_map") or {}
+    combo_map = dict(combined_state or {}).get("player_map") or {}
+    rows: List[Dict[str, Any]] = []
+    for player in players:
+        if bool(getattr(player, "is_injured", False)) or bool(getattr(player, "is_excluded", False)):
+            continue
+        try:
+            player_id = int(getattr(player, "player_id", 0) or 0)
+        except (TypeError, ValueError):
+            player_id = 0
+        if player_id <= 0:
+            continue
+
+        base_proj = float(
+            getattr(player, "_model_proj_fpts", getattr(player, "proj_fpts", 0.0)) or 0.0
+        )
+        base_own = float(
+            getattr(player, "_model_ownership_proj", getattr(player, "ownership_proj", 0.0)) or 0.0
+        )
+        rw_info = rw_map.get(player_id) or {}
+        ls_info = ls_map.get(player_id) or {}
+        combo_info = combo_map.get(player_id) or {}
+        rw_proj = pd.to_numeric(rw_info.get("supplement_proj_fpts"), errors="coerce")
+        ls_proj = pd.to_numeric(ls_info.get("supplement_proj_fpts"), errors="coerce")
+        combo_proj = pd.to_numeric(combo_info.get("supplement_proj_fpts"), errors="coerce")
+        rw_own = pd.to_numeric(rw_info.get("supplement_ownership"), errors="coerce")
+        ls_own = pd.to_numeric(ls_info.get("supplement_ownership"), errors="coerce")
+        combo_own = pd.to_numeric(combo_info.get("supplement_ownership"), errors="coerce")
+
+        row = {
+            "Player": str(getattr(player, "name", "") or "").strip(),
+            "Team": str(getattr(player, "team", "") or "").strip(),
+            "Pos": "/".join(getattr(player, "positions", []) or []),
+            "Salary": int(getattr(player, "salary", 0) or 0),
+            "Our Proj FPTS": round(base_proj, 3),
+            "RotoWire Proj FPTS": float(rw_proj) if pd.notna(rw_proj) else np.nan,
+            "LineupStarter Proj FPTS": float(ls_proj) if pd.notna(ls_proj) else np.nan,
+            "Blend Proj FPTS": float(combo_proj) if pd.notna(combo_proj) else np.nan,
+            "Our Own %": round(base_own, 3),
+            "RotoWire Own %": float(rw_own) if pd.notna(rw_own) else np.nan,
+            "LineupStarter Own %": float(ls_own) if pd.notna(ls_own) else np.nan,
+            "Blend Own %": float(combo_own) if pd.notna(combo_own) else np.nan,
+        }
+        for label in ["RotoWire", "LineupStarter", "Blend"]:
+            proj_col = f"{label} Proj FPTS"
+            own_col = f"{label} Own %"
+            proj_val = pd.to_numeric(row.get(proj_col), errors="coerce")
+            own_val = pd.to_numeric(row.get(own_col), errors="coerce")
+            row[f"{label} Proj Delta"] = (
+                float(proj_val) - base_proj if pd.notna(proj_val) else np.nan
+            )
+            row[f"{label} Own Delta (pp)"] = (
+                float(own_val) - base_own if pd.notna(own_val) else np.nan
+            )
+            row[f"{label} Proj Delta %"] = (
+                ((float(proj_val) - base_proj) / max(abs(base_proj), 1.0)) * 100.0
+                if pd.notna(proj_val)
+                else np.nan
+            )
+            row[f"{label} Own Delta %"] = (
+                ((float(own_val) - base_own) / max(abs(base_own), 1.0)) * 100.0
+                if pd.notna(own_val)
+                else np.nan
+            )
+        rows.append(row)
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    proj_delta_cols = [f"{label} Proj Delta %" for label in ["RotoWire", "LineupStarter", "Blend"]]
+    own_delta_cols = [f"{label} Own Delta %" for label in ["RotoWire", "LineupStarter", "Blend"]]
+    df["Max Proj Delta %"] = df[proj_delta_cols].abs().max(axis=1, skipna=True)
+    df["Max Own Delta %"] = df[own_delta_cols].abs().max(axis=1, skipna=True)
+    df["Outside Range"] = False
+    return df
+
+
+def _build_combined_ownership_supplement_state(
+    rotowire_state: Mapping[str, Any],
+    secondary_state: Mapping[str, Any],
+    rotowire_weight: float,
+    secondary_weight: float,
+    slate_date: str,
+) -> Dict[str, Any]:
+    """Combine ownership fields from RotoWire + secondary supplement by player_id."""
+    return _build_combined_dual_source_supplement_state(
+        primary_state=rotowire_state,
+        secondary_state=secondary_state,
+        primary_proj_weight=1.0,
+        secondary_proj_weight=0.0,
+        primary_own_weight=rotowire_weight,
+        secondary_own_weight=secondary_weight,
+        slate_date=slate_date,
+        blend_projection=False,
+        blend_ownership=True,
+    )
 
 
 def _save_dfs_supplement_state(
@@ -15690,7 +16029,6 @@ def _apply_supplement_profile_blend(
         if match_score < match_score_min:
             continue
 
-        eligible_matches += 1
         base_proj = float(getattr(player, "proj_fpts", 0.0) or 0.0)
         base_own = float(getattr(player, "ownership_proj", 0.0) or 0.0)
         base_floor = float(getattr(player, "proj_floor", 0.0) or 0.0)
@@ -15698,6 +16036,18 @@ def _apply_supplement_profile_blend(
         base_risk_adj = float(getattr(player, "risk_adjusted_proj_fpts", 0.0) or 0.0)
 
         supplement_proj = supplement_info.get("supplement_proj_fpts")
+        supplement_own = supplement_info.get("supplement_ownership")
+        effective_own_weight = 0.0 if bool(
+            getattr(player, "rotowire_ownership_blend_active", False)
+        ) else own_weight
+        has_requested_signal = bool(
+            (proj_weight > 0 and supplement_proj is not None)
+            or (effective_own_weight > 0 and supplement_own is not None)
+        )
+        if not has_requested_signal:
+            continue
+
+        eligible_matches += 1
         if proj_weight > 0 and supplement_proj is not None and base_proj > 0:
             raw_proj_delta = float(supplement_proj) - base_proj
             capped_proj_delta = raw_proj_delta
@@ -15714,10 +16064,6 @@ def _apply_supplement_profile_blend(
             player.supplement_proj_delta_applied = round(player.proj_fpts - base_proj, 3)
             proj_adjusted += 1
 
-        supplement_own = supplement_info.get("supplement_ownership")
-        effective_own_weight = 0.0 if bool(
-            getattr(player, "rotowire_ownership_blend_active", False)
-        ) else own_weight
         if effective_own_weight > 0 and supplement_own is not None:
             raw_own_delta = float(supplement_own) - base_own
             capped_own_delta = raw_own_delta
@@ -17604,6 +17950,42 @@ if selected_page == "DFS Lineup Builder":
                 current_slate_date,
                 supplement_state,
             )
+            dual_proj_available = bool(
+                _supplement_state_has_signal(rotowire_own_state, "projection")
+                and _supplement_state_has_signal(lineupstarter_own_state, "projection")
+            )
+            default_dual_proj = bool(
+                st.session_state.get("dfs_dual_proj_blend_enabled", dual_proj_available)
+            )
+            use_dual_proj = False
+            lineupstarter_proj_weight = float(
+                st.session_state.get("dfs_dual_proj_weight", 0.35)
+            )
+            if dual_proj_available:
+                proj_blend_col1, proj_blend_col2 = st.columns([1, 2])
+                with proj_blend_col1:
+                    use_dual_proj = st.toggle(
+                        "Blend RotoWire + LineupStarter Projection",
+                        value=default_dual_proj,
+                        key="dfs_dual_proj_blend_enabled",
+                    )
+                with proj_blend_col2:
+                    if use_dual_proj:
+                        lineupstarter_proj_weight = (
+                            st.slider(
+                                "LineupStarter projection weight",
+                                min_value=10,
+                                max_value=90,
+                                value=int(round(lineupstarter_proj_weight * 100)),
+                                step=5,
+                                format="%d%%",
+                                key="dfs_dual_proj_weight_pct",
+                            )
+                            / 100.0
+                        )
+                        st.session_state.dfs_dual_proj_weight = float(
+                            lineupstarter_proj_weight
+                        )
             dual_own_available = bool(
                 rotowire_own_state
                 and (rotowire_own_state.get("player_map") or {})
@@ -17643,7 +18025,21 @@ if selected_page == "DFS Lineup Builder":
                             lineupstarter_own_weight
                         )
 
-            ownership_supplement_state = dict(rotowire_own_state or {})
+            projection_supplement_state = dict(supplement_state or {})
+            if use_dual_proj and dual_proj_available:
+                projection_supplement_state = _build_combined_dual_source_supplement_state(
+                    primary_state=rotowire_own_state,
+                    secondary_state=lineupstarter_own_state,
+                    primary_proj_weight=max(0.0, 1.0 - float(lineupstarter_proj_weight)),
+                    secondary_proj_weight=float(lineupstarter_proj_weight),
+                    primary_own_weight=0.0,
+                    secondary_own_weight=0.0,
+                    slate_date=current_slate_date,
+                    blend_projection=True,
+                    blend_ownership=False,
+                )
+
+            ownership_supplement_state = dict(rotowire_own_state or supplement_state or {})
             if use_dual_own and dual_own_available:
                 ownership_supplement_state = _build_combined_ownership_supplement_state(
                     rotowire_state=rotowire_own_state,
@@ -17651,6 +18047,15 @@ if selected_page == "DFS Lineup Builder":
                     rotowire_weight=max(0.0, 1.0 - float(lineupstarter_own_weight)),
                     secondary_weight=float(lineupstarter_own_weight),
                     slate_date=current_slate_date,
+                )
+            lineup_generation_supplement_state = _merge_supplement_signal_states(
+                projection_supplement_state,
+                ownership_supplement_state,
+                current_slate_date,
+            )
+            if not lineup_generation_supplement_state:
+                lineup_generation_supplement_state = dict(
+                    projection_supplement_state or ownership_supplement_state or {}
                 )
             rotowire_ownership_stats = _apply_rotowire_pre_run_ownership_blend(
                 players,
@@ -17683,6 +18088,23 @@ if selected_page == "DFS Lineup Builder":
                         f"Loaded saved supplement snapshot for {current_slate_date}. "
                         "Open `DFS Supplement` to refresh from the latest source."
                     )
+            signal_source_name = str(
+                lineup_generation_supplement_state.get("source_name") or ""
+            )
+            if signal_source_name:
+                st.caption(f"Lineup generation signal matrix: {signal_source_name}")
+            proj_mix = (
+                projection_supplement_state.get("summary", {}).get("projection_mix", {})
+                if projection_supplement_state
+                else {}
+            )
+            if proj_mix.get("enabled"):
+                st.caption(
+                    "Projection source blend active: "
+                    f"RotoWire {int(round((1.0 - float(lineupstarter_proj_weight)) * 100))}% + "
+                    f"{str(proj_mix.get('secondary_source_name') or 'secondary source')} "
+                    f"{int(round(float(proj_mix.get('secondary_weight', 0.0)) * 100))}%."
+                )
             if rotowire_ownership_stats.get("active"):
                 st.caption(
                     "RotoWire ownership consensus is feeding lineup generation: "
@@ -18172,9 +18594,9 @@ if selected_page == "DFS Lineup Builder":
                             key for key in model_run_keys if key in supplement_required_models
                         ]
                         current_supplement_loaded = bool(
-                            supplement_state
-                            and str(supplement_state.get("slate_date") or "") == current_slate_date
-                            and (supplement_state.get("player_map") or {})
+                            lineup_generation_supplement_state
+                            and str(lineup_generation_supplement_state.get("slate_date") or "") == current_slate_date
+                            and (lineup_generation_supplement_state.get("player_map") or {})
                         )
                         if not current_supplement_loaded:
                             auto_supplement_state, auto_supplement_msg = _autofetch_rotowire_supplement_state(
@@ -18185,14 +18607,32 @@ if selected_page == "DFS Lineup Builder":
                             if auto_supplement_state:
                                 st.session_state.dfs_supplement_state = auto_supplement_state
                                 supplement_state = auto_supplement_state
-                                runtime_rotowire_state, runtime_lineupstarter_state = (
-                                    _resolve_ownership_source_states(
-                                        dfs_conn,
-                                        current_slate_date,
-                                        supplement_state,
-                                    )
+                                runtime_rotowire_state, runtime_lineupstarter_state = _resolve_ownership_source_states(
+                                    dfs_conn,
+                                    current_slate_date,
+                                    supplement_state,
                                 )
-                                runtime_ownership_state = dict(runtime_rotowire_state or {})
+                                runtime_projection_state = dict(supplement_state or {})
+                                if (
+                                    use_dual_proj
+                                    and _supplement_state_has_signal(runtime_rotowire_state, "projection")
+                                    and _supplement_state_has_signal(runtime_lineupstarter_state, "projection")
+                                ):
+                                    runtime_projection_state = _build_combined_dual_source_supplement_state(
+                                        primary_state=runtime_rotowire_state,
+                                        secondary_state=runtime_lineupstarter_state,
+                                        primary_proj_weight=max(
+                                            0.0,
+                                            1.0 - float(lineupstarter_proj_weight),
+                                        ),
+                                        secondary_proj_weight=float(lineupstarter_proj_weight),
+                                        primary_own_weight=0.0,
+                                        secondary_own_weight=0.0,
+                                        slate_date=current_slate_date,
+                                        blend_projection=True,
+                                        blend_ownership=False,
+                                    )
+                                runtime_ownership_state = dict(runtime_rotowire_state or supplement_state or {})
                                 if (
                                     use_dual_own
                                     and runtime_rotowire_state
@@ -18217,6 +18657,15 @@ if selected_page == "DFS Lineup Builder":
                                     runtime_ownership_state,
                                     current_slate_date,
                                 )
+                                lineup_generation_supplement_state = _merge_supplement_signal_states(
+                                    runtime_projection_state,
+                                    runtime_ownership_state,
+                                    current_slate_date,
+                                )
+                                if not lineup_generation_supplement_state:
+                                    lineup_generation_supplement_state = dict(
+                                        runtime_projection_state or runtime_ownership_state or {}
+                                    )
                                 st.info(auto_supplement_msg)
                             elif auto_supplement_msg:
                                 st.warning(
@@ -18225,12 +18674,17 @@ if selected_page == "DFS Lineup Builder":
                                 )
 
                         supplement_player_map = {}
-                        supplement_source_name = str(supplement_state.get("source_name") or "")
+                        supplement_source_name = str(
+                            lineup_generation_supplement_state.get("source_name") or ""
+                        )
                         supplement_is_rotowire = bool(
-                            supplement_state.get("is_rotowire_source")
+                            lineup_generation_supplement_state.get("is_rotowire_source")
                         ) or ("rotowire" in supplement_source_name.lower())
-                        if supplement_state and str(supplement_state.get("slate_date") or "") == current_slate_date:
-                            supplement_player_map = supplement_state.get("player_map", {}) or {}
+                        if (
+                            lineup_generation_supplement_state
+                            and str(lineup_generation_supplement_state.get("slate_date") or "") == current_slate_date
+                        ):
+                            supplement_player_map = lineup_generation_supplement_state.get("player_map", {}) or {}
                         skipped_supplement_models: List[str] = []
                         skipped_source_mismatch_models: List[str] = []
                         if not supplement_player_map:
@@ -18428,7 +18882,7 @@ if selected_page == "DFS Lineup Builder":
                                 slate_date=slate_date,
                                 players=players,
                                 lineups=lineups,
-                                supplement_state=supplement_state,
+                                supplement_state=lineup_generation_supplement_state,
                                 run_context={
                                     "run_mode": run_mode,
                                     "selected_model_key": selected_model_key if run_mode == "Single Version" else "",
@@ -21873,7 +22327,7 @@ if selected_page == "DFS Lineup Builder":
             active_col, clear_col = st.columns([5, 1])
             with active_col:
                 st.info(
-                    f"Active supplement: {active_supplement_state.get('source_name', 'Supplement')} | "
+                    f"Most recent loaded supplement: {active_supplement_state.get('source_name', 'Supplement')} | "
                     f"Slate {active_supplement_state.get('slate_date', '—')} | "
                     f"Matched {active_summary.get('matched_rows', 0)}/{active_summary.get('total_rows', 0)} | "
                     f"Proj MAE {active_summary.get('projection_mae_display', '—')} | "
@@ -22003,10 +22457,222 @@ if selected_page == "DFS Lineup Builder":
                 st.session_state.get("dfs_projection_date")
                 or str(datetime.now(EASTERN_TZ).date())
             )
+            rotowire_source_state, lineupstarter_source_state = _resolve_ownership_source_states(
+                dfs_conn,
+                current_slate_date,
+                active_supplement_state,
+            )
+            dual_proj_available = bool(
+                _supplement_state_has_signal(rotowire_source_state, "projection")
+                and _supplement_state_has_signal(lineupstarter_source_state, "projection")
+            )
+            dual_own_available = bool(
+                _supplement_state_has_signal(rotowire_source_state, "ownership")
+                and _supplement_state_has_signal(lineupstarter_source_state, "ownership")
+            )
+            matrix_use_dual_proj = bool(
+                st.session_state.get("dfs_dual_proj_blend_enabled", dual_proj_available)
+            )
+            matrix_lineupstarter_proj_weight = float(
+                st.session_state.get("dfs_dual_proj_weight", 0.35)
+            )
+            matrix_use_dual_own = bool(
+                st.session_state.get("dfs_dual_own_blend_enabled", dual_own_available)
+            )
+            matrix_lineupstarter_own_weight = float(
+                st.session_state.get("dfs_dual_own_weight", 0.35)
+            )
+
+            st.markdown("**Source Matrix**")
+            source_m1, source_m2, source_m3 = st.columns(3)
+            source_m1.metric(
+                "RotoWire Snapshot",
+                "Ready" if rotowire_source_state.get("player_map") else "Missing",
+                (
+                    f"{int(rotowire_source_state.get('summary', {}).get('matched_rows', 0) or 0)} matched"
+                    if rotowire_source_state.get("player_map")
+                    else None
+                ),
+            )
+            source_m2.metric(
+                "LineupStarter Snapshot",
+                "Ready" if lineupstarter_source_state.get("player_map") else "Missing",
+                (
+                    f"{int(lineupstarter_source_state.get('summary', {}).get('matched_rows', 0) or 0)} matched"
+                    if lineupstarter_source_state.get("player_map")
+                    else None
+                ),
+            )
+            source_m3.metric(
+                "Blend Ready",
+                "Yes" if (dual_proj_available or dual_own_available) else "No",
+                (
+                    "Projection + Ownership"
+                    if dual_proj_available and dual_own_available
+                    else "Projection only"
+                    if dual_proj_available
+                    else "Ownership only"
+                    if dual_own_available
+                    else None
+                ),
+            )
+
+            matrix_blend_col1, matrix_blend_col2 = st.columns(2)
+            with matrix_blend_col1:
+                matrix_use_dual_proj = st.toggle(
+                    "Blend RotoWire + LineupStarter Projection",
+                    value=matrix_use_dual_proj and dual_proj_available,
+                    disabled=not dual_proj_available,
+                    key="dfs_source_matrix_proj_toggle",
+                    help="Blend external projection signals for the source matrix and supplement lineup models.",
+                )
+                if matrix_use_dual_proj and dual_proj_available:
+                    matrix_lineupstarter_proj_weight = (
+                        st.slider(
+                            "LineupStarter projection weight",
+                            min_value=10,
+                            max_value=90,
+                            value=int(round(matrix_lineupstarter_proj_weight * 100)),
+                            step=5,
+                            format="%d%%",
+                            key="dfs_source_matrix_proj_weight_pct",
+                        )
+                        / 100.0
+                    )
+            with matrix_blend_col2:
+                matrix_use_dual_own = st.toggle(
+                    "Blend RotoWire + LineupStarter Ownership",
+                    value=matrix_use_dual_own and dual_own_available,
+                    disabled=not dual_own_available,
+                    key="dfs_source_matrix_own_toggle",
+                    help="Blend external ownership signals for the source matrix and lineup generation.",
+                )
+                if matrix_use_dual_own and dual_own_available:
+                    matrix_lineupstarter_own_weight = (
+                        st.slider(
+                            "LineupStarter ownership weight",
+                            min_value=10,
+                            max_value=90,
+                            value=int(round(matrix_lineupstarter_own_weight * 100)),
+                            step=5,
+                            format="%d%%",
+                            key="dfs_source_matrix_own_weight_pct",
+                        )
+                        / 100.0
+                    )
+
+            st.session_state.dfs_dual_proj_blend_enabled = bool(matrix_use_dual_proj)
+            st.session_state.dfs_dual_proj_weight = float(matrix_lineupstarter_proj_weight)
+            st.session_state.dfs_dual_own_blend_enabled = bool(matrix_use_dual_own)
+            st.session_state.dfs_dual_own_weight = float(matrix_lineupstarter_own_weight)
+
+            matrix_projection_state: Dict[str, Any] = {}
+            if matrix_use_dual_proj and dual_proj_available:
+                matrix_projection_state = _build_combined_dual_source_supplement_state(
+                    primary_state=rotowire_source_state,
+                    secondary_state=lineupstarter_source_state,
+                    primary_proj_weight=max(0.0, 1.0 - float(matrix_lineupstarter_proj_weight)),
+                    secondary_proj_weight=float(matrix_lineupstarter_proj_weight),
+                    primary_own_weight=0.0,
+                    secondary_own_weight=0.0,
+                    slate_date=current_slate_date,
+                    blend_projection=True,
+                    blend_ownership=False,
+                )
+
+            matrix_ownership_state: Dict[str, Any] = {}
+            if matrix_use_dual_own and dual_own_available:
+                matrix_ownership_state = _build_combined_ownership_supplement_state(
+                    rotowire_state=rotowire_source_state,
+                    secondary_state=lineupstarter_source_state,
+                    rotowire_weight=max(0.0, 1.0 - float(matrix_lineupstarter_own_weight)),
+                    secondary_weight=float(matrix_lineupstarter_own_weight),
+                    slate_date=current_slate_date,
+                )
+
+            matrix_signal_state = _merge_supplement_signal_states(
+                matrix_projection_state,
+                matrix_ownership_state,
+                current_slate_date,
+            )
+            source_matrix_df = _build_supplement_source_matrix_df(
+                supplement_players,
+                rotowire_source_state,
+                lineupstarter_source_state,
+                matrix_signal_state,
+            )
+            if not source_matrix_df.empty:
+                matrix_threshold_pct = st.slider(
+                    "Source matrix flag threshold (% difference)",
+                    min_value=5,
+                    max_value=60,
+                    value=20,
+                    step=5,
+                    key="dfs_source_matrix_threshold_pct",
+                    help="Flag a player when any external source differs from our model by at least this percentage.",
+                )
+                source_matrix_df["Outside Range"] = (
+                    source_matrix_df["Max Proj Delta %"].fillna(0.0)
+                    >= float(matrix_threshold_pct)
+                ) | (
+                    source_matrix_df["Max Own Delta %"].fillna(0.0)
+                    >= float(matrix_threshold_pct)
+                )
+                show_flagged_matrix_only = st.toggle(
+                    "Show flagged source-matrix players only",
+                    value=False,
+                    key="dfs_source_matrix_flagged_only",
+                )
+                matrix_view_df = source_matrix_df.copy()
+                if show_flagged_matrix_only:
+                    matrix_view_df = matrix_view_df[
+                        matrix_view_df["Outside Range"].fillna(False)
+                    ].copy()
+                matrix_view_df = matrix_view_df.sort_values(
+                    ["Outside Range", "Max Proj Delta %", "Max Own Delta %", "Player"],
+                    ascending=[False, False, False, True],
+                )
+                st.dataframe(
+                    matrix_view_df[
+                        [
+                            "Player",
+                            "Team",
+                            "Pos",
+                            "Salary",
+                            "Our Proj FPTS",
+                            "RotoWire Proj FPTS",
+                            "LineupStarter Proj FPTS",
+                            "Blend Proj FPTS",
+                            "Our Own %",
+                            "RotoWire Own %",
+                            "LineupStarter Own %",
+                            "Blend Own %",
+                            "Max Proj Delta %",
+                            "Max Own Delta %",
+                            "Outside Range",
+                        ]
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Salary": st.column_config.NumberColumn(format="$%d"),
+                        "Our Proj FPTS": st.column_config.NumberColumn(format="%.1f"),
+                        "RotoWire Proj FPTS": st.column_config.NumberColumn(format="%.1f"),
+                        "LineupStarter Proj FPTS": st.column_config.NumberColumn(format="%.1f"),
+                        "Blend Proj FPTS": st.column_config.NumberColumn(format="%.1f"),
+                        "Our Own %": st.column_config.NumberColumn(format="%.1f%%"),
+                        "RotoWire Own %": st.column_config.NumberColumn(format="%.1f%%"),
+                        "LineupStarter Own %": st.column_config.NumberColumn(format="%.1f%%"),
+                        "Blend Own %": st.column_config.NumberColumn(format="%.1f%%"),
+                        "Max Proj Delta %": st.column_config.NumberColumn(format="%.1f%%"),
+                        "Max Own Delta %": st.column_config.NumberColumn(format="%.1f%%"),
+                    },
+                )
+
             st.caption(
                 "RotoWire and CSV are distinct supplement sources. "
                 "Run both each slate: load RotoWire snapshot, then upload CSV. "
-                "Both are saved and used for ownership blending/tracking."
+                "Both are saved and can feed projection and ownership blending/tracking."
             )
             quick_rw_col1, quick_rw_col2 = st.columns([1.4, 2.6])
             with quick_rw_col1:
