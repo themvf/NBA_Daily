@@ -22096,9 +22096,12 @@ if selected_page == "DFS Lineup Builder":
                                                 'Cheap Core',
                                                 'Cheap Core Score',
                                                 'Cheap Core Reasons',
+                                                'GPP Ceiling Score',
+                                                'GPP Ceiling Tags',
                                                 'Core Gate',
                                                 'Low Own Gate',
                                                 'Standout Gate',
+                                                'GPP Ceiling Rank',
                                                 'Own Delta',
                                                 'Proj Delta',
                                                 'field_exposure_pct',
@@ -22116,9 +22119,12 @@ if selected_page == "DFS Lineup Builder":
                                             'Cheap Core',
                                             'Cheap-Core Score',
                                             'Reasons',
+                                            'GPP Ceiling Score',
+                                            'GPP Ceiling Tags',
                                             'Core Gate',
                                             'Low Own Gate',
                                             'Standout Gate',
+                                            'GPP Ceiling Rank',
                                             'Own Delta',
                                             'Proj Delta',
                                             'Field Exp %',
@@ -22129,7 +22135,7 @@ if selected_page == "DFS Lineup Builder":
                                         reason_view['Salary'] = reason_view['Salary'].apply(
                                             lambda x: f"${int(x):,}" if pd.notna(x) else "—"
                                         )
-                                        for c in ['Cheap-Core Score', 'Own Delta', 'Proj Delta', 'Actual-Proj']:
+                                        for c in ['Cheap-Core Score', 'GPP Ceiling Score', 'Own Delta', 'Proj Delta', 'Actual-Proj']:
                                             reason_view[c] = reason_view[c].apply(
                                                 lambda x: f"{x:.2f}" if pd.notna(x) else "—"
                                             )
