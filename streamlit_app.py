@@ -13913,6 +13913,57 @@ def _enrich_players_with_vegas_signals(conn, players, game_date, debug=False):
     return signals
 
 
+def _enrich_players_with_game_environment(conn, players, slate_date):
+    """Attach game total / spread / stack environment fields to the active player pool."""
+    if not conn or not players or not slate_date:
+        return {}
+
+    env_lookup = {}
+    try:
+        cursor = conn.execute(
+            """
+            SELECT home_team, away_team, total, spread, stack_score, pace_score, blowout_risk
+            FROM game_odds
+            WHERE date(game_date) = date(?)
+            """,
+            [slate_date],
+        )
+        for row in cursor.fetchall():
+            team_key = frozenset([row[0], row[1]])
+            env_lookup[team_key] = {
+                "game_total": float(row[2]) if row[2] is not None else None,
+                "spread_abs": abs(float(row[3])) if row[3] is not None else None,
+                "stack_score": float(row[4]) if row[4] is not None else None,
+                "pace_score": float(row[5]) if row[5] is not None else 0.0,
+                "blowout_risk": float(row[6]) if row[6] is not None else 0.0,
+            }
+    except Exception:
+        return {}
+
+    game_summary = {}
+    for p in players:
+        team_key = frozenset(
+            [
+                str(getattr(p, "team", "") or "").strip(),
+                str(getattr(p, "opponent", "") or "").strip(),
+            ]
+        )
+        env = env_lookup.get(team_key) or {}
+        if not env:
+            continue
+        if env.get("game_total") is not None:
+            p.game_total = float(env["game_total"])
+        if env.get("spread_abs") is not None:
+            p.game_spread_abs = float(env["spread_abs"])
+        if env.get("stack_score") is not None:
+            p.stack_score = float(env["stack_score"])
+        p.game_pace_score = float(env.get("pace_score") or 0.0)
+        p.game_blowout_risk = float(env.get("blowout_risk") or 0.0)
+        game_summary[str(getattr(p, "game_id", "") or "")] = env
+
+    return game_summary
+
+
 def _get_openai_api_key() -> Optional[str]:
     """Read OpenAI API key from Streamlit secrets first, then env var."""
     key = ""
@@ -16005,6 +16056,8 @@ def _build_lineup_signal_view_frames(
         rw_signal_count = 0
         ls_signal_count = 0
         blend_signal_count = 0
+        lineup_game_leverage_vals: List[float] = []
+        lineup_game_own_vals: List[float] = []
 
         for slot in dfs.ROSTER_SLOTS:
             player = lineup.players.get(slot)
@@ -16063,6 +16116,12 @@ def _build_lineup_signal_view_frames(
             rw_own_vals.append(rw_own)
             ls_own_vals.append(ls_own)
             blend_own_vals.append(combo_own)
+            lineup_game_leverage_vals.append(
+                float(getattr(player, "game_leverage_score", 0.0) or 0.0)
+            )
+            lineup_game_own_vals.append(
+                float(getattr(player, "game_ownership_share", 0.0) or 0.0)
+            )
 
             props = vegas_lookup.get(
                 str(getattr(player, "name", "") or "").strip().lower(),
@@ -16146,6 +16205,17 @@ def _build_lineup_signal_view_frames(
                         ),
                         3,
                     ),
+                    "Game Leverage": round(
+                        float(getattr(player, "game_leverage_score", 0.0) or 0.0),
+                        3,
+                    ),
+                    "Game Own Share %": round(
+                        float(getattr(player, "game_ownership_share", 0.0) or 0.0),
+                        3,
+                    ),
+                    "Game Leverage Tags": str(
+                        getattr(player, "game_leverage_tags", "") or ""
+                    ),
                     "Boost": boost,
                     "Game": str(getattr(player, "game_id", "") or "").strip(),
                 }
@@ -16187,6 +16257,12 @@ def _build_lineup_signal_view_frames(
                 ),
                 "Blend Avg Own %": round(
                     _aggregate_optional_numeric(blend_own_vals, mode="avg"), 3
+                ),
+                "Avg Game Leverage": round(
+                    _aggregate_optional_numeric(lineup_game_leverage_vals, mode="avg"), 3
+                ),
+                "Avg Game Own Share %": round(
+                    _aggregate_optional_numeric(lineup_game_own_vals, mode="avg"), 3
                 ),
                 "RotoWire Signals": int(rw_signal_count),
                 "LineupStarter Signals": int(ls_signal_count),
@@ -17662,6 +17738,8 @@ if selected_page == "DFS Lineup Builder":
                     f"{int(ROTOWIRE_PRE_RUN_MODEL_OWNERSHIP_WEIGHT * 100)}% model)."
                 )
 
+            _enrich_players_with_game_environment(dfs_conn, players, current_slate_date)
+            game_leverage_summary = dfs.refresh_game_leverage_signals(players)
             for p in players:
                 dfs.refresh_gpp_ceiling_signal(p)
 
@@ -17672,6 +17750,7 @@ if selected_page == "DFS Lineup Builder":
                 "Value (FPTS/$)",
                 "Ceiling",
                 "GPP Ceiling Signal",
+                "Game Leverage",
             ]
             if vegas_sigs:
                 sort_options.append("Vegas Edge")
@@ -17692,6 +17771,11 @@ if selected_page == "DFS Lineup Builder":
             elif sort_by == "GPP Ceiling Signal":
                 filtered.sort(
                     key=lambda p: float(getattr(p, "ceiling_opportunity_score", 0.0) or 0.0),
+                    reverse=True,
+                )
+            elif sort_by == "Game Leverage":
+                filtered.sort(
+                    key=lambda p: float(getattr(p, "game_leverage_score", 0.0) or 0.0),
                     reverse=True,
                 )
             elif sort_by == "Vegas Edge":
@@ -17770,6 +17854,9 @@ if selected_page == "DFS Lineup Builder":
                     'Ceiling': round(p.proj_ceiling, 1),
                     'GPP Ceiling': round(float(getattr(p, 'ceiling_opportunity_score', 0.0) or 0.0), 2),
                     'GPP Tags': str(getattr(p, 'ceiling_opportunity_tags', '') or ''),
+                    'Game Lev': round(float(getattr(p, 'game_leverage_score', 0.0) or 0.0), 2),
+                    'Game Own%': round(float(getattr(p, 'game_ownership_share', 0.0) or 0.0), 2),
+                    'Game Tags': str(getattr(p, 'game_leverage_tags', '') or ''),
                     'Value': round(p.fpts_per_dollar, 2),
                     'Rest': rest_indicator,
                     'Own%': round(p.ownership_proj, 1),
@@ -17786,6 +17873,8 @@ if selected_page == "DFS Lineup Builder":
                 'Floor': st.column_config.NumberColumn(format="%.1f"),
                 'Ceiling': st.column_config.NumberColumn(format="%.1f"),
                 'GPP Ceiling': st.column_config.NumberColumn(format="%.2f"),
+                'Game Lev': st.column_config.NumberColumn(format="%+.2f"),
+                'Game Own%': st.column_config.NumberColumn(format="%.1f%%"),
                 'Value': st.column_config.NumberColumn(format="%.2f"),
                 'Own%': st.column_config.NumberColumn(format="%.1f%%"),
             }
@@ -17887,6 +17976,72 @@ if selected_page == "DFS Lineup Builder":
                     st.caption("Players where Vegas implied FPTS exceeds our projection by ≥10% at salary < $7K. "
                                "These are value plays where the market sees upside our model may underweight. "
                                "They are now used as automatic scoring inputs, not fixed exposure floors.")
+
+            leverage_games = sorted(
+                (game_leverage_summary or {}).values(),
+                key=lambda row: (
+                    float((row or {}).get("game_leverage_score", 0.0) or 0.0),
+                    float((row or {}).get("game_total") or 0.0),
+                ),
+                reverse=True,
+            )
+            with st.expander(
+                "🏟️ Game Leverage View",
+                expanded=bool(leverage_games),
+            ):
+                if not leverage_games:
+                    st.caption(
+                        "No game leverage view available yet. Load a slate with ownership and game odds."
+                    )
+                else:
+                    leverage_df = pd.DataFrame(
+                        [
+                            {
+                                "Game": row.get("game_label"),
+                                "Vegas Total": row.get("game_total"),
+                                "Spread": row.get("spread_abs"),
+                                "Stack Score": row.get("stack_score"),
+                                "Game Own %": row.get("game_ownership_share"),
+                                "Total Rank": row.get("total_rank"),
+                                "Own Rank": row.get("ownership_rank"),
+                                "Game Leverage": row.get("game_leverage_score"),
+                                "Tags": row.get("game_leverage_tags"),
+                            }
+                            for row in leverage_games
+                        ]
+                    )
+                    lev_m1, lev_m2, lev_m3 = st.columns(3)
+                    best_game = leverage_games[0]
+                    positive_games = [
+                        row for row in leverage_games
+                        if float(row.get("game_leverage_score", 0.0) or 0.0) > 0
+                    ]
+                    lev_m1.metric(
+                        "Best Game Leverage",
+                        f"{float(best_game.get('game_leverage_score', 0.0) or 0.0):+.2f}",
+                        best_game.get("game_label") or "—",
+                    )
+                    lev_m2.metric("Positive Games", len(positive_games))
+                    lev_m3.metric(
+                        "Highest Game Own %",
+                        f"{max(float(row.get('game_ownership_share', 0.0) or 0.0) for row in leverage_games):.1f}%",
+                    )
+                    st.dataframe(
+                        leverage_df,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Vegas Total": st.column_config.NumberColumn(format="%.1f"),
+                            "Spread": st.column_config.NumberColumn(format="%.1f"),
+                            "Stack Score": st.column_config.NumberColumn(format="%.2f"),
+                            "Game Own %": st.column_config.NumberColumn(format="%.1f%%"),
+                            "Game Leverage": st.column_config.NumberColumn(format="%+.2f"),
+                        },
+                    )
+                    st.info(
+                        "This uses the current player-pool ownership state and game environment to score under-owned games. "
+                        "Lineup generation now uses it as a bounded multiplier in ceiling and leverage builds."
+                    )
 
             # --- OpenAI Projection Review Agent ---
             with st.expander("OpenAI Projection Review Agent", expanded=False):
@@ -18207,6 +18362,9 @@ if selected_page == "DFS Lineup Builder":
                         'Ceiling': round(p.proj_ceiling, 2),
                         'GPP_Ceiling_Score': round(float(getattr(p, 'ceiling_opportunity_score', 0.0) or 0.0), 3),
                         'GPP_Ceiling_Tags': str(getattr(p, 'ceiling_opportunity_tags', '') or ''),
+                        'Game_Leverage_Score': round(float(getattr(p, 'game_leverage_score', 0.0) or 0.0), 3),
+                        'Game_Leverage_Tags': str(getattr(p, 'game_leverage_tags', '') or ''),
+                        'Game_Own_Share_Pct': round(float(getattr(p, 'game_ownership_share', 0.0) or 0.0), 3),
                         'Value': round(p.fpts_per_dollar, 3),
                         'Own_Pct': round(p.ownership_proj, 1),
                         'Days_Rest': getattr(p, 'days_rest', None),
@@ -18319,6 +18477,9 @@ if selected_page == "DFS Lineup Builder":
                                 "Cheap Core Reasons",
                                 "GPP Ceiling Score",
                                 "GPP Ceiling Tags",
+                                "Game Leverage Score",
+                                "Game Leverage Tags",
+                                "Game Own Share %",
                                 "Core Gate",
                                 "Low Own Gate",
                                 "Standout Gate",
@@ -18331,6 +18492,7 @@ if selected_page == "DFS Lineup Builder":
                                 "Leverage Rank",
                                 "Ceiling Rank",
                                 "GPP Ceiling Rank",
+                                "Game Leverage Rank",
                                 "Likely Blocker",
                             ]
                         ],
@@ -18344,6 +18506,8 @@ if selected_page == "DFS Lineup Builder":
                             "Lineup Exp%": st.column_config.NumberColumn(format="%.1f%%"),
                             "Cheap Core Score": st.column_config.NumberColumn(format="%.2f"),
                             "GPP Ceiling Score": st.column_config.NumberColumn(format="%.2f"),
+                            "Game Leverage Score": st.column_config.NumberColumn(format="%+.2f"),
+                            "Game Own Share %": st.column_config.NumberColumn(format="%.1f%%"),
                             "Segment Cap": st.column_config.NumberColumn(format="%.0f%%"),
                             "Risk Penalty": st.column_config.NumberColumn(format="%.2f"),
                             "Own Delta": st.column_config.NumberColumn(format="%+.1f"),
@@ -18942,6 +19106,7 @@ if selected_page == "DFS Lineup Builder":
                     scores = ginfo['stack_scores']
                     team_key = frozenset(ginfo['teams'])
                     odds_data = game_odds_lookup.get(team_key)
+                    lev_info = (game_leverage_summary or {}).get(dk_gid) or {}
 
                     if scores:
                         ss = max(scores)
@@ -18952,6 +19117,8 @@ if selected_page == "DFS Lineup Builder":
 
                     spread = odds_data.get('spread', 0) if odds_data else None
                     total = odds_data.get('total', 0) if odds_data else None
+                    lev_score = float(lev_info.get('game_leverage_score', 0.0) or 0.0)
+                    lev_own = lev_info.get('game_ownership_share')
 
                     # Default selection based on stack_score
                     if ss >= 0.75:
@@ -18964,10 +19131,19 @@ if selected_page == "DFS Lineup Builder":
                     col_game, col_sel = st.columns([3, 2])
                     with col_game:
                         score_bar = "🟢" if ss >= 0.75 else "🟡" if ss >= 0.50 else "🔴"
+                        lev_parts = [f"Lev: {lev_score:+.2f}"]
+                        if lev_own is not None:
+                            lev_parts.append(f"Game Own: {float(lev_own):.1f}%")
+                        lev_text = " | ".join(lev_parts)
                         if spread is not None and total is not None:
-                            st.markdown(f"**{matchup}** — Spread: {spread:+.1f} | Total: {total:.0f} | {score_bar} {ss:.2f}")
+                            st.markdown(
+                                f"**{matchup}** — Spread: {spread:+.1f} | Total: {total:.0f} | "
+                                f"{score_bar} {ss:.2f} | {lev_text}"
+                            )
                         else:
-                            st.markdown(f"**{matchup}** — {player_count} players | {score_bar} {ss:.2f}")
+                            st.markdown(
+                                f"**{matchup}** — {player_count} players | {score_bar} {ss:.2f} | {lev_text}"
+                            )
                     with col_sel:
                         choice = st.selectbox(
                             "Stack", stack_options, index=default_idx,
@@ -19839,6 +20015,8 @@ if selected_page == "DFS Lineup Builder":
                                     "RotoWire Avg Own %",
                                     "LineupStarter Avg Own %",
                                     "Blend Avg Own %",
+                                    "Avg Game Leverage",
+                                    "Avg Game Own Share %",
                                     "RotoWire Signals",
                                     "LineupStarter Signals",
                                     "Blend Signals",
@@ -19862,6 +20040,8 @@ if selected_page == "DFS Lineup Builder":
                                 "RotoWire Avg Own %": st.column_config.NumberColumn(format="%.1f%%"),
                                 "LineupStarter Avg Own %": st.column_config.NumberColumn(format="%.1f%%"),
                                 "Blend Avg Own %": st.column_config.NumberColumn(format="%.1f%%"),
+                                "Avg Game Leverage": st.column_config.NumberColumn(format="%+.2f"),
+                                "Avg Game Own Share %": st.column_config.NumberColumn(format="%.1f%%"),
                             },
                         )
 
@@ -19892,6 +20072,9 @@ if selected_page == "DFS Lineup Builder":
                                     "Supplement Proj Delta Applied",
                                     "Supplement Own Delta Applied",
                                     "RotoWire Own Delta Applied",
+                                    "Game Leverage",
+                                    "Game Own Share %",
+                                    "Game Leverage Tags",
                                     "Boost",
                                     "Game",
                                 ]
@@ -19916,6 +20099,8 @@ if selected_page == "DFS Lineup Builder":
                                 "Supplement Proj Delta Applied": st.column_config.NumberColumn(format="%+.1f"),
                                 "Supplement Own Delta Applied": st.column_config.NumberColumn(format="%+.1f"),
                                 "RotoWire Own Delta Applied": st.column_config.NumberColumn(format="%+.1f"),
+                                "Game Leverage": st.column_config.NumberColumn(format="%+.2f"),
+                                "Game Own Share %": st.column_config.NumberColumn(format="%.1f%%"),
                             },
                         )
 
@@ -21204,6 +21389,7 @@ if selected_page == "DFS Lineup Builder":
                 get_shark_strategy_profile,
                 analyze_top_finishers,
                 analyze_game_environment,
+                analyze_game_leverage,
                 build_tournament_postmortem,
             )
             import plotly.express as px
@@ -21603,10 +21789,16 @@ if selected_page == "DFS Lineup Builder":
 
                             with st.spinner("Analyzing game environment..."):
                                 env_analysis = analyze_game_environment(dfs_conn, selected_slate, analysis, top_n)
+                                game_leverage_analysis = analyze_game_leverage(
+                                    dfs_conn, selected_slate, analysis, top_n
+                                )
 
                             if env_analysis.get('errors'):
                                 for err in env_analysis['errors']:
                                     st.warning(f"⚠️ {err}")
+                            if game_leverage_analysis.get('errors'):
+                                for err in game_leverage_analysis['errors']:
+                                    st.caption(f"⚠️ {err}")
 
                             if env_analysis.get('games'):
                                 # Metrics row
@@ -21639,6 +21831,50 @@ if selected_page == "DFS Lineup Builder":
                                 game_env_df = pd.DataFrame(game_rows)
                                 st.dataframe(game_env_df, use_container_width=True, hide_index=True)
 
+                                if game_leverage_analysis.get('games'):
+                                    st.markdown("**Game Leverage vs Field Ownership**")
+                                    lev_summary = game_leverage_analysis.get('summary', {})
+                                    lev_m1, lev_m2, lev_m3 = st.columns(3)
+                                    lev_m1.metric(
+                                        "Ownership Source",
+                                        str(lev_summary.get('ownership_source', '—')).title(),
+                                    )
+                                    lev_m2.metric(
+                                        "Best Game Delta",
+                                        f"{float(lev_summary.get('best_delta', 0.0) or 0.0):+.1f}",
+                                        lev_summary.get('best_game') or "—",
+                                    )
+                                    lev_m3.metric(
+                                        "Top-Total Avg Delta",
+                                        f"{float(lev_summary.get('avg_total_rank_1_delta', 0.0) or 0.0):+.1f}",
+                                    )
+
+                                    leverage_rows = []
+                                    for g in game_leverage_analysis['games']:
+                                        leverage_rows.append(
+                                            {
+                                                'Game': g['game_label'],
+                                                'Total Rank': g.get('total_rank'),
+                                                'Own Rank': g.get('ownership_rank'),
+                                                'Vegas O/U': g.get('vegas_total'),
+                                                'Field Own %': g.get('ownership_share_pct'),
+                                                f'Top {top_n} Slot %': g.get('top_slot_share_pct'),
+                                                'Leverage Delta': g.get('leverage_delta_pct'),
+                                                'Tags': g.get('tags', ''),
+                                            }
+                                        )
+                                    st.dataframe(
+                                        pd.DataFrame(leverage_rows),
+                                        use_container_width=True,
+                                        hide_index=True,
+                                        column_config={
+                                            'Vegas O/U': st.column_config.NumberColumn(format="%.1f"),
+                                            'Field Own %': st.column_config.NumberColumn(format="%.1f%%"),
+                                            f'Top {top_n} Slot %': st.column_config.NumberColumn(format="%.1f%%"),
+                                            'Leverage Delta': st.column_config.NumberColumn(format="%+.1f"),
+                                        },
+                                    )
+
                                 # Bar chart: player usage by game, colored by Vegas total
                                 chart_data = pd.DataFrame([{
                                     'Game': g['game_label'],
@@ -21663,6 +21899,10 @@ if selected_page == "DFS Lineup Builder":
                                 if env_analysis.get('insights'):
                                     st.markdown("**Key Findings:**")
                                     for ins in env_analysis['insights']:
+                                        st.markdown(f"• {ins}")
+                                if game_leverage_analysis.get('insights'):
+                                    st.markdown("**Leverage Notes:**")
+                                    for ins in game_leverage_analysis['insights']:
                                         st.markdown(f"• {ins}")
 
                     # --- Tournament Postmortem Review ---
@@ -22098,10 +22338,14 @@ if selected_page == "DFS Lineup Builder":
                                                 'Cheap Core Reasons',
                                                 'GPP Ceiling Score',
                                                 'GPP Ceiling Tags',
+                                                'Game Leverage Score',
+                                                'Game Leverage Tags',
+                                                'Game Own Share %',
                                                 'Core Gate',
                                                 'Low Own Gate',
                                                 'Standout Gate',
                                                 'GPP Ceiling Rank',
+                                                'Game Leverage Rank',
                                                 'Own Delta',
                                                 'Proj Delta',
                                                 'field_exposure_pct',
@@ -22121,10 +22365,14 @@ if selected_page == "DFS Lineup Builder":
                                             'Reasons',
                                             'GPP Ceiling Score',
                                             'GPP Ceiling Tags',
+                                            'Game Leverage Score',
+                                            'Game Leverage Tags',
+                                            'Game Own Share %',
                                             'Core Gate',
                                             'Low Own Gate',
                                             'Standout Gate',
                                             'GPP Ceiling Rank',
+                                            'Game Leverage Rank',
                                             'Own Delta',
                                             'Proj Delta',
                                             'Field Exp %',
@@ -22135,11 +22383,11 @@ if selected_page == "DFS Lineup Builder":
                                         reason_view['Salary'] = reason_view['Salary'].apply(
                                             lambda x: f"${int(x):,}" if pd.notna(x) else "—"
                                         )
-                                        for c in ['Cheap-Core Score', 'GPP Ceiling Score', 'Own Delta', 'Proj Delta', 'Actual-Proj']:
+                                        for c in ['Cheap-Core Score', 'GPP Ceiling Score', 'Game Leverage Score', 'Own Delta', 'Proj Delta', 'Actual-Proj']:
                                             reason_view[c] = reason_view[c].apply(
                                                 lambda x: f"{x:.2f}" if pd.notna(x) else "—"
                                             )
-                                        for c in ['Field Exp %', 'Our Exp %']:
+                                        for c in ['Game Own Share %', 'Field Exp %', 'Our Exp %']:
                                             reason_view[c] = reason_view[c].apply(
                                                 lambda x: f"{x:.1f}%" if pd.notna(x) else "—"
                                             )
@@ -22524,13 +22772,19 @@ if selected_page == "DFS Lineup Builder":
                     if len(slate_dates) >= 2:
                         with st.expander("📊 Cross-Slate Game Environment Aggregate"):
                             all_env_games = []
+                            all_game_leverage = []
                             agg_errors = []
                             for s_date in slate_dates:
                                 s_analysis = analyze_top_finishers(dfs_conn, s_date, top_n)
                                 if not s_analysis.get('errors'):
                                     s_env = analyze_game_environment(dfs_conn, s_date, s_analysis, top_n)
+                                    s_lev = analyze_game_leverage(dfs_conn, s_date, s_analysis, top_n)
                                     all_env_games.extend(s_env.get('games', []))
+                                    all_game_leverage.extend(
+                                        [{**row, 'slate_date': s_date} for row in (s_lev.get('games') or [])]
+                                    )
                                     agg_errors.extend(s_env.get('errors', []))
+                                    agg_errors.extend(s_lev.get('errors', []))
 
                             if all_env_games:
                                 # Total bucket breakdown
@@ -22597,6 +22851,45 @@ if selected_page == "DFS Lineup Builder":
                                         st.info(f"Positive correlation ({corr:.2f}) confirms top lineups favor high-total games across {len(slate_dates)} slates")
                                     elif corr < -0.1:
                                         st.info(f"Negative correlation ({corr:.2f}) — top lineups did NOT favor high-total games across these slates")
+
+                                if all_game_leverage:
+                                    lev_df = pd.DataFrame(all_game_leverage)
+                                    st.markdown("**Game Leverage Examples**")
+                                    lev_col1, lev_col2 = st.columns(2)
+                                    with lev_col1:
+                                        st.caption("Best positive leverage games")
+                                        pos_cols = [
+                                            'slate_date', 'game_label', 'total_rank', 'ownership_rank',
+                                            'vegas_total', 'ownership_share_pct', 'top_slot_share_pct', 'leverage_delta_pct',
+                                        ]
+                                        st.dataframe(
+                                            lev_df.sort_values('leverage_delta_pct', ascending=False)[pos_cols].head(10),
+                                            use_container_width=True,
+                                            hide_index=True,
+                                            column_config={
+                                                'vegas_total': st.column_config.NumberColumn(format="%.1f"),
+                                                'ownership_share_pct': st.column_config.NumberColumn(format="%.1f%%"),
+                                                'top_slot_share_pct': st.column_config.NumberColumn(format="%.1f%%"),
+                                                'leverage_delta_pct': st.column_config.NumberColumn(format="%+.1f"),
+                                            },
+                                        )
+                                    with lev_col2:
+                                        st.caption("Most crowded / negative leverage games")
+                                        neg_cols = [
+                                            'slate_date', 'game_label', 'total_rank', 'ownership_rank',
+                                            'vegas_total', 'ownership_share_pct', 'top_slot_share_pct', 'leverage_delta_pct',
+                                        ]
+                                        st.dataframe(
+                                            lev_df.sort_values('leverage_delta_pct')[neg_cols].head(10),
+                                            use_container_width=True,
+                                            hide_index=True,
+                                            column_config={
+                                                'vegas_total': st.column_config.NumberColumn(format="%.1f"),
+                                                'ownership_share_pct': st.column_config.NumberColumn(format="%.1f%%"),
+                                                'top_slot_share_pct': st.column_config.NumberColumn(format="%.1f%%"),
+                                                'leverage_delta_pct': st.column_config.NumberColumn(format="%+.1f"),
+                                            },
+                                        )
 
                                 if agg_errors:
                                     for err in agg_errors:

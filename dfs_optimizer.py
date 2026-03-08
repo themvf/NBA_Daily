@@ -609,6 +609,15 @@ class DFSPlayer:
 
     # Stack scoring
     stack_score: float = 0.0      # Game stacking quality (0-1)
+    game_total: float = 0.0
+    game_spread_abs: float = 0.0
+    game_blowout_risk: float = 0.0
+    game_pace_score: float = 0.0
+    game_ownership_share: float = 0.0
+    game_total_rank: int = 0
+    game_ownership_rank: int = 0
+    game_leverage_score: float = 0.0
+    game_leverage_tags: str = ""
     is_star: bool = False         # Season avg >= 25 PPG
 
     # Minutes validation
@@ -745,6 +754,8 @@ LINEUP_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
         "standout_min_ceiling_gap": 7.0,
         "gpp_ceiling_signal_weight": 0.008,
         "gpp_ceiling_signal_cap": 0.12,
+        "game_leverage_signal_weight": 0.014,
+        "game_leverage_signal_cap": 0.08,
         "strategy_mix": [
             ("projection", 0.25, 0.20),
             ("ceiling", 0.30, 0.25),
@@ -769,6 +780,8 @@ LINEUP_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
         "standout_min_ceiling_gap": 8.0,
         "gpp_ceiling_signal_weight": 0.011,
         "gpp_ceiling_signal_cap": 0.16,
+        "game_leverage_signal_weight": 0.018,
+        "game_leverage_signal_cap": 0.11,
         "strategy_mix": [
             ("ceiling", 0.24, 0.45),
             ("leverage", 0.30, 0.25),
@@ -792,6 +805,8 @@ LINEUP_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
         "standout_min_ceiling_gap": 9.5,
         "gpp_ceiling_signal_weight": 0.013,
         "gpp_ceiling_signal_cap": 0.18,
+        "game_leverage_signal_weight": 0.022,
+        "game_leverage_signal_cap": 0.13,
         "strategy_mix": [
             ("ceiling", 0.20, 0.55),
             ("leverage", 0.28, 0.25),
@@ -814,6 +829,8 @@ LINEUP_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
         "standout_min_ceiling_gap": 7.5,
         "gpp_ceiling_signal_weight": 0.010,
         "gpp_ceiling_signal_cap": 0.14,
+        "game_leverage_signal_weight": 0.017,
+        "game_leverage_signal_cap": 0.10,
         "strategy_mix": [
             ("ceiling", 0.34, 0.30),
             ("leverage", 0.48, 0.20),
@@ -837,6 +854,8 @@ LINEUP_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
         "standout_min_ceiling_gap": 9.0,
         "gpp_ceiling_signal_weight": 0.015,
         "gpp_ceiling_signal_cap": 0.22,
+        "game_leverage_signal_weight": 0.024,
+        "game_leverage_signal_cap": 0.15,
         "strategy_mix": [
             ("ceiling", 0.18, 0.60),
             ("leverage", 0.26, 0.20),
@@ -1568,6 +1587,236 @@ def _vegas_signal_score_multiplier(
 
     adjustment *= strategy_scale
     return max(0.85, 1.0 + adjustment)
+
+
+def refresh_game_leverage_signals(
+    player_pool: List[DFSPlayer],
+    profile_cfg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Annotate players with a game-level leverage score based on environment vs ownership."""
+    profile_cfg = profile_cfg or {}
+
+    for player in player_pool:
+        player.game_ownership_share = 0.0
+        player.game_total_rank = 0
+        player.game_ownership_rank = 0
+        player.game_leverage_score = 0.0
+        player.game_leverage_tags = ""
+
+    active_players = [
+        p
+        for p in player_pool
+        if not bool(getattr(p, "is_injured", False))
+        and not bool(getattr(p, "is_excluded", False))
+        and float(getattr(p, "proj_fpts", 0.0) or 0.0) > 0
+    ]
+    if not active_players:
+        return {}
+
+    game_map: Dict[str, Dict[str, Any]] = {}
+    total_ownership = 0.0
+
+    for player in active_players:
+        game_id = str(getattr(player, "game_id", "") or "").strip()
+        if not game_id:
+            game_id = f"{player.team}_{player.opponent}"
+        bucket = game_map.setdefault(
+            game_id,
+            {
+                "game_id": game_id,
+                "teams": set(),
+                "players": [],
+                "ownership_sum": 0.0,
+                "totals": [],
+                "stack_scores": [],
+                "spreads": [],
+                "blowouts": [],
+            },
+        )
+        bucket["players"].append(player)
+        bucket["teams"].update(
+            team
+            for team in [str(player.team or "").strip(), str(player.opponent or "").strip()]
+            if team
+        )
+
+        ownership = max(0.0, float(getattr(player, "ownership_proj", 0.0) or 0.0))
+        bucket["ownership_sum"] += ownership
+        total_ownership += ownership
+
+        game_total = float(getattr(player, "game_total", 0.0) or 0.0)
+        if game_total > 0:
+            bucket["totals"].append(game_total)
+
+        stack_score = float(getattr(player, "stack_score", 0.0) or 0.0)
+        if stack_score > 0:
+            bucket["stack_scores"].append(stack_score)
+
+        spread_abs = float(getattr(player, "game_spread_abs", 0.0) or 0.0)
+        if spread_abs > 0:
+            bucket["spreads"].append(spread_abs)
+
+        blowout_risk = float(getattr(player, "game_blowout_risk", 0.0) or 0.0)
+        if blowout_risk > 0:
+            bucket["blowouts"].append(blowout_risk)
+
+    if len(game_map) <= 1:
+        return {}
+
+    def _avg(values: List[float], fallback: float = 0.0) -> float:
+        return float(np.mean(values)) if values else fallback
+
+    game_rows: List[Dict[str, Any]] = []
+    for bucket in game_map.values():
+        teams = sorted(bucket["teams"])
+        game_total = _avg(bucket["totals"], 0.0)
+        stack_score = _avg(bucket["stack_scores"], 0.5)
+        spread_abs = _avg(bucket["spreads"], 0.0)
+        blowout_risk = _avg(bucket["blowouts"], 0.0)
+        own_share = (
+            (bucket["ownership_sum"] / total_ownership) * 100.0 if total_ownership > 0 else 0.0
+        )
+        game_rows.append(
+            {
+                "game_id": bucket["game_id"],
+                "game_label": " vs ".join(teams) if teams else bucket["game_id"],
+                "teams": teams,
+                "game_total": game_total if game_total > 0 else None,
+                "stack_score": stack_score,
+                "spread_abs": spread_abs if spread_abs > 0 else None,
+                "blowout_risk": blowout_risk if blowout_risk > 0 else 0.0,
+                "game_ownership_share": own_share,
+                "players": bucket["players"],
+            }
+        )
+
+    total_rank_rows = sorted(
+        game_rows,
+        key=lambda row: (row["game_total"] is not None, row["game_total"] or -999.0),
+        reverse=True,
+    )
+    own_rank_rows = sorted(
+        game_rows,
+        key=lambda row: float(row["game_ownership_share"] or 0.0),
+        reverse=True,
+    )
+    total_rank_map = {row["game_id"]: idx + 1 for idx, row in enumerate(total_rank_rows)}
+    own_rank_map = {row["game_id"]: idx + 1 for idx, row in enumerate(own_rank_rows)}
+
+    game_count = len(game_rows)
+    even_share = 100.0 / max(1, game_count)
+    totals = [float(row["game_total"]) for row in game_rows if row["game_total"] is not None]
+    total_avg = float(np.mean(totals)) if totals else 0.0
+    stack_avg = float(np.mean([float(row["stack_score"] or 0.5) for row in game_rows]))
+    denom = max(1, game_count - 1)
+
+    summary: Dict[str, Dict[str, Any]] = {}
+    for row in game_rows:
+        game_id = row["game_id"]
+        total_rank = total_rank_map.get(game_id, 0)
+        own_rank = own_rank_map.get(game_id, 0)
+        total_rank_score = 1.0 - ((total_rank - 1) / denom) if total_rank else 0.0
+        own_rank_score = 1.0 - ((own_rank - 1) / denom) if own_rank else 0.0
+
+        game_total = float(row["game_total"] or 0.0)
+        stack_score = float(row["stack_score"] or 0.0)
+        spread_abs = float(row["spread_abs"] or 0.0)
+        blowout_risk = float(row["blowout_risk"] or 0.0)
+        own_share = float(row["game_ownership_share"] or 0.0)
+
+        leverage_gap = (total_rank_score - own_rank_score) * 2.6
+        own_gap = ((even_share - own_share) / max(4.0, even_share)) * 2.2
+        total_component = (
+            min(1.6, max(-1.0, (game_total - total_avg) / 4.5))
+            if game_total > 0 and total_avg > 0
+            else 0.0
+        )
+        stack_component = min(1.1, max(-0.6, (stack_score - stack_avg) * 2.6))
+        spread_penalty = min(0.7, max(0.0, spread_abs - 8.0) * 0.08)
+        blowout_penalty = min(0.8, max(0.0, blowout_risk - 0.45) * 1.4)
+
+        raw_score = leverage_gap + own_gap + total_component + stack_component
+        raw_score -= spread_penalty + blowout_penalty
+        raw_score = float(max(-3.5, min(4.5, raw_score)))
+
+        tags: List[str] = []
+        if total_rank and total_rank <= 2:
+            tags.append("top-total")
+        elif game_total > 0 and total_avg > 0 and game_total >= total_avg:
+            tags.append("good-total")
+        if own_share <= even_share * 0.90:
+            tags.append("underowned")
+        elif own_share >= even_share * 1.15:
+            tags.append("crowded")
+        if stack_score >= max(0.60, stack_avg):
+            tags.append("stack+")
+        if 0 < spread_abs <= 5.0:
+            tags.append("tight")
+        elif spread_abs >= 9.0:
+            tags.append("wide")
+        if raw_score >= 1.25:
+            tags.append("lev+")
+        elif raw_score <= -0.90:
+            tags.append("lev-")
+
+        summary[game_id] = {
+            "game_id": game_id,
+            "game_label": row["game_label"],
+            "teams": row["teams"],
+            "game_total": row["game_total"],
+            "stack_score": round(stack_score, 3),
+            "spread_abs": row["spread_abs"],
+            "blowout_risk": round(blowout_risk, 3),
+            "game_ownership_share": round(own_share, 3),
+            "total_rank": total_rank,
+            "ownership_rank": own_rank,
+            "game_leverage_score": round(raw_score, 3),
+            "game_leverage_tags": ", ".join(dict.fromkeys(tags)),
+        }
+
+        for player in row["players"]:
+            player.game_ownership_share = round(own_share, 3)
+            player.game_total_rank = int(total_rank or 0)
+            player.game_ownership_rank = int(own_rank or 0)
+            player.game_leverage_score = round(raw_score, 3)
+            player.game_leverage_tags = summary[game_id]["game_leverage_tags"]
+            if row["game_total"] is not None:
+                player.game_total = float(row["game_total"])
+            if row["spread_abs"] is not None:
+                player.game_spread_abs = float(row["spread_abs"])
+
+    return summary
+
+
+def _game_leverage_multiplier(
+    player: DFSPlayer,
+    strategy: str = "projection",
+    model_profile: Optional[Dict[str, Any]] = None,
+) -> float:
+    """Apply a bounded game-level leverage adjustment for GPP-oriented builds."""
+    profile_cfg = model_profile or {}
+    score = float(getattr(player, "game_leverage_score", 0.0) or 0.0)
+    if abs(score) < 0.05:
+        return 1.0
+
+    positive_cap = float(profile_cfg.get("game_leverage_signal_cap", 0.10) or 0.10)
+    negative_cap = float(
+        profile_cfg.get("game_leverage_signal_negative_cap", 0.05) or 0.05
+    )
+    weight = float(profile_cfg.get("game_leverage_signal_weight", 0.018) or 0.018)
+
+    if score > 0:
+        adjustment = min(positive_cap, score * weight)
+    else:
+        adjustment = -min(negative_cap, abs(score) * weight * 0.85)
+
+    strategy_scale = {
+        "projection": 0.25,
+        "value": 0.20,
+        "ceiling": 0.75,
+        "leverage": 1.00,
+    }.get(strategy, 0.35)
+    return max(0.90, 1.0 + (adjustment * strategy_scale))
 
 
 def refresh_gpp_ceiling_signal(
@@ -3118,7 +3367,8 @@ def enrich_players_with_correlation_model(
         try:
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT game_id, home_team, away_team, ot_probability, stack_score, total
+                SELECT game_id, home_team, away_team, ot_probability, stack_score, total,
+                       spread, pace_score, blowout_risk
                 FROM game_odds
                 WHERE date(game_date) = date(?)
             """, (game_date,))
@@ -3128,7 +3378,10 @@ def enrich_players_with_correlation_model(
                 env = {
                     'ot_probability': row[3] or 0.06,
                     'stack_score': row[4] or 0.5,
-                    'total': row[5] or 228
+                    'total': row[5] or 228,
+                    'spread': row[6],
+                    'pace_score': row[7] or 0.0,
+                    'blowout_risk': row[8] or 0.0,
                 }
                 game_environments[gid] = env
                 # Also key by team pair for matching DK game_ids
@@ -3173,7 +3426,13 @@ def enrich_players_with_correlation_model(
                 # Update stack score from game environment (match by team pair)
                 team_key = frozenset([p.team, p.opponent]) if p.opponent else None
                 if team_key and team_key in team_env_lookup:
-                    p.stack_score = team_env_lookup[team_key].get('stack_score', 0.5)
+                    env = team_env_lookup[team_key]
+                    p.stack_score = env.get('stack_score', 0.5)
+                    p.game_total = float(env.get('total') or 0.0)
+                    spread = env.get('spread')
+                    p.game_spread_abs = abs(float(spread)) if spread is not None else 0.0
+                    p.game_pace_score = float(env.get('pace_score') or 0.0)
+                    p.game_blowout_risk = float(env.get('blowout_risk') or 0.0)
 
                 # Mark as star
                 p.is_star = p.role_tier == 'STAR' or p.proj_points >= 25
@@ -3314,6 +3573,11 @@ def _select_stack_players(
                 p,
                 strategy=strategy,
                 model_key=model_key,
+                model_profile=model_profile,
+            )
+            * _game_leverage_multiplier(
+                p,
+                strategy=strategy,
                 model_profile=model_profile,
             )
             * _cheap_core_score_multiplier(
@@ -3545,6 +3809,11 @@ def optimize_lineup_randomized(
             p,
             strategy=strategy,
             model_key=model_key,
+            model_profile=model_profile,
+        )
+        base_score *= _game_leverage_multiplier(
+            p,
+            strategy=strategy,
             model_profile=model_profile,
         )
         base_score *= _gpp_ceiling_signal_multiplier(
@@ -3912,6 +4181,7 @@ def generate_diversified_lineups(
         profile_cfg.get("cheap_core_triple_inject_prob", 0.08) or 0.08
     )
     model_context = _build_midrange_minutes_vegas_context(filtered_pool, profile_cfg)
+    refresh_game_leverage_signals(filtered_pool, profile_cfg)
     for p in filtered_pool:
         refresh_gpp_ceiling_signal(p, profile_cfg)
     _dbg("cheap_core_candidates", int(cheap_core_context.get("candidate_count", 0) or 0))
@@ -3962,6 +4232,7 @@ def generate_diversified_lineups(
                 _risk_adjusted_fpts(p) * 0.65
                 + float(getattr(p, "proj_ceiling", 0.0) or 0.0) * 0.35
                 + float(getattr(p, "ceiling_opportunity_score", 0.0) or 0.0) * 0.30
+                + float(getattr(p, "game_leverage_score", 0.0) or 0.0) * 0.25
             )
             * (1.0 + min(30.0, float(getattr(p, "ownership_proj", 0.0) or 0.0)) / 100.0),
             float(getattr(p, "salary", 0.0) or 0.0),
@@ -3982,6 +4253,7 @@ def generate_diversified_lineups(
     low_own_candidates = sorted(
         low_own_candidates,
         key=lambda p: (
+            float(getattr(p, "game_leverage_score", 0.0) or 0.0),
             float(getattr(p, "ceiling_opportunity_score", 0.0) or 0.0),
             float(getattr(p, "leverage_score", 0.0) or 0.0),
             float(getattr(p, "proj_ceiling", 0.0) or 0.0),
@@ -4000,6 +4272,7 @@ def generate_diversified_lineups(
         standout_score = (
             (ceiling_gap ** 1.10) * (1.0 + max(0.0, 15.0 - ownership) / 18.0)
             + float(getattr(p, "ceiling_opportunity_score", 0.0) or 0.0) * 1.35
+            + float(getattr(p, "game_leverage_score", 0.0) or 0.0) * 0.85
         )
         standout_scored.append((p, standout_score))
     standout_scored.sort(key=lambda x: x[1], reverse=True)
@@ -4194,6 +4467,7 @@ def generate_diversified_lineups(
                             _risk_adjusted_fpts(p)
                             + (float(getattr(p, "proj_ceiling", 0.0) or 0.0) * 0.20)
                             + (float(getattr(p, "ceiling_opportunity_score", 0.0) or 0.0) * 0.80)
+                            + (float(getattr(p, "game_leverage_score", 0.0) or 0.0) * 0.40)
                             + (float(getattr(p, "ownership_proj", 0.0) or 0.0) * 0.30),
                         )
                         for p in weighted_pool
@@ -4215,6 +4489,7 @@ def generate_diversified_lineups(
                             0.05,
                             float(getattr(p, "leverage_score", 0.0) or 0.0) +
                             (float(getattr(p, "ceiling_opportunity_score", 0.0) or 0.0) * 0.90) +
+                            (float(getattr(p, "game_leverage_score", 0.0) or 0.0) * 0.75) +
                             (float(getattr(p, "proj_ceiling", 0.0) or 0.0) * 0.02),
                         )
                         for p in weighted_pool
@@ -4401,6 +4676,7 @@ def build_player_selection_diagnostics(
     ]
     if not active_players:
         return pd.DataFrame()
+    refresh_game_leverage_signals(active_players, profile_cfg)
     for p in active_players:
         refresh_gpp_ceiling_signal(p, profile_cfg)
 
@@ -4436,6 +4712,7 @@ def build_player_selection_diagnostics(
     leverage_rank = _rank_map("leverage_score", reverse=True)
     ceiling_rank = _rank_map("proj_ceiling", reverse=True)
     ceiling_signal_rank = _rank_map("ceiling_opportunity_score", reverse=True)
+    game_leverage_rank = _rank_map("game_leverage_score", reverse=True)
 
     rows: List[Dict[str, Any]] = []
     for player in active_players:
@@ -4509,6 +4786,17 @@ def build_player_selection_diagnostics(
                 "GPP Ceiling Tags": str(
                     getattr(player, "ceiling_opportunity_tags", "") or ""
                 ),
+                "Game Leverage Score": round(
+                    float(getattr(player, "game_leverage_score", 0.0) or 0.0),
+                    3,
+                ),
+                "Game Leverage Tags": str(
+                    getattr(player, "game_leverage_tags", "") or ""
+                ),
+                "Game Own Share %": round(
+                    float(getattr(player, "game_ownership_share", 0.0) or 0.0),
+                    3,
+                ),
                 "Core Gate": core_gate,
                 "Low Own Gate": low_own_gate,
                 "Standout Gate": standout_gate,
@@ -4539,6 +4827,7 @@ def build_player_selection_diagnostics(
                 "Leverage Rank": leverage_rank.get(player.player_id, 0),
                 "Ceiling Rank": ceiling_rank.get(player.player_id, 0),
                 "GPP Ceiling Rank": ceiling_signal_rank.get(player.player_id, 0),
+                "Game Leverage Rank": game_leverage_rank.get(player.player_id, 0),
                 "Likely Blocker": "; ".join(dict.fromkeys(blockers)) if blockers else "",
             }
         )
@@ -4552,10 +4841,11 @@ def build_player_selection_diagnostics(
             "Core Gate",
             "Low Own Gate",
             "GPP Ceiling Score",
+            "Game Leverage Score",
             "Cheap Core Score",
             "Eff Proj FPTS",
         ],
-        ascending=[False, False, False, False, False, False],
+        ascending=[False, False, False, False, False, False, False],
     ).reset_index(drop=True)
 
 

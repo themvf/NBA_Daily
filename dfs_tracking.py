@@ -4435,3 +4435,179 @@ def analyze_game_environment(
         result['errors'].append(f"Game environment analysis error: {e}")
 
     return result
+
+
+def analyze_game_leverage(
+    conn: sqlite3.Connection,
+    slate_date: str,
+    top_lineups_analysis: Dict,
+    top_n: int = 10,
+) -> Dict:
+    """Compare top-lineup game usage to slate ownership concentration by game."""
+    result = {
+        'games': [],
+        'summary': {},
+        'insights': [],
+        'errors': [],
+    }
+
+    env_analysis = analyze_game_environment(conn, slate_date, top_lineups_analysis, top_n)
+    if env_analysis.get('errors'):
+        result['errors'].extend(env_analysis.get('errors', []))
+
+    env_games = list(env_analysis.get('games', []) or [])
+    if not env_games:
+        if not result['errors']:
+            result['errors'].append(f"No game environment data found for {slate_date}")
+        return result
+
+    own_df = pd.read_sql_query(
+        """
+        SELECT team, actual_ownership, ownership_proj
+        FROM dfs_slate_projections
+        WHERE slate_date = ?
+        """,
+        conn,
+        params=[slate_date],
+    )
+    if own_df.empty:
+        result['errors'].append(f"No ownership data found for {slate_date}")
+        return result
+
+    actual_own = pd.to_numeric(own_df.get('actual_ownership'), errors='coerce')
+    use_projected = actual_own.dropna().empty or float(actual_own.fillna(0.0).sum()) <= 0.0
+    own_df['ownership_value'] = (
+        pd.to_numeric(own_df.get('ownership_proj'), errors='coerce').fillna(0.0)
+        if use_projected
+        else actual_own.fillna(0.0)
+    )
+    ownership_source = 'projected' if use_projected else 'actual'
+
+    team_own_lookup = (
+        own_df.groupby('team', as_index=False)['ownership_value']
+        .sum()
+        .set_index('team')['ownership_value']
+        .to_dict()
+    )
+
+    total_rank_rows = sorted(
+        env_games,
+        key=lambda g: (g.get('vegas_total') is not None, g.get('vegas_total') or -999.0),
+        reverse=True,
+    )
+    total_rank_map = {
+        row['game_label']: idx + 1 for idx, row in enumerate(total_rank_rows)
+    }
+
+    game_rows: List[Dict[str, Any]] = []
+    total_game_ownership = 0.0
+    for game in env_games:
+        game_label = str(game.get('game_label') or '').strip()
+        teams = [part.strip() for part in game_label.split('@')] if '@' in game_label else []
+        away = teams[0] if teams else ''
+        home = teams[1] if len(teams) > 1 else ''
+        ownership_sum = float(team_own_lookup.get(away, 0.0) + team_own_lookup.get(home, 0.0))
+        total_game_ownership += ownership_sum
+        game_rows.append(
+            {
+                'game_label': game_label,
+                'vegas_total': game.get('vegas_total'),
+                'spread': game.get('spread'),
+                'stack_score': game.get('stack_score'),
+                'top_lineup_players': int(game.get('top_lineup_players') or 0),
+                'top_slot_share_pct': float(game.get('pct_of_slots') or 0.0),
+                'ownership_sum': ownership_sum,
+                'total_rank': total_rank_map.get(game_label, 0),
+            }
+        )
+
+    if total_game_ownership <= 0:
+        result['errors'].append(f"No usable game ownership totals found for {slate_date}")
+        return result
+
+    own_rank_rows = sorted(
+        game_rows,
+        key=lambda row: float(row.get('ownership_sum') or 0.0),
+        reverse=True,
+    )
+    own_rank_map = {
+        row['game_label']: idx + 1 for idx, row in enumerate(own_rank_rows)
+    }
+
+    for row in game_rows:
+        own_share = (float(row['ownership_sum']) / total_game_ownership) * 100.0
+        leverage_delta = float(row['top_slot_share_pct']) - own_share
+        total_rank = int(row.get('total_rank') or 0)
+        own_rank = int(own_rank_map.get(row['game_label'], 0) or 0)
+        rank_gap = own_rank - total_rank
+
+        tags: List[str] = []
+        if total_rank and total_rank <= 2:
+            tags.append('top-total')
+        if rank_gap >= 2:
+            tags.append('underowned-env')
+        elif rank_gap <= -2:
+            tags.append('crowded-env')
+        if leverage_delta >= 4.0:
+            tags.append('won-leverage')
+        elif leverage_delta <= -4.0:
+            tags.append('chalk-trap')
+
+        row.update(
+            {
+                'ownership_share_pct': round(own_share, 3),
+                'ownership_rank': own_rank,
+                'rank_gap': rank_gap,
+                'leverage_delta_pct': round(leverage_delta, 3),
+                'tags': ", ".join(tags),
+            }
+        )
+
+    result['games'] = sorted(
+        game_rows,
+        key=lambda row: (
+            float(row.get('leverage_delta_pct') or 0.0),
+            float(row.get('vegas_total') or 0.0),
+        ),
+        reverse=True,
+    )
+
+    best_game = max(result['games'], key=lambda row: float(row.get('leverage_delta_pct') or -999.0))
+    worst_game = min(result['games'], key=lambda row: float(row.get('leverage_delta_pct') or 999.0))
+    result['summary'] = {
+        'ownership_source': ownership_source,
+        'best_game': best_game.get('game_label'),
+        'best_delta': float(best_game.get('leverage_delta_pct') or 0.0),
+        'worst_game': worst_game.get('game_label'),
+        'worst_delta': float(worst_game.get('leverage_delta_pct') or 0.0),
+        'avg_total_rank_1_delta': float(
+            np.mean(
+                [
+                    float(row.get('leverage_delta_pct') or 0.0)
+                    for row in result['games']
+                    if int(row.get('total_rank') or 0) == 1
+                ]
+            )
+        ) if any(int(row.get('total_rank') or 0) == 1 for row in result['games']) else 0.0,
+    }
+
+    insights: List[str] = []
+    if best_game.get('leverage_delta_pct', 0.0) > 0:
+        insights.append(
+            f"Best leverage game: {best_game['game_label']} ({best_game['leverage_delta_pct']:+.1f} pts vs game ownership share)"
+        )
+    if worst_game.get('leverage_delta_pct', 0.0) < 0:
+        insights.append(
+            f"Most over-owned game: {worst_game['game_label']} ({worst_game['leverage_delta_pct']:+.1f} pts vs game ownership share)"
+        )
+    avg_top_total_delta = float(result['summary'].get('avg_total_rank_1_delta') or 0.0)
+    if avg_top_total_delta < 0:
+        insights.append(
+            f"Highest-total games ran negative leverage on average ({avg_top_total_delta:+.1f})"
+        )
+    elif avg_top_total_delta > 0:
+        insights.append(
+            f"Highest-total games ran positive leverage on average ({avg_top_total_delta:+.1f})"
+        )
+    result['insights'] = insights
+    return result
