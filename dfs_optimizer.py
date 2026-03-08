@@ -637,6 +637,8 @@ class DFSPlayer:
     cheap_core_reason_tags: str = ""
     cheap_core_effective_exposure_cap: float = 1.0
     cheap_core_effective_risk_fpts: float = 0.0
+    ceiling_opportunity_score: float = 0.0
+    ceiling_opportunity_tags: str = ""
 
     def calculate_projections(self) -> None:
         """Calculate derived projection values."""
@@ -684,10 +686,7 @@ ROSTER_SLOTS = ['PG', 'SG', 'SF', 'PF', 'C', 'G', 'F', 'UTIL']
 SALARY_CAP = 50000
 MIN_GAMES = 2
 MIN_PLAYER_SALARY = 3000
-MIN_SALARY_PROJ_FPTS_GATE = 12.0
-MIN_SALARY_RECENT_MINUTES_GATE = 16.0
-MIN_SALARY_PROJ_FLOOR_GATE = 6.0
-MAX_MIN_SALARY_PLAYERS_PER_LINEUP = 1
+MAX_MIN_SALARY_PLAYERS_PER_LINEUP = 8
 MINUTES_VARIANCE_FILTER_MIN_SAMPLE = 8
 MINUTES_VARIANCE_FILTER_PERCENTILE = 75.0
 MINUTES_VARIANCE_ELITE_PROJ_FPTS = 34.0
@@ -744,6 +743,8 @@ LINEUP_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
         "low_own_min_projection": 22.0,
         "standout_lock_prob": 0.10,
         "standout_min_ceiling_gap": 7.0,
+        "gpp_ceiling_signal_weight": 0.008,
+        "gpp_ceiling_signal_cap": 0.12,
         "strategy_mix": [
             ("projection", 0.25, 0.20),
             ("ceiling", 0.30, 0.25),
@@ -766,6 +767,8 @@ LINEUP_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
         "low_own_min_projection": 20.0,
         "standout_lock_prob": 0.25,
         "standout_min_ceiling_gap": 8.0,
+        "gpp_ceiling_signal_weight": 0.011,
+        "gpp_ceiling_signal_cap": 0.16,
         "strategy_mix": [
             ("ceiling", 0.24, 0.45),
             ("leverage", 0.30, 0.25),
@@ -787,6 +790,8 @@ LINEUP_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
         "low_own_min_projection": 18.0,
         "standout_lock_prob": 0.35,
         "standout_min_ceiling_gap": 9.5,
+        "gpp_ceiling_signal_weight": 0.013,
+        "gpp_ceiling_signal_cap": 0.18,
         "strategy_mix": [
             ("ceiling", 0.20, 0.55),
             ("leverage", 0.28, 0.25),
@@ -807,6 +812,8 @@ LINEUP_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
         "low_own_min_projection": 20.0,
         "standout_lock_prob": 0.20,
         "standout_min_ceiling_gap": 7.5,
+        "gpp_ceiling_signal_weight": 0.010,
+        "gpp_ceiling_signal_cap": 0.14,
         "strategy_mix": [
             ("ceiling", 0.34, 0.30),
             ("leverage", 0.48, 0.20),
@@ -828,6 +835,8 @@ LINEUP_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
         "low_own_min_projection": 18.0,
         "standout_lock_prob": 0.55,
         "standout_min_ceiling_gap": 9.0,
+        "gpp_ceiling_signal_weight": 0.015,
+        "gpp_ceiling_signal_cap": 0.22,
         "strategy_mix": [
             ("ceiling", 0.18, 0.60),
             ("leverage", 0.26, 0.20),
@@ -1559,6 +1568,114 @@ def _vegas_signal_score_multiplier(
 
     adjustment *= strategy_scale
     return max(0.85, 1.0 + adjustment)
+
+
+def refresh_gpp_ceiling_signal(
+    player: DFSPlayer,
+    profile_cfg: Optional[Dict[str, Any]] = None,
+) -> float:
+    """Annotate a player with a bounded upside score built from existing GPP signals."""
+    profile_cfg = profile_cfg or {}
+
+    base_proj = _effective_risk_adjusted_fpts(player, profile_cfg)
+    proj_fpts = max(base_proj, float(getattr(player, "proj_fpts", 0.0) or 0.0))
+    proj_ceiling = max(proj_fpts, float(getattr(player, "proj_ceiling", 0.0) or 0.0))
+    ceiling_gap = max(0.0, proj_ceiling - base_proj)
+
+    p_top1 = max(0.0, min(1.0, float(getattr(player, "p_top1", 0.0) or 0.0)))
+    p_top3 = max(0.0, min(1.0, float(getattr(player, "p_top3", 0.0) or 0.0)))
+    vegas_edge = max(0.0, float(getattr(player, "vegas_edge_pct", 0.0) or 0.0))
+    vegas_implied = float(getattr(player, "vegas_implied_fpts", 0.0) or 0.0)
+    supplement_delta = max(
+        0.0,
+        float(getattr(player, "supplement_proj_delta_applied", 0.0) or 0.0),
+    )
+    recent_minutes = float(getattr(player, "recent_minutes_avg", 0.0) or 0.0)
+    ownership = max(0.0, float(getattr(player, "ownership_proj", 0.0) or 0.0))
+    analytics = str(getattr(player, "analytics_used", "") or "")
+    vegas_signal = str(getattr(player, "vegas_signal", "") or "").strip().upper()
+
+    gap_component = min(7.5, ceiling_gap * 0.55)
+    rel_gap_component = min(3.0, (ceiling_gap / max(12.0, base_proj, 1.0)) * 6.0)
+    sim_component = min(4.5, p_top1 * 22.0 + p_top3 * 7.0)
+    vegas_component = min(
+        3.0,
+        (vegas_edge * 0.10) + max(0.0, vegas_implied - proj_fpts) * 0.35,
+    )
+    supplement_component = min(2.5, supplement_delta * 0.60)
+    minutes_component = min(2.5, max(0.0, recent_minutes - 26.0) * 0.12)
+    ownership_component = min(1.8, max(0.0, 12.0 - ownership) * 0.12)
+
+    signal_component = 0.0
+    tags: List[str] = []
+    if ceiling_gap >= 8.0:
+        tags.append("gap")
+    if sim_component >= 0.75:
+        signal_component += 0.45
+        tags.append("sim")
+    if vegas_component >= 0.60 or vegas_signal == "BOOST":
+        signal_component += 0.65
+        tags.append("vegas")
+    if supplement_component >= 0.50:
+        signal_component += 0.35
+        tags.append("supp")
+    if recent_minutes >= 30.0:
+        tags.append("mins")
+    if ownership <= 12.0 and ceiling_gap >= 6.0:
+        tags.append("low-own")
+    if "💉" in analytics:
+        signal_component += 1.00
+        tags.append("inj")
+    if "⚡" in analytics:
+        signal_component += 0.75
+        tags.append("pace")
+    if "🎯" in analytics:
+        signal_component += 0.55
+        tags.append("matchup")
+    if "💪" in analytics:
+        signal_component += 0.35
+        tags.append("rest")
+
+    total_score = (
+        gap_component
+        + rel_gap_component
+        + sim_component
+        + vegas_component
+        + supplement_component
+        + minutes_component
+        + ownership_component
+        + signal_component
+    )
+
+    player.ceiling_opportunity_score = round(max(0.0, total_score), 3)
+    player.ceiling_opportunity_tags = ", ".join(dict.fromkeys(tags))
+    return player.ceiling_opportunity_score
+
+
+def _gpp_ceiling_signal_multiplier(
+    player: DFSPlayer,
+    strategy: str = "projection",
+    model_profile: Optional[Dict[str, Any]] = None,
+) -> float:
+    """Apply a bounded upside multiplier from the composite ceiling-opportunity score."""
+    profile_cfg = model_profile or {}
+    score = float(getattr(player, "ceiling_opportunity_score", 0.0) or 0.0)
+    if score <= 0:
+        score = refresh_gpp_ceiling_signal(player, profile_cfg)
+    if score <= 0:
+        return 1.0
+
+    base_adjustment = min(
+        float(profile_cfg.get("gpp_ceiling_signal_cap", 0.18) or 0.18),
+        score * float(profile_cfg.get("gpp_ceiling_signal_weight", 0.010) or 0.010),
+    )
+    strategy_scale = {
+        "projection": 0.35,
+        "value": 0.25,
+        "ceiling": 1.00,
+        "leverage": 0.85,
+    }.get(strategy, 0.40)
+    return max(1.0, 1.0 + (base_adjustment * strategy_scale))
 
 
 # =============================================================================
@@ -3367,23 +3484,7 @@ def optimize_lineup_randomized(
         return player.salary <= MIN_PLAYER_SALARY
 
     def min_salary_player_eligible(player: DFSPlayer) -> bool:
-        if not is_min_salary_player(player):
-            return True
-        if bool(getattr(player, "is_locked", False)):
-            return True
-        if bool(getattr(player, "is_fallback", False)):
-            return False
-        proj_fpts = float(getattr(player, "proj_fpts", 0.0) or 0.0)
-        minutes_ok = bool(getattr(player, "minutes_validated", False))
-        recent_minutes = float(getattr(player, "recent_minutes_avg", 0.0) or 0.0)
-        proj_floor = float(getattr(player, "proj_floor", 0.0) or 0.0)
-        # Keep minimum-salary plays on a tight leash to reduce DNP/zero-point risk.
-        return (
-            proj_fpts >= MIN_SALARY_PROJ_FPTS_GATE
-            and minutes_ok
-            and recent_minutes >= MIN_SALARY_RECENT_MINUTES_GATE
-            and proj_floor >= MIN_SALARY_PROJ_FLOOR_GATE
-        )
+        return True
 
     # Filter available players (exclude injured, excluded, and specified IDs)
     available = [
@@ -3444,6 +3545,11 @@ def optimize_lineup_randomized(
             p,
             strategy=strategy,
             model_key=model_key,
+            model_profile=model_profile,
+        )
+        base_score *= _gpp_ceiling_signal_multiplier(
+            p,
+            strategy=strategy,
             model_profile=model_profile,
         )
 
@@ -3806,6 +3912,8 @@ def generate_diversified_lineups(
         profile_cfg.get("cheap_core_triple_inject_prob", 0.08) or 0.08
     )
     model_context = _build_midrange_minutes_vegas_context(filtered_pool, profile_cfg)
+    for p in filtered_pool:
+        refresh_gpp_ceiling_signal(p, profile_cfg)
     _dbg("cheap_core_candidates", int(cheap_core_context.get("candidate_count", 0) or 0))
     _dbg("cheap_core_pairs", len(cheap_core_context.get("pair_pool", []) or []))
     _dbg("cheap_core_triples", len(cheap_core_context.get("triple_pool", []) or []))
@@ -3853,6 +3961,7 @@ def generate_diversified_lineups(
             (
                 _risk_adjusted_fpts(p) * 0.65
                 + float(getattr(p, "proj_ceiling", 0.0) or 0.0) * 0.35
+                + float(getattr(p, "ceiling_opportunity_score", 0.0) or 0.0) * 0.30
             )
             * (1.0 + min(30.0, float(getattr(p, "ownership_proj", 0.0) or 0.0)) / 100.0),
             float(getattr(p, "salary", 0.0) or 0.0),
@@ -3873,6 +3982,7 @@ def generate_diversified_lineups(
     low_own_candidates = sorted(
         low_own_candidates,
         key=lambda p: (
+            float(getattr(p, "ceiling_opportunity_score", 0.0) or 0.0),
             float(getattr(p, "leverage_score", 0.0) or 0.0),
             float(getattr(p, "proj_ceiling", 0.0) or 0.0),
         ),
@@ -3887,7 +3997,10 @@ def generate_diversified_lineups(
         if ceiling_gap < standout_min_ceiling_gap:
             continue
         ownership = max(1.0, float(getattr(p, "ownership_proj", 0.0) or 0.0))
-        standout_score = (ceiling_gap ** 1.15) * (1.0 + max(0.0, 15.0 - ownership) / 18.0)
+        standout_score = (
+            (ceiling_gap ** 1.10) * (1.0 + max(0.0, 15.0 - ownership) / 18.0)
+            + float(getattr(p, "ceiling_opportunity_score", 0.0) or 0.0) * 1.35
+        )
         standout_scored.append((p, standout_score))
     standout_scored.sort(key=lambda x: x[1], reverse=True)
     standout_scored = standout_scored[:40]
@@ -4080,6 +4193,7 @@ def generate_diversified_lineups(
                             0.05,
                             _risk_adjusted_fpts(p)
                             + (float(getattr(p, "proj_ceiling", 0.0) or 0.0) * 0.20)
+                            + (float(getattr(p, "ceiling_opportunity_score", 0.0) or 0.0) * 0.80)
                             + (float(getattr(p, "ownership_proj", 0.0) or 0.0) * 0.30),
                         )
                         for p in weighted_pool
@@ -4100,6 +4214,7 @@ def generate_diversified_lineups(
                         max(
                             0.05,
                             float(getattr(p, "leverage_score", 0.0) or 0.0) +
+                            (float(getattr(p, "ceiling_opportunity_score", 0.0) or 0.0) * 0.90) +
                             (float(getattr(p, "proj_ceiling", 0.0) or 0.0) * 0.02),
                         )
                         for p in weighted_pool
@@ -4286,6 +4401,8 @@ def build_player_selection_diagnostics(
     ]
     if not active_players:
         return pd.DataFrame()
+    for p in active_players:
+        refresh_gpp_ceiling_signal(p, profile_cfg)
 
     def _rank_map(metric_name: str, reverse: bool = True) -> Dict[int, int]:
         sorted_players = sorted(
@@ -4318,6 +4435,7 @@ def build_player_selection_diagnostics(
     }
     leverage_rank = _rank_map("leverage_score", reverse=True)
     ceiling_rank = _rank_map("proj_ceiling", reverse=True)
+    ceiling_signal_rank = _rank_map("ceiling_opportunity_score", reverse=True)
 
     rows: List[Dict[str, Any]] = []
     for player in active_players:
@@ -4384,6 +4502,13 @@ def build_player_selection_diagnostics(
                 "Cheap Core Reasons": str(
                     getattr(player, "cheap_core_reason_tags", "") or ""
                 ),
+                "GPP Ceiling Score": round(
+                    float(getattr(player, "ceiling_opportunity_score", 0.0) or 0.0),
+                    3,
+                ),
+                "GPP Ceiling Tags": str(
+                    getattr(player, "ceiling_opportunity_tags", "") or ""
+                ),
                 "Core Gate": core_gate,
                 "Low Own Gate": low_own_gate,
                 "Standout Gate": standout_gate,
@@ -4413,6 +4538,7 @@ def build_player_selection_diagnostics(
                 "Value Rank": eff_value_rank.get(player.player_id, 0),
                 "Leverage Rank": leverage_rank.get(player.player_id, 0),
                 "Ceiling Rank": ceiling_rank.get(player.player_id, 0),
+                "GPP Ceiling Rank": ceiling_signal_rank.get(player.player_id, 0),
                 "Likely Blocker": "; ".join(dict.fromkeys(blockers)) if blockers else "",
             }
         )
@@ -4425,10 +4551,11 @@ def build_player_selection_diagnostics(
             "Cheap Core",
             "Core Gate",
             "Low Own Gate",
+            "GPP Ceiling Score",
             "Cheap Core Score",
             "Eff Proj FPTS",
         ],
-        ascending=[False, False, False, False, False],
+        ascending=[False, False, False, False, False, False],
     ).reset_index(drop=True)
 
 

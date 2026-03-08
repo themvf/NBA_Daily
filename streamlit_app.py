@@ -16799,16 +16799,10 @@ if selected_page == "DFS Lineup Builder":
             "Min player salary",
             min_value=3000,
             max_value=5000,
-            value=3100,
+            value=3000,
             step=100,
             key="dfs_builder_min_salary",
-            help="Filter out players below this salary. Default is $3,100 to avoid $3K punt/DNP risk.",
-        )
-        allow_min_salary_punts = st.checkbox(
-            "Allow $3K punt plays",
-            value=False,
-            key="dfs_builder_allow_min_salary_punts",
-            help="When off, $3,000 players are excluded unless manually locked.",
+            help="Filter out players below this salary.",
         )
         max_remaining_salary = st.slider(
             "Max remaining salary",
@@ -17668,8 +17662,17 @@ if selected_page == "DFS Lineup Builder":
                     f"{int(ROTOWIRE_PRE_RUN_MODEL_OWNERSHIP_WEIGHT * 100)}% model)."
                 )
 
+            for p in players:
+                dfs.refresh_gpp_ceiling_signal(p)
+
             # Sort options
-            sort_options = ["Projected FPTS", "Salary", "Value (FPTS/$)", "Ceiling"]
+            sort_options = [
+                "Projected FPTS",
+                "Salary",
+                "Value (FPTS/$)",
+                "Ceiling",
+                "GPP Ceiling Signal",
+            ]
             if vegas_sigs:
                 sort_options.append("Vegas Edge")
             if ai_adjusted_players > 0:
@@ -17686,6 +17689,11 @@ if selected_page == "DFS Lineup Builder":
                 filtered.sort(key=lambda p: p.salary, reverse=True)
             elif sort_by == "Value (FPTS/$)":
                 filtered.sort(key=lambda p: p.fpts_per_dollar, reverse=True)
+            elif sort_by == "GPP Ceiling Signal":
+                filtered.sort(
+                    key=lambda p: float(getattr(p, "ceiling_opportunity_score", 0.0) or 0.0),
+                    reverse=True,
+                )
             elif sort_by == "Vegas Edge":
                 filtered.sort(key=lambda p: vegas_sigs.get(p.player_id, {}).get('edge_pct', 0), reverse=True)
             elif sort_by == "AI Delta":
@@ -17760,6 +17768,8 @@ if selected_page == "DFS Lineup Builder":
                 row.update({
                     'Floor': round(p.proj_floor, 1),
                     'Ceiling': round(p.proj_ceiling, 1),
+                    'GPP Ceiling': round(float(getattr(p, 'ceiling_opportunity_score', 0.0) or 0.0), 2),
+                    'GPP Tags': str(getattr(p, 'ceiling_opportunity_tags', '') or ''),
                     'Value': round(p.fpts_per_dollar, 2),
                     'Rest': rest_indicator,
                     'Own%': round(p.ownership_proj, 1),
@@ -17775,6 +17785,7 @@ if selected_page == "DFS Lineup Builder":
                 'Salary': st.column_config.NumberColumn(format="$%d"),
                 'Floor': st.column_config.NumberColumn(format="%.1f"),
                 'Ceiling': st.column_config.NumberColumn(format="%.1f"),
+                'GPP Ceiling': st.column_config.NumberColumn(format="%.2f"),
                 'Value': st.column_config.NumberColumn(format="%.2f"),
                 'Own%': st.column_config.NumberColumn(format="%.1f%%"),
             }
@@ -18194,6 +18205,8 @@ if selected_page == "DFS Lineup Builder":
                         'Proj_FPTS': round(p.proj_fpts, 2),
                         'Floor': round(p.proj_floor, 2),
                         'Ceiling': round(p.proj_ceiling, 2),
+                        'GPP_Ceiling_Score': round(float(getattr(p, 'ceiling_opportunity_score', 0.0) or 0.0), 3),
+                        'GPP_Ceiling_Tags': str(getattr(p, 'ceiling_opportunity_tags', '') or ''),
                         'Value': round(p.fpts_per_dollar, 3),
                         'Own_Pct': round(p.ownership_proj, 1),
                         'Days_Rest': getattr(p, 'days_rest', None),
@@ -18304,6 +18317,8 @@ if selected_page == "DFS Lineup Builder":
                                 "Cheap Core",
                                 "Cheap Core Score",
                                 "Cheap Core Reasons",
+                                "GPP Ceiling Score",
+                                "GPP Ceiling Tags",
                                 "Core Gate",
                                 "Low Own Gate",
                                 "Standout Gate",
@@ -18315,6 +18330,7 @@ if selected_page == "DFS Lineup Builder":
                                 "Value Rank",
                                 "Leverage Rank",
                                 "Ceiling Rank",
+                                "GPP Ceiling Rank",
                                 "Likely Blocker",
                             ]
                         ],
@@ -18327,6 +18343,7 @@ if selected_page == "DFS Lineup Builder":
                             "Own %": st.column_config.NumberColumn(format="%.1f%%"),
                             "Lineup Exp%": st.column_config.NumberColumn(format="%.1f%%"),
                             "Cheap Core Score": st.column_config.NumberColumn(format="%.2f"),
+                            "GPP Ceiling Score": st.column_config.NumberColumn(format="%.2f"),
                             "Segment Cap": st.column_config.NumberColumn(format="%.0f%%"),
                             "Risk Penalty": st.column_config.NumberColumn(format="%.2f"),
                             "Own Delta": st.column_config.NumberColumn(format="%+.1f"),
@@ -18991,20 +19008,6 @@ if selected_page == "DFS Lineup Builder":
                     salary_filtered_count = len(players) - len(filtered_players)
                     if salary_filtered_count > 0:
                         st.info(f"💰 Filtered out {salary_filtered_count} players below ${min_salary:,} salary")
-
-                    if not allow_min_salary_punts:
-                        min_player_salary = int(getattr(dfs, "MIN_PLAYER_SALARY", 3000) or 3000)
-                        before_punt_filter = len(filtered_players)
-                        filtered_players = [
-                            p for p in filtered_players
-                            if p.salary > min_player_salary or bool(getattr(p, "is_locked", False))
-                        ]
-                        punt_filtered_count = before_punt_filter - len(filtered_players)
-                        if punt_filtered_count > 0:
-                            st.info(
-                                f"🚫 Excluded {punt_filtered_count} $3K punt player(s). "
-                                "Enable `Allow $3K punt plays` to include them."
-                            )
 
                     # Snapshot calibration coverage in the active pool so we can flag
                     # low-coverage slates before trusting corrected projections.
