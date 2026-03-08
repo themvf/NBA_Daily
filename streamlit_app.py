@@ -15166,7 +15166,12 @@ def _load_saved_dfs_supplement_state(
             where_clauses.append("lower(source_name) LIKE '%rotowire%'")
         elif source_filter_value in {"lineupstarter", "lineup_starter", "lineup-starter"}:
             where_clauses.append(
-                "(lower(source_name) LIKE '%lineupstarter%' OR lower(source_name) LIKE '%lineup starter%')"
+                "("
+                "lower(source_name) LIKE '%lineupstarter%' "
+                "OR lower(source_name) LIKE '%lineup starter%' "
+                "OR lower(source_name) LIKE '%linestarter%' "
+                "OR lower(source_name) LIKE '%line starter%'"
+                ")"
             )
         elif source_filter_value == "non_rotowire":
             where_clauses.append("lower(source_name) NOT LIKE '%rotowire%'")
@@ -17585,6 +17590,14 @@ if selected_page == "DFS Lineup Builder":
         st.subheader("Player Pool & Projections")
 
         if not st.session_state.dfs_player_pool:
+            recovery_date = (
+                st.session_state.get("dfs_projection_date")
+                or (st.session_state.get("dfs_slate_context", {}) or {}).get("slate_date")
+                or str(datetime.now(EASTERN_TZ).date())
+            )
+            _recover_dfs_session_from_cache(dfs_conn, str(recovery_date))
+
+        if not st.session_state.dfs_player_pool:
             st.info("Load a slate in the first tab and generate projections to populate the player pool.")
         else:
             current_slate_date = (
@@ -18597,6 +18610,14 @@ if selected_page == "DFS Lineup Builder":
         st.subheader("Generated Lineups")
 
         if not st.session_state.dfs_player_pool:
+            recovery_date = (
+                st.session_state.get("dfs_projection_date")
+                or (st.session_state.get("dfs_slate_context", {}) or {}).get("slate_date")
+                or str(datetime.now(EASTERN_TZ).date())
+            )
+            _recover_dfs_session_from_cache(dfs_conn, str(recovery_date))
+
+        if not st.session_state.dfs_player_pool:
             st.info("Load a slate and generate projections first.")
         else:
             players = st.session_state.dfs_player_pool
@@ -18959,9 +18980,9 @@ if selected_page == "DFS Lineup Builder":
                 or float(profile.get("supplement_own_weight", 0.0) or 0.0) > 0
             }
             has_current_supplement = bool(
-                supplement_state
-                and str(supplement_state.get("slate_date") or "") == current_slate_date
-                and (supplement_state.get("player_map") or {})
+                lineup_generation_supplement_state
+                and str(lineup_generation_supplement_state.get("slate_date") or "") == current_slate_date
+                and (lineup_generation_supplement_state.get("player_map") or {})
             )
             if run_mode == "All Versions" and not has_current_supplement and supplement_required_models:
                 st.warning(
@@ -24313,6 +24334,10 @@ if selected_page == "DFS Lineup Builder":
                                 ),
                             },
                         }
+                        st.caption(
+                            "Matched supplement snapshots auto-save as soon as this comparison is built. "
+                            "Use the button below to force a re-save if you want to confirm persistence."
+                        )
 
                         if run_key != st.session_state.get("dfs_supplement_saved_run_key", ""):
                             try:
@@ -24403,6 +24428,33 @@ if selected_page == "DFS Lineup Builder":
                                 )
                             except Exception as exc:
                                 st.warning(f"Could not save supplement snapshot: {exc}")
+
+                        save_button_col, save_status_col = st.columns([1.2, 4])
+                        with save_button_col:
+                            manual_save_clicked = st.button(
+                                "Save / Resave Snapshot",
+                                key=f"dfs_supplement_manual_save_{run_key}",
+                                use_container_width=True,
+                            )
+                        with save_status_col:
+                            if st.session_state.get("dfs_supplement_saved_run_key", "") == run_key:
+                                st.caption(
+                                    f"Current snapshot run key `{run_key}` is saved for slate {slate_date}."
+                                )
+
+                        if manual_save_clicked:
+                            save_error = _save_dfs_supplement_state(
+                                dfs_conn,
+                                supplement_state=st.session_state.get("dfs_supplement_state", {}) or {},
+                                comparison_df=comparison_df,
+                                unmatched_df=unmatched_df,
+                            )
+                            if save_error:
+                                st.warning(f"Could not save supplement snapshot: {save_error}")
+                            else:
+                                st.success(
+                                    f"Saved supplement snapshot for {slate_date}: {source_name}"
+                                )
 
                         if method_counts:
                             method_parts = [
