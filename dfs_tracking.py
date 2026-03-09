@@ -191,6 +191,27 @@ def create_dfs_tracking_tables(conn: sqlite3.Connection) -> None:
             created_at TEXT,
             PRIMARY KEY (slate_date, player_id, salary, positions)
         );
+
+        CREATE TABLE IF NOT EXISTS dfs_ownership_calibration_runs (
+            run_key TEXT PRIMARY KEY,
+            model_version TEXT NOT NULL,
+            fitted_at TEXT NOT NULL,
+            train_start_date TEXT,
+            train_end_date TEXT,
+            holdout_start_date TEXT,
+            holdout_end_date TEXT,
+            total_rows INTEGER,
+            train_rows INTEGER,
+            test_rows INTEGER,
+            source_rows_train INTEGER,
+            source_rows_test INTEGER,
+            feature_count_base INTEGER,
+            feature_count_source INTEGER,
+            base_metrics_json TEXT,
+            final_metrics_json TEXT,
+            baseline_metrics_json TEXT,
+            artifact_json TEXT
+        );
     """)
 
     # Migration-safe column additions (check first, then add if missing)
@@ -232,6 +253,8 @@ def create_dfs_tracking_tables(conn: sqlite3.Connection) -> None:
             ON dfs_dk_slate_player_cache(slate_date);
         CREATE INDEX IF NOT EXISTS idx_ddspc_player
             ON dfs_dk_slate_player_cache(player_id);
+        CREATE INDEX IF NOT EXISTS idx_docr_fitted_at
+            ON dfs_ownership_calibration_runs(fitted_at);
     """)
 
     # --- Opponent tracking tables ---

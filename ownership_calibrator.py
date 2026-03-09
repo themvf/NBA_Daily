@@ -1,0 +1,1342 @@
+#!/usr/bin/env python3
+"""Build and fit a DFS ownership calibration dataset.
+
+The goal is to learn toward actual ownership while treating third-party
+ownership sources as explanatory features, not as the prediction target.
+
+This module exposes two main entry points:
+    - build_ownership_training_dataset(...)
+    - fit_ownership_calibrator(...)
+
+It can also be run directly as a CLI to export the training frame and save
+calibration summaries back into SQLite.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sqlite3
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from secrets import token_hex
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import Ridge
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+
+MODEL_VERSION = "ownership_calibrator_v1"
+SOURCE_SHRINK_K = 250.0
+
+
+@dataclass
+class OwnershipCalibrationResult:
+    """Container for the fitted calibration summary."""
+
+    run_key: str
+    model_version: str
+    fitted_at: str
+    total_rows: int
+    train_rows: int
+    test_rows: int
+    source_rows_train: int
+    source_rows_test: int
+    train_start_date: Optional[str]
+    train_end_date: Optional[str]
+    holdout_start_date: Optional[str]
+    holdout_end_date: Optional[str]
+    feature_count_base: int
+    feature_count_source: int
+    base_metrics: Dict[str, Any]
+    final_metrics: Dict[str, Any]
+    baseline_metrics: Dict[str, Any]
+    artifact: Dict[str, Any]
+
+
+def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table_name,),
+    ).fetchone()
+    return bool(row)
+
+
+def _normalize_source_bucket(source_name: object) -> str:
+    raw = str(source_name or "").strip().lower()
+    if "rotowire" in raw:
+        return "rotowire"
+    if "lineupstarter" in raw or "linestarter" in raw or "line starter" in raw:
+        return "lineupstarter"
+    return ""
+
+
+def _primary_position(raw_positions: object) -> str:
+    raw = str(raw_positions or "").upper().replace("-", "/").replace(",", "/")
+    if not raw:
+        return "UNK"
+    valid = {"PG", "SG", "SF", "PF", "C"}
+    alias_map = {
+        "G": "PG",
+        "GUARD": "PG",
+        "F": "PF",
+        "FORWARD": "PF",
+        "UTIL": "C",
+        "U": "C",
+    }
+    for token in [piece.strip() for piece in raw.split("/") if piece.strip()]:
+        if token in valid:
+            return token
+        if token in alias_map:
+            return alias_map[token]
+    return "UNK"
+
+
+def _ensure_calibration_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS dfs_ownership_calibration_runs (
+            run_key TEXT PRIMARY KEY,
+            model_version TEXT NOT NULL,
+            fitted_at TEXT NOT NULL,
+            train_start_date TEXT,
+            train_end_date TEXT,
+            holdout_start_date TEXT,
+            holdout_end_date TEXT,
+            total_rows INTEGER,
+            train_rows INTEGER,
+            test_rows INTEGER,
+            source_rows_train INTEGER,
+            source_rows_test INTEGER,
+            feature_count_base INTEGER,
+            feature_count_source INTEGER,
+            base_metrics_json TEXT,
+            final_metrics_json TEXT,
+            baseline_metrics_json TEXT,
+            artifact_json TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_docr_fitted_at
+        ON dfs_ownership_calibration_runs(fitted_at)
+        """
+    )
+    conn.commit()
+
+
+def _read_base_ownership_rows(
+    conn: sqlite3.Connection,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+) -> pd.DataFrame:
+    if not _table_exists(conn, "dfs_slate_projections"):
+        return pd.DataFrame()
+
+    filters = ["p.salary > 0"]
+    params: List[Any] = []
+    if start_date:
+        filters.append("date(p.slate_date) >= date(?)")
+        params.append(start_date)
+    if end_date:
+        filters.append("date(p.slate_date) <= date(?)")
+        params.append(end_date)
+    where_clause = " AND ".join(filters)
+
+    contest_cte = (
+        "contest_slates AS (SELECT DISTINCT slate_date FROM dfs_contest_entries)"
+        if _table_exists(conn, "dfs_contest_entries")
+        else "contest_slates AS (SELECT NULL AS slate_date WHERE 1 = 0)"
+    )
+
+    query = f"""
+        WITH {contest_cte}
+        SELECT
+            date(p.slate_date) AS slate_date,
+            p.player_id,
+            p.player_name,
+            p.team,
+            p.opponent,
+            p.salary,
+            p.positions,
+            p.proj_fpts,
+            p.proj_floor,
+            p.proj_ceiling,
+            p.fpts_per_dollar,
+            p.ownership_proj AS our_ownership_proj,
+            p.actual_ownership AS recorded_actual_ownership,
+            CASE
+                WHEN cs.slate_date IS NOT NULL THEN COALESCE(p.actual_ownership, 0.0)
+                ELSE p.actual_ownership
+            END AS target_actual_ownership,
+            CASE
+                WHEN cs.slate_date IS NOT NULL AND p.actual_ownership IS NULL THEN 1
+                ELSE 0
+            END AS actual_ownership_imputed_zero,
+            CASE WHEN cs.slate_date IS NOT NULL THEN 1 ELSE 0 END AS contest_imported,
+            p.actual_fpts,
+            p.actual_minutes,
+            COALESCE(p.did_play, 0) AS did_play
+        FROM dfs_slate_projections p
+        LEFT JOIN contest_slates cs
+            ON cs.slate_date = p.slate_date
+        WHERE {where_clause}
+          AND (
+              p.actual_ownership IS NOT NULL
+              OR cs.slate_date IS NOT NULL
+          )
+    """
+    df = pd.read_sql_query(query, conn, params=params)
+    if df.empty:
+        return df
+    df["target_actual_ownership"] = pd.to_numeric(
+        df["target_actual_ownership"], errors="coerce"
+    )
+    df = df.dropna(subset=["target_actual_ownership"]).copy()
+    df["target_actual_ownership"] = df["target_actual_ownership"].clip(0.0, 100.0)
+    return df
+
+
+def _read_predictions_frame(
+    conn: sqlite3.Connection,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+) -> pd.DataFrame:
+    if not _table_exists(conn, "predictions"):
+        return pd.DataFrame()
+
+    filters = []
+    params: List[Any] = []
+    if start_date:
+        filters.append("date(game_date) >= date(?)")
+        params.append(start_date)
+    if end_date:
+        filters.append("date(game_date) <= date(?)")
+        params.append(end_date)
+    where_clause = ""
+    if filters:
+        where_clause = "WHERE " + " AND ".join(filters)
+
+    query = f"""
+        WITH ranked_predictions AS (
+            SELECT
+                date(game_date) AS slate_date,
+                player_id,
+                projected_ppg,
+                proj_confidence,
+                season_avg_ppg,
+                recent_avg_3,
+                recent_avg_5,
+                dfs_score,
+                proj_minutes,
+                l5_minutes_avg,
+                minutes_confidence,
+                role_change,
+                p_top1,
+                p_top3,
+                sim_sigma,
+                role_tier,
+                vegas_implied_fpts,
+                vegas_vs_proj_diff,
+                injury_adjusted,
+                opponent_injury_detected,
+                opponent_def_rating,
+                opponent_pace,
+                analytics_used,
+                ROW_NUMBER() OVER (
+                    PARTITION BY date(game_date), player_id
+                    ORDER BY COALESCE(last_refreshed_at, created_at, prediction_date) DESC,
+                             prediction_id DESC
+                ) AS rn
+            FROM predictions
+            {where_clause}
+        )
+        SELECT
+            slate_date,
+            player_id,
+            projected_ppg,
+            proj_confidence,
+            season_avg_ppg,
+            recent_avg_3,
+            recent_avg_5,
+            dfs_score,
+            proj_minutes,
+            l5_minutes_avg,
+            minutes_confidence,
+            role_change,
+            p_top1,
+            p_top3,
+            sim_sigma,
+            role_tier,
+            vegas_implied_fpts,
+            vegas_vs_proj_diff,
+            injury_adjusted,
+            opponent_injury_detected,
+            opponent_def_rating,
+            opponent_pace,
+            analytics_used
+        FROM ranked_predictions
+        WHERE rn = 1
+    """
+    return pd.read_sql_query(query, conn, params=params)
+
+
+def _read_game_environment_frame(
+    conn: sqlite3.Connection,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+) -> pd.DataFrame:
+    if not _table_exists(conn, "game_odds"):
+        return pd.DataFrame()
+
+    filters = []
+    params: List[Any] = []
+    if start_date:
+        filters.append("date(game_date) >= date(?)")
+        params.append(start_date)
+    if end_date:
+        filters.append("date(game_date) <= date(?)")
+        params.append(end_date)
+    where_clause = ""
+    if filters:
+        where_clause = "WHERE " + " AND ".join(filters)
+
+    odds_df = pd.read_sql_query(
+        f"""
+        SELECT
+            date(game_date) AS slate_date,
+            home_team,
+            away_team,
+            total,
+            spread,
+            pace_score,
+            blowout_risk,
+            stack_score
+        FROM game_odds
+        {where_clause}
+        """,
+        conn,
+        params=params,
+    )
+    if odds_df.empty:
+        return odds_df
+
+    rows: List[Dict[str, Any]] = []
+    for row in odds_df.to_dict("records"):
+        shared = {
+            "slate_date": row.get("slate_date"),
+            "game_total": pd.to_numeric(row.get("total"), errors="coerce"),
+            "game_spread_abs": abs(float(row.get("spread") or 0.0)),
+            "game_pace_score": pd.to_numeric(row.get("pace_score"), errors="coerce"),
+            "game_blowout_risk": pd.to_numeric(row.get("blowout_risk"), errors="coerce"),
+            "game_stack_score": pd.to_numeric(row.get("stack_score"), errors="coerce"),
+        }
+        rows.append(
+            {
+                **shared,
+                "team": row.get("home_team"),
+                "opponent": row.get("away_team"),
+            }
+        )
+        rows.append(
+            {
+                **shared,
+                "team": row.get("away_team"),
+                "opponent": row.get("home_team"),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _read_latest_supplement_frame(
+    conn: sqlite3.Connection,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+) -> pd.DataFrame:
+    if not _table_exists(conn, "dfs_supplement_runs") or not _table_exists(
+        conn, "dfs_supplement_player_deltas"
+    ):
+        return pd.DataFrame()
+
+    filters = []
+    params: List[Any] = []
+    if start_date:
+        filters.append("date(slate_date) >= date(?)")
+        params.append(start_date)
+    if end_date:
+        filters.append("date(slate_date) <= date(?)")
+        params.append(end_date)
+    where_clause = ""
+    if filters:
+        where_clause = "WHERE " + " AND ".join(filters)
+
+    runs_df = pd.read_sql_query(
+        f"""
+        SELECT run_key, date(slate_date) AS slate_date, source_name, created_at
+        FROM dfs_supplement_runs
+        {where_clause}
+        """,
+        conn,
+        params=params,
+    )
+    if runs_df.empty:
+        return runs_df
+
+    runs_df["source_bucket"] = runs_df["source_name"].map(_normalize_source_bucket)
+    runs_df = runs_df[runs_df["source_bucket"] != ""].copy()
+    if runs_df.empty:
+        return runs_df
+
+    runs_df["created_sort"] = pd.to_datetime(runs_df["created_at"], errors="coerce")
+    runs_df = runs_df.sort_values(
+        ["slate_date", "source_bucket", "created_sort", "run_key"],
+        ascending=[True, True, False, False],
+    )
+    latest_runs = (
+        runs_df.groupby(["slate_date", "source_bucket"], as_index=False)
+        .head(1)
+        .copy()
+    )
+    run_keys = latest_runs["run_key"].dropna().astype(str).tolist()
+    if not run_keys:
+        return pd.DataFrame()
+
+    placeholders = ",".join(["?"] * len(run_keys))
+    deltas_df = pd.read_sql_query(
+        f"""
+        SELECT
+            run_key,
+            date(slate_date) AS slate_date,
+            player_id,
+            supplement_proj_fpts,
+            supplement_own_pct,
+            proj_delta,
+            own_delta_pp,
+            match_score
+        FROM dfs_supplement_player_deltas
+        WHERE run_key IN ({placeholders})
+        """,
+        conn,
+        params=run_keys,
+    )
+    if deltas_df.empty:
+        return deltas_df
+
+    deltas_df = deltas_df.merge(
+        latest_runs[["run_key", "source_bucket"]],
+        on="run_key",
+        how="left",
+    )
+    output_frames: List[pd.DataFrame] = []
+    for source_bucket, prefix in (("rotowire", "rw"), ("lineupstarter", "ls")):
+        source_df = deltas_df[deltas_df["source_bucket"] == source_bucket].copy()
+        if source_df.empty:
+            continue
+        source_df = source_df[
+            [
+                "slate_date",
+                "player_id",
+                "supplement_proj_fpts",
+                "supplement_own_pct",
+                "proj_delta",
+                "own_delta_pp",
+                "match_score",
+            ]
+        ].rename(
+            columns={
+                "supplement_proj_fpts": f"{prefix}_proj_fpts",
+                "supplement_own_pct": f"{prefix}_own_pct",
+                "proj_delta": f"{prefix}_proj_delta",
+                "own_delta_pp": f"{prefix}_own_delta_pp",
+                "match_score": f"{prefix}_match_score",
+            }
+        )
+        output_frames.append(source_df)
+
+    if not output_frames:
+        return pd.DataFrame()
+
+    merged = output_frames[0]
+    for frame in output_frames[1:]:
+        merged = merged.merge(frame, on=["slate_date", "player_id"], how="outer")
+    return merged
+
+
+def _add_rank_features(df: pd.DataFrame, column: str, feature_key: str) -> None:
+    if column not in df.columns:
+        return
+    numeric = pd.to_numeric(df[column], errors="coerce")
+    df[column] = numeric
+    df[f"{feature_key}_rank"] = df.groupby("slate_date")[column].rank(
+        ascending=False,
+        method="average",
+    )
+    df[f"{feature_key}_rank_pct"] = df.groupby("slate_date")[column].rank(
+        ascending=False,
+        method="average",
+        pct=True,
+    )
+
+
+def _series_or_default(
+    df: pd.DataFrame,
+    column: str,
+    default_value: Any,
+) -> pd.Series:
+    if column in df.columns:
+        return df[column]
+    return pd.Series(default_value, index=df.index)
+
+
+def build_ownership_training_dataset(
+    conn: sqlite3.Connection,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+) -> pd.DataFrame:
+    """Build a per-player, per-slate ownership training frame."""
+
+    base_df = _read_base_ownership_rows(conn, start_date=start_date, end_date=end_date)
+    if base_df.empty:
+        return base_df
+
+    predictions_df = _read_predictions_frame(conn, start_date=start_date, end_date=end_date)
+    game_env_df = _read_game_environment_frame(conn, start_date=start_date, end_date=end_date)
+    supplement_df = _read_latest_supplement_frame(
+        conn, start_date=start_date, end_date=end_date
+    )
+
+    df = base_df.merge(
+        predictions_df,
+        on=["slate_date", "player_id"],
+        how="left",
+    )
+    if not game_env_df.empty:
+        df = df.merge(
+            game_env_df,
+            on=["slate_date", "team", "opponent"],
+            how="left",
+        )
+    if not supplement_df.empty:
+        df = df.merge(
+            supplement_df,
+            on=["slate_date", "player_id"],
+            how="left",
+        )
+
+    numeric_defaults = [
+        "proj_fpts",
+        "proj_floor",
+        "proj_ceiling",
+        "fpts_per_dollar",
+        "our_ownership_proj",
+        "recorded_actual_ownership",
+        "actual_fpts",
+        "actual_minutes",
+        "projected_ppg",
+        "proj_confidence",
+        "season_avg_ppg",
+        "recent_avg_3",
+        "recent_avg_5",
+        "dfs_score",
+        "proj_minutes",
+        "l5_minutes_avg",
+        "minutes_confidence",
+        "role_change",
+        "p_top1",
+        "p_top3",
+        "sim_sigma",
+        "vegas_implied_fpts",
+        "vegas_vs_proj_diff",
+        "injury_adjusted",
+        "opponent_injury_detected",
+        "opponent_def_rating",
+        "opponent_pace",
+        "game_total",
+        "game_spread_abs",
+        "game_pace_score",
+        "game_blowout_risk",
+        "game_stack_score",
+        "rw_proj_fpts",
+        "rw_own_pct",
+        "rw_proj_delta",
+        "rw_own_delta_pp",
+        "rw_match_score",
+        "ls_proj_fpts",
+        "ls_own_pct",
+        "ls_proj_delta",
+        "ls_own_delta_pp",
+        "ls_match_score",
+    ]
+    for column in numeric_defaults:
+        if column in df.columns:
+            df[column] = pd.to_numeric(df[column], errors="coerce")
+
+    for column in [
+        "rw_proj_fpts",
+        "rw_own_pct",
+        "rw_proj_delta",
+        "rw_own_delta_pp",
+        "rw_match_score",
+        "ls_proj_fpts",
+        "ls_own_pct",
+        "ls_proj_delta",
+        "ls_own_delta_pp",
+        "ls_match_score",
+        "vegas_implied_fpts",
+        "game_total",
+        "game_spread_abs",
+        "game_pace_score",
+        "game_blowout_risk",
+        "game_stack_score",
+        "projected_ppg",
+        "proj_confidence",
+        "season_avg_ppg",
+        "recent_avg_3",
+        "recent_avg_5",
+        "dfs_score",
+        "proj_minutes",
+        "l5_minutes_avg",
+        "minutes_confidence",
+        "role_change",
+        "p_top1",
+        "p_top3",
+        "sim_sigma",
+        "injury_adjusted",
+        "opponent_injury_detected",
+        "opponent_def_rating",
+        "opponent_pace",
+    ]:
+        if column not in df.columns:
+            df[column] = np.nan
+    for column, default_value in (("role_tier", "UNK"), ("analytics_used", "")):
+        if column not in df.columns:
+            df[column] = default_value
+
+    df["primary_position"] = df["positions"].map(_primary_position)
+    df["role_tier"] = df["role_tier"].fillna("UNK").astype(str).str.upper()
+    df["salary_k"] = pd.to_numeric(df["salary"], errors="coerce") / 1000.0
+    df["ceiling_gap"] = (
+        pd.to_numeric(df["proj_ceiling"], errors="coerce")
+        - pd.to_numeric(df["proj_fpts"], errors="coerce")
+    )
+    df["floor_gap"] = (
+        pd.to_numeric(df["proj_fpts"], errors="coerce")
+        - pd.to_numeric(df["proj_floor"], errors="coerce")
+    )
+    df["vegas_edge_fpts"] = (
+        pd.to_numeric(_series_or_default(df, "vegas_implied_fpts", np.nan), errors="coerce")
+        - pd.to_numeric(df["proj_fpts"], errors="coerce")
+    )
+
+    analytics_text = df["analytics_used"].fillna("").astype(str)
+    df["flag_pace"] = analytics_text.str.contains("PACE", case=False, na=False).astype(int)
+    df["flag_defense"] = analytics_text.str.contains("DEF", case=False, na=False).astype(int)
+    df["flag_injury"] = analytics_text.str.contains("INJ", case=False, na=False).astype(int)
+    df["flag_rest"] = analytics_text.str.contains("REST|B2B", case=False, na=False).astype(int)
+
+    df["rw_present"] = df["rw_own_pct"].notna().astype(int)
+    df["ls_present"] = df["ls_own_pct"].notna().astype(int)
+    df["supplement_source_count"] = df["rw_present"] + df["ls_present"]
+
+    df["supplement_own_consensus"] = df[["rw_own_pct", "ls_own_pct"]].mean(
+        axis=1, skipna=True
+    )
+    df["supplement_proj_consensus"] = df[["rw_proj_fpts", "ls_proj_fpts"]].mean(
+        axis=1, skipna=True
+    )
+    df["source_match_score_avg"] = df[["rw_match_score", "ls_match_score"]].mean(
+        axis=1, skipna=True
+    )
+
+    df["rw_our_own_gap"] = df["rw_own_pct"] - df["our_ownership_proj"]
+    df["ls_our_own_gap"] = df["ls_own_pct"] - df["our_ownership_proj"]
+    df["rw_ls_own_gap"] = df["rw_own_pct"] - df["ls_own_pct"]
+    df["supplement_consensus_own_gap"] = (
+        df["supplement_own_consensus"] - df["our_ownership_proj"]
+    )
+
+    df["rw_our_proj_gap"] = df["rw_proj_fpts"] - df["proj_fpts"]
+    df["ls_our_proj_gap"] = df["ls_proj_fpts"] - df["proj_fpts"]
+    df["rw_ls_proj_gap"] = df["rw_proj_fpts"] - df["ls_proj_fpts"]
+    df["supplement_consensus_proj_gap"] = (
+        df["supplement_proj_consensus"] - df["proj_fpts"]
+    )
+
+    df["both_sources_zero_own"] = (
+        (df["rw_present"] == 1)
+        & (df["ls_present"] == 1)
+        & (df["rw_own_pct"].fillna(0.0) <= 0.0)
+        & (df["ls_own_pct"].fillna(0.0) <= 0.0)
+    ).astype(int)
+    df["both_sources_zero_proj"] = (
+        df["rw_proj_fpts"].notna()
+        & df["ls_proj_fpts"].notna()
+        & (df["rw_proj_fpts"].fillna(0.0) <= 0.0)
+        & (df["ls_proj_fpts"].fillna(0.0) <= 0.0)
+    ).astype(int)
+
+    slate_summary = (
+        df.groupby("slate_date", observed=True)
+        .agg(
+            slate_player_count=("player_id", "count"),
+            slate_team_count=("team", "nunique"),
+        )
+        .reset_index()
+    )
+    slate_summary["slate_game_count"] = (
+        pd.to_numeric(slate_summary["slate_team_count"], errors="coerce") / 2.0
+    )
+    df = df.merge(slate_summary, on="slate_date", how="left")
+
+    for source_column in (
+        "rw_own_pct",
+        "ls_own_pct",
+        "supplement_own_consensus",
+        "rw_our_own_gap",
+        "ls_our_own_gap",
+        "rw_ls_own_gap",
+        "supplement_consensus_own_gap",
+        "rw_proj_fpts",
+        "ls_proj_fpts",
+        "supplement_proj_consensus",
+        "rw_our_proj_gap",
+        "ls_our_proj_gap",
+        "rw_ls_proj_gap",
+        "supplement_consensus_proj_gap",
+        "rw_match_score",
+        "ls_match_score",
+        "source_match_score_avg",
+    ):
+        if source_column in df.columns:
+            df[source_column] = pd.to_numeric(df[source_column], errors="coerce").fillna(0.0)
+
+    df["salary_tier"] = pd.cut(
+        pd.to_numeric(df["salary"], errors="coerce"),
+        bins=[0, 4000, 6000, 8000, np.inf],
+        labels=["PUNT", "VALUE", "MID", "STUD"],
+        include_lowest=True,
+        right=False,
+    ).astype(str)
+    df["ownership_tier"] = pd.cut(
+        pd.to_numeric(df["our_ownership_proj"], errors="coerce"),
+        bins=[-0.1, 5.0, 15.0, 30.0, np.inf],
+        labels=["LOW", "MID", "CHALK", "MEGA"],
+        include_lowest=True,
+        right=False,
+    ).astype(str)
+
+    _add_rank_features(df, "proj_fpts", "proj_fpts")
+    _add_rank_features(df, "fpts_per_dollar", "value")
+    _add_rank_features(df, "salary", "salary")
+    _add_rank_features(df, "our_ownership_proj", "our_ownership")
+    _add_rank_features(df, "game_total", "game_total")
+
+    return (
+        df.sort_values(
+            ["slate_date", "target_actual_ownership", "player_name"],
+            ascending=[True, False, True],
+        )
+        .reset_index(drop=True)
+    )
+
+
+def _build_ridge_pipeline(
+    numeric_features: Sequence[str],
+    categorical_features: Sequence[str],
+    alpha: float,
+) -> Pipeline:
+    transformers: List[Tuple[str, Any, Sequence[str]]] = []
+    if numeric_features:
+        transformers.append(
+            (
+                "num",
+                Pipeline(
+                    steps=[
+                        ("imputer", SimpleImputer(strategy="median")),
+                        ("scaler", StandardScaler()),
+                    ]
+                ),
+                list(numeric_features),
+            )
+        )
+    if categorical_features:
+        transformers.append(
+            (
+                "cat",
+                Pipeline(
+                    steps=[
+                        ("imputer", SimpleImputer(strategy="most_frequent")),
+                        ("encoder", OneHotEncoder(handle_unknown="ignore")),
+                    ]
+                ),
+                list(categorical_features),
+            )
+        )
+    return Pipeline(
+        steps=[
+            ("preprocessor", ColumnTransformer(transformers=transformers)),
+            ("model", Ridge(alpha=alpha)),
+        ]
+    )
+
+
+def _metrics_from_predictions(y_true: Sequence[float], y_pred: Sequence[float]) -> Dict[str, Any]:
+    actual = pd.to_numeric(pd.Series(list(y_true)), errors="coerce").reset_index(drop=True)
+    pred = pd.to_numeric(pd.Series(list(y_pred)), errors="coerce").reset_index(drop=True)
+    mask = actual.notna() & pred.notna()
+    if mask.sum() == 0:
+        return {
+            "rows": 0,
+            "mae": None,
+            "rmse": None,
+            "bias": None,
+            "correlation": None,
+        }
+    actual_arr = actual[mask].to_numpy(dtype=float)
+    pred_arr = pred[mask].to_numpy(dtype=float)
+    err = actual_arr - pred_arr
+    corr = None
+    if len(actual_arr) >= 2 and np.unique(actual_arr).size > 1 and np.unique(pred_arr).size > 1:
+        corr = float(np.corrcoef(actual_arr, pred_arr)[0, 1])
+    return {
+        "rows": int(mask.sum()),
+        "mae": float(np.mean(np.abs(err))),
+        "rmse": float(np.sqrt(np.mean(np.square(err)))),
+        "bias": float(np.mean(err)),
+        "correlation": corr,
+    }
+
+
+def _coefficient_summary(model: Optional[Pipeline], top_n: int = 20) -> List[Dict[str, Any]]:
+    if model is None:
+        return []
+    try:
+        feature_names = model.named_steps["preprocessor"].get_feature_names_out()
+        coefficients = model.named_steps["model"].coef_
+    except Exception:
+        return []
+
+    pairs = [
+        {"feature": str(name), "coef": float(value)}
+        for name, value in zip(feature_names, coefficients)
+    ]
+    pairs.sort(key=lambda row: abs(row["coef"]), reverse=True)
+    return pairs[:top_n]
+
+
+def _select_holdout_dates(df: pd.DataFrame, holdout_slates: int) -> List[str]:
+    unique_dates = sorted(df["slate_date"].dropna().astype(str).unique().tolist())
+    if holdout_slates <= 0 or len(unique_dates) <= 1:
+        return []
+
+    source_dates = sorted(
+        df.loc[df["supplement_source_count"] > 0, "slate_date"]
+        .dropna()
+        .astype(str)
+        .unique()
+        .tolist()
+    )
+    effective_holdout = min(holdout_slates, len(unique_dates) - 1)
+    if source_dates and len(source_dates) <= effective_holdout:
+        effective_holdout = max(1, len(source_dates) - 1)
+    if effective_holdout <= 0:
+        return []
+    return unique_dates[-effective_holdout:]
+
+
+def _filter_live_features(
+    df: pd.DataFrame,
+    numeric_features: Sequence[str],
+    categorical_features: Sequence[str],
+) -> Tuple[List[str], List[str]]:
+    numeric_live = [
+        col
+        for col in numeric_features
+        if col in df.columns and pd.to_numeric(df[col], errors="coerce").notna().any()
+    ]
+    categorical_live = [
+        col
+        for col in categorical_features
+        if col in df.columns and df[col].fillna("").astype(str).ne("").any()
+    ]
+    return numeric_live, categorical_live
+
+
+def fit_ownership_calibrator(
+    conn: sqlite3.Connection,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    holdout_slates: int = 2,
+    save_run: bool = True,
+) -> Dict[str, Any]:
+    """Fit a two-stage ownership calibrator and return training artifacts."""
+
+    df = build_ownership_training_dataset(conn, start_date=start_date, end_date=end_date)
+    if df.empty:
+        return {"error": "No ownership rows with actuals were available for calibration."}
+
+    target = pd.to_numeric(df["target_actual_ownership"], errors="coerce")
+    valid_mask = target.notna()
+    df = df.loc[valid_mask].copy()
+    target = target.loc[valid_mask].astype(float)
+
+    holdout_dates = _select_holdout_dates(df, holdout_slates=holdout_slates)
+    if holdout_dates:
+        test_mask = df["slate_date"].astype(str).isin(holdout_dates)
+    else:
+        test_mask = pd.Series(False, index=df.index)
+    train_mask = ~test_mask
+
+    if train_mask.sum() < 25:
+        train_mask[:] = True
+        test_mask[:] = False
+        holdout_dates = []
+
+    base_numeric_features = [
+        "salary",
+        "salary_k",
+        "proj_fpts",
+        "proj_floor",
+        "proj_ceiling",
+        "ceiling_gap",
+        "floor_gap",
+        "fpts_per_dollar",
+        "our_ownership_proj",
+        "projected_ppg",
+        "proj_confidence",
+        "season_avg_ppg",
+        "recent_avg_3",
+        "recent_avg_5",
+        "dfs_score",
+        "proj_minutes",
+        "l5_minutes_avg",
+        "minutes_confidence",
+        "role_change",
+        "p_top1",
+        "p_top3",
+        "sim_sigma",
+        "vegas_implied_fpts",
+        "vegas_vs_proj_diff",
+        "vegas_edge_fpts",
+        "game_total",
+        "game_spread_abs",
+        "game_pace_score",
+        "game_blowout_risk",
+        "game_stack_score",
+        "slate_game_count",
+        "slate_player_count",
+        "proj_fpts_rank_pct",
+        "value_rank_pct",
+        "salary_rank_pct",
+        "our_ownership_rank_pct",
+        "game_total_rank_pct",
+        "injury_adjusted",
+        "opponent_injury_detected",
+        "opponent_def_rating",
+        "opponent_pace",
+        "flag_pace",
+        "flag_defense",
+        "flag_injury",
+        "flag_rest",
+    ]
+    base_categorical_features = [
+        "primary_position",
+        "salary_tier",
+        "ownership_tier",
+        "role_tier",
+    ]
+    source_numeric_features = [
+        "salary",
+        "proj_fpts",
+        "our_ownership_proj",
+        "proj_confidence",
+        "game_total",
+        "rw_present",
+        "ls_present",
+        "supplement_source_count",
+        "rw_own_pct",
+        "ls_own_pct",
+        "supplement_own_consensus",
+        "rw_our_own_gap",
+        "ls_our_own_gap",
+        "rw_ls_own_gap",
+        "supplement_consensus_own_gap",
+        "rw_proj_fpts",
+        "ls_proj_fpts",
+        "supplement_proj_consensus",
+        "rw_our_proj_gap",
+        "ls_our_proj_gap",
+        "rw_ls_proj_gap",
+        "supplement_consensus_proj_gap",
+        "both_sources_zero_own",
+        "both_sources_zero_proj",
+        "rw_match_score",
+        "ls_match_score",
+        "source_match_score_avg",
+    ]
+    source_categorical_features = ["primary_position", "role_tier"]
+
+    base_numeric_features = [col for col in base_numeric_features if col in df.columns]
+    base_categorical_features = [col for col in base_categorical_features if col in df.columns]
+    source_numeric_features = [col for col in source_numeric_features if col in df.columns]
+    source_categorical_features = [
+        col for col in source_categorical_features if col in df.columns
+    ]
+    train_df = df.loc[train_mask].copy()
+    base_numeric_features, base_categorical_features = _filter_live_features(
+        train_df, base_numeric_features, base_categorical_features
+    )
+    source_numeric_features, source_categorical_features = _filter_live_features(
+        train_df, source_numeric_features, source_categorical_features
+    )
+
+    base_model = _build_ridge_pipeline(
+        numeric_features=base_numeric_features,
+        categorical_features=base_categorical_features,
+        alpha=10.0,
+    )
+    base_columns = base_numeric_features + base_categorical_features
+    base_model.fit(df.loc[train_mask, base_columns], target.loc[train_mask])
+
+    base_pred_all = base_model.predict(df[base_columns])
+    base_pred_all = np.clip(base_pred_all, 0.0, 100.0)
+
+    source_train_mask = train_mask & df["supplement_source_count"].gt(0)
+    source_rows_train = int(source_train_mask.sum())
+    source_rows_test = int((test_mask & df["supplement_source_count"].gt(0)).sum())
+    source_adjustment_weight = (
+        source_rows_train / (source_rows_train + SOURCE_SHRINK_K)
+        if source_rows_train > 0
+        else 0.0
+    )
+
+    source_model: Optional[Pipeline] = None
+    source_adjustment_all = np.zeros(len(df), dtype=float)
+    if source_rows_train >= 25 and source_numeric_features + source_categorical_features:
+        source_model = _build_ridge_pipeline(
+            numeric_features=source_numeric_features,
+            categorical_features=source_categorical_features,
+            alpha=18.0,
+        )
+        residual_target = target.loc[train_mask] - base_pred_all[train_mask.to_numpy()]
+        source_columns = source_numeric_features + source_categorical_features
+        source_model.fit(df.loc[train_mask, source_columns], residual_target)
+        raw_adjustment = source_model.predict(df[source_columns])
+        source_active = df["supplement_source_count"].gt(0).astype(float).to_numpy()
+        source_adjustment_all = raw_adjustment * source_adjustment_weight * source_active
+
+    final_pred_all = np.clip(base_pred_all + source_adjustment_all, 0.0, 100.0)
+
+    baseline_metrics = {
+        "our_model_all": _metrics_from_predictions(target, df["our_ownership_proj"]),
+        "our_model_test": _metrics_from_predictions(
+            target.loc[test_mask], df.loc[test_mask, "our_ownership_proj"]
+        ),
+        "source_consensus_all": _metrics_from_predictions(
+            target.loc[df["supplement_source_count"].gt(0)],
+            df.loc[df["supplement_source_count"].gt(0), "supplement_own_consensus"],
+        ),
+        "source_consensus_test": _metrics_from_predictions(
+            target.loc[test_mask & df["supplement_source_count"].gt(0)],
+            df.loc[test_mask & df["supplement_source_count"].gt(0), "supplement_own_consensus"],
+        ),
+    }
+    base_metrics = {
+        "base_model_all": _metrics_from_predictions(target, base_pred_all),
+        "base_model_test": _metrics_from_predictions(
+            target.loc[test_mask], base_pred_all[test_mask.to_numpy()]
+        ),
+    }
+    final_metrics = {
+        "final_model_all": _metrics_from_predictions(target, final_pred_all),
+        "final_model_test": _metrics_from_predictions(
+            target.loc[test_mask],
+            final_pred_all[test_mask.to_numpy()],
+        ),
+        "final_model_source_test": _metrics_from_predictions(
+            target.loc[test_mask & df["supplement_source_count"].gt(0)],
+            final_pred_all[(test_mask & df["supplement_source_count"].gt(0)).to_numpy()],
+        ),
+    }
+
+    run_key = token_hex(10)
+    fitted_at = datetime.now().isoformat(timespec="seconds")
+    train_dates = sorted(df.loc[train_mask, "slate_date"].astype(str).unique().tolist())
+    test_dates = sorted(df.loc[test_mask, "slate_date"].astype(str).unique().tolist())
+
+    prediction_frame = df[
+        [
+            "slate_date",
+            "player_id",
+            "player_name",
+            "team",
+            "salary",
+            "proj_fpts",
+            "our_ownership_proj",
+            "supplement_own_consensus",
+            "target_actual_ownership",
+            "supplement_source_count",
+        ]
+    ].copy()
+    prediction_frame["base_ownership_pred"] = base_pred_all
+    prediction_frame["source_adjustment"] = source_adjustment_all
+    prediction_frame["final_ownership_pred"] = final_pred_all
+    prediction_frame["split"] = np.where(test_mask.to_numpy(), "test", "train")
+
+    artifact = {
+        "source_adjustment_weight": round(float(source_adjustment_weight), 6),
+        "holdout_dates": test_dates,
+        "base_top_coefficients": _coefficient_summary(base_model),
+        "source_top_coefficients": _coefficient_summary(source_model),
+    }
+    result = OwnershipCalibrationResult(
+        run_key=run_key,
+        model_version=MODEL_VERSION,
+        fitted_at=fitted_at,
+        total_rows=int(len(df)),
+        train_rows=int(train_mask.sum()),
+        test_rows=int(test_mask.sum()),
+        source_rows_train=source_rows_train,
+        source_rows_test=source_rows_test,
+        train_start_date=train_dates[0] if train_dates else None,
+        train_end_date=train_dates[-1] if train_dates else None,
+        holdout_start_date=test_dates[0] if test_dates else None,
+        holdout_end_date=test_dates[-1] if test_dates else None,
+        feature_count_base=len(base_numeric_features) + len(base_categorical_features),
+        feature_count_source=len(source_numeric_features) + len(source_categorical_features),
+        base_metrics=base_metrics,
+        final_metrics=final_metrics,
+        baseline_metrics=baseline_metrics,
+        artifact=artifact,
+    )
+
+    if save_run:
+        _ensure_calibration_table(conn)
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO dfs_ownership_calibration_runs (
+                run_key,
+                model_version,
+                fitted_at,
+                train_start_date,
+                train_end_date,
+                holdout_start_date,
+                holdout_end_date,
+                total_rows,
+                train_rows,
+                test_rows,
+                source_rows_train,
+                source_rows_test,
+                feature_count_base,
+                feature_count_source,
+                base_metrics_json,
+                final_metrics_json,
+                baseline_metrics_json,
+                artifact_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                result.run_key,
+                result.model_version,
+                result.fitted_at,
+                result.train_start_date,
+                result.train_end_date,
+                result.holdout_start_date,
+                result.holdout_end_date,
+                result.total_rows,
+                result.train_rows,
+                result.test_rows,
+                result.source_rows_train,
+                result.source_rows_test,
+                result.feature_count_base,
+                result.feature_count_source,
+                json.dumps(result.base_metrics, sort_keys=True),
+                json.dumps(result.final_metrics, sort_keys=True),
+                json.dumps(result.baseline_metrics, sort_keys=True),
+                json.dumps(result.artifact, sort_keys=True),
+            ),
+        )
+        conn.commit()
+
+    return {
+        "summary": result,
+        "training_df": df,
+        "prediction_df": prediction_frame,
+    }
+
+
+def get_latest_ownership_calibration_run(conn: sqlite3.Connection) -> Optional[Dict[str, Any]]:
+    """Load the most recent saved ownership calibration summary."""
+    if not _table_exists(conn, "dfs_ownership_calibration_runs"):
+        return None
+    row = conn.execute(
+        """
+        SELECT
+            run_key,
+            model_version,
+            fitted_at,
+            train_start_date,
+            train_end_date,
+            holdout_start_date,
+            holdout_end_date,
+            total_rows,
+            train_rows,
+            test_rows,
+            source_rows_train,
+            source_rows_test,
+            feature_count_base,
+            feature_count_source,
+            base_metrics_json,
+            final_metrics_json,
+            baseline_metrics_json,
+            artifact_json
+        FROM dfs_ownership_calibration_runs
+        ORDER BY datetime(fitted_at) DESC, run_key DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    if row is None:
+        return None
+
+    columns = [
+        "run_key",
+        "model_version",
+        "fitted_at",
+        "train_start_date",
+        "train_end_date",
+        "holdout_start_date",
+        "holdout_end_date",
+        "total_rows",
+        "train_rows",
+        "test_rows",
+        "source_rows_train",
+        "source_rows_test",
+        "feature_count_base",
+        "feature_count_source",
+        "base_metrics_json",
+        "final_metrics_json",
+        "baseline_metrics_json",
+        "artifact_json",
+    ]
+    payload = dict(zip(columns, row))
+    for json_key in (
+        "base_metrics_json",
+        "final_metrics_json",
+        "baseline_metrics_json",
+        "artifact_json",
+    ):
+        if payload.get(json_key):
+            payload[json_key[:-5]] = json.loads(payload[json_key])
+        payload.pop(json_key, None)
+    return payload
+
+
+def _print_summary(result: OwnershipCalibrationResult) -> None:
+    final_test = result.final_metrics.get("final_model_test", {})
+    base_test = result.base_metrics.get("base_model_test", {})
+    our_test = result.baseline_metrics.get("our_model_test", {})
+    source_test = result.baseline_metrics.get("source_consensus_test", {})
+
+    print(f"Run key: {result.run_key}")
+    print(f"Model version: {result.model_version}")
+    print(
+        f"Rows: total={result.total_rows} train={result.train_rows} "
+        f"test={result.test_rows}"
+    )
+    print(
+        f"Source rows: train={result.source_rows_train} "
+        f"test={result.source_rows_test}"
+    )
+    if result.holdout_start_date and result.holdout_end_date:
+        print(
+            f"Holdout slates: {result.holdout_start_date} -> "
+            f"{result.holdout_end_date}"
+        )
+    print(
+        "Test MAE:"
+        f" our={our_test.get('mae')}"
+        f" base={base_test.get('mae')}"
+        f" final={final_test.get('mae')}"
+        f" source_consensus={source_test.get('mae')}"
+    )
+    print(
+        "Test corr:"
+        f" our={our_test.get('correlation')}"
+        f" base={base_test.get('correlation')}"
+        f" final={final_test.get('correlation')}"
+        f" source_consensus={source_test.get('correlation')}"
+    )
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Fit DFS ownership calibrator")
+    parser.add_argument("--db-path", default="nba_stats.db", help="SQLite database path")
+    parser.add_argument("--start-date", default=None, help="Optional YYYY-MM-DD lower bound")
+    parser.add_argument("--end-date", default=None, help="Optional YYYY-MM-DD upper bound")
+    parser.add_argument(
+        "--holdout-slates",
+        type=int,
+        default=2,
+        help="Number of latest slates to reserve as a holdout set",
+    )
+    parser.add_argument(
+        "--export-training-csv",
+        default=None,
+        help="Optional path to export the training dataset as CSV",
+    )
+    parser.add_argument(
+        "--export-predictions-csv",
+        default=None,
+        help="Optional path to export fitted train/test predictions as CSV",
+    )
+    parser.add_argument(
+        "--no-save-run",
+        action="store_true",
+        help="Do not save the calibration summary back into SQLite",
+    )
+    return parser
+
+
+def main() -> None:
+    parser = _build_arg_parser()
+    args = parser.parse_args()
+
+    conn = sqlite3.connect(args.db_path)
+    try:
+        result = fit_ownership_calibrator(
+            conn,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            holdout_slates=args.holdout_slates,
+            save_run=not args.no_save_run,
+        )
+        if "error" in result:
+            raise SystemExit(result["error"])
+
+        summary: OwnershipCalibrationResult = result["summary"]
+        training_df: pd.DataFrame = result["training_df"]
+        prediction_df: pd.DataFrame = result["prediction_df"]
+
+        if args.export_training_csv:
+            output_path = Path(args.export_training_csv)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            training_df.to_csv(output_path, index=False)
+        if args.export_predictions_csv:
+            output_path = Path(args.export_predictions_csv)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            prediction_df.to_csv(output_path, index=False)
+
+        _print_summary(summary)
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    main()
