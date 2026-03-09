@@ -20617,21 +20617,77 @@ if selected_page == "DFS Lineup Builder":
 
                 postmortem_state_key = "dfs_tournament_postmortem_payload"
                 postmortem_slate_options = sorted(all_dates, reverse=True) if all_dates else []
+                postmortem_field_counts: Dict[str, int] = {}
                 if postmortem_slate_options:
-                    pm_action_col1, pm_action_col2 = st.columns([2, 1])
+                    try:
+                        postmortem_counts_df = pd.read_sql_query(
+                            """
+                            SELECT slate_date, COUNT(*) AS ranked_field_lineups
+                            FROM dfs_contest_entries
+                            WHERE rank IS NOT NULL
+                            GROUP BY slate_date
+                            """,
+                            dfs_conn,
+                        )
+                        if not postmortem_counts_df.empty:
+                            postmortem_field_counts = {
+                                str(row["slate_date"]): int(row["ranked_field_lineups"] or 0)
+                                for _, row in postmortem_counts_df.iterrows()
+                            }
+                    except Exception:
+                        postmortem_field_counts = {}
+                if postmortem_slate_options:
+                    pm_action_col1, pm_action_col2, pm_action_col3 = st.columns([2, 1, 1])
                     with pm_action_col1:
                         selected_postmortem_slate = st.selectbox(
                             "Postmortem Slate",
                             postmortem_slate_options,
                             key="model_accuracy_postmortem_slate",
                         )
+                    available_postmortem_lineups = int(
+                        postmortem_field_counts.get(selected_postmortem_slate, 0)
+                    )
                     with pm_action_col2:
-                        top_n_postmortem = st.slider(
+                        use_full_field_postmortem = st.checkbox(
+                            "Use Full Contest Field",
+                            value=False,
+                            disabled=available_postmortem_lineups <= 0,
+                            key=f"model_accuracy_postmortem_full_field_{selected_postmortem_slate}",
+                            help=(
+                                "Analyze every ranked contest lineup for this slate instead of only the "
+                                "top finishing slice."
+                            ),
+                        )
+                    with pm_action_col3:
+                        default_top_n_postmortem = (
+                            min(50, available_postmortem_lineups)
+                            if available_postmortem_lineups > 0
+                            else 50
+                        )
+                        top_n_step = 1 if available_postmortem_lineups <= 25 else 25
+                        manual_top_n_postmortem = st.number_input(
                             "Top Field Lineups",
-                            5,
-                            50,
-                            50,
-                            key="model_accuracy_postmortem_top_n",
+                            min_value=1,
+                            max_value=max(1, available_postmortem_lineups),
+                            value=max(1, default_top_n_postmortem),
+                            step=max(1, top_n_step),
+                            disabled=(
+                                use_full_field_postmortem or available_postmortem_lineups <= 0
+                            ),
+                            key=f"model_accuracy_postmortem_top_n_{selected_postmortem_slate}",
+                        )
+                        top_n_postmortem = (
+                            available_postmortem_lineups
+                            if use_full_field_postmortem and available_postmortem_lineups > 0
+                            else int(manual_top_n_postmortem)
+                        )
+                    if available_postmortem_lineups > 0:
+                        sample_pct = 100.0 * float(top_n_postmortem) / float(
+                            max(1, available_postmortem_lineups)
+                        )
+                        st.caption(
+                            f"{available_postmortem_lineups:,} ranked contest lineups available. "
+                            f"Current sample: {int(top_n_postmortem):,} ({sample_pct:.1f}%)."
                         )
 
                     pm_c1, pm_c2, pm_c3 = st.columns(3)
@@ -20751,7 +20807,15 @@ if selected_page == "DFS Lineup Builder":
                                     "lineups": int(
                                         metrics_payload.get("field_lineups_analyzed") or 0
                                     ),
-                                    "description": "Percent of top-N field lineups analyzed for this postmortem.",
+                                    "description": "Percent of analyzed top-N field lineups for this postmortem.",
+                                },
+                                "actual_ownership": {
+                                    "lineups": int(
+                                        metrics_payload.get("field_lineups_available")
+                                        or metrics_payload.get("field_lineups_analyzed")
+                                        or 0
+                                    ),
+                                    "description": "Whole-contest actual ownership for the tracked slate.",
                                 },
                                 "our_exposure_pct": {
                                     "lineups": int(metrics_payload.get("our_lineups") or 0),
@@ -20766,6 +20830,9 @@ if selected_page == "DFS Lineup Builder":
                                 "exposure_comparison": _df_records_safe(exp_comp_df),
                                 "exposure_comparison_top_field_only": _df_records_safe(
                                     exp_comp_top_field_df
+                                ),
+                                "ownership_context": _df_records_safe(
+                                    pm_payload.get("ownership_context_df")
                                 ),
                                 "missed_core": _df_records_safe(pm_payload.get("missed_core_df")),
                                 "missed_standouts": _df_records_safe(
@@ -22013,14 +22080,20 @@ if selected_page == "DFS Lineup Builder":
                     pm_payload = st.session_state.get(postmortem_state_key)
                     if isinstance(pm_payload, dict):
                         pm_context = pm_payload.get("context") or {}
+                        pm_metrics = pm_payload.get('metrics') or {}
                         pm_selected_slate = str(
                             pm_context.get("slate_date") or pm_payload.get("__slate_date") or ""
                         )
                         pm_top_n = int(pm_context.get("top_n") or pm_payload.get("__top_n") or 0)
                         if pm_selected_slate:
+                            pm_field_available = int(pm_metrics.get('field_lineups_available') or 0)
                             label = (
                                 f"Loaded postmortem: `{pm_selected_slate}`"
-                                + (f" | top-{pm_top_n}" if pm_top_n > 0 else "")
+                                + (
+                                    f" | {pm_top_n:,}/{pm_field_available:,} ranked field lineups"
+                                    if pm_top_n > 0 and pm_field_available > 0
+                                    else (f" | top-{pm_top_n}" if pm_top_n > 0 else "")
+                                )
                             )
                             st.caption(label)
 
@@ -22029,7 +22102,6 @@ if selected_page == "DFS Lineup Builder":
                             for err in pm_errors:
                                 st.warning(f"⚠️ {err}")
                         else:
-                            pm_metrics = pm_payload.get('metrics') or {}
                             pm_m1, pm_m2, pm_m3, pm_m4, pm_m5 = st.columns(5)
                             winner_score = pm_metrics.get('winner_score')
                             our_best = pm_metrics.get('our_best_score')
@@ -22072,7 +22144,7 @@ if selected_page == "DFS Lineup Builder":
                             pm_m13.metric("Combo Misses (Raw)", int(pm_metrics.get('combo_capture_miss_count') or 0))
                             pm_m14.metric("Team Mismatch", int(pm_metrics.get('team_concentration_mismatch_count') or 0))
 
-                            pm_m15, pm_m16, pm_m17, pm_m18 = st.columns(4)
+                            pm_m15, pm_m16, pm_m17, pm_m18, pm_m19 = st.columns(5)
                             pm_m15.metric(
                                 "Avg Overlap",
                                 (
@@ -22102,10 +22174,22 @@ if selected_page == "DFS Lineup Builder":
                                 ),
                             )
                             pm_m17.metric(
+                                "Field Sample",
+                                (
+                                    f"{int(pm_metrics.get('field_lineups_analyzed') or 0):,}/"
+                                    f"{int(pm_metrics.get('field_lineups_available') or pm_metrics.get('field_lineups_analyzed') or 0):,}"
+                                ),
+                                delta=(
+                                    f"{float(pm_metrics.get('field_sample_pct')):.1f}% of ranked field"
+                                    if pm_metrics.get('field_sample_pct') is not None
+                                    else None
+                                ),
+                            )
+                            pm_m18.metric(
                                 "Model Groups",
                                 int(pm_metrics.get('model_group_count') or 0),
                             )
-                            pm_m18.metric(
+                            pm_m19.metric(
                                 "High-Signal Players",
                                 int(pm_metrics.get('high_signal_player_count') or 0),
                             )
@@ -22117,6 +22201,10 @@ if selected_page == "DFS Lineup Builder":
                                     f"Top scorer in top-{pm_top_n} field lineups: "
                                     f"`{top_scorer_name}` ({float(top_scorer_actual):.1f} DK points)."
                                 )
+                            st.caption(
+                                "In this postmortem, `Top-N Field Exp %` is exposure inside the analyzed "
+                                "winner sample, while `Actual Own%` is whole-contest ownership."
+                            )
 
                             portfolio_diag_df = pm_payload.get('portfolio_diagnostics_df')
                             if isinstance(portfolio_diag_df, pd.DataFrame) and not portfolio_diag_df.empty:
@@ -22224,13 +22312,13 @@ if selected_page == "DFS Lineup Builder":
                                     'Signal',
                                     'Model',
                                     'Strategy',
-                                    'Field Exp %',
+                                    'Top-N Field Exp %',
                                     'Model Exp %',
-                                    'Gap (Field-Model)',
+                                    'Gap (Top-N-Model)',
                                     'Actual-Proj',
                                     'Actual FPTS',
                                 ]
-                                for c in ['Field Exp %', 'Model Exp %', 'Gap (Field-Model)']:
+                                for c in ['Top-N Field Exp %', 'Model Exp %', 'Gap (Top-N-Model)']:
                                     signal_view[c] = signal_view[c].apply(
                                         lambda x: f"{x:.1f}%" if pd.notna(x) else "—"
                                     )
@@ -22257,7 +22345,7 @@ if selected_page == "DFS Lineup Builder":
                                     int(pm_metrics.get('cheap_core_candidate_count') or 0),
                                 )
                                 cc_m2.metric(
-                                    "Field Lineup Share",
+                                    "Top-N Field Lineup Share",
                                     (
                                         f"{float(pm_metrics.get('cheap_core_field_lineup_share_pct')):.1f}%"
                                         if pm_metrics.get('cheap_core_field_lineup_share_pct') is not None
@@ -22272,7 +22360,7 @@ if selected_page == "DFS Lineup Builder":
                                         else "—"
                                     ),
                                     delta=(
-                                        f"{float(pm_metrics.get('cheap_core_our_lineup_share_pct') - pm_metrics.get('cheap_core_field_lineup_share_pct')):+.1f}pp vs field"
+                                        f"{float(pm_metrics.get('cheap_core_our_lineup_share_pct') - pm_metrics.get('cheap_core_field_lineup_share_pct')):+.1f}pp vs top-N"
                                         if pm_metrics.get('cheap_core_field_lineup_share_pct') is not None
                                         and pm_metrics.get('cheap_core_our_lineup_share_pct') is not None
                                         else None
@@ -22330,9 +22418,9 @@ if selected_page == "DFS Lineup Builder":
                                         'Proj FPTS',
                                         'Proj Own%',
                                         'Supp Own%',
-                                        'Field Exp %',
+                                        'Top-N Field Exp %',
                                         'Our Exp %',
-                                        'Gap (Field-Our)',
+                                        'Gap (Top-N-Our)',
                                         'Actual-Proj',
                                         'Cheap-Core Score',
                                         'Reasons',
@@ -22345,7 +22433,7 @@ if selected_page == "DFS Lineup Builder":
                                         candidate_view[c] = candidate_view[c].apply(
                                             lambda x: f"{x:.2f}" if pd.notna(x) else "—"
                                         )
-                                    for c in ['Proj Own%', 'Supp Own%', 'Field Exp %', 'Our Exp %', 'Gap (Field-Our)']:
+                                    for c in ['Proj Own%', 'Supp Own%', 'Top-N Field Exp %', 'Our Exp %', 'Gap (Top-N-Our)']:
                                         candidate_view[c] = candidate_view[c].apply(
                                             lambda x: f"{x:.1f}%" if pd.notna(x) else "—"
                                         )
@@ -22368,16 +22456,16 @@ if selected_page == "DFS Lineup Builder":
                                         'Combo Size',
                                         'Players',
                                         'Strength',
-                                        'Field Combo %',
+                                        'Top-N Combo %',
                                         'Our Combo %',
-                                        'Gap (Field-Our)',
+                                        'Gap (Top-N-Our)',
                                         'Actual FPTS Sum',
                                     ]
                                     for c in ['Strength', 'Actual FPTS Sum']:
                                         combo_view[c] = combo_view[c].apply(
                                             lambda x: f"{x:.2f}" if pd.notna(x) else "—"
                                         )
-                                    for c in ['Field Combo %', 'Our Combo %', 'Gap (Field-Our)']:
+                                    for c in ['Top-N Combo %', 'Our Combo %', 'Gap (Top-N-Our)']:
                                         combo_view[c] = combo_view[c].apply(
                                             lambda x: f"{x:.1f}%" if pd.notna(x) else "—"
                                         )
@@ -22470,7 +22558,7 @@ if selected_page == "DFS Lineup Builder":
                                             'Game Leverage Rank',
                                             'Own Delta',
                                             'Proj Delta',
-                                            'Field Exp %',
+                                            'Top-N Field Exp %',
                                             'Our Exp %',
                                             'Actual-Proj',
                                             'Likely Blocker',
@@ -22482,7 +22570,7 @@ if selected_page == "DFS Lineup Builder":
                                             reason_view[c] = reason_view[c].apply(
                                                 lambda x: f"{x:.2f}" if pd.notna(x) else "—"
                                             )
-                                        for c in ['Game Own Share %', 'Field Exp %', 'Our Exp %']:
+                                        for c in ['Game Own Share %', 'Top-N Field Exp %', 'Our Exp %']:
                                             reason_view[c] = reason_view[c].apply(
                                                 lambda x: f"{x:.1f}%" if pd.notna(x) else "—"
                                             )
@@ -22494,7 +22582,7 @@ if selected_page == "DFS Lineup Builder":
 
                             exp_df = pm_payload.get('top_field_players_df')
                             if isinstance(exp_df, pd.DataFrame) and not exp_df.empty:
-                                st.markdown("**Field vs Our Exposure (Top Field Players)**")
+                                st.markdown("**Top-N Field vs Our Exposure**")
                                 exp_view = exp_df.copy()
                                 exp_view = exp_view[
                                     [
@@ -22511,9 +22599,9 @@ if selected_page == "DFS Lineup Builder":
                                 ]
                                 exp_view.columns = [
                                     'Player',
-                                    'Field Exp %',
+                                    'Top-N Field Exp %',
                                     'Our Exp %',
-                                    'Gap (Field-Our)',
+                                    'Gap (Top-N-Our)',
                                     'Proj FPTS',
                                     'Actual FPTS',
                                     'Actual-Proj',
@@ -22521,7 +22609,7 @@ if selected_page == "DFS Lineup Builder":
                                     'Actual Own%',
                                 ]
 
-                                for c in ['Field Exp %', 'Our Exp %', 'Gap (Field-Our)', 'Proj Own%', 'Actual Own%']:
+                                for c in ['Top-N Field Exp %', 'Our Exp %', 'Gap (Top-N-Our)', 'Proj Own%', 'Actual Own%']:
                                     exp_view[c] = exp_view[c].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "—")
                                 for c in ['Proj FPTS', 'Actual FPTS', 'Actual-Proj']:
                                     exp_view[c] = exp_view[c].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "—")
@@ -22539,7 +22627,7 @@ if selected_page == "DFS Lineup Builder":
                                         value_name='Exposure %',
                                     )
                                     chart_long['Series'] = chart_long['Series'].map({
-                                        'field_exposure_pct': 'Field',
+                                        'field_exposure_pct': 'Top-N Field',
                                         'our_exposure_pct': 'Our',
                                     })
                                     fig_pm_exp = px.bar(
@@ -22548,15 +22636,56 @@ if selected_page == "DFS Lineup Builder":
                                         y='Exposure %',
                                         color='Series',
                                         barmode='group',
-                                        title='Top 15 Field Exposure vs Our Exposure',
+                                        title='Top 15 Top-N Field Exposure vs Our Exposure',
                                         labels={'Player': 'Player', 'Exposure %': 'Exposure %'},
                                     )
                                     fig_pm_exp.update_layout(height=380, xaxis_tickangle=-45)
                                     st.plotly_chart(fig_pm_exp, use_container_width=True)
 
+                            ownership_context_df = pm_payload.get('ownership_context_df')
+                            if isinstance(ownership_context_df, pd.DataFrame) and not ownership_context_df.empty:
+                                st.markdown("**Top-N vs Contest Ownership Context**")
+                                ownership_context_view = ownership_context_df[
+                                    [
+                                        'display_name',
+                                        'field_exposure_pct',
+                                        'actual_ownership',
+                                        'our_exposure_pct',
+                                        'ownership_proj',
+                                        'topn_field_minus_actual_own_pp',
+                                        'our_minus_actual_own_pp',
+                                        'proj_minus_actual_own_pp',
+                                        'context_tags',
+                                    ]
+                                ].copy()
+                                ownership_context_view.columns = [
+                                    'Player',
+                                    'Top-N Field Exp %',
+                                    'Actual Own%',
+                                    'Our Exp %',
+                                    'Proj Own%',
+                                    'Top-N vs Actual (pp)',
+                                    'Our vs Actual (pp)',
+                                    'Proj vs Actual (pp)',
+                                    'Context',
+                                ]
+                                for c in ['Top-N Field Exp %', 'Actual Own%', 'Our Exp %', 'Proj Own%']:
+                                    ownership_context_view[c] = ownership_context_view[c].apply(
+                                        lambda x: f"{x:.1f}%" if pd.notna(x) else "â€”"
+                                    )
+                                for c in ['Top-N vs Actual (pp)', 'Our vs Actual (pp)', 'Proj vs Actual (pp)']:
+                                    ownership_context_view[c] = ownership_context_view[c].apply(
+                                        lambda x: f"{x:+.1f}" if pd.notna(x) else "â€”"
+                                    )
+                                st.dataframe(
+                                    ownership_context_view.head(40),
+                                    use_container_width=True,
+                                    hide_index=True,
+                                )
+
                             missed_core_df = pm_payload.get('missed_core_df')
                             if isinstance(missed_core_df, pd.DataFrame) and not missed_core_df.empty:
-                                st.markdown("**Missed Core Field Plays**")
+                                st.markdown("**Missed Core Top-N Field Plays**")
                                 core_view = missed_core_df[
                                     [
                                         'display_name',
@@ -22569,13 +22698,13 @@ if selected_page == "DFS Lineup Builder":
                                 ].copy()
                                 core_view.columns = [
                                     'Player',
-                                    'Field Exp %',
+                                    'Top-N Field Exp %',
                                     'Our Exp %',
-                                    'Gap (Field-Our)',
+                                    'Gap (Top-N-Our)',
                                     'Actual FPTS',
                                     'Actual-Proj',
                                 ]
-                                for c in ['Field Exp %', 'Our Exp %', 'Gap (Field-Our)']:
+                                for c in ['Top-N Field Exp %', 'Our Exp %', 'Gap (Top-N-Our)']:
                                     core_view[c] = core_view[c].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "—")
                                 for c in ['Actual FPTS', 'Actual-Proj']:
                                     core_view[c] = core_view[c].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "—")
@@ -22597,14 +22726,14 @@ if selected_page == "DFS Lineup Builder":
                                 ].copy()
                                 standout_view.columns = [
                                     'Player',
-                                    'Field Exp %',
+                                    'Top-N Field Exp %',
                                     'Our Exp %',
                                     'Actual FPTS',
                                     'Proj FPTS',
                                     'Actual-Proj',
                                     'Actual Own%',
                                 ]
-                                for c in ['Field Exp %', 'Our Exp %', 'Actual Own%']:
+                                for c in ['Top-N Field Exp %', 'Our Exp %', 'Actual Own%']:
                                     standout_view[c] = standout_view[c].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "—")
                                 for c in ['Actual FPTS', 'Proj FPTS', 'Actual-Proj']:
                                     standout_view[c] = standout_view[c].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "—")
@@ -22626,14 +22755,14 @@ if selected_page == "DFS Lineup Builder":
                                 ].copy()
                                 own_view.columns = [
                                     'Player',
-                                    'Field Exp %',
+                                    'Top-N Field Exp %',
                                     'Our Exp %',
                                     'Actual Own%',
                                     'Proj Own%',
                                     'Own Error (pp)',
                                     'Type',
                                 ]
-                                for c in ['Field Exp %', 'Our Exp %', 'Actual Own%', 'Proj Own%']:
+                                for c in ['Top-N Field Exp %', 'Our Exp %', 'Actual Own%', 'Proj Own%']:
                                     own_view[c] = own_view[c].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "â€”")
                                 own_view['Own Error (pp)'] = own_view['Own Error (pp)'].apply(
                                     lambda x: f"{x:+.1f}" if pd.notna(x) else "â€”"
@@ -22657,15 +22786,15 @@ if selected_page == "DFS Lineup Builder":
                                 dud_view.columns = [
                                     'Player',
                                     'Our Exp %',
-                                    'Field Exp %',
-                                    'Our-Field (pp)',
+                                    'Top-N Field Exp %',
+                                    'Our-Top-N (pp)',
                                     'Actual FPTS',
                                     'Proj FPTS',
                                     'Actual-Proj',
                                 ]
-                                for c in ['Our Exp %', 'Field Exp %']:
+                                for c in ['Our Exp %', 'Top-N Field Exp %']:
                                     dud_view[c] = dud_view[c].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "â€”")
-                                dud_view['Our-Field (pp)'] = dud_view['Our-Field (pp)'].apply(
+                                dud_view['Our-Top-N (pp)'] = dud_view['Our-Top-N (pp)'].apply(
                                     lambda x: f"{x:+.1f}" if pd.notna(x) else "â€”"
                                 )
                                 for c in ['Actual FPTS', 'Proj FPTS', 'Actual-Proj']:
@@ -22690,7 +22819,7 @@ if selected_page == "DFS Lineup Builder":
                                 value_view.columns = [
                                     'Player',
                                     'Salary',
-                                    'Field Exp %',
+                                    'Top-N Field Exp %',
                                     'Our Exp %',
                                     'Actual FPTS',
                                     'Proj FPTS',
@@ -22700,7 +22829,7 @@ if selected_page == "DFS Lineup Builder":
                                 value_view['Salary'] = value_view['Salary'].apply(
                                     lambda x: f"${int(x):,}" if pd.notna(x) else "â€”"
                                 )
-                                for c in ['Field Exp %', 'Our Exp %']:
+                                for c in ['Top-N Field Exp %', 'Our Exp %']:
                                     value_view[c] = value_view[c].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "â€”")
                                 for c in ['Actual FPTS', 'Proj FPTS', 'Actual-Proj']:
                                     value_view[c] = value_view[c].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "â€”")
@@ -22722,12 +22851,12 @@ if selected_page == "DFS Lineup Builder":
                                 combo_view.columns = [
                                     'Combo Size',
                                     'Players',
-                                    'Field Combo %',
+                                    'Top-N Combo %',
                                     'Our Combo %',
-                                    'Gap (Field-Our)',
+                                    'Gap (Top-N-Our)',
                                     'Combo Actual FPTS Sum',
                                 ]
-                                for c in ['Field Combo %', 'Our Combo %', 'Gap (Field-Our)']:
+                                for c in ['Top-N Combo %', 'Our Combo %', 'Gap (Top-N-Our)']:
                                     combo_view[c] = combo_view[c].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "â€”")
                                 combo_view['Combo Actual FPTS Sum'] = combo_view['Combo Actual FPTS Sum'].apply(
                                     lambda x: f"{x:.1f}" if pd.notna(x) else "â€”"
@@ -22760,14 +22889,14 @@ if selected_page == "DFS Lineup Builder":
                                 ].copy()
                                 team_view.columns = [
                                     'Team',
-                                    'Field Slot Share',
+                                    'Top-N Field Slot Share',
                                     'Our Slot Share',
                                     'Slot Share Gap',
-                                    'Field Lineup Share',
+                                    'Top-N Field Lineup Share',
                                     'Our Lineup Share',
                                     'Lineup Share Gap',
                                 ]
-                                for c in ['Field Slot Share', 'Our Slot Share', 'Field Lineup Share', 'Our Lineup Share']:
+                                for c in ['Top-N Field Slot Share', 'Our Slot Share', 'Top-N Field Lineup Share', 'Our Lineup Share']:
                                     team_view[c] = team_view[c].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "â€”")
                                 for c in ['Slot Share Gap', 'Lineup Share Gap']:
                                     team_view[c] = team_view[c].apply(lambda x: f"{x:+.1f}pp" if pd.notna(x) else "â€”")

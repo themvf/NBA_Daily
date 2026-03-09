@@ -2027,6 +2027,7 @@ def build_tournament_postmortem(
         'metrics': {},
         'top_field_players_df': pd.DataFrame(),
         'exposure_comparison_df': pd.DataFrame(),
+        'ownership_context_df': pd.DataFrame(),
         'missed_core_df': pd.DataFrame(),
         'missed_standouts_df': pd.DataFrame(),
         'ownership_polarity_df': pd.DataFrame(),
@@ -2050,6 +2051,21 @@ def build_tournament_postmortem(
     }
 
     try:
+        total_field_lineups_row = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM dfs_contest_entries
+            WHERE slate_date = ? AND rank IS NOT NULL
+            """,
+            (slate_date,),
+        ).fetchone()
+        total_field_lineups = int(total_field_lineups_row[0]) if total_field_lineups_row else 0
+        if total_field_lineups <= 0:
+            result['errors'].append("No contest standings found for this slate.")
+            return result
+        top_n = min(top_n, total_field_lineups)
+        result['top_n'] = top_n
+
         # 1) Top-N field lineups from contest standings
         top_entries_df = pd.read_sql_query(
             """
@@ -2380,6 +2396,58 @@ def build_tournament_postmortem(
         )
 
         top_field_players_df = exposure_df[exposure_df['field_slots'] > 0].copy()
+        ownership_context_df = exposure_df.dropna(
+            subset=['actual_ownership', 'ownership_proj']
+        ).copy()
+        if not ownership_context_df.empty:
+            ownership_context_df['topn_field_minus_actual_own_pp'] = (
+                ownership_context_df['field_exposure_pct'] - ownership_context_df['actual_ownership']
+            )
+            ownership_context_df['our_minus_actual_own_pp'] = (
+                ownership_context_df['our_exposure_pct'] - ownership_context_df['actual_ownership']
+            )
+            ownership_context_df['proj_minus_actual_own_pp'] = (
+                ownership_context_df['ownership_proj'] - ownership_context_df['actual_ownership']
+            )
+
+            def _ownership_context_tag(row: pd.Series) -> str:
+                tags: List[str] = []
+                topn_gap = pd.to_numeric(
+                    row.get('topn_field_minus_actual_own_pp'),
+                    errors='coerce',
+                )
+                our_gap = pd.to_numeric(
+                    row.get('our_minus_actual_own_pp'),
+                    errors='coerce',
+                )
+                proj_gap = pd.to_numeric(
+                    row.get('proj_minus_actual_own_pp'),
+                    errors='coerce',
+                )
+                if pd.notna(topn_gap):
+                    if topn_gap >= 15.0:
+                        tags.append('topn-concentrated')
+                    elif topn_gap <= -15.0:
+                        tags.append('topn-faded')
+                if pd.notna(our_gap):
+                    if our_gap >= 10.0:
+                        tags.append('our-overweight')
+                    elif our_gap <= -10.0:
+                        tags.append('our-underweight')
+                if pd.notna(proj_gap) and abs(float(proj_gap)) >= 8.0:
+                    tags.append('own-model-miss')
+                return ', '.join(tags) if tags else 'aligned'
+
+            ownership_context_df['context_tags'] = ownership_context_df.apply(
+                _ownership_context_tag,
+                axis=1,
+            )
+            ownership_context_df = ownership_context_df.sort_values(
+                ['actual_ownership', 'field_exposure_pct', 'ownership_error_abs']
+                if 'ownership_error_abs' in ownership_context_df.columns
+                else ['actual_ownership', 'field_exposure_pct'],
+                ascending=[False, False, False] if 'ownership_error_abs' in ownership_context_df.columns else [False, False],
+            )
 
         missed_core_df = top_field_players_df[
             (top_field_players_df['field_exposure_pct'] >= core_field_exposure_pct)
@@ -2697,6 +2765,26 @@ def build_tournament_postmortem(
         combo_capture_miss_count = int(combo_capture_miss_raw_count)
         combo_capture_rows_exported = int(len(combo_capture_misses_df))
         team_concentration_mismatch_count = int(len(team_concentration_mismatch_df))
+        field_sample_pct = (
+            100.0 * float(field_lineups) / float(max(1, total_field_lineups))
+            if total_field_lineups > 0
+            else None
+        )
+        topn_vs_actual_ownership_mae = None
+        our_vs_actual_ownership_gap_mae = None
+        if not ownership_context_df.empty:
+            topn_vs_actual_ownership_mae = float(
+                pd.to_numeric(
+                    ownership_context_df['topn_field_minus_actual_own_pp'],
+                    errors='coerce',
+                ).abs().mean()
+            )
+            our_vs_actual_ownership_gap_mae = float(
+                pd.to_numeric(
+                    ownership_context_df['our_minus_actual_own_pp'],
+                    errors='coerce',
+                ).abs().mean()
+            )
         largest_team_slot_gap = None
         largest_team_slot_gap_team = ""
         if not team_concentration_mismatch_df.empty:
@@ -3521,6 +3609,8 @@ def build_tournament_postmortem(
 
         result['metrics'] = {
             'field_lineups_analyzed': field_lineups,
+            'field_lineups_available': total_field_lineups,
+            'field_sample_pct': field_sample_pct,
             'our_lineups': our_lineups,
             'winner_score': winner_score,
             'our_best_score': our_best_score,
@@ -3532,6 +3622,8 @@ def build_tournament_postmortem(
             'projection_rank_corr': proj_rank_corr,
             'ownership_mae': ownership_mae,
             'ownership_rank_corr': ownership_rank_corr,
+            'topn_vs_actual_ownership_mae': topn_vs_actual_ownership_mae,
+            'our_vs_actual_ownership_gap_mae': our_vs_actual_ownership_gap_mae,
             'missed_core_count': int(len(missed_core_df)),
             'missed_standout_count': int(len(missed_standouts_df)),
             'ownership_polarity_count': ownership_polarity_count,
@@ -3604,10 +3696,10 @@ def build_tournament_postmortem(
                 wrong_notes.append(f"Ownership MAE was elevated at {ownership_mae:.2f}%.")
 
         if len(missed_core_df) == 0:
-            right_notes.append("No major underexposure on core field plays.")
+            right_notes.append("No major underexposure on core top-N field plays.")
         else:
             wrong_notes.append(
-                f"Missed {len(missed_core_df)} core field plays (field >= {core_field_exposure_pct:.0f}% with underexposure)."
+                f"Missed {len(missed_core_df)} core top-N field plays (top-N field exp >= {core_field_exposure_pct:.0f}% with underexposure)."
             )
 
         if len(missed_standouts_df) > 0:
@@ -3649,7 +3741,7 @@ def build_tournament_postmortem(
             top_combo_gap = pd.to_numeric(combo_capture_misses_df.iloc[0].get('combo_gap_pct'), errors='coerce')
             if top_combo and pd.notna(top_combo_gap):
                 wrong_notes.append(
-                    f"Combo capture miss: `{top_combo}` field-minus-our gap was {float(top_combo_gap):.1f}pp."
+                    f"Combo capture miss: `{top_combo}` top-N field-minus-our gap was {float(top_combo_gap):.1f}pp."
                 )
 
         if team_concentration_mismatch_count > 0 and largest_team_slot_gap_team:
@@ -3663,14 +3755,14 @@ def build_tournament_postmortem(
         if overlap_gap_avg is not None:
             if overlap_gap_avg <= -1.0:
                 wrong_notes.append(
-                    f"Portfolio overlap ran {abs(overlap_gap_avg):.2f} players below the field average, suggesting over-diversification."
+                    f"Portfolio overlap ran {abs(overlap_gap_avg):.2f} players below the top-N field average, suggesting over-diversification."
                 )
             elif overlap_gap_avg >= 1.0:
                 wrong_notes.append(
-                    f"Portfolio overlap ran {overlap_gap_avg:.2f} players above the field average, suggesting over-concentration."
+                    f"Portfolio overlap ran {overlap_gap_avg:.2f} players above the top-N field average, suggesting over-concentration."
                 )
             else:
-                right_notes.append("Portfolio overlap tracked close to field average.")
+                right_notes.append("Portfolio overlap tracked close to the top-N field average.")
 
         if supplement_run_key:
             right_notes.append(
@@ -3712,126 +3804,159 @@ def build_tournament_postmortem(
         # 7) Next-slate improvement actions
         improvement_rows: List[Dict[str, Any]] = []
         priority = 1
+        projection_is_healthy = bool(
+            proj_mae is not None
+            and proj_mae <= 10.0
+            and (proj_rank_corr is None or proj_rank_corr >= 0.60)
+        )
+        ownership_is_healthy = bool(
+            ownership_mae is not None
+            and ownership_mae <= 10.0
+            and (ownership_rank_corr is None or ownership_rank_corr >= 0.45)
+        )
 
-        if proj_mae is not None:
+        def _append_improvement(
+            area: str,
+            why: str,
+            next_slate_change: str,
+            success_metric: str,
+        ) -> None:
+            nonlocal priority
             improvement_rows.append({
                 'priority': priority,
-                'area': 'Projection Calibration',
-                'why': f"MAE={proj_mae:.2f}, rank_corr={proj_rank_corr:.2f}" if proj_rank_corr is not None else f"MAE={proj_mae:.2f}",
-                'next_slate_change': 'Recalibrate projection weights by role/salary tier for this slate profile.',
-                'success_metric': 'Lower MAE while holding or improving rank correlation.',
+                'area': area,
+                'why': why,
+                'next_slate_change': next_slate_change,
+                'success_metric': success_metric,
             })
             priority += 1
 
-        if ownership_mae is not None:
-            improvement_rows.append({
-                'priority': priority,
-                'area': 'Ownership Calibration',
-                'why': (
+        if not projection_is_healthy and proj_mae is not None:
+            _append_improvement(
+                'Projection Calibration',
+                (
+                    f"MAE={proj_mae:.2f}, rank_corr={proj_rank_corr:.2f}"
+                    if proj_rank_corr is not None
+                    else f"MAE={proj_mae:.2f}"
+                ),
+                'Recalibrate projection weights by role/salary tier for this slate profile.',
+                'Lower MAE while holding or improving rank correlation.',
+            )
+
+        if not ownership_is_healthy and ownership_mae is not None:
+            _append_improvement(
+                'Ownership Calibration',
+                (
                     f"ownership_mae={ownership_mae:.2f}, rank_corr={ownership_rank_corr:.2f}"
                     if ownership_rank_corr is not None
                     else f"ownership_mae={ownership_mae:.2f}"
                 ),
-                'next_slate_change': 'Adjust ownership curve by projection tier and game environment.',
-                'success_metric': 'Reduce ownership MAE and improve ownership rank correlation.',
-            })
-            priority += 1
+                'Adjust ownership curve by projection tier and game environment.',
+                'Reduce ownership MAE and improve ownership rank correlation.',
+            )
 
         if winner_gap is not None and winner_gap > 0:
-            improvement_rows.append({
-                'priority': priority,
-                'area': 'Top-End Ceiling Capture',
-                'why': f"winner_gap={winner_gap:.1f}",
-                'next_slate_change': 'Increase exposure to high-ceiling constructions present in top field entries.',
-                'success_metric': 'Shrink winner gap and raise best-lineup actual FPTS.',
-            })
-            priority += 1
+            _append_improvement(
+                'Top-End Ceiling Capture',
+                f"winner_gap={winner_gap:.1f}",
+                'Increase exposure to high-ceiling constructions present in top-N field entries.',
+                'Shrink winner gap and raise best-lineup actual FPTS.',
+            )
 
         if not missed_core_df.empty:
             top_core = str(missed_core_df.iloc[0].get('display_name') or '')
-            improvement_rows.append({
-                'priority': priority,
-                'area': 'Core Field Coverage',
-                'why': f"missed_core={len(missed_core_df)} (largest gap: {top_core})",
-                'next_slate_change': 'Add guardrail minimum exposure for core field plays in high-leverage builds.',
-                'success_metric': 'Reduce count of core underexposure misses.',
-            })
-            priority += 1
-
-        if not missed_standouts_df.empty:
-            top_miss = str(missed_standouts_df.iloc[0].get('display_name') or '')
-            top_err = pd.to_numeric(missed_standouts_df.iloc[0].get('actual_minus_proj'), errors='coerce')
-            improvement_rows.append({
-                'priority': priority,
-                'area': 'Missed Standout Detection',
-                'why': (
-                    f"missed_standouts={len(missed_standouts_df)} (top: {top_miss}, +{top_err:.1f})"
-                    if pd.notna(top_err)
-                    else f"missed_standouts={len(missed_standouts_df)}"
-                ),
-                'next_slate_change': 'Strengthen standout rules for volatile upside profiles and stack contexts.',
-                'success_metric': 'Improve coverage of high actual-minus-projection players.',
-            })
-            priority += 1
+            _append_improvement(
+                'Core Top-N Coverage',
+                f"missed_core={len(missed_core_df)} (largest gap: {top_core})",
+                'Add guardrail minimum exposure for core top-N field plays in high-leverage builds.',
+                'Reduce count of core underexposure misses.',
+            )
 
         if ownership_polarity_count > 0:
             top_own = str(ownership_polarity_df.iloc[0].get('display_name') or '')
             own_err = pd.to_numeric(ownership_polarity_df.iloc[0].get('ownership_error_pp'), errors='coerce')
-            improvement_rows.append({
-                'priority': priority,
-                'area': 'Ownership Polarity Calibration',
-                'why': (
+            _append_improvement(
+                'Ownership Polarity Calibration',
+                (
                     f"polarity_misses={ownership_polarity_count} (top: {top_own}, error={own_err:+.1f}pp)"
                     if pd.notna(own_err)
                     else f"polarity_misses={ownership_polarity_count}"
                 ),
-                'next_slate_change': 'Add bidirectional ownership guardrails for underprojected/overprojected chalk.',
-                'success_metric': 'Lower ownership polarity misses and improve ownership rank alignment.',
-            })
-            priority += 1
+                'Add bidirectional ownership guardrails for underprojected/overprojected chalk.',
+                'Lower ownership polarity misses and improve ownership rank alignment.',
+            )
 
-        if overexposed_dud_count > 0:
-            top_dud = str(overexposed_duds_df.iloc[0].get('display_name') or '')
-            over_gap = pd.to_numeric(overexposed_duds_df.iloc[0].get('our_minus_field_pct'), errors='coerce')
-            improvement_rows.append({
-                'priority': priority,
-                'area': 'Overexposed Dud Guardrails',
-                'why': (
-                    f"overexposed_duds={overexposed_dud_count} (top: {top_dud}, overexposure={over_gap:+.1f}pp)"
-                    if pd.notna(over_gap)
-                    else f"overexposed_duds={overexposed_dud_count}"
-                ),
-                'next_slate_change': 'Cap fragile high-exposure plays when field is underweight and downside risk is high.',
-                'success_metric': 'Reduce negative-leverage overexposure without sacrificing ceiling.',
-            })
-            priority += 1
-
-        if value_tier_miss_count > 0:
-            top_value = str(value_tier_misses_df.iloc[0].get('display_name') or '')
-            improvement_rows.append({
-                'priority': priority,
-                'area': 'Value-Tier (4k-5k) Coverage',
-                'why': f"value_tier_misses={value_tier_miss_count} (top: {top_value})",
-                'next_slate_change': 'Reweight sub-$5k value detection and minutes/role volatility filters.',
-                'success_metric': 'Improve hit rate on 4k-5k core and standout outcomes.',
-            })
-            priority += 1
+        if overlap_gap_avg is not None and abs(overlap_gap_avg) >= 1.0:
+            _append_improvement(
+                'Portfolio Concentration',
+                f"avg_overlap_gap={overlap_gap_avg:+.2f} players vs field",
+                'Tune lineup uniqueness / overlap targets so portfolio concentration stays closer to top-N winning structure.',
+                'Reduce pairwise overlap gap while preserving best-lineup ceiling.',
+            )
 
         if combo_capture_miss_count > 0:
             top_combo = str(combo_capture_misses_df.iloc[0].get('combo_players') or '')
             top_combo_gap = pd.to_numeric(combo_capture_misses_df.iloc[0].get('combo_gap_pct'), errors='coerce')
-            improvement_rows.append({
-                'priority': priority,
-                'area': 'Pair/Triple Combo Capture',
-                'why': (
+            _append_improvement(
+                'Pair/Triple Combo Capture',
+                (
                     f"combo_misses={combo_capture_miss_count} (top: {top_combo}, gap={top_combo_gap:.1f}pp)"
                     if pd.notna(top_combo_gap)
                     else f"combo_misses={combo_capture_miss_count}"
                 ),
-                'next_slate_change': 'Add co-occurrence boosts for high-field player pairs/triples in lineup generation.',
-                'success_metric': 'Increase capture rate of top-field combo structures.',
-            })
-            priority += 1
+                'Add co-occurrence boosts for high top-N player pairs/triples in lineup generation.',
+                'Increase capture rate of top-field combo structures.',
+            )
+
+        if team_concentration_mismatch_count > 0:
+            _append_improvement(
+                'Team Concentration Alignment',
+                (
+                    f"team_mismatches={team_concentration_mismatch_count} "
+                    f"(largest: {largest_team_slot_gap_team} {largest_team_slot_gap:+.1f}pp)"
+                    if largest_team_slot_gap is not None and largest_team_slot_gap_team
+                    else f"team_mismatches={team_concentration_mismatch_count}"
+                ),
+                'Constrain team slot-share drift vs top-field concentration patterns.',
+                'Shrink team concentration gap on heavily targeted games/teams.',
+            )
+
+        if not missed_standouts_df.empty:
+            top_miss = str(missed_standouts_df.iloc[0].get('display_name') or '')
+            top_err = pd.to_numeric(missed_standouts_df.iloc[0].get('actual_minus_proj'), errors='coerce')
+            _append_improvement(
+                'Missed Standout Detection',
+                (
+                    f"missed_standouts={len(missed_standouts_df)} (top: {top_miss}, +{top_err:.1f})"
+                    if pd.notna(top_err)
+                    else f"missed_standouts={len(missed_standouts_df)}"
+                ),
+                'Strengthen standout rules for volatile upside profiles and stack contexts.',
+                'Improve coverage of high actual-minus-projection players.',
+            )
+
+        if overexposed_dud_count > 0:
+            top_dud = str(overexposed_duds_df.iloc[0].get('display_name') or '')
+            over_gap = pd.to_numeric(overexposed_duds_df.iloc[0].get('our_minus_field_pct'), errors='coerce')
+            _append_improvement(
+                'Overexposed Dud Guardrails',
+                (
+                    f"overexposed_duds={overexposed_dud_count} (top: {top_dud}, overexposure={over_gap:+.1f}pp)"
+                    if pd.notna(over_gap)
+                    else f"overexposed_duds={overexposed_dud_count}"
+                ),
+                'Cap fragile high-exposure plays when field is underweight and downside risk is high.',
+                'Reduce negative-leverage overexposure without sacrificing ceiling.',
+            )
+
+        if value_tier_miss_count > 0:
+            top_value = str(value_tier_misses_df.iloc[0].get('display_name') or '')
+            _append_improvement(
+                'Value-Tier (4k-5k) Coverage',
+                f"value_tier_misses={value_tier_miss_count} (top: {top_value})",
+                'Reweight sub-$5k value detection and minutes/role volatility filters.',
+                'Improve hit rate on 4k-5k core and standout outcomes.',
+            )
 
         if len(cheap_core_candidates_df) > 0:
             why_parts: List[str] = [
@@ -3843,43 +3968,39 @@ def build_tournament_postmortem(
                 why_parts.append(f"pair_gap={cheap_core_pair_gap:.1f}pp")
             if cheap_core_triple_gap is not None:
                 why_parts.append(f"triple_gap={cheap_core_triple_gap:.1f}pp")
-            improvement_rows.append({
-                'priority': priority,
-                'area': 'Cheap-Core Capture',
-                'why': ', '.join(why_parts),
-                'next_slate_change': (
+            _append_improvement(
+                'Cheap-Core Capture',
+                ', '.join(why_parts),
+                (
                     'Review cheap-core candidates, pair coverage, and blocker reasons before build lock; '
                     'increase cheap-core combo concentration only when field support is broad.'
                 ),
-                'success_metric': (
-                    'Raise cheap-core lineup/pair/triple coverage toward field levels without inflating dud exposure.'
-                ),
-            })
-            priority += 1
+                'Raise cheap-core lineup/pair/triple coverage toward field levels without inflating dud exposure.',
+            )
 
-        if team_concentration_mismatch_count > 0:
-            improvement_rows.append({
-                'priority': priority,
-                'area': 'Team Concentration Alignment',
-                'why': (
-                    f"team_mismatches={team_concentration_mismatch_count} "
-                    f"(largest: {largest_team_slot_gap_team} {largest_team_slot_gap:+.1f}pp)"
-                    if largest_team_slot_gap is not None and largest_team_slot_gap_team
-                    else f"team_mismatches={team_concentration_mismatch_count}"
+        if ownership_is_healthy and ownership_mae is not None:
+            _append_improvement(
+                'Ownership Calibration',
+                (
+                    f"ownership_mae={ownership_mae:.2f}, rank_corr={ownership_rank_corr:.2f}"
+                    if ownership_rank_corr is not None
+                    else f"ownership_mae={ownership_mae:.2f}"
                 ),
-                'next_slate_change': 'Constrain team slot-share drift vs top-field concentration patterns.',
-                'success_metric': 'Shrink team concentration gap on heavily targeted games/teams.',
-            })
-            priority += 1
+                'Keep ownership as a secondary tuning pass behind structural exposure fixes.',
+                'Maintain current ownership accuracy while improving structural capture.',
+            )
 
-        if overlap_gap_avg is not None and abs(overlap_gap_avg) >= 1.0:
-            improvement_rows.append({
-                'priority': priority,
-                'area': 'Portfolio Concentration',
-                'why': f"avg_overlap_gap={overlap_gap_avg:+.2f} players vs field",
-                'next_slate_change': 'Tune lineup uniqueness / overlap targets so portfolio concentration stays closer to field-winning structure.',
-                'success_metric': 'Reduce pairwise overlap gap while preserving best-lineup ceiling.',
-            })
+        if projection_is_healthy and proj_mae is not None:
+            _append_improvement(
+                'Projection Calibration',
+                (
+                    f"MAE={proj_mae:.2f}, rank_corr={proj_rank_corr:.2f}"
+                    if proj_rank_corr is not None
+                    else f"MAE={proj_mae:.2f}"
+                ),
+                'Treat projection tuning as secondary unless structural fixes stop closing the winner gap.',
+                'Hold projection accuracy while improving best-lineup actual FPTS.',
+            )
 
         result['improvements_df'] = (
             pd.DataFrame(improvement_rows).sort_values('priority')
@@ -3889,6 +4010,7 @@ def build_tournament_postmortem(
 
         result['top_field_players_df'] = top_field_players_df.reset_index(drop=True)
         result['exposure_comparison_df'] = exposure_df.reset_index(drop=True)
+        result['ownership_context_df'] = ownership_context_df.reset_index(drop=True)
         result['missed_core_df'] = missed_core_df.reset_index(drop=True)
         result['missed_standouts_df'] = missed_standouts_df.reset_index(drop=True)
         result['ownership_polarity_df'] = ownership_polarity_df.reset_index(drop=True)
