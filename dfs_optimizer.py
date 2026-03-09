@@ -1069,6 +1069,230 @@ def get_lineup_model_profiles() -> Dict[str, Dict[str, Any]]:
     return LINEUP_MODEL_PROFILES
 
 
+LINEUP_GENERATION_REGIME_HINTS: Dict[str, Dict[str, str]] = {
+    "auto": {
+        "label": "Auto (Slate + Build Size)",
+        "description": (
+            "Infer slate regime from game count and field regime from the size "
+            "of the lineup build."
+        ),
+    },
+    "small_field": {
+        "label": "Small Field / SE / 3-max",
+        "description": (
+            "Concentrate on core outcomes with tighter overlap and less low-owned noise."
+        ),
+    },
+    "medium_field": {
+        "label": "Mid-Field / 20-max",
+        "description": "Balanced GPP posture between concentration and leverage.",
+    },
+    "large_field": {
+        "label": "Large Field / MME",
+        "description": (
+            "Push more leverage, ceiling, and stack pressure without abandoning core plays."
+        ),
+    },
+}
+
+LINEUP_GENERATION_SLATE_RULES: Dict[str, Dict[str, Any]] = {
+    "small_slate": {
+        "label": "Small Slate",
+        "overlap_cap_delta": 1,
+        "core_play_inject_prob_mult": 1.25,
+        "low_own_inject_prob_mult": 0.70,
+        "standout_lock_prob_mult": 0.85,
+        "ceiling_focus_delta": -10,
+        "force_aggressive_ceiling_stack": False,
+    },
+    "medium_slate": {
+        "label": "Mid Slate",
+        "overlap_cap_delta": 0,
+        "core_play_inject_prob_mult": 1.00,
+        "low_own_inject_prob_mult": 1.00,
+        "standout_lock_prob_mult": 1.00,
+        "ceiling_focus_delta": 0,
+        "force_aggressive_ceiling_stack": False,
+    },
+    "large_slate": {
+        "label": "Large Slate",
+        "overlap_cap_delta": -1,
+        "core_play_inject_prob_mult": 0.95,
+        "low_own_inject_prob_mult": 1.10,
+        "standout_lock_prob_mult": 1.08,
+        "ceiling_focus_delta": 10,
+        "force_aggressive_ceiling_stack": True,
+    },
+}
+
+LINEUP_GENERATION_FIELD_RULES: Dict[str, Dict[str, Any]] = {
+    "small_field": {
+        "label": "Small Field / SE / 3-max",
+        "overlap_cap_delta": 1,
+        "core_play_inject_prob_mult": 1.20,
+        "low_own_inject_prob_mult": 0.75,
+        "standout_lock_prob_mult": 0.85,
+        "ceiling_focus_delta": -10,
+        "force_aggressive_ceiling_stack": False,
+    },
+    "medium_field": {
+        "label": "Mid-Field / 20-max",
+        "overlap_cap_delta": 0,
+        "core_play_inject_prob_mult": 1.00,
+        "low_own_inject_prob_mult": 1.00,
+        "standout_lock_prob_mult": 1.00,
+        "ceiling_focus_delta": 0,
+        "force_aggressive_ceiling_stack": False,
+    },
+    "large_field": {
+        "label": "Large Field / MME",
+        "overlap_cap_delta": -1,
+        "core_play_inject_prob_mult": 1.00,
+        "low_own_inject_prob_mult": 1.15,
+        "standout_lock_prob_mult": 1.12,
+        "ceiling_focus_delta": 10,
+        "force_aggressive_ceiling_stack": True,
+    },
+}
+
+
+def get_lineup_generation_regime_hints() -> Dict[str, Dict[str, str]]:
+    """Return lineup-generation regime hint metadata for the UI."""
+    return LINEUP_GENERATION_REGIME_HINTS
+
+
+def resolve_lineup_generation_regime(
+    player_pool: List["DFSPlayer"],
+    num_lineups: int,
+    regime_hint: str = "auto",
+    slate_game_count: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Resolve the active lineup-construction regime for this build.
+
+    The slate bucket is inferred from game count. The field bucket is either a
+    manual hint or an automatic build-size proxy when the hint is `auto`.
+    """
+    normalized_hint = str(regime_hint or "auto").strip().lower()
+    if normalized_hint not in LINEUP_GENERATION_REGIME_HINTS:
+        normalized_hint = "auto"
+
+    if slate_game_count is None:
+        slate_game_count = len(
+            {
+                str(getattr(player, "game_id", "") or "").strip()
+                for player in player_pool
+                if str(getattr(player, "game_id", "") or "").strip()
+            }
+        )
+    slate_games = max(0, int(slate_game_count or 0))
+    if slate_games <= 4:
+        slate_bucket = "small_slate"
+    elif slate_games >= 8:
+        slate_bucket = "large_slate"
+    else:
+        slate_bucket = "medium_slate"
+
+    auto_field_bucket = "medium_field"
+    if int(num_lineups or 0) <= 3:
+        auto_field_bucket = "small_field"
+    elif int(num_lineups or 0) >= 50:
+        auto_field_bucket = "large_field"
+
+    field_bucket = (
+        normalized_hint if normalized_hint != "auto" else auto_field_bucket
+    )
+    if field_bucket not in LINEUP_GENERATION_FIELD_RULES:
+        field_bucket = auto_field_bucket
+
+    slate_rule = LINEUP_GENERATION_SLATE_RULES[slate_bucket]
+    field_rule = LINEUP_GENERATION_FIELD_RULES[field_bucket]
+    overlap_cap_delta = int(
+        slate_rule.get("overlap_cap_delta", 0) or 0
+    ) + int(field_rule.get("overlap_cap_delta", 0) or 0)
+    core_mult = float(
+        slate_rule.get("core_play_inject_prob_mult", 1.0) or 1.0
+    ) * float(field_rule.get("core_play_inject_prob_mult", 1.0) or 1.0)
+    low_own_mult = float(
+        slate_rule.get("low_own_inject_prob_mult", 1.0) or 1.0
+    ) * float(field_rule.get("low_own_inject_prob_mult", 1.0) or 1.0)
+    standout_mult = float(
+        slate_rule.get("standout_lock_prob_mult", 1.0) or 1.0
+    ) * float(field_rule.get("standout_lock_prob_mult", 1.0) or 1.0)
+    ceiling_focus_delta = int(
+        slate_rule.get("ceiling_focus_delta", 0) or 0
+    ) + int(field_rule.get("ceiling_focus_delta", 0) or 0)
+    force_aggressive_ceiling_stack = bool(
+        slate_rule.get("force_aggressive_ceiling_stack", False)
+        or field_rule.get("force_aggressive_ceiling_stack", False)
+    )
+    if slate_bucket == "small_slate":
+        force_aggressive_ceiling_stack = False
+
+    regime_key = f"{slate_bucket}__{field_bucket}"
+    regime_label = (
+        f"{slate_rule.get('label', slate_bucket)} + "
+        f"{field_rule.get('label', field_bucket)}"
+    )
+    notes = (
+        f"{slate_games} games | overlap {overlap_cap_delta:+d} | "
+        f"core x{core_mult:.2f} | low-own x{low_own_mult:.2f} | "
+        f"standout x{standout_mult:.2f} | ceiling {ceiling_focus_delta:+d}"
+    )
+
+    return {
+        "regime_hint": normalized_hint,
+        "regime_key": regime_key,
+        "regime_label": regime_label,
+        "regime_notes": notes,
+        "slate_games": slate_games,
+        "slate_bucket": slate_bucket,
+        "field_bucket": field_bucket,
+        "auto_field_bucket": auto_field_bucket,
+        "overlap_cap_delta": overlap_cap_delta,
+        "core_play_inject_prob_mult": core_mult,
+        "low_own_inject_prob_mult": low_own_mult,
+        "standout_lock_prob_mult": standout_mult,
+        "ceiling_focus_delta": ceiling_focus_delta,
+        "force_aggressive_ceiling_stack": force_aggressive_ceiling_stack,
+        "auto_inferred": normalized_hint == "auto",
+    }
+
+
+def _apply_lineup_generation_regime(
+    profile_cfg: Dict[str, Any],
+    resolved_regime: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Apply bounded regime overrides to a lineup profile."""
+    effective_cfg = dict(profile_cfg or {})
+    if effective_cfg.get("strategy_mix"):
+        effective_cfg["strategy_mix"] = [
+            tuple(item) for item in effective_cfg.get("strategy_mix", [])
+        ]
+
+    if not resolved_regime:
+        return effective_cfg
+
+    def _scaled_prob(key: str) -> None:
+        if key not in effective_cfg:
+            return
+        multiplier = float(resolved_regime.get(f"{key}_mult", 1.0) or 1.0)
+        value = float(effective_cfg.get(key, 0.0) or 0.0)
+        effective_cfg[key] = max(0.0, min(1.0, value * multiplier))
+
+    base_overlap_cap = int(effective_cfg.get("overlap_cap", 8) or 8)
+    effective_cfg["overlap_cap"] = int(
+        max(2, min(8, base_overlap_cap + int(resolved_regime.get("overlap_cap_delta", 0) or 0)))
+    )
+    _scaled_prob("core_play_inject_prob")
+    _scaled_prob("low_own_inject_prob")
+    _scaled_prob("standout_lock_prob")
+
+    effective_cfg["regime_key"] = str(resolved_regime.get("regime_key") or "")
+    effective_cfg["regime_label"] = str(resolved_regime.get("regime_label") or "")
+    effective_cfg["regime_notes"] = str(resolved_regime.get("regime_notes") or "")
+    return effective_cfg
+
+
 LINEUPSTARTER_SOURCE_MARKERS = ("lineupstarter", "linestarter", "line starter")
 
 LINEUPSTARTER_OWNERSHIP_GUARDRAIL_DEFAULTS: Dict[str, float] = {
@@ -2076,6 +2300,9 @@ class DFSLineup:
     model_key: str = ""
     model_label: str = ""
     generation_strategy: str = ""
+    regime_key: str = ""
+    regime_label: str = ""
+    regime_notes: str = ""
 
     @property
     def total_salary(self) -> int:
@@ -4169,6 +4396,8 @@ def generate_diversified_lineups(
     aggressive_ceiling_stack: bool = False,
     model_key: str = "",
     model_label: str = "",
+    regime_hint: str = "auto",
+    slate_game_count: Optional[int] = None,
     debug_stats: Optional[Dict[str, int]] = None,
 ) -> List[DFSLineup]:
     """
@@ -4197,6 +4426,8 @@ def generate_diversified_lineups(
         aggressive_ceiling_stack: If True, keep stacking active for ceiling/leverage.
         model_key: Optional model/profile key annotation on generated lineups.
         model_label: Optional display label annotation on generated lineups.
+        regime_hint: Auto or manual field-size regime hint.
+        slate_game_count: Optional explicit slate game count for regime inference.
 
     Returns:
         List of valid DFSLineup objects
@@ -4283,7 +4514,29 @@ def generate_diversified_lineups(
     for pid, info in target_player_map.items():
         max_exp[pid] = max(max_player_exposure, info['target'])
 
-    profile_cfg = LINEUP_MODEL_PROFILES.get(model_key, {}) if model_key else {}
+    profile_cfg = dict(LINEUP_MODEL_PROFILES.get(model_key, {}) if model_key else {})
+    resolved_regime = resolve_lineup_generation_regime(
+        filtered_pool,
+        num_lineups=num_lineups,
+        regime_hint=regime_hint,
+        slate_game_count=slate_game_count,
+    )
+    profile_cfg = _apply_lineup_generation_regime(profile_cfg, resolved_regime)
+    effective_ceiling_focus_pct = int(
+        max(
+            0,
+            min(
+                100,
+                int(ceiling_focus_pct)
+                + int(resolved_regime.get("ceiling_focus_delta", 0) or 0),
+            ),
+        )
+    )
+    effective_aggressive_ceiling_stack = bool(
+        aggressive_ceiling_stack
+        or bool(profile_cfg.get("aggressive_ceiling_stack", False))
+        or bool(resolved_regime.get("force_aggressive_ceiling_stack", False))
+    )
     cheap_core_context = _build_cheap_core_context(filtered_pool, profile_cfg)
     cheap_core_player_ids = set(cheap_core_context.get("candidate_ids", set()) or set())
 
@@ -4451,7 +4704,7 @@ def generate_diversified_lineups(
 
     # Ceiling focus dial shifts weight from projection/value into ceiling/leverage.
     # This keeps model profiles flexible while allowing a slate-level upside push.
-    focus = max(0.0, min(1.0, float(ceiling_focus_pct) / 100.0))
+    focus = max(0.0, min(1.0, float(effective_ceiling_focus_pct) / 100.0))
     if focus > 0:
         adjusted = []
         for strategy, rand_factor, pct in strategies:
@@ -4722,7 +4975,7 @@ def generate_diversified_lineups(
             if not stack_locked_by_profile:
                 if stack_config and strategy == 'leverage':
                     # In aggressive ceiling-stack mode, keep leverage stacks active.
-                    if not aggressive_ceiling_stack and random.random() < 0.5:
+                    if not effective_aggressive_ceiling_stack and random.random() < 0.5:
                         attempt_stack = None  # Contrarian: no forced stacking
                 elif stack_config and strategy == 'projection' and rand_factor >= 0.5:
                     # Balanced bucket: randomize between full/mini/none
@@ -4760,6 +5013,9 @@ def generate_diversified_lineups(
                     lineup.model_key = model_key
                     lineup.model_label = model_label
                     lineup.generation_strategy = strategy
+                    lineup.regime_key = str(resolved_regime.get("regime_key") or "")
+                    lineup.regime_label = str(resolved_regime.get("regime_label") or "")
+                    lineup.regime_notes = str(resolved_regime.get("regime_notes") or "")
                     lineups.append(lineup)
                     existing_lineup_keys.add(lineup_key)
                     lineup_player_sets.append(set(lineup_key))

@@ -16836,6 +16836,8 @@ if selected_page == "DFS Lineup Builder":
 
     # Builder configuration
     model_profiles = dfs.get_lineup_model_profiles()
+    regime_hint_metadata = dfs.get_lineup_generation_regime_hints()
+    regime_hint_keys = list(regime_hint_metadata.keys())
 
     # Ensure expected model catalog is always present in UI order.
     expected_model_labels = {
@@ -16921,6 +16923,52 @@ if selected_page == "DFS Lineup Builder":
                 "Keeps stacking active in ceiling/leverage builds to maximize "
                 "correlated upside."
             ),
+        )
+        contest_regime_hint = st.selectbox(
+            "Contest Regime",
+            options=regime_hint_keys,
+            index=regime_hint_keys.index(
+                st.session_state.get("dfs_builder_regime_hint", "auto")
+            )
+            if st.session_state.get("dfs_builder_regime_hint", "auto") in regime_hint_keys
+            else 0,
+            format_func=lambda key: regime_hint_metadata.get(key, {}).get("label", key),
+            key="dfs_builder_regime_hint",
+            help=(
+                "Auto uses slate game count plus lineup-build size as a field proxy. "
+                "Use a manual regime when you know you are building for SE/3-max or a large-field MME contest."
+            ),
+        )
+        builder_upload_metadata = st.session_state.get("dfs_upload_metadata", {}) or {}
+        builder_loaded_players = (
+            st.session_state.get("dfs_loaded_slate_players", [])
+            or st.session_state.get("dfs_player_pool", [])
+            or []
+        )
+        builder_slate_game_count = int(builder_upload_metadata.get("unique_games") or 0)
+        if builder_slate_game_count <= 0:
+            builder_slate_game_count = len(
+                {
+                    str(getattr(player, "game_id", "") or "").strip()
+                    for player in builder_loaded_players
+                    if str(getattr(player, "game_id", "") or "").strip()
+                }
+            )
+        resolved_builder_regime = dfs.resolve_lineup_generation_regime(
+            builder_loaded_players,
+            num_lineups=int(num_lineups),
+            regime_hint=contest_regime_hint,
+            slate_game_count=builder_slate_game_count or None,
+        )
+        st.caption(
+            "Resolved regime: "
+            f"{resolved_builder_regime.get('regime_label') or 'Unknown'}"
+            + (
+                " (auto)"
+                if bool(resolved_builder_regime.get("auto_inferred"))
+                else ""
+            )
+            + f" | {resolved_builder_regime.get('regime_notes') or ''}"
         )
 
     with settings_col2:
@@ -18534,6 +18582,16 @@ if selected_page == "DFS Lineup Builder":
                         f"Diagnostics for {model_profiles.get(diagnostic_model_key, {}).get('label', diagnostic_model_key)}. "
                         "Cheap-core signals and likely blockers update from the current player-pool state."
                     )
+                    st.caption(
+                        "Resolved build regime: "
+                        f"{resolved_builder_regime.get('regime_label') or 'Unknown'}"
+                        + (
+                            " (auto)"
+                            if bool(resolved_builder_regime.get("auto_inferred"))
+                            else ""
+                        )
+                        + f" | {resolved_builder_regime.get('regime_notes') or ''}"
+                    )
 
                     display_diag = diagnostic_df.copy()
                     display_diag = display_diag.drop(columns=["player_id"], errors="ignore")
@@ -19604,6 +19662,8 @@ if selected_page == "DFS Lineup Builder":
                                 aggressive_ceiling_stack=(aggressive_ceiling_stacks or profile_stack_bias),
                                 model_key=model_key,
                                 model_label=profile_label,
+                                regime_hint=contest_regime_hint,
+                                slate_game_count=builder_slate_game_count or None,
                                 debug_stats=model_debug_stats,
                             )
                             optimizer_debug_by_model[model_key] = model_debug_stats
@@ -19652,6 +19712,20 @@ if selected_page == "DFS Lineup Builder":
 
                     if lineups:
                         st.success(f"✅ Generated {len(lineups)} valid lineups!")
+                        resolved_lineup_regimes = sorted(
+                            {
+                                str(getattr(lineup, "regime_label", "") or "").strip()
+                                for lineup in lineups
+                                if str(getattr(lineup, "regime_label", "") or "").strip()
+                            }
+                        )
+                        resolved_lineup_regime_notes = sorted(
+                            {
+                                str(getattr(lineup, "regime_notes", "") or "").strip()
+                                for lineup in lineups
+                                if str(getattr(lineup, "regime_notes", "") or "").strip()
+                            }
+                        )
                         if run_mode == "All Versions":
                             breakdown = []
                             for model_key in model_run_keys:
@@ -19661,6 +19735,11 @@ if selected_page == "DFS Lineup Builder":
                         else:
                             active_model_label = model_profiles.get(selected_model_key, {}).get("label", selected_model_key)
                             st.caption(f"Model used: {active_model_label} | Ceiling focus: {ceiling_focus_pct}%")
+                        if resolved_lineup_regimes:
+                            regime_caption = ", ".join(resolved_lineup_regimes)
+                            if resolved_lineup_regime_notes:
+                                regime_caption += f" | {resolved_lineup_regime_notes[0]}"
+                            st.caption(f"Active regime: {regime_caption}")
 
                         # Auto-save slate projections + lineups for tracking
                         try:
@@ -19687,10 +19766,14 @@ if selected_page == "DFS Lineup Builder":
                                     "num_lineups_requested": int(num_lineups),
                                     "num_lineups_returned": int(len(lineups)),
                                     "max_player_exposure": float(max_exposure),
+                                    "slate_game_count": int(builder_slate_game_count or 0),
                                     "ceiling_focus_pct": int(ceiling_focus_pct),
                                     "aggressive_ceiling_stacks": bool(
                                         aggressive_ceiling_stacks or False
                                     ),
+                                    "contest_regime_hint": str(contest_regime_hint or "auto"),
+                                    "resolved_regime_labels": resolved_lineup_regimes,
+                                    "resolved_regime_notes": resolved_lineup_regime_notes,
                                     "min_salary_floor": int(min_salary_floor),
                                     "excluded_games": sorted(
                                         st.session_state.get("dfs_excluded_games", set()) or set()
@@ -20792,7 +20875,7 @@ if selected_page == "DFS Lineup Builder":
 
                         metrics_payload = pm_payload.get("metrics") or {}
                         pm_export_payload = {
-                            "schema_version": "dfs_tournament_postmortem_v2",
+                            "schema_version": "dfs_tournament_postmortem_v3",
                             "generated_at": datetime.now(EASTERN_TZ).isoformat(),
                             "context": {
                                 "slate_date": selected_postmortem_slate,
@@ -20864,6 +20947,9 @@ if selected_page == "DFS Lineup Builder":
                                 ),
                                 "model_strategy_breakdown": _df_records_safe(
                                     pm_payload.get("model_strategy_breakdown_df")
+                                ),
+                                "regime_breakdown": _df_records_safe(
+                                    pm_payload.get("regime_breakdown_df")
                                 ),
                                 "model_signal_coverage": _df_records_safe(
                                     pm_payload.get("model_signal_coverage_df")
@@ -22201,6 +22287,9 @@ if selected_page == "DFS Lineup Builder":
                                     f"Top scorer in top-{pm_top_n} field lineups: "
                                     f"`{top_scorer_name}` ({float(top_scorer_actual):.1f} DK points)."
                                 )
+                            active_regime_label = str(pm_metrics.get('active_regime_label') or '').strip()
+                            if active_regime_label:
+                                st.caption(f"Active saved regime: `{active_regime_label}`.")
                             st.caption(
                                 "In this postmortem, `Top-N Field Exp %` is exposure inside the analyzed "
                                 "winner sample, while `Actual Own%` is whole-contest ownership."
@@ -22245,6 +22334,7 @@ if selected_page == "DFS Lineup Builder":
                                 st.markdown("**Model / Strategy Breakdown**")
                                 model_view = model_breakdown_df[
                                     [
+                                        'regime_label',
                                         'model_label',
                                         'generation_strategy',
                                         'lineups',
@@ -22261,6 +22351,7 @@ if selected_page == "DFS Lineup Builder":
                                     ]
                                 ].copy()
                                 model_view.columns = [
+                                    'Regime',
                                     'Model',
                                     'Strategy',
                                     'Lineups',
@@ -22290,6 +22381,52 @@ if selected_page == "DFS Lineup Builder":
                                     lambda x: "Yes" if bool(x) else "No"
                                 )
                                 st.dataframe(model_view, use_container_width=True, hide_index=True)
+
+                            regime_breakdown_df = pm_payload.get('regime_breakdown_df')
+                            if isinstance(regime_breakdown_df, pd.DataFrame) and not regime_breakdown_df.empty:
+                                st.markdown("**Regime Breakdown**")
+                                regime_view = regime_breakdown_df[
+                                    [
+                                        'regime_label',
+                                        'lineups',
+                                        'avg_actual_fpts',
+                                        'best_actual_fpts',
+                                        'avg_proj_fpts',
+                                        'avg_salary',
+                                        'avg_top_stack_size',
+                                        'avg_pairwise_overlap',
+                                        'avg_proj_ownership',
+                                        'avg_actual_ownership',
+                                    ]
+                                ].copy()
+                                regime_view.columns = [
+                                    'Regime',
+                                    'Lineups',
+                                    'Avg Actual',
+                                    'Best Actual',
+                                    'Avg Proj',
+                                    'Avg Salary',
+                                    'Avg Top Stack',
+                                    'Avg Overlap',
+                                    'Avg Proj Own%',
+                                    'Avg Actual Own%',
+                                ]
+                                for c in [
+                                    'Avg Actual',
+                                    'Best Actual',
+                                    'Avg Proj',
+                                    'Avg Top Stack',
+                                    'Avg Overlap',
+                                    'Avg Proj Own%',
+                                    'Avg Actual Own%',
+                                ]:
+                                    regime_view[c] = regime_view[c].apply(
+                                        lambda x: f"{x:.2f}" if pd.notna(x) else "—"
+                                    )
+                                regime_view['Avg Salary'] = regime_view['Avg Salary'].apply(
+                                    lambda x: f"${int(round(x)):,.0f}" if pd.notna(x) else "—"
+                                )
+                                st.dataframe(regime_view, use_container_width=True, hide_index=True)
 
                             model_signal_df = pm_payload.get('model_signal_coverage_df')
                             if isinstance(model_signal_df, pd.DataFrame) and not model_signal_df.empty:
@@ -22975,6 +23112,9 @@ if selected_page == "DFS Lineup Builder":
                                         'Model Key',
                                         'Model',
                                         'Strategy',
+                                        'Regime Key',
+                                        'Regime',
+                                        'Regime Notes',
                                         'Total Proj FPTS',
                                         'Total Actual FPTS',
                                         'Total Salary',

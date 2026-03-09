@@ -80,6 +80,9 @@ def create_dfs_tracking_tables(conn: sqlite3.Connection) -> None:
             model_key TEXT,
             model_label TEXT,
             generation_strategy TEXT,
+            regime_key TEXT,
+            regime_label TEXT,
+            regime_notes TEXT,
             total_proj_fpts REAL,
             total_salary INTEGER,
             pg_id INTEGER,
@@ -223,6 +226,9 @@ def create_dfs_tracking_tables(conn: sqlite3.Connection) -> None:
         ("dfs_slate_lineups", "model_key", "TEXT"),
         ("dfs_slate_lineups", "model_label", "TEXT"),
         ("dfs_slate_lineups", "generation_strategy", "TEXT"),
+        ("dfs_slate_lineups", "regime_key", "TEXT"),
+        ("dfs_slate_lineups", "regime_label", "TEXT"),
+        ("dfs_slate_lineups", "regime_notes", "TEXT"),
         ("dfs_slate_lineups", "created_at", "TEXT"),
     ]
     for table, col, col_type in migrations:
@@ -357,14 +363,19 @@ def save_slate_lineups(
         model_key = getattr(lineup, "model_key", "") or "standard_v1"
         model_label = getattr(lineup, "model_label", "") or model_key
         generation_strategy = getattr(lineup, "generation_strategy", "") or ""
+        regime_key = getattr(lineup, "regime_key", "") or ""
+        regime_label = getattr(lineup, "regime_label", "") or regime_key
+        regime_notes = getattr(lineup, "regime_notes", "") or ""
         cursor.execute("""
             INSERT OR REPLACE INTO dfs_slate_lineups (
                 slate_date, lineup_num, model_key, model_label, generation_strategy,
+                regime_key, regime_label, regime_notes,
                 total_proj_fpts, total_salary,
                 pg_id, sg_id, sf_id, pf_id, c_id, g_id, f_id, util_id, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             slate_date, i, model_key, model_label, generation_strategy,
+            regime_key, regime_label, regime_notes,
             lineup.total_proj_fpts, lineup.total_salary,
             players['PG'].player_id if players.get('PG') else None,
             players['SG'].player_id if players.get('SG') else None,
@@ -2016,6 +2027,7 @@ def build_tournament_postmortem(
     - raw lineup structure and portfolio concentration diagnostics
     - concise "what went right / wrong" notes and next-slate actions
     """
+    create_dfs_tracking_tables(conn)
     top_n = max(1, int(top_n))
     core_field_exposure_pct = float(max(0.0, min(100.0, core_field_exposure_pct)))
     underexposure_ratio = float(max(0.0, min(1.0, underexposure_ratio)))
@@ -2039,6 +2051,7 @@ def build_tournament_postmortem(
         'our_lineup_structures_df': pd.DataFrame(),
         'portfolio_diagnostics_df': pd.DataFrame(),
         'model_strategy_breakdown_df': pd.DataFrame(),
+        'regime_breakdown_df': pd.DataFrame(),
         'model_signal_coverage_df': pd.DataFrame(),
         'cheap_core_candidates_df': pd.DataFrame(),
         'cheap_core_combo_coverage_df': pd.DataFrame(),
@@ -2121,6 +2134,9 @@ def build_tournament_postmortem(
                    COALESCE(NULLIF(model_key, ''), 'standard_v1') AS model_key,
                    COALESCE(NULLIF(model_label, ''), COALESCE(NULLIF(model_key, ''), 'standard_v1')) AS model_label,
                    COALESCE(generation_strategy, '') AS generation_strategy,
+                   COALESCE(NULLIF(regime_key, ''), '') AS regime_key,
+                   COALESCE(NULLIF(regime_label, ''), COALESCE(NULLIF(regime_key, ''), '')) AS regime_label,
+                   COALESCE(regime_notes, '') AS regime_notes,
                    total_proj_fpts,
                    total_salary,
                    total_actual_fpts,
@@ -2175,12 +2191,31 @@ def build_tournament_postmortem(
         our_long = pd.DataFrame(columns=['lineup_num', 'slot', 'player', 'name_key'])
         lineup_name_sets: List[set] = []
         if not our_lineups_df.empty:
-            for col in ['model_key', 'model_label', 'generation_strategy']:
+            for col in [
+                'model_key',
+                'model_label',
+                'generation_strategy',
+                'regime_key',
+                'regime_label',
+                'regime_notes',
+            ]:
                 our_lineups_df[col] = our_lineups_df[col].fillna('').astype(str).str.strip()
             our_lineups_df['model_key'] = our_lineups_df['model_key'].replace('', 'standard_v1')
             our_lineups_df['model_label'] = our_lineups_df['model_label'].where(
                 our_lineups_df['model_label'].ne(''),
                 our_lineups_df['model_key'],
+            )
+            our_lineups_df['regime_key'] = our_lineups_df['regime_key'].replace(
+                '',
+                'legacy_untracked',
+            )
+            our_lineups_df['regime_label'] = our_lineups_df['regime_label'].where(
+                our_lineups_df['regime_label'].ne(''),
+                our_lineups_df['regime_key'].map(
+                    lambda value: 'Legacy / Untracked'
+                    if str(value or '').strip() == 'legacy_untracked'
+                    else value
+                ),
             )
         if our_lineups > 0 and our_name_cols:
             our_long = our_lineups_df[['lineup_num'] + our_name_cols].melt(
@@ -2364,7 +2399,16 @@ def build_tournament_postmortem(
             )
         if not our_long.empty:
             our_long = our_long.merge(
-                our_lineups_df[['lineup_num', 'model_key', 'model_label', 'generation_strategy']],
+                our_lineups_df[
+                    [
+                        'lineup_num',
+                        'model_key',
+                        'model_label',
+                        'generation_strategy',
+                        'regime_key',
+                        'regime_label',
+                    ]
+                ],
                 on='lineup_num',
                 how='left',
             )
@@ -2528,6 +2572,9 @@ def build_tournament_postmortem(
                     'model_key': str(lineup_row.get('model_key') or 'standard_v1'),
                     'model_label': str(lineup_row.get('model_label') or lineup_row.get('model_key') or 'standard_v1'),
                     'generation_strategy': str(lineup_row.get('generation_strategy') or ''),
+                    'regime_key': str(lineup_row.get('regime_key') or ''),
+                    'regime_label': str(lineup_row.get('regime_label') or lineup_row.get('regime_key') or ''),
+                    'regime_notes': str(lineup_row.get('regime_notes') or ''),
                     'total_proj_fpts': float(lineup_row['total_proj_fpts']) if pd.notna(lineup_row.get('total_proj_fpts')) else None,
                     'total_actual_fpts': float(lineup_row['total_actual_fpts']) if pd.notna(lineup_row.get('total_actual_fpts')) else None,
                     'total_salary': int(lineup_row['total_salary']) if pd.notna(lineup_row.get('total_salary')) else None,
@@ -3302,9 +3349,15 @@ def build_tournament_postmortem(
 
                 if not our_lineups_df.empty:
                     model_rows: List[Dict[str, Any]] = []
-                    model_group_cols = ['model_key', 'model_label', 'generation_strategy']
+                    model_group_cols = [
+                        'model_key',
+                        'model_label',
+                        'generation_strategy',
+                        'regime_key',
+                        'regime_label',
+                    ]
                     for group_vals, group_lineups_df in our_lineups_df.groupby(model_group_cols, dropna=False):
-                        model_key, model_label, generation_strategy = group_vals
+                        model_key, model_label, generation_strategy, regime_key, regime_label = group_vals
                         group_lineup_nums = group_lineups_df['lineup_num'].tolist()
                         group_long_df = our_long[our_long['lineup_num'].isin(group_lineup_nums)].copy()
                         group_sets = (
@@ -3339,6 +3392,8 @@ def build_tournament_postmortem(
                             'model_key': str(model_key or 'standard_v1'),
                             'model_label': str(model_label or model_key or 'standard_v1'),
                             'generation_strategy': str(generation_strategy or ''),
+                            'regime_key': str(regime_key or ''),
+                            'regime_label': str(regime_label or regime_key or ''),
                             'lineups': int(len(group_sets)),
                             'cheap_core_players_hit_pct': (
                                 100.0 * float(len(model_hit_keys)) / float(max(1, len(cheap_core_candidate_keys)))
@@ -3475,6 +3530,7 @@ def build_tournament_postmortem(
         }
 
         model_strategy_breakdown_df = pd.DataFrame()
+        regime_breakdown_df = pd.DataFrame()
         model_signal_coverage_df = pd.DataFrame()
         if not our_lineups_df.empty:
             model_rows: List[Dict[str, Any]] = []
@@ -3487,9 +3543,15 @@ def build_tournament_postmortem(
                     display_lookup.get(key, key),
                 ),
             )
-            model_group_cols = ['model_key', 'model_label', 'generation_strategy']
+            model_group_cols = [
+                'model_key',
+                'model_label',
+                'generation_strategy',
+                'regime_key',
+                'regime_label',
+            ]
             for group_vals, group_lineups_df in our_lineups_df.groupby(model_group_cols, dropna=False):
-                model_key, model_label, generation_strategy = group_vals
+                model_key, model_label, generation_strategy, regime_key, regime_label = group_vals
                 group_lineup_nums = group_lineups_df['lineup_num'].tolist()
                 group_size = int(len(group_lineups_df))
                 group_long_df = our_long[our_long['lineup_num'].isin(group_lineup_nums)].copy()
@@ -3541,6 +3603,8 @@ def build_tournament_postmortem(
                         'model_key': str(model_key or 'standard_v1'),
                         'model_label': str(model_label or model_key or 'standard_v1'),
                         'generation_strategy': str(generation_strategy or ''),
+                        'regime_key': str(regime_key or ''),
+                        'regime_label': str(regime_label or regime_key or ''),
                         'player': display_lookup.get(name_key, name_key),
                         'signal_type': ', '.join(signal_type_parts) or 'Signal',
                         'field_exposure_pct': field_pct,
@@ -3558,6 +3622,8 @@ def build_tournament_postmortem(
                     'model_key': str(model_key or 'standard_v1'),
                     'model_label': str(model_label or model_key or 'standard_v1'),
                     'generation_strategy': str(generation_strategy or ''),
+                    'regime_key': str(regime_key or ''),
+                    'regime_label': str(regime_label or regime_key or ''),
                     'lineups': group_size,
                     'avg_proj_fpts': float(pd.to_numeric(group_lineups_df['total_proj_fpts'], errors='coerce').mean())
                     if group_size > 0 else None,
@@ -3606,6 +3672,57 @@ def build_tournament_postmortem(
                 )
                 if signal_rows else pd.DataFrame()
             )
+            if not our_lineup_structures_df.empty:
+                regime_rows: List[Dict[str, Any]] = []
+                regime_group_cols = ['regime_key', 'regime_label']
+                for group_vals, group_structures_df in our_lineup_structures_df.groupby(
+                    regime_group_cols,
+                    dropna=False,
+                ):
+                    regime_key, regime_label = group_vals
+                    group_structures_df = group_structures_df.copy()
+                    group_lineup_nums = group_structures_df['lineup_num'].tolist()
+                    group_lineup_sets = (
+                        our_long[our_long['lineup_num'].isin(group_lineup_nums)]
+                        .groupby('lineup_num')['name_key']
+                        .apply(lambda s: {x for x in s.tolist() if x})
+                        .tolist()
+                        if not our_long.empty
+                        else []
+                    )
+                    group_overlap = _pairwise_overlap_summary(group_lineup_sets)
+                    regime_rows.append({
+                        'regime_key': str(regime_key or ''),
+                        'regime_label': str(regime_label or regime_key or ''),
+                        'lineups': int(len(group_structures_df)),
+                        'avg_actual_fpts': float(
+                            pd.to_numeric(group_structures_df['total_actual_fpts'], errors='coerce').mean()
+                        ) if not group_structures_df.empty else None,
+                        'best_actual_fpts': float(
+                            pd.to_numeric(group_structures_df['total_actual_fpts'], errors='coerce').max()
+                        ) if not group_structures_df.empty else None,
+                        'avg_proj_fpts': float(
+                            pd.to_numeric(group_structures_df['total_proj_fpts'], errors='coerce').mean()
+                        ) if not group_structures_df.empty else None,
+                        'avg_salary': float(
+                            pd.to_numeric(group_structures_df['total_salary'], errors='coerce').mean()
+                        ) if not group_structures_df.empty else None,
+                        'avg_top_stack_size': float(
+                            pd.to_numeric(group_structures_df['top_stack_size'], errors='coerce').mean()
+                        ) if not group_structures_df.empty else None,
+                        'avg_pairwise_overlap': group_overlap.get('avg'),
+                        'avg_proj_ownership': float(
+                            pd.to_numeric(group_structures_df['avg_proj_ownership'], errors='coerce').mean()
+                        ) if not group_structures_df.empty else None,
+                        'avg_actual_ownership': float(
+                            pd.to_numeric(group_structures_df['avg_actual_ownership'], errors='coerce').mean()
+                        ) if not group_structures_df.empty else None,
+                    })
+                if regime_rows:
+                    regime_breakdown_df = pd.DataFrame(regime_rows).sort_values(
+                        ['best_actual_fpts', 'avg_actual_fpts', 'lineups'],
+                        ascending=[False, False, False],
+                    )
 
         result['metrics'] = {
             'field_lineups_analyzed': field_lineups,
@@ -3653,6 +3770,14 @@ def build_tournament_postmortem(
             'model_group_count': int(model_strategy_breakdown_df['model_key'].nunique())
             if isinstance(model_strategy_breakdown_df, pd.DataFrame) and not model_strategy_breakdown_df.empty
             else 0,
+            'regime_group_count': int(regime_breakdown_df['regime_key'].nunique())
+            if isinstance(regime_breakdown_df, pd.DataFrame) and not regime_breakdown_df.empty
+            else 0,
+            'active_regime_label': (
+                str(regime_breakdown_df.iloc[0].get('regime_label') or '')
+                if isinstance(regime_breakdown_df, pd.DataFrame) and not regime_breakdown_df.empty
+                else ''
+            ),
             'high_signal_player_count': int(len(high_signal_keys)),
             'supplement_snapshot_available': bool(supplement_run_key),
             'supplement_source_name': supplement_source_name,
@@ -3763,6 +3888,21 @@ def build_tournament_postmortem(
                 )
             else:
                 right_notes.append("Portfolio overlap tracked close to the top-N field average.")
+
+        active_regime_label = str(result['metrics'].get('active_regime_label') or '').strip()
+        if active_regime_label:
+            if overlap_gap_avg is not None and overlap_gap_avg <= -1.0:
+                wrong_notes.append(
+                    f"Active regime `{active_regime_label}` still produced a portfolio that was too unique for this field sample."
+                )
+            elif overlap_gap_avg is not None and overlap_gap_avg >= 1.0:
+                wrong_notes.append(
+                    f"Active regime `{active_regime_label}` still produced a portfolio that was too concentrated for this field sample."
+                )
+            else:
+                right_notes.append(
+                    f"Active regime `{active_regime_label}` stayed reasonably aligned with the observed field structure."
+                )
 
         if supplement_run_key:
             right_notes.append(
@@ -3978,6 +4118,22 @@ def build_tournament_postmortem(
                 'Raise cheap-core lineup/pair/triple coverage toward field levels without inflating dud exposure.',
             )
 
+        if active_regime_label:
+            regime_why_parts: List[str] = [f"active_regime={active_regime_label}"]
+            if overlap_gap_avg is not None:
+                regime_why_parts.append(f"overlap_gap={overlap_gap_avg:+.2f}")
+            if winner_gap is not None:
+                regime_why_parts.append(f"winner_gap={winner_gap:.1f}")
+            _append_improvement(
+                'Regime Audit',
+                ', '.join(regime_why_parts),
+                (
+                    'Keep the active slate/field regime visible in the build workflow and review its '
+                    'overlap and core-capture outputs in postmortem before changing broader projection logic.'
+                ),
+                'Track winner gap, overlap, and core-hit rates by active regime across future slates.',
+            )
+
         if ownership_is_healthy and ownership_mae is not None:
             _append_improvement(
                 'Ownership Calibration',
@@ -4022,6 +4178,7 @@ def build_tournament_postmortem(
         result['our_lineup_structures_df'] = our_lineup_structures_df.reset_index(drop=True)
         result['portfolio_diagnostics_df'] = portfolio_diagnostics_df.reset_index(drop=True)
         result['model_strategy_breakdown_df'] = model_strategy_breakdown_df.reset_index(drop=True)
+        result['regime_breakdown_df'] = regime_breakdown_df.reset_index(drop=True)
         result['model_signal_coverage_df'] = model_signal_coverage_df.reset_index(drop=True)
         result['cheap_core_candidates_df'] = cheap_core_candidates_df.reset_index(drop=True)
         result['cheap_core_combo_coverage_df'] = cheap_core_combo_coverage_df.reset_index(drop=True)
