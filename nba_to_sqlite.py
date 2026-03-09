@@ -10,7 +10,7 @@ import argparse
 import sqlite3
 import time
 from pathlib import Path
-from typing import Dict, List, Mapping, Sequence
+from typing import Callable, Dict, List, Mapping, Sequence
 
 import pandas as pd
 from nba_api.stats.endpoints import (
@@ -22,6 +22,7 @@ from nba_api.stats.endpoints import (
 )
 from nba_api.stats.static import players as players_api
 from nba_api.stats.static import teams as teams_api
+from requests.exceptions import ConnectTimeout, ReadTimeout, Timeout
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,6 +54,24 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.6,
         help="Delay between roster API calls to avoid rate limiting.",
+    )
+    parser.add_argument(
+        "--api-timeout",
+        type=int,
+        default=60,
+        help="Timeout in seconds for stats.nba.com requests (default: 60).",
+    )
+    parser.add_argument(
+        "--api-max-retries",
+        type=int,
+        default=3,
+        help="Retry attempts for timeout errors from stats.nba.com (default: 3).",
+    )
+    parser.add_argument(
+        "--api-retry-delay",
+        type=float,
+        default=2.0,
+        help="Delay in seconds between retry attempts after a timeout (default: 2.0).",
     )
     parser.add_argument(
         "--shooting-season",
@@ -384,6 +403,49 @@ def bool_to_int(value: object) -> int:
     return 0
 
 
+def is_nba_stats_timeout_error(exc: Exception) -> bool:
+    if isinstance(exc, (ReadTimeout, ConnectTimeout, Timeout)):
+        return True
+    message = str(exc).lower()
+    return "read timed out" in message or "connect timeout" in message
+
+
+def fetch_nba_stats_frame(
+    endpoint_factory: Callable[[int], object],
+    *,
+    label: str,
+    timeout: int = 60,
+    max_retries: int = 3,
+    retry_delay: float = 2.0,
+) -> pd.DataFrame:
+    attempts = max(1, int(max_retries))
+    for attempt in range(1, attempts + 1):
+        try:
+            endpoint = endpoint_factory(max(1, int(timeout)))
+            return endpoint.get_data_frames()[0]
+        except Exception as exc:  # noqa: BLE001
+            if not is_nba_stats_timeout_error(exc):
+                raise
+            if attempt == attempts:
+                raise RuntimeError(
+                    f"{label} failed after {attempts} timeout attempts against "
+                    "stats.nba.com. The upstream NBA Stats API is likely slow or "
+                    "temporarily unavailable. Try the update again in a few minutes."
+                ) from exc
+            if retry_delay > 0:
+                print(
+                    f"[warn] {label} timed out on attempt {attempt}/{attempts}; "
+                    f"retrying in {retry_delay:.1f}s ..."
+                )
+                time.sleep(retry_delay)
+            else:
+                print(
+                    f"[warn] {label} timed out on attempt {attempt}/{attempts}; "
+                    "retrying immediately ..."
+                )
+    raise RuntimeError(f"{label} did not return a dataframe.")
+
+
 def upsert_rows(
     conn: sqlite3.Connection,
     table: str,
@@ -450,12 +512,25 @@ def load_players(conn: sqlite3.Connection) -> int:
     return upsert_rows(conn, "players", rows, ["player_id"])
 
 
-def fetch_league_standings(season: str, season_type: str) -> List[Dict[str, object]]:
-    endpoint = leaguestandings.LeagueStandings(
-        season=season,
-        season_type=season_type,
+def fetch_league_standings(
+    season: str,
+    season_type: str,
+    *,
+    api_timeout: int = 60,
+    api_max_retries: int = 3,
+    api_retry_delay: float = 2.0,
+) -> List[Dict[str, object]]:
+    df = fetch_nba_stats_frame(
+        lambda timeout: leaguestandings.LeagueStandings(
+            season=season,
+            season_type=season_type,
+            timeout=timeout,
+        ),
+        label=f"League standings for {season} ({season_type})",
+        timeout=api_timeout,
+        max_retries=api_max_retries,
+        retry_delay=api_retry_delay,
     )
-    df: pd.DataFrame = endpoint.get_data_frames()[0]
     records = df.to_dict(orient="records")
     normalized: List[Dict[str, object]] = []
     for record in records:
@@ -486,9 +561,21 @@ def fetch_league_standings(season: str, season_type: str) -> List[Dict[str, obje
 
 
 def load_standings(
-    conn: sqlite3.Connection, season: str, season_type: str
+    conn: sqlite3.Connection,
+    season: str,
+    season_type: str,
+    *,
+    api_timeout: int = 60,
+    api_max_retries: int = 3,
+    api_retry_delay: float = 2.0,
 ) -> int:
-    rows = fetch_league_standings(season, season_type)
+    rows = fetch_league_standings(
+        season,
+        season_type,
+        api_timeout=api_timeout,
+        api_max_retries=api_max_retries,
+        api_retry_delay=api_retry_delay,
+    )
     return upsert_rows(
         conn,
         "standings",
@@ -501,13 +588,23 @@ def load_player_shooting_totals(
     conn: sqlite3.Connection,
     season: str,
     season_type: str,
+    *,
+    api_timeout: int = 60,
+    api_max_retries: int = 3,
+    api_retry_delay: float = 2.0,
 ) -> int:
-    endpoint = leaguedashplayerstats.LeagueDashPlayerStats(
-        season=season,
-        season_type_all_star=season_type,
-        per_mode_detailed="Totals",
+    df = fetch_nba_stats_frame(
+        lambda timeout: leaguedashplayerstats.LeagueDashPlayerStats(
+            season=season,
+            season_type_all_star=season_type,
+            per_mode_detailed="Totals",
+            timeout=timeout,
+        ),
+        label=f"Player shooting totals for {season} ({season_type})",
+        timeout=api_timeout,
+        max_retries=api_max_retries,
+        retry_delay=api_retry_delay,
     )
-    df: pd.DataFrame = endpoint.get_data_frames()[0]
     records = df.to_dict(orient="records")
     rows: List[Dict[str, object]] = []
     for record in records:
@@ -553,14 +650,24 @@ def update_player_usage(
     conn: sqlite3.Connection,
     season: str,
     season_type: str,
+    *,
+    api_timeout: int = 60,
+    api_max_retries: int = 3,
+    api_retry_delay: float = 2.0,
 ) -> int:
-    endpoint = leaguedashplayerstats.LeagueDashPlayerStats(
-        season=season,
-        season_type_all_star=season_type,
-        measure_type_detailed_defense="Advanced",
-        per_mode_detailed="Totals",
+    df = fetch_nba_stats_frame(
+        lambda timeout: leaguedashplayerstats.LeagueDashPlayerStats(
+            season=season,
+            season_type_all_star=season_type,
+            measure_type_detailed_defense="Advanced",
+            per_mode_detailed="Totals",
+            timeout=timeout,
+        ),
+        label=f"Player usage totals for {season} ({season_type})",
+        timeout=api_timeout,
+        max_retries=api_max_retries,
+        retry_delay=api_retry_delay,
     )
-    df: pd.DataFrame = endpoint.get_data_frames()[0]
     records = df.to_dict(orient="records")
     updates: List[tuple[float | None, int, str, str]] = []
     for record in records:
@@ -590,13 +697,23 @@ def load_player_game_logs(
     conn: sqlite3.Connection,
     season: str,
     season_type: str,
+    *,
+    api_timeout: int = 60,
+    api_max_retries: int = 3,
+    api_retry_delay: float = 2.0,
 ) -> int:
-    endpoint = playergamelogs.PlayerGameLogs(
-        season_nullable=season,
-        season_type_nullable=season_type,
-        player_id_nullable=None,
+    df = fetch_nba_stats_frame(
+        lambda timeout: playergamelogs.PlayerGameLogs(
+            season_nullable=season,
+            season_type_nullable=season_type,
+            player_id_nullable=None,
+            timeout=timeout,
+        ),
+        label=f"Player game logs for {season} ({season_type})",
+        timeout=api_timeout,
+        max_retries=api_max_retries,
+        retry_delay=api_retry_delay,
     )
-    df: pd.DataFrame = endpoint.get_data_frames()[0]
     records = df.to_dict(orient="records")
     rows: List[Dict[str, object]] = []
     for record in records:
@@ -662,13 +779,23 @@ def load_team_game_logs(
     conn: sqlite3.Connection,
     season: str,
     season_type: str,
+    *,
+    api_timeout: int = 60,
+    api_max_retries: int = 3,
+    api_retry_delay: float = 2.0,
 ) -> int:
-    endpoint = teamgamelogs.TeamGameLogs(
-        season_nullable=season,
-        season_type_nullable=season_type,
-        league_id_nullable="00",
+    df = fetch_nba_stats_frame(
+        lambda timeout: teamgamelogs.TeamGameLogs(
+            season_nullable=season,
+            season_type_nullable=season_type,
+            league_id_nullable="00",
+            timeout=timeout,
+        ),
+        label=f"Team game logs for {season} ({season_type})",
+        timeout=api_timeout,
+        max_retries=api_max_retries,
+        retry_delay=api_retry_delay,
     )
-    df: pd.DataFrame = endpoint.get_data_frames()[0]
     records = df.to_dict(orient="records")
 
     # Build abbreviation -> team_id lookup
@@ -757,9 +884,25 @@ def normalize_float(value: object) -> float | None:
         return None
 
 
-def fetch_team_roster(team_id: int, season: str) -> List[Dict[str, object]]:
-    endpoint = commonteamroster.CommonTeamRoster(team_id=team_id, season=season)
-    df: pd.DataFrame = endpoint.get_data_frames()[0]
+def fetch_team_roster(
+    team_id: int,
+    season: str,
+    *,
+    api_timeout: int = 60,
+    api_max_retries: int = 3,
+    api_retry_delay: float = 2.0,
+) -> List[Dict[str, object]]:
+    df = fetch_nba_stats_frame(
+        lambda timeout: commonteamroster.CommonTeamRoster(
+            team_id=team_id,
+            season=season,
+            timeout=timeout,
+        ),
+        label=f"Team roster for team_id={team_id} season={season}",
+        timeout=api_timeout,
+        max_retries=api_max_retries,
+        retry_delay=api_retry_delay,
+    )
     records = df.to_dict(orient="records")
     formatted: List[Dict[str, object]] = []
     for record in records:
@@ -889,6 +1032,10 @@ def load_team_rosters(
     conn: sqlite3.Connection,
     season: str,
     throttle: float,
+    *,
+    api_timeout: int = 60,
+    api_max_retries: int = 3,
+    api_retry_delay: float = 2.0,
 ) -> int:
     cursor = conn.execute(
         "SELECT team_id FROM teams WHERE is_nba_team = 1 ORDER BY team_id"
@@ -897,7 +1044,13 @@ def load_team_rosters(
     inserted = 0
     for idx, team_id in enumerate(team_ids, 1):
         try:
-            roster_rows = fetch_team_roster(team_id, season)
+            roster_rows = fetch_team_roster(
+                team_id,
+                season,
+                api_timeout=api_timeout,
+                api_max_retries=api_max_retries,
+                api_retry_delay=api_retry_delay,
+            )
         except Exception as exc:  # noqa: BLE001
             print(f"[warn] Failed to fetch roster for team {team_id}: {exc}")
             continue
@@ -1422,6 +1575,9 @@ def build_database(
     defense_pts_view_season_type: str | None = None,
     defense_mix_view_season: str = "2025-26",
     defense_mix_view_season_type: str | None = None,
+    api_timeout: int = 60,
+    api_max_retries: int = 3,
+    api_retry_delay: float = 2.0,
 ) -> Path:
     """Build the NBA SQLite database and return the resulting path."""
     db_path = Path(db_path).expanduser()
@@ -1438,7 +1594,14 @@ def build_database(
         print(f"Upserted {player_count} players.")
 
         print(f"Loading standings for season {season} ({season_type}) ...")
-        standings_count = load_standings(conn, season, season_type)
+        standings_count = load_standings(
+            conn,
+            season,
+            season_type,
+            api_timeout=api_timeout,
+            api_max_retries=api_max_retries,
+            api_retry_delay=api_retry_delay,
+        )
         print(f"Upserted {standings_count} standings rows.")
 
         if include_rosters:
@@ -1447,6 +1610,9 @@ def build_database(
                 conn,
                 season,
                 max(throttle_seconds, 0.0),
+                api_timeout=api_timeout,
+                api_max_retries=api_max_retries,
+                api_retry_delay=api_retry_delay,
             )
             print(f"Upserted {roster_count} roster rows.")
 
@@ -1479,6 +1645,9 @@ def build_database(
                 conn,
                 season,
                 season_type,
+                api_timeout=api_timeout,
+                api_max_retries=api_max_retries,
+                api_retry_delay=api_retry_delay,
             )
             print(
                 f"Upserted {shooting_count} player shooting rows "
@@ -1488,6 +1657,9 @@ def build_database(
                 conn,
                 season,
                 season_type,
+                api_timeout=api_timeout,
+                api_max_retries=api_max_retries,
+                api_retry_delay=api_retry_delay,
             )
             print(
                 f"Updated usage% for {usage_count} players "
@@ -1507,6 +1679,9 @@ def build_database(
                 conn,
                 season,
                 season_type,
+                api_timeout=api_timeout,
+                api_max_retries=api_max_retries,
+                api_retry_delay=api_retry_delay,
             )
             print(
                 f"Upserted {game_log_count} player game log rows "
@@ -1562,6 +1737,9 @@ def build_database(
                 conn,
                 season,
                 season_type,
+                api_timeout=api_timeout,
+                api_max_retries=api_max_retries,
+                api_retry_delay=api_retry_delay,
             )
             print(
                 f"Upserted {team_log_count} team game log rows "
