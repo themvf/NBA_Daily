@@ -15028,7 +15028,93 @@ def _build_dfs_supplement_comparison(
             }
         )
 
-    return pd.DataFrame(comparison_rows), pd.DataFrame(unmatched_rows)
+    return (
+        _ensure_dfs_supplement_comparison_df(pd.DataFrame(comparison_rows)),
+        _ensure_dfs_supplement_unmatched_df(pd.DataFrame(unmatched_rows)),
+    )
+
+
+DFS_SUPPLEMENT_COMPARISON_COLUMNS = [
+    "Our Player ID",
+    "Supplement Player",
+    "Supplement Team",
+    "Our Player",
+    "Our Team",
+    "Pos",
+    "Salary",
+    "Match Method",
+    "Match Score",
+    "Our Proj FPTS",
+    "Supplement Proj FPTS",
+    "Proj Delta",
+    "Our Own %",
+    "Supplement Own %",
+    "Own Delta (pp)",
+]
+
+DFS_SUPPLEMENT_COMPARISON_NUMERIC_COLUMNS = [
+    "Our Player ID",
+    "Salary",
+    "Match Score",
+    "Our Proj FPTS",
+    "Supplement Proj FPTS",
+    "Proj Delta",
+    "Our Own %",
+    "Supplement Own %",
+    "Own Delta (pp)",
+]
+
+DFS_SUPPLEMENT_UNMATCHED_COLUMNS = [
+    "Supplement Player",
+    "Supplement Team",
+    "Projection",
+    "Ownership %",
+    "Unmatched Reason",
+    "Candidate Player",
+    "Candidate Score",
+]
+
+DFS_SUPPLEMENT_UNMATCHED_NUMERIC_COLUMNS = [
+    "Projection",
+    "Ownership %",
+    "Candidate Score",
+]
+
+
+def _ensure_dfs_supplement_comparison_df(df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    normalized = pd.DataFrame() if df is None else df.copy()
+    for col in DFS_SUPPLEMENT_COMPARISON_COLUMNS:
+        if col not in normalized.columns:
+            normalized[col] = np.nan if col in DFS_SUPPLEMENT_COMPARISON_NUMERIC_COLUMNS else ""
+
+    for col in DFS_SUPPLEMENT_COMPARISON_NUMERIC_COLUMNS:
+        normalized[col] = pd.to_numeric(normalized[col], errors="coerce")
+
+    missing_proj_delta = normalized["Proj Delta"].isna()
+    normalized.loc[missing_proj_delta, "Proj Delta"] = (
+        normalized.loc[missing_proj_delta, "Supplement Proj FPTS"]
+        - normalized.loc[missing_proj_delta, "Our Proj FPTS"]
+    )
+
+    missing_own_delta = normalized["Own Delta (pp)"].isna()
+    normalized.loc[missing_own_delta, "Own Delta (pp)"] = (
+        normalized.loc[missing_own_delta, "Supplement Own %"]
+        - normalized.loc[missing_own_delta, "Our Own %"]
+    )
+
+    return normalized
+
+
+def _ensure_dfs_supplement_unmatched_df(df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    normalized = pd.DataFrame() if df is None else df.copy()
+    for col in DFS_SUPPLEMENT_UNMATCHED_COLUMNS:
+        if col not in normalized.columns:
+            normalized[col] = np.nan if col in DFS_SUPPLEMENT_UNMATCHED_NUMERIC_COLUMNS else ""
+
+    for col in DFS_SUPPLEMENT_UNMATCHED_NUMERIC_COLUMNS:
+        normalized[col] = pd.to_numeric(normalized[col], errors="coerce")
+
+    return normalized
 
 
 def _annotate_dfs_supplement_unmatched_rows(
@@ -15037,7 +15123,7 @@ def _annotate_dfs_supplement_unmatched_rows(
 ) -> pd.DataFrame:
     """Explain whether unmatched rows are off-slate names or likely alias problems."""
     if unmatched_df is None or unmatched_df.empty:
-        return pd.DataFrame() if unmatched_df is None else unmatched_df
+        return _ensure_dfs_supplement_unmatched_df(unmatched_df)
 
     master_lookup = _load_dfs_global_player_name_lookup(conn)
     exact_name_to_record = master_lookup.get("exact_name_to_record", {}) or {}
@@ -15080,7 +15166,7 @@ def _annotate_dfs_supplement_unmatched_rows(
         enriched_row["Candidate Score"] = candidate_score
         annotated_rows.append(enriched_row)
 
-    return pd.DataFrame(annotated_rows)
+    return _ensure_dfs_supplement_unmatched_df(pd.DataFrame(annotated_rows))
 
 
 def _sanitize_supplement_artifact_token(value: object) -> str:
@@ -15339,6 +15425,8 @@ def _build_dfs_supplement_state(
     unmatched_df: pd.DataFrame,
 ) -> Dict[str, Any]:
     """Construct normalized supplement session state from comparison outputs."""
+    comparison_df = _ensure_dfs_supplement_comparison_df(comparison_df)
+    unmatched_df = _ensure_dfs_supplement_unmatched_df(unmatched_df)
     proj_comp_df = comparison_df.dropna(
         subset=["Supplement Proj FPTS", "Our Proj FPTS"]
     ).copy()
@@ -15402,53 +15490,9 @@ def _build_rotowire_pre_screen_df(
     """Build per-player RotoWire vs model comparison rows for pre-run screening."""
     comparison_records = supplement_state.get("comparison_records") or []
     if not comparison_records:
-        return pd.DataFrame()
+        return _ensure_dfs_supplement_comparison_df(pd.DataFrame())
 
-    df = pd.DataFrame(comparison_records).copy()
-    required_cols = [
-        "Supplement Player",
-        "Our Player",
-        "Our Team",
-        "Pos",
-        "Salary",
-        "Match Method",
-        "Match Score",
-        "Our Proj FPTS",
-        "Supplement Proj FPTS",
-        "Proj Delta",
-        "Our Own %",
-        "Supplement Own %",
-        "Own Delta (pp)",
-    ]
-    for col in required_cols:
-        if col not in df.columns:
-            df[col] = np.nan
-
-    for num_col in [
-        "Salary",
-        "Match Score",
-        "Our Proj FPTS",
-        "Supplement Proj FPTS",
-        "Proj Delta",
-        "Our Own %",
-        "Supplement Own %",
-        "Own Delta (pp)",
-    ]:
-        df[num_col] = pd.to_numeric(df[num_col], errors="coerce")
-
-    # Backfill deltas if older snapshots are missing derived columns.
-    if "Proj Delta" in df.columns:
-        missing_proj_delta = df["Proj Delta"].isna()
-        df.loc[missing_proj_delta, "Proj Delta"] = (
-            df.loc[missing_proj_delta, "Supplement Proj FPTS"]
-            - df.loc[missing_proj_delta, "Our Proj FPTS"]
-        )
-    if "Own Delta (pp)" in df.columns:
-        missing_own_delta = df["Own Delta (pp)"].isna()
-        df.loc[missing_own_delta, "Own Delta (pp)"] = (
-            df.loc[missing_own_delta, "Supplement Own %"]
-            - df.loc[missing_own_delta, "Our Own %"]
-        )
+    df = _ensure_dfs_supplement_comparison_df(pd.DataFrame(comparison_records))
 
     proj_base = df["Our Proj FPTS"].abs().replace(0, np.nan)
     own_base = df["Our Own %"].abs().clip(lower=1.0)
@@ -24686,6 +24730,12 @@ if selected_page == "DFS Lineup Builder":
                         metric_col3.metric("Fuzzy Matches", fuzzy_count)
                         metric_col4.metric("Unmatched Rows", int(len(unmatched_df)))
 
+                        if matched_rows == 0:
+                            st.warning(
+                                "The supplement file loaded, but zero players matched the active DFS slate. "
+                                "Review the player/team columns or alias mapping before saving or using it."
+                            )
+
                         metric_col5, metric_col6, metric_col7, metric_col8 = st.columns(4)
                         metric_col5.metric(
                             "Projection MAE",
@@ -24766,7 +24816,7 @@ if selected_page == "DFS Lineup Builder":
                             "Use the button below to force a re-save if you want to confirm persistence."
                         )
 
-                        if run_key != st.session_state.get("dfs_supplement_saved_run_key", ""):
+                        if matched_rows > 0 and run_key != st.session_state.get("dfs_supplement_saved_run_key", ""):
                             try:
                                 _save_supplement_snapshot(
                                     dfs_conn,
@@ -24855,6 +24905,10 @@ if selected_page == "DFS Lineup Builder":
                                 )
                             except Exception as exc:
                                 st.warning(f"Could not save supplement snapshot: {exc}")
+                        elif matched_rows == 0:
+                            st.caption(
+                                "Snapshot auto-save is skipped until at least one supplement row matches the active slate."
+                            )
 
                         save_button_col, save_status_col = st.columns([1.2, 4])
                         with save_button_col:
@@ -24870,18 +24924,23 @@ if selected_page == "DFS Lineup Builder":
                                 )
 
                         if manual_save_clicked:
-                            save_error = _save_dfs_supplement_state(
-                                dfs_conn,
-                                supplement_state=st.session_state.get("dfs_supplement_state", {}) or {},
-                                comparison_df=comparison_df,
-                                unmatched_df=unmatched_df,
-                            )
-                            if save_error:
-                                st.warning(f"Could not save supplement snapshot: {save_error}")
-                            else:
-                                st.success(
-                                    f"Saved supplement snapshot for {slate_date}: {source_name}"
+                            if matched_rows == 0:
+                                st.warning(
+                                    "Cannot save a supplement snapshot with zero matched players."
                                 )
+                            else:
+                                save_error = _save_dfs_supplement_state(
+                                    dfs_conn,
+                                    supplement_state=st.session_state.get("dfs_supplement_state", {}) or {},
+                                    comparison_df=comparison_df,
+                                    unmatched_df=unmatched_df,
+                                )
+                                if save_error:
+                                    st.warning(f"Could not save supplement snapshot: {save_error}")
+                                else:
+                                    st.success(
+                                        f"Saved supplement snapshot for {slate_date}: {source_name}"
+                                    )
 
                         if method_counts:
                             method_parts = [
