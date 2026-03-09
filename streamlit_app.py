@@ -16543,6 +16543,7 @@ def _apply_supplement_profile_blend(
     players: List[Any],
     supplement_player_map: Mapping[int, Mapping[str, Any]],
     profile_cfg: Mapping[str, Any],
+    supplement_state: Optional[Mapping[str, Any]] = None,
 ) -> Tuple[List[Any], Dict[str, int]]:
     """Return a model-specific player pool with supplement blends applied."""
     proj_weight = float(profile_cfg.get("supplement_proj_weight", 0.0) or 0.0)
@@ -16561,6 +16562,14 @@ def _apply_supplement_profile_blend(
     eligible_matches = 0
     proj_adjusted = 0
     own_adjusted = 0
+    own_guardrailed = 0
+    own_weight_sum = 0.0
+    own_weight_rows = 0
+    ownership_source_name = str(
+        (supplement_state or {}).get("ownership_source_name")
+        or (supplement_state or {}).get("source_name")
+        or ""
+    )
 
     for player in blended_players:
         try:
@@ -16611,15 +16620,30 @@ def _apply_supplement_profile_blend(
             proj_adjusted += 1
 
         if effective_own_weight > 0 and supplement_own is not None:
-            raw_own_delta = float(supplement_own) - base_own
-            capped_own_delta = raw_own_delta
-            if own_delta_cap > 0:
-                capped_own_delta = max(-own_delta_cap, min(own_delta_cap, raw_own_delta))
+            own_blend = dfs.get_guardrailed_supplement_ownership_projection(
+                player=player,
+                base_ownership=base_own,
+                supplement_ownership=float(supplement_own),
+                requested_weight=effective_own_weight,
+                source_name=ownership_source_name,
+                delta_cap=own_delta_cap,
+            )
             player.ownership_proj = round(
-                max(0.0, base_own + (capped_own_delta * effective_own_weight)),
+                max(0.0, float(own_blend.get("projected_ownership", base_own) or base_own)),
                 3,
             )
             player.supplement_own_delta_applied = round(player.ownership_proj - base_own, 3)
+            player.supplement_own_weight_applied = round(
+                float(own_blend.get("weight_applied", effective_own_weight) or 0.0),
+                3,
+            )
+            player.supplement_own_guardrail_tag = str(
+                own_blend.get("guardrail_tag") or ""
+            )
+            if bool(own_blend.get("lineupstarter_guardrails")):
+                own_guardrailed += 1
+            own_weight_sum += float(own_blend.get("weight_applied", 0.0) or 0.0)
+            own_weight_rows += 1
             own_adjusted += 1
 
         upside = max(0.0, float(getattr(player, "proj_ceiling", 0.0) or 0.0) - float(getattr(player, "proj_fpts", 0.0) or 0.0))
@@ -16632,6 +16656,10 @@ def _apply_supplement_profile_blend(
         "eligible_matches": eligible_matches,
         "proj_adjusted": proj_adjusted,
         "own_adjusted": own_adjusted,
+        "own_guardrailed": own_guardrailed,
+        "avg_own_weight_applied_pct": (
+            (own_weight_sum / own_weight_rows) * 100.0 if own_weight_rows > 0 else 0.0
+        ),
     }
 
 
@@ -16660,6 +16688,9 @@ def _apply_rotowire_pre_run_ownership_blend(
         "adjusted_players": 0,
         "weight_rotowire": ROTOWIRE_PRE_RUN_OWNERSHIP_WEIGHT,
         "weight_model": ROTOWIRE_PRE_RUN_MODEL_OWNERSHIP_WEIGHT,
+        "guardrailed_players": 0,
+        "guardrail_mode": "",
+        "avg_effective_weight_pct": 0.0,
     }
 
     for player in players:
@@ -16676,6 +16707,9 @@ def _apply_rotowire_pre_run_ownership_blend(
         return stats
 
     source_name = str(supplement_state.get("source_name") or "")
+    ownership_source_name = str(
+        supplement_state.get("ownership_source_name") or source_name
+    )
     supplement_slate_date = str(supplement_state.get("slate_date") or "")
     player_map = supplement_state.get("player_map") or {}
     is_rotowire_source = bool(supplement_state.get("is_rotowire_source")) or (
@@ -16689,6 +16723,8 @@ def _apply_rotowire_pre_run_ownership_blend(
         return stats
 
     stats["active"] = True
+    effective_weight_sum = 0.0
+    effective_weight_rows = 0
     for player in players:
         try:
             player_id = int(getattr(player, "player_id", 0) or 0)
@@ -16704,18 +16740,38 @@ def _apply_rotowire_pre_run_ownership_blend(
             continue
 
         base_own = float(getattr(player, "_model_ownership_proj", 0.0) or 0.0)
-        blended_own = (
-            base_own * ROTOWIRE_PRE_RUN_MODEL_OWNERSHIP_WEIGHT
-            + float(supplement_own) * ROTOWIRE_PRE_RUN_OWNERSHIP_WEIGHT
+        own_blend = dfs.get_guardrailed_supplement_ownership_projection(
+            player=player,
+            base_ownership=base_own,
+            supplement_ownership=float(supplement_own),
+            requested_weight=ROTOWIRE_PRE_RUN_OWNERSHIP_WEIGHT,
+            source_name=ownership_source_name,
+            delta_cap=0.0,
         )
+        blended_own = float(own_blend.get("projected_ownership", base_own) or base_own)
         player.ownership_proj = round(max(0.0, blended_own), 3)
         player.rotowire_ownership_blend_active = True
         player.rotowire_ownership_delta_applied = round(
             player.ownership_proj - base_own,
             3,
         )
+        player.supplement_own_weight_applied = round(
+            float(own_blend.get("weight_applied", 0.0) or 0.0),
+            3,
+        )
+        player.supplement_own_guardrail_tag = str(own_blend.get("guardrail_tag") or "")
+        if bool(own_blend.get("lineupstarter_guardrails")):
+            stats["guardrailed_players"] += 1
+            stats["guardrail_mode"] = "lineupstarter_default"
+        effective_weight_sum += float(own_blend.get("weight_applied", 0.0) or 0.0)
+        effective_weight_rows += 1
         _recalculate_player_leverage(player)
         stats["adjusted_players"] += 1
+
+    if effective_weight_rows > 0:
+        stats["avg_effective_weight_pct"] = (
+            effective_weight_sum / effective_weight_rows
+        ) * 100.0
 
     return stats
 
@@ -17744,12 +17800,20 @@ if selected_page == "DFS Lineup Builder":
                 current_slate_date,
             )
             if rotowire_ownership_stats.get("active"):
-                st.caption(
-                    "RotoWire ownership consensus active - "
-                    f"{rotowire_ownership_stats.get('adjusted_players', 0)} players blended "
-                    f"({int(ROTOWIRE_PRE_RUN_OWNERSHIP_WEIGHT * 100)}% RotoWire / "
-                    f"{int(ROTOWIRE_PRE_RUN_MODEL_OWNERSHIP_WEIGHT * 100)}% model)."
-                )
+                if rotowire_ownership_stats.get("guardrailed_players", 0) > 0:
+                    st.caption(
+                        "LineupStarter ownership guardrails active inside the external blend: "
+                        f"{rotowire_ownership_stats.get('guardrailed_players', 0)} players, "
+                        f"avg effective external weight "
+                        f"{rotowire_ownership_stats.get('avg_effective_weight_pct', 0.0):.0f}%."
+                    )
+                else:
+                    st.caption(
+                        "RotoWire ownership consensus active - "
+                        f"{rotowire_ownership_stats.get('adjusted_players', 0)} players blended "
+                        f"({int(ROTOWIRE_PRE_RUN_OWNERSHIP_WEIGHT * 100)}% RotoWire / "
+                        f"{int(ROTOWIRE_PRE_RUN_MODEL_OWNERSHIP_WEIGHT * 100)}% model)."
+                    )
 
             _enrich_players_with_game_environment(dfs_conn, players, current_slate_date)
             game_leverage_summary = dfs.refresh_game_leverage_signals(players)
@@ -18816,12 +18880,21 @@ if selected_page == "DFS Lineup Builder":
                     f"{int(round(float(proj_mix.get('secondary_weight', 0.0)) * 100))}%."
                 )
             if rotowire_ownership_stats.get("active"):
-                st.caption(
-                    "RotoWire ownership consensus is feeding lineup generation: "
-                    f"{rotowire_ownership_stats.get('adjusted_players', 0)} matched players "
-                    f"at {int(ROTOWIRE_PRE_RUN_OWNERSHIP_WEIGHT * 100)}% RotoWire / "
-                    f"{int(ROTOWIRE_PRE_RUN_MODEL_OWNERSHIP_WEIGHT * 100)}% model."
-                )
+                if rotowire_ownership_stats.get("guardrailed_players", 0) > 0:
+                    st.caption(
+                        "LineupStarter ownership guardrails active: "
+                        f"{rotowire_ownership_stats.get('guardrailed_players', 0)} players, "
+                        f"avg effective external weight "
+                        f"{rotowire_ownership_stats.get('avg_effective_weight_pct', 0.0):.0f}%, "
+                        "with stronger boosts reserved for likely chalk/core plays."
+                    )
+                else:
+                    st.caption(
+                        "RotoWire ownership consensus is feeding lineup generation: "
+                        f"{rotowire_ownership_stats.get('adjusted_players', 0)} matched players "
+                        f"at {int(ROTOWIRE_PRE_RUN_OWNERSHIP_WEIGHT * 100)}% RotoWire / "
+                        f"{int(ROTOWIRE_PRE_RUN_MODEL_OWNERSHIP_WEIGHT * 100)}% model."
+                    )
                 own_mix = (
                     ownership_supplement_state.get("summary", {}).get("ownership_mix", {})
                     if ownership_supplement_state
@@ -19498,6 +19571,7 @@ if selected_page == "DFS Lineup Builder":
                                     filtered_players,
                                     supplement_player_map,
                                     profile,
+                                    supplement_state=lineup_generation_supplement_state,
                                 )
                                 if blend_stats.get("eligible_matches", 0) <= 0:
                                     model_lineup_counts[model_key] = 0

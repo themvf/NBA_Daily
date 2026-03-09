@@ -1069,6 +1069,144 @@ def get_lineup_model_profiles() -> Dict[str, Dict[str, Any]]:
     return LINEUP_MODEL_PROFILES
 
 
+LINEUPSTARTER_SOURCE_MARKERS = ("lineupstarter", "linestarter", "line starter")
+
+LINEUPSTARTER_OWNERSHIP_GUARDRAIL_DEFAULTS: Dict[str, float] = {
+    "low_weight_cap": 0.25,
+    "mid_weight_cap": 0.35,
+    "chalk_weight_floor": 0.45,
+    "core_weight_floor": 0.60,
+    "weight_ceiling": 0.65,
+    "low_up_cap": 5.0,
+    "low_down_cap": 6.0,
+    "mid_up_cap": 8.0,
+    "mid_down_cap": 8.0,
+    "chalk_up_cap": 18.0,
+    "chalk_down_cap": 10.0,
+    "core_up_cap": 30.0,
+    "core_down_cap": 14.0,
+    "anti_fake_chalk_up_cap": 6.0,
+}
+
+
+def source_mentions_lineupstarter(source_name: str) -> bool:
+    """Return True when the source label references LineupStarter."""
+    lowered = str(source_name or "").strip().lower()
+    return any(marker in lowered for marker in LINEUPSTARTER_SOURCE_MARKERS)
+
+
+def get_guardrailed_supplement_ownership_projection(
+    player: Any,
+    base_ownership: float,
+    supplement_ownership: float,
+    requested_weight: float,
+    source_name: str = "",
+    delta_cap: float = 0.0,
+) -> Dict[str, float | str | bool]:
+    """Blend supplement ownership into our model with source-aware guardrails.
+
+    LineupStarter is useful as a teacher signal, but it can overstate ownership on
+    medium-owned secondary plays. Default behavior:
+    - 25-35% effective weight for low/mid-owned players
+    - ~45% for likely chalk
+    - up to 60-65% for core/chalk candidates
+    - explicit anti-fake-chalk upward caps on non-core players
+    """
+    base_own = max(0.0, float(base_ownership or 0.0))
+    external_own = max(0.0, float(supplement_ownership or 0.0))
+    requested = max(0.0, min(1.0, float(requested_weight or 0.0)))
+    raw_delta = external_own - base_own
+    effective_weight = requested
+    capped_delta = raw_delta
+    guardrail_tag = "standard"
+    lineupstarter_guardrails = source_mentions_lineupstarter(source_name)
+
+    if lineupstarter_guardrails:
+        proj_fpts = float(getattr(player, "proj_fpts", 0.0) or 0.0)
+        proj_ceiling = float(getattr(player, "proj_ceiling", 0.0) or 0.0)
+        value_score = float(getattr(player, "fpts_per_dollar", 0.0) or 0.0)
+        recent_minutes = float(getattr(player, "recent_minutes_avg", 0.0) or 0.0)
+        ceiling_gap = max(0.0, proj_ceiling - proj_fpts)
+        signal_own = max(base_own, external_own)
+
+        core_candidate = bool(
+            base_own >= 24.0
+            or (external_own >= 30.0 and proj_fpts >= 28.0)
+            or proj_fpts >= 34.0
+            or (value_score >= 5.3 and external_own >= 24.0)
+            or (external_own >= 28.0 and recent_minutes >= 28.0 and proj_fpts >= 24.0)
+            or (external_own >= 30.0 and base_own >= 14.0)
+        )
+        chalk_candidate = bool(
+            core_candidate
+            or base_own >= 18.0
+            or (
+                external_own >= 26.0
+                and (
+                    proj_fpts >= 24.0
+                    or (value_score >= 4.8 and proj_fpts >= 22.0)
+                    or recent_minutes >= 26.0
+                    or base_own >= 10.0
+                )
+            )
+            or (value_score >= 5.0 and external_own >= 20.0 and proj_fpts >= 20.0)
+            or (recent_minutes >= 30.0 and external_own >= 22.0 and proj_fpts >= 20.0)
+            or (ceiling_gap >= 10.0 and external_own >= 22.0 and proj_fpts >= 22.0)
+        )
+
+        cfg = LINEUPSTARTER_OWNERSHIP_GUARDRAIL_DEFAULTS
+        if core_candidate:
+            effective_weight = min(
+                cfg["weight_ceiling"],
+                max(requested, cfg["core_weight_floor"]),
+            )
+            up_cap = cfg["core_up_cap"]
+            down_cap = cfg["core_down_cap"]
+            guardrail_tag = "ls_core_chalk"
+        elif chalk_candidate:
+            effective_weight = min(
+                cfg["weight_ceiling"],
+                max(requested, cfg["chalk_weight_floor"]),
+            )
+            up_cap = cfg["chalk_up_cap"]
+            down_cap = cfg["chalk_down_cap"]
+            guardrail_tag = "ls_chalk"
+        elif signal_own >= 8.0:
+            effective_weight = min(requested, cfg["mid_weight_cap"])
+            up_cap = cfg["mid_up_cap"]
+            down_cap = cfg["mid_down_cap"]
+            guardrail_tag = "ls_mid"
+        else:
+            effective_weight = min(requested, cfg["low_weight_cap"])
+            up_cap = cfg["low_up_cap"]
+            down_cap = cfg["low_down_cap"]
+            guardrail_tag = "ls_low"
+
+        if raw_delta >= 0:
+            capped_delta = min(raw_delta, up_cap)
+        else:
+            capped_delta = max(raw_delta, -down_cap)
+
+        if not chalk_candidate and external_own >= 25.0 and base_own < 16.0:
+            capped_delta = min(capped_delta, cfg["anti_fake_chalk_up_cap"])
+            guardrail_tag = f"{guardrail_tag}|anti_fake_chalk"
+
+    if delta_cap > 0:
+        capped_delta = max(-float(delta_cap), min(float(delta_cap), capped_delta))
+
+    delta_applied = capped_delta * effective_weight
+    projected_own = max(0.0, base_own + delta_applied)
+    return {
+        "projected_ownership": float(projected_own),
+        "delta_applied": float(delta_applied),
+        "raw_delta": float(raw_delta),
+        "capped_delta": float(capped_delta),
+        "weight_applied": float(effective_weight),
+        "guardrail_tag": guardrail_tag,
+        "lineupstarter_guardrails": bool(lineupstarter_guardrails),
+    }
+
+
 def _canonical_primary_position(positions: List[str], fallback: str = "") -> str:
     """Resolve a player's primary DFS position into canonical buckets."""
     valid = {"PG", "SG", "SF", "PF", "C"}
