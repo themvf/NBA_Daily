@@ -83,6 +83,8 @@ def create_dfs_tracking_tables(conn: sqlite3.Connection) -> None:
             regime_key TEXT,
             regime_label TEXT,
             regime_notes TEXT,
+            regime_hint TEXT,
+            contest_field_size INTEGER,
             total_proj_fpts REAL,
             total_salary INTEGER,
             pg_id INTEGER,
@@ -229,6 +231,8 @@ def create_dfs_tracking_tables(conn: sqlite3.Connection) -> None:
         ("dfs_slate_lineups", "regime_key", "TEXT"),
         ("dfs_slate_lineups", "regime_label", "TEXT"),
         ("dfs_slate_lineups", "regime_notes", "TEXT"),
+        ("dfs_slate_lineups", "regime_hint", "TEXT"),
+        ("dfs_slate_lineups", "contest_field_size", "INTEGER"),
         ("dfs_slate_lineups", "created_at", "TEXT"),
     ]
     for table, col, col_type in migrations:
@@ -366,16 +370,18 @@ def save_slate_lineups(
         regime_key = getattr(lineup, "regime_key", "") or ""
         regime_label = getattr(lineup, "regime_label", "") or regime_key
         regime_notes = getattr(lineup, "regime_notes", "") or ""
+        regime_hint = getattr(lineup, "regime_hint", "") or ""
+        contest_field_size = getattr(lineup, "contest_field_size", None)
         cursor.execute("""
             INSERT OR REPLACE INTO dfs_slate_lineups (
                 slate_date, lineup_num, model_key, model_label, generation_strategy,
-                regime_key, regime_label, regime_notes,
+                regime_key, regime_label, regime_notes, regime_hint, contest_field_size,
                 total_proj_fpts, total_salary,
                 pg_id, sg_id, sf_id, pf_id, c_id, g_id, f_id, util_id, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             slate_date, i, model_key, model_label, generation_strategy,
-            regime_key, regime_label, regime_notes,
+            regime_key, regime_label, regime_notes, regime_hint, contest_field_size,
             lineup.total_proj_fpts, lineup.total_salary,
             players['PG'].player_id if players.get('PG') else None,
             players['SG'].player_id if players.get('SG') else None,
@@ -2137,6 +2143,8 @@ def build_tournament_postmortem(
                    COALESCE(NULLIF(regime_key, ''), '') AS regime_key,
                    COALESCE(NULLIF(regime_label, ''), COALESCE(NULLIF(regime_key, ''), '')) AS regime_label,
                    COALESCE(regime_notes, '') AS regime_notes,
+                   COALESCE(regime_hint, '') AS regime_hint,
+                   contest_field_size,
                    total_proj_fpts,
                    total_salary,
                    total_actual_fpts,
@@ -2198,6 +2206,7 @@ def build_tournament_postmortem(
                 'regime_key',
                 'regime_label',
                 'regime_notes',
+                'regime_hint',
             ]:
                 our_lineups_df[col] = our_lineups_df[col].fillna('').astype(str).str.strip()
             our_lineups_df['model_key'] = our_lineups_df['model_key'].replace('', 'standard_v1')
@@ -2407,6 +2416,8 @@ def build_tournament_postmortem(
                         'generation_strategy',
                         'regime_key',
                         'regime_label',
+                        'regime_hint',
+                        'contest_field_size',
                     ]
                 ],
                 on='lineup_num',
@@ -2575,6 +2586,12 @@ def build_tournament_postmortem(
                     'regime_key': str(lineup_row.get('regime_key') or ''),
                     'regime_label': str(lineup_row.get('regime_label') or lineup_row.get('regime_key') or ''),
                     'regime_notes': str(lineup_row.get('regime_notes') or ''),
+                    'regime_hint': str(lineup_row.get('regime_hint') or ''),
+                    'contest_field_size': (
+                        int(lineup_row.get('contest_field_size'))
+                        if pd.notna(lineup_row.get('contest_field_size'))
+                        else None
+                    ),
                     'total_proj_fpts': float(lineup_row['total_proj_fpts']) if pd.notna(lineup_row.get('total_proj_fpts')) else None,
                     'total_actual_fpts': float(lineup_row['total_actual_fpts']) if pd.notna(lineup_row.get('total_actual_fpts')) else None,
                     'total_salary': int(lineup_row['total_salary']) if pd.notna(lineup_row.get('total_salary')) else None,
@@ -3355,9 +3372,19 @@ def build_tournament_postmortem(
                         'generation_strategy',
                         'regime_key',
                         'regime_label',
+                        'regime_hint',
+                        'contest_field_size',
                     ]
                     for group_vals, group_lineups_df in our_lineups_df.groupby(model_group_cols, dropna=False):
-                        model_key, model_label, generation_strategy, regime_key, regime_label = group_vals
+                        (
+                            model_key,
+                            model_label,
+                            generation_strategy,
+                            regime_key,
+                            regime_label,
+                            regime_hint,
+                            contest_field_size,
+                        ) = group_vals
                         group_lineup_nums = group_lineups_df['lineup_num'].tolist()
                         group_long_df = our_long[our_long['lineup_num'].isin(group_lineup_nums)].copy()
                         group_sets = (
@@ -3394,6 +3421,12 @@ def build_tournament_postmortem(
                             'generation_strategy': str(generation_strategy or ''),
                             'regime_key': str(regime_key or ''),
                             'regime_label': str(regime_label or regime_key or ''),
+                            'regime_hint': str(regime_hint or ''),
+                            'contest_field_size': (
+                                int(contest_field_size)
+                                if pd.notna(contest_field_size)
+                                else None
+                            ),
                             'lineups': int(len(group_sets)),
                             'cheap_core_players_hit_pct': (
                                 100.0 * float(len(model_hit_keys)) / float(max(1, len(cheap_core_candidate_keys)))
@@ -3549,9 +3582,19 @@ def build_tournament_postmortem(
                 'generation_strategy',
                 'regime_key',
                 'regime_label',
+                'regime_hint',
+                'contest_field_size',
             ]
             for group_vals, group_lineups_df in our_lineups_df.groupby(model_group_cols, dropna=False):
-                model_key, model_label, generation_strategy, regime_key, regime_label = group_vals
+                (
+                    model_key,
+                    model_label,
+                    generation_strategy,
+                    regime_key,
+                    regime_label,
+                    regime_hint,
+                    contest_field_size,
+                ) = group_vals
                 group_lineup_nums = group_lineups_df['lineup_num'].tolist()
                 group_size = int(len(group_lineups_df))
                 group_long_df = our_long[our_long['lineup_num'].isin(group_lineup_nums)].copy()
@@ -3605,6 +3648,12 @@ def build_tournament_postmortem(
                         'generation_strategy': str(generation_strategy or ''),
                         'regime_key': str(regime_key or ''),
                         'regime_label': str(regime_label or regime_key or ''),
+                        'regime_hint': str(regime_hint or ''),
+                        'contest_field_size': (
+                            int(contest_field_size)
+                            if pd.notna(contest_field_size)
+                            else None
+                        ),
                         'player': display_lookup.get(name_key, name_key),
                         'signal_type': ', '.join(signal_type_parts) or 'Signal',
                         'field_exposure_pct': field_pct,
@@ -3624,6 +3673,12 @@ def build_tournament_postmortem(
                     'generation_strategy': str(generation_strategy or ''),
                     'regime_key': str(regime_key or ''),
                     'regime_label': str(regime_label or regime_key or ''),
+                    'regime_hint': str(regime_hint or ''),
+                    'contest_field_size': (
+                        int(contest_field_size)
+                        if pd.notna(contest_field_size)
+                        else None
+                    ),
                     'lineups': group_size,
                     'avg_proj_fpts': float(pd.to_numeric(group_lineups_df['total_proj_fpts'], errors='coerce').mean())
                     if group_size > 0 else None,
@@ -3674,12 +3729,12 @@ def build_tournament_postmortem(
             )
             if not our_lineup_structures_df.empty:
                 regime_rows: List[Dict[str, Any]] = []
-                regime_group_cols = ['regime_key', 'regime_label']
+                regime_group_cols = ['regime_key', 'regime_label', 'regime_hint', 'contest_field_size']
                 for group_vals, group_structures_df in our_lineup_structures_df.groupby(
                     regime_group_cols,
                     dropna=False,
                 ):
-                    regime_key, regime_label = group_vals
+                    regime_key, regime_label, regime_hint, contest_field_size = group_vals
                     group_structures_df = group_structures_df.copy()
                     group_lineup_nums = group_structures_df['lineup_num'].tolist()
                     group_lineup_sets = (
@@ -3694,6 +3749,12 @@ def build_tournament_postmortem(
                     regime_rows.append({
                         'regime_key': str(regime_key or ''),
                         'regime_label': str(regime_label or regime_key or ''),
+                        'regime_hint': str(regime_hint or ''),
+                        'contest_field_size': (
+                            int(contest_field_size)
+                            if pd.notna(contest_field_size)
+                            else None
+                        ),
                         'lineups': int(len(group_structures_df)),
                         'avg_actual_fpts': float(
                             pd.to_numeric(group_structures_df['total_actual_fpts'], errors='coerce').mean()
@@ -3777,6 +3838,18 @@ def build_tournament_postmortem(
                 str(regime_breakdown_df.iloc[0].get('regime_label') or '')
                 if isinstance(regime_breakdown_df, pd.DataFrame) and not regime_breakdown_df.empty
                 else ''
+            ),
+            'active_regime_hint': (
+                str(regime_breakdown_df.iloc[0].get('regime_hint') or '')
+                if isinstance(regime_breakdown_df, pd.DataFrame) and not regime_breakdown_df.empty
+                else ''
+            ),
+            'active_contest_field_size': (
+                int(regime_breakdown_df.iloc[0].get('contest_field_size'))
+                if isinstance(regime_breakdown_df, pd.DataFrame)
+                and not regime_breakdown_df.empty
+                and pd.notna(regime_breakdown_df.iloc[0].get('contest_field_size'))
+                else None
             ),
             'high_signal_player_count': int(len(high_signal_keys)),
             'supplement_snapshot_available': bool(supplement_run_key),

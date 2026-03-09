@@ -1166,6 +1166,7 @@ def resolve_lineup_generation_regime(
     num_lineups: int,
     regime_hint: str = "auto",
     slate_game_count: Optional[int] = None,
+    contest_field_size: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Resolve the active lineup-construction regime for this build.
 
@@ -1192,11 +1193,23 @@ def resolve_lineup_generation_regime(
     else:
         slate_bucket = "medium_slate"
 
+    normalized_field_size = (
+        int(contest_field_size)
+        if contest_field_size is not None and int(contest_field_size or 0) > 0
+        else None
+    )
+
     auto_field_bucket = "medium_field"
-    if int(num_lineups or 0) <= 3:
-        auto_field_bucket = "small_field"
-    elif int(num_lineups or 0) >= 50:
-        auto_field_bucket = "large_field"
+    if normalized_field_size is not None:
+        if normalized_field_size <= 500:
+            auto_field_bucket = "small_field"
+        elif normalized_field_size >= 5000:
+            auto_field_bucket = "large_field"
+    else:
+        if int(num_lineups or 0) <= 3:
+            auto_field_bucket = "small_field"
+        elif int(num_lineups or 0) >= 50:
+            auto_field_bucket = "large_field"
 
     field_bucket = (
         normalized_hint if normalized_hint != "auto" else auto_field_bucket
@@ -1235,6 +1248,7 @@ def resolve_lineup_generation_regime(
     )
     notes = (
         f"{slate_games} games | overlap {overlap_cap_delta:+d} | "
+        f"{f'field {normalized_field_size} | ' if normalized_field_size is not None else ''}"
         f"core x{core_mult:.2f} | low-own x{low_own_mult:.2f} | "
         f"standout x{standout_mult:.2f} | ceiling {ceiling_focus_delta:+d}"
     )
@@ -1248,6 +1262,7 @@ def resolve_lineup_generation_regime(
         "slate_bucket": slate_bucket,
         "field_bucket": field_bucket,
         "auto_field_bucket": auto_field_bucket,
+        "contest_field_size": normalized_field_size,
         "overlap_cap_delta": overlap_cap_delta,
         "core_play_inject_prob_mult": core_mult,
         "low_own_inject_prob_mult": low_own_mult,
@@ -2303,6 +2318,8 @@ class DFSLineup:
     regime_key: str = ""
     regime_label: str = ""
     regime_notes: str = ""
+    regime_hint: str = ""
+    contest_field_size: Optional[int] = None
 
     @property
     def total_salary(self) -> int:
@@ -4398,6 +4415,7 @@ def generate_diversified_lineups(
     model_label: str = "",
     regime_hint: str = "auto",
     slate_game_count: Optional[int] = None,
+    contest_field_size: Optional[int] = None,
     debug_stats: Optional[Dict[str, int]] = None,
 ) -> List[DFSLineup]:
     """
@@ -4428,6 +4446,7 @@ def generate_diversified_lineups(
         model_label: Optional display label annotation on generated lineups.
         regime_hint: Auto or manual field-size regime hint.
         slate_game_count: Optional explicit slate game count for regime inference.
+        contest_field_size: Optional actual contest field size / opponents proxy.
 
     Returns:
         List of valid DFSLineup objects
@@ -4520,6 +4539,7 @@ def generate_diversified_lineups(
         num_lineups=num_lineups,
         regime_hint=regime_hint,
         slate_game_count=slate_game_count,
+        contest_field_size=contest_field_size,
     )
     profile_cfg = _apply_lineup_generation_regime(profile_cfg, resolved_regime)
     effective_ceiling_focus_pct = int(
@@ -5016,6 +5036,12 @@ def generate_diversified_lineups(
                     lineup.regime_key = str(resolved_regime.get("regime_key") or "")
                     lineup.regime_label = str(resolved_regime.get("regime_label") or "")
                     lineup.regime_notes = str(resolved_regime.get("regime_notes") or "")
+                    lineup.regime_hint = str(regime_hint or "auto")
+                    lineup.contest_field_size = (
+                        int(contest_field_size)
+                        if contest_field_size is not None and int(contest_field_size or 0) > 0
+                        else None
+                    )
                     lineups.append(lineup)
                     existing_lineup_keys.add(lineup_key)
                     lineup_player_sets.append(set(lineup_key))
@@ -5044,12 +5070,24 @@ def generate_diversified_lineups(
 def build_player_selection_diagnostics(
     player_pool: List[DFSPlayer],
     model_key: str = "",
+    num_lineups: int = 20,
+    regime_hint: str = "auto",
+    slate_game_count: Optional[int] = None,
+    contest_field_size: Optional[int] = None,
 ) -> pd.DataFrame:
     """Summarize how the active model classifies players before lineup generation."""
     if not player_pool:
         return pd.DataFrame()
 
-    profile_cfg = LINEUP_MODEL_PROFILES.get(model_key, {}) if model_key else {}
+    profile_cfg = dict(LINEUP_MODEL_PROFILES.get(model_key, {}) if model_key else {})
+    resolved_regime = resolve_lineup_generation_regime(
+        player_pool,
+        num_lineups=int(num_lineups or 0),
+        regime_hint=regime_hint,
+        slate_game_count=slate_game_count,
+        contest_field_size=contest_field_size,
+    )
+    profile_cfg = _apply_lineup_generation_regime(profile_cfg, resolved_regime)
     _build_cheap_core_context(player_pool, profile_cfg)
 
     core_play_min_own_pct = float(profile_cfg.get("core_play_min_own_pct", 14.0) or 14.0)

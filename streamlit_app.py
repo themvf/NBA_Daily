@@ -16939,6 +16939,18 @@ if selected_page == "DFS Lineup Builder":
                 "Use a manual regime when you know you are building for SE/3-max or a large-field MME contest."
             ),
         )
+        contest_field_size = st.slider(
+            "Contest Field Size (0 = Auto)",
+            min_value=0,
+            max_value=50000,
+            value=int(st.session_state.get("dfs_builder_contest_field_size", 0) or 0),
+            step=100,
+            key="dfs_builder_contest_field_size",
+            help=(
+                "Approximate total contest entries / opponents. "
+                "Set to 0 to keep using the build-size proxy for auto field-size inference."
+            ),
+        )
         builder_upload_metadata = st.session_state.get("dfs_upload_metadata", {}) or {}
         builder_loaded_players = (
             st.session_state.get("dfs_loaded_slate_players", [])
@@ -16959,6 +16971,9 @@ if selected_page == "DFS Lineup Builder":
             num_lineups=int(num_lineups),
             regime_hint=contest_regime_hint,
             slate_game_count=builder_slate_game_count or None,
+            contest_field_size=(
+                int(contest_field_size) if int(contest_field_size or 0) > 0 else None
+            ),
         )
         st.caption(
             "Resolved regime: "
@@ -16966,6 +16981,11 @@ if selected_page == "DFS Lineup Builder":
             + (
                 " (auto)"
                 if bool(resolved_builder_regime.get("auto_inferred"))
+                else ""
+            )
+            + (
+                f" | Field size {int(resolved_builder_regime.get('contest_field_size'))}"
+                if resolved_builder_regime.get("contest_field_size") is not None
                 else ""
             )
             + f" | {resolved_builder_regime.get('regime_notes') or ''}"
@@ -18529,6 +18549,12 @@ if selected_page == "DFS Lineup Builder":
                 diagnostic_df = dfs.build_player_selection_diagnostics(
                     filtered,
                     model_key=diagnostic_model_key,
+                    num_lineups=int(num_lineups),
+                    regime_hint=contest_regime_hint,
+                    slate_game_count=builder_slate_game_count or None,
+                    contest_field_size=(
+                        int(contest_field_size) if int(contest_field_size or 0) > 0 else None
+                    ),
                 )
                 if diagnostic_df.empty:
                     st.info("No active players available for diagnostics.")
@@ -19664,6 +19690,11 @@ if selected_page == "DFS Lineup Builder":
                                 model_label=profile_label,
                                 regime_hint=contest_regime_hint,
                                 slate_game_count=builder_slate_game_count or None,
+                                contest_field_size=(
+                                    int(contest_field_size)
+                                    if int(contest_field_size or 0) > 0
+                                    else None
+                                ),
                                 debug_stats=model_debug_stats,
                             )
                             optimizer_debug_by_model[model_key] = model_debug_stats
@@ -19767,6 +19798,11 @@ if selected_page == "DFS Lineup Builder":
                                     "num_lineups_returned": int(len(lineups)),
                                     "max_player_exposure": float(max_exposure),
                                     "slate_game_count": int(builder_slate_game_count or 0),
+                                    "contest_field_size": (
+                                        int(contest_field_size)
+                                        if int(contest_field_size or 0) > 0
+                                        else None
+                                    ),
                                     "ceiling_focus_pct": int(ceiling_focus_pct),
                                     "aggressive_ceiling_stacks": bool(
                                         aggressive_ceiling_stacks or False
@@ -20875,7 +20911,7 @@ if selected_page == "DFS Lineup Builder":
 
                         metrics_payload = pm_payload.get("metrics") or {}
                         pm_export_payload = {
-                            "schema_version": "dfs_tournament_postmortem_v3",
+                            "schema_version": "dfs_tournament_postmortem_v4",
                             "generated_at": datetime.now(EASTERN_TZ).isoformat(),
                             "context": {
                                 "slate_date": selected_postmortem_slate,
@@ -22289,7 +22325,15 @@ if selected_page == "DFS Lineup Builder":
                                 )
                             active_regime_label = str(pm_metrics.get('active_regime_label') or '').strip()
                             if active_regime_label:
-                                st.caption(f"Active saved regime: `{active_regime_label}`.")
+                                active_regime_hint = str(pm_metrics.get('active_regime_hint') or '').strip()
+                                active_contest_field_size = pm_metrics.get('active_contest_field_size')
+                                regime_caption = f"Active saved regime: `{active_regime_label}`"
+                                if active_regime_hint:
+                                    regime_caption += f" | hint `{active_regime_hint}`"
+                                if active_contest_field_size is not None:
+                                    regime_caption += f" | field size {int(active_contest_field_size):,}"
+                                regime_caption += "."
+                                st.caption(regime_caption)
                             st.caption(
                                 "In this postmortem, `Top-N Field Exp %` is exposure inside the analyzed "
                                 "winner sample, while `Actual Own%` is whole-contest ownership."
@@ -22335,6 +22379,8 @@ if selected_page == "DFS Lineup Builder":
                                 model_view = model_breakdown_df[
                                     [
                                         'regime_label',
+                                        'regime_hint',
+                                        'contest_field_size',
                                         'model_label',
                                         'generation_strategy',
                                         'lineups',
@@ -22352,6 +22398,8 @@ if selected_page == "DFS Lineup Builder":
                                 ].copy()
                                 model_view.columns = [
                                     'Regime',
+                                    'Regime Hint',
+                                    'Field Size',
                                     'Model',
                                     'Strategy',
                                     'Lineups',
@@ -22377,6 +22425,9 @@ if selected_page == "DFS Lineup Builder":
                                 model_view['Avg Salary'] = model_view['Avg Salary'].apply(
                                     lambda x: f"${int(round(x)):,.0f}" if pd.notna(x) else "—"
                                 )
+                                model_view['Field Size'] = model_view['Field Size'].apply(
+                                    lambda x: f"{int(x):,}" if pd.notna(x) else "—"
+                                )
                                 model_view['Top-3 In One Lineup'] = model_view['Top-3 In One Lineup'].apply(
                                     lambda x: "Yes" if bool(x) else "No"
                                 )
@@ -22388,6 +22439,8 @@ if selected_page == "DFS Lineup Builder":
                                 regime_view = regime_breakdown_df[
                                     [
                                         'regime_label',
+                                        'regime_hint',
+                                        'contest_field_size',
                                         'lineups',
                                         'avg_actual_fpts',
                                         'best_actual_fpts',
@@ -22401,6 +22454,8 @@ if selected_page == "DFS Lineup Builder":
                                 ].copy()
                                 regime_view.columns = [
                                     'Regime',
+                                    'Regime Hint',
+                                    'Field Size',
                                     'Lineups',
                                     'Avg Actual',
                                     'Best Actual',
@@ -22425,6 +22480,9 @@ if selected_page == "DFS Lineup Builder":
                                     )
                                 regime_view['Avg Salary'] = regime_view['Avg Salary'].apply(
                                     lambda x: f"${int(round(x)):,.0f}" if pd.notna(x) else "—"
+                                )
+                                regime_view['Field Size'] = regime_view['Field Size'].apply(
+                                    lambda x: f"{int(x):,}" if pd.notna(x) else "—"
                                 )
                                 st.dataframe(regime_view, use_container_width=True, hide_index=True)
 
@@ -23097,7 +23155,28 @@ if selected_page == "DFS Lineup Builder":
                                 our_struct_df = pm_payload.get('our_lineup_structures_df')
                                 if isinstance(our_struct_df, pd.DataFrame) and not our_struct_df.empty:
                                     st.markdown("**Our Lineup Structures**")
-                                    our_struct_view = our_struct_df.copy()
+                                    our_struct_view = our_struct_df[
+                                        [
+                                            'lineup_num',
+                                            'model_key',
+                                            'model_label',
+                                            'generation_strategy',
+                                            'regime_key',
+                                            'regime_label',
+                                            'regime_hint',
+                                            'contest_field_size',
+                                            'regime_notes',
+                                            'total_proj_fpts',
+                                            'total_actual_fpts',
+                                            'total_salary',
+                                            'avg_proj_ownership',
+                                            'avg_actual_ownership',
+                                            'team_count',
+                                            'top_stack_size',
+                                            'stack_shape',
+                                            'players',
+                                        ]
+                                    ].copy()
                                     for c in ['total_proj_fpts', 'total_actual_fpts', 'avg_proj_ownership', 'avg_actual_ownership']:
                                         if c in our_struct_view.columns:
                                             our_struct_view[c] = our_struct_view[c].apply(
@@ -23107,6 +23186,9 @@ if selected_page == "DFS Lineup Builder":
                                         our_struct_view['total_salary'] = our_struct_view['total_salary'].apply(
                                             lambda x: f"${int(x):,}" if pd.notna(x) else "—"
                                         )
+                                    our_struct_view['contest_field_size'] = our_struct_view['contest_field_size'].apply(
+                                        lambda x: f"{int(x):,}" if pd.notna(x) else "—"
+                                    )
                                     our_struct_view.columns = [
                                         'Lineup #',
                                         'Model Key',
@@ -23114,6 +23196,8 @@ if selected_page == "DFS Lineup Builder":
                                         'Strategy',
                                         'Regime Key',
                                         'Regime',
+                                        'Regime Hint',
+                                        'Field Size',
                                         'Regime Notes',
                                         'Total Proj FPTS',
                                         'Total Actual FPTS',

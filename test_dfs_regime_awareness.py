@@ -40,13 +40,15 @@ def _make_player(
 def test_resolve_lineup_generation_regime_auto_small_slate_small_field() -> None:
     regime = resolve_lineup_generation_regime(
         player_pool=[],
-        num_lineups=3,
+        num_lineups=20,
         regime_hint="auto",
         slate_game_count=3,
+        contest_field_size=250,
     )
 
     assert regime["slate_bucket"] == "small_slate"
     assert regime["field_bucket"] == "small_field"
+    assert regime["contest_field_size"] == 250
     assert regime["overlap_cap_delta"] == 2
     assert regime["ceiling_focus_delta"] == -20
 
@@ -54,13 +56,15 @@ def test_resolve_lineup_generation_regime_auto_small_slate_small_field() -> None
 def test_resolve_lineup_generation_regime_auto_large_slate_large_field() -> None:
     regime = resolve_lineup_generation_regime(
         player_pool=[],
-        num_lineups=100,
+        num_lineups=3,
         regime_hint="auto",
         slate_game_count=9,
+        contest_field_size=20000,
     )
 
     assert regime["slate_bucket"] == "large_slate"
     assert regime["field_bucket"] == "large_field"
+    assert regime["contest_field_size"] == 20000
     assert regime["overlap_cap_delta"] == -2
     assert regime["force_aggressive_ceiling_stack"] is True
 
@@ -113,7 +117,9 @@ def test_postmortem_exposes_saved_regime_breakdown() -> None:
         generation_strategy="ceiling",
         regime_key="small_slate__small_field",
         regime_label="Small Slate + Small Field / SE / 3-max",
-        regime_notes="4 games | overlap +2 | core x1.50 | low-own x0.52 | standout x0.72 | ceiling -20",
+        regime_notes="4 games | overlap +2 | field 250 | core x1.50 | low-own x0.52 | standout x0.72 | ceiling -20",
+        regime_hint="auto",
+        contest_field_size=250,
     )
     save_slate_lineups(conn, slate_date, [lineup])
     conn.execute(
@@ -165,6 +171,9 @@ def test_postmortem_exposes_saved_regime_breakdown() -> None:
 
     assert not payload["errors"]
     assert payload["metrics"]["active_regime_label"] == "Small Slate + Small Field / SE / 3-max"
+    assert payload["metrics"]["active_regime_hint"] == "auto"
+    assert payload["metrics"]["active_contest_field_size"] == 250
     assert not payload["regime_breakdown_df"].empty
     assert "regime_label" in payload["our_lineup_structures_df"].columns
+    assert "contest_field_size" in payload["our_lineup_structures_df"].columns
     assert payload["regime_breakdown_df"].iloc[0]["regime_label"] == "Small Slate + Small Field / SE / 3-max"
