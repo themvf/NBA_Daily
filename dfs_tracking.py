@@ -654,10 +654,22 @@ def save_supplement_snapshot(
 def get_recent_supplement_runs(
     conn: sqlite3.Connection,
     limit: int = 20,
+    slate_date: str = "",
+    source_name_filter: str = "",
 ) -> pd.DataFrame:
     """Return recent saved supplement snapshots for review."""
+    where_clauses = []
+    params: List[Any] = []
+    if str(slate_date or "").strip():
+        where_clauses.append("slate_date = ?")
+        params.append(str(slate_date).strip())
+    if str(source_name_filter or "").strip():
+        where_clauses.append("lower(source_name) LIKE ?")
+        params.append(f"%{str(source_name_filter).strip().lower()}%")
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+    params.append(int(limit))
     return pd.read_sql_query(
-        """
+        f"""
         SELECT
             run_key,
             slate_date,
@@ -675,11 +687,12 @@ def get_recent_supplement_runs(
             avg_own_delta,
             created_at
         FROM dfs_supplement_runs
+        {where_sql}
         ORDER BY slate_date DESC, created_at DESC
         LIMIT ?
         """,
         conn,
-        params=[int(limit)],
+        params=params,
     )
 
 

@@ -15412,6 +15412,43 @@ def _load_saved_dfs_supplement_state(
     }
 
 
+def _get_active_current_slate_supplement_state(
+    supplement_state: Mapping[str, Any],
+    slate_date: str,
+) -> Dict[str, Any]:
+    state = dict(supplement_state or {})
+    if not state:
+        return {}
+    if str(state.get("slate_date") or "") != str(slate_date or ""):
+        return {}
+    if not (state.get("player_map") or {}):
+        return {}
+    return state
+
+
+def _format_dfs_supplement_summary_line(
+    supplement_state: Mapping[str, Any],
+    *,
+    include_created_at: str = "",
+) -> str:
+    state = dict(supplement_state or {})
+    summary = state.get("summary", {}) or {}
+    parts = [
+        f"Source {state.get('source_name') or 'Supplement'}",
+        f"Matched {int(summary.get('matched_rows', 0) or 0)}/{int(summary.get('total_rows', 0) or 0)}",
+        f"Proj MAE {summary.get('projection_mae_display', '—')}",
+        f"Own MAE {summary.get('ownership_mae_display', '—')}",
+    ]
+    created_label = str(include_created_at or "").strip()
+    if created_label:
+        parts.insert(1, f"Saved {created_label}")
+    return " | ".join(parts)
+
+
+def _supplement_run_scope_label(run_slate_date: object, current_slate_date: object) -> str:
+    return "Current Slate" if str(run_slate_date or "") == str(current_slate_date or "") else "Archive"
+
+
 def _build_dfs_supplement_state(
     slate_date: str,
     source_name: str,
@@ -15598,6 +15635,401 @@ def _supplement_state_has_signal(
     player_map = dict(supplement_state or {}).get("player_map") or {}
     if not player_map:
         return False
+    signal_key = (
+        "supplement_proj_fpts"
+        if str(signal_name or "").strip().lower().startswith("proj")
+        else "supplement_ownership"
+    )
+    return any(
+        info.get(signal_key) is not None
+        for info in player_map.values()
+        if isinstance(info, Mapping)
+    )
+
+
+def _render_dfs_supplement_source_matrix(
+    supplement_players: List[Any],
+    rotowire_source_state: Mapping[str, Any],
+    lineupstarter_source_state: Mapping[str, Any],
+    current_slate_date: str,
+) -> None:
+    dual_proj_available = bool(
+        _supplement_state_has_signal(rotowire_source_state, "projection")
+        and _supplement_state_has_signal(lineupstarter_source_state, "projection")
+    )
+    dual_own_available = bool(
+        _supplement_state_has_signal(rotowire_source_state, "ownership")
+        and _supplement_state_has_signal(lineupstarter_source_state, "ownership")
+    )
+    matrix_use_dual_proj = bool(
+        st.session_state.get(
+            "dfs_dual_proj_blend_enabled_state",
+            st.session_state.get("dfs_dual_proj_blend_enabled", dual_proj_available),
+        )
+    )
+    matrix_lineupstarter_proj_weight = float(
+        st.session_state.get("dfs_dual_proj_weight", 0.35)
+    )
+    matrix_use_dual_own = bool(
+        st.session_state.get(
+            "dfs_dual_own_blend_enabled_state",
+            st.session_state.get("dfs_dual_own_blend_enabled", dual_own_available),
+        )
+    )
+    matrix_lineupstarter_own_weight = float(
+        st.session_state.get("dfs_dual_own_weight", 0.35)
+    )
+
+    st.markdown("**Source Matrix**")
+    source_m1, source_m2, source_m3 = st.columns(3)
+    source_m1.metric(
+        "RotoWire Snapshot",
+        "Ready" if rotowire_source_state.get("player_map") else "Missing",
+        (
+            f"{int(rotowire_source_state.get('summary', {}).get('matched_rows', 0) or 0)} matched"
+            if rotowire_source_state.get("player_map")
+            else None
+        ),
+    )
+    source_m2.metric(
+        "LineupStarter Snapshot",
+        "Ready" if lineupstarter_source_state.get("player_map") else "Missing",
+        (
+            f"{int(lineupstarter_source_state.get('summary', {}).get('matched_rows', 0) or 0)} matched"
+            if lineupstarter_source_state.get("player_map")
+            else None
+        ),
+    )
+    source_m3.metric(
+        "Blend Ready",
+        "Yes" if (dual_proj_available or dual_own_available) else "No",
+        (
+            "Projection + Ownership"
+            if dual_proj_available and dual_own_available
+            else "Projection only"
+            if dual_proj_available
+            else "Ownership only"
+            if dual_own_available
+            else None
+        ),
+    )
+
+    matrix_blend_col1, matrix_blend_col2 = st.columns(2)
+    with matrix_blend_col1:
+        matrix_use_dual_proj = st.toggle(
+            "Blend RotoWire + LineupStarter Projection",
+            value=matrix_use_dual_proj and dual_proj_available,
+            disabled=not dual_proj_available,
+            key="dfs_source_matrix_proj_toggle",
+            help="Blend external projection signals for the source matrix and supplement lineup models.",
+        )
+        if matrix_use_dual_proj and dual_proj_available:
+            matrix_lineupstarter_proj_weight = (
+                st.slider(
+                    "LineupStarter projection weight",
+                    min_value=10,
+                    max_value=90,
+                    value=int(round(matrix_lineupstarter_proj_weight * 100)),
+                    step=5,
+                    format="%d%%",
+                    key="dfs_source_matrix_proj_weight_pct",
+                )
+                / 100.0
+            )
+    with matrix_blend_col2:
+        matrix_use_dual_own = st.toggle(
+            "Blend RotoWire + LineupStarter Ownership",
+            value=matrix_use_dual_own and dual_own_available,
+            disabled=not dual_own_available,
+            key="dfs_source_matrix_own_toggle",
+            help="Blend external ownership signals for the source matrix and lineup generation.",
+        )
+        if matrix_use_dual_own and dual_own_available:
+            matrix_lineupstarter_own_weight = (
+                st.slider(
+                    "LineupStarter ownership weight",
+                    min_value=10,
+                    max_value=90,
+                    value=int(round(matrix_lineupstarter_own_weight * 100)),
+                    step=5,
+                    format="%d%%",
+                    key="dfs_source_matrix_own_weight_pct",
+                )
+                / 100.0
+            )
+
+    st.session_state["dfs_dual_proj_blend_enabled_state"] = bool(matrix_use_dual_proj)
+    st.session_state.dfs_dual_proj_weight = float(matrix_lineupstarter_proj_weight)
+    st.session_state["dfs_dual_own_blend_enabled_state"] = bool(matrix_use_dual_own)
+    st.session_state.dfs_dual_own_weight = float(matrix_lineupstarter_own_weight)
+
+    matrix_projection_state: Dict[str, Any] = {}
+    if matrix_use_dual_proj and dual_proj_available:
+        matrix_projection_state = _build_combined_dual_source_supplement_state(
+            primary_state=rotowire_source_state,
+            secondary_state=lineupstarter_source_state,
+            primary_proj_weight=max(0.0, 1.0 - float(matrix_lineupstarter_proj_weight)),
+            secondary_proj_weight=float(matrix_lineupstarter_proj_weight),
+            primary_own_weight=0.0,
+            secondary_own_weight=0.0,
+            slate_date=current_slate_date,
+            blend_projection=True,
+            blend_ownership=False,
+        )
+
+    matrix_ownership_state: Dict[str, Any] = {}
+    if matrix_use_dual_own and dual_own_available:
+        matrix_ownership_state = _build_combined_ownership_supplement_state(
+            rotowire_state=rotowire_source_state,
+            secondary_state=lineupstarter_source_state,
+            rotowire_weight=max(0.0, 1.0 - float(matrix_lineupstarter_own_weight)),
+            secondary_weight=float(matrix_lineupstarter_own_weight),
+            slate_date=current_slate_date,
+        )
+
+    matrix_signal_state = _merge_supplement_signal_states(
+        matrix_projection_state,
+        matrix_ownership_state,
+        current_slate_date,
+    )
+    source_matrix_df = _build_supplement_source_matrix_df(
+        supplement_players,
+        rotowire_source_state,
+        lineupstarter_source_state,
+        matrix_signal_state,
+    )
+    if source_matrix_df.empty:
+        st.caption("No source matrix rows are available yet for the current slate.")
+        return
+
+    matrix_threshold_pct = st.slider(
+        "Source matrix flag threshold (% difference)",
+        min_value=5,
+        max_value=60,
+        value=20,
+        step=5,
+        key="dfs_source_matrix_threshold_pct",
+        help="Flag a player when any external source differs from our model by at least this percentage.",
+    )
+    source_matrix_df["Outside Range"] = (
+        source_matrix_df["Max Proj Delta %"].fillna(0.0)
+        >= float(matrix_threshold_pct)
+    ) | (
+        source_matrix_df["Max Own Delta %"].fillna(0.0)
+        >= float(matrix_threshold_pct)
+    )
+    show_flagged_matrix_only = st.toggle(
+        "Show flagged source-matrix players only",
+        value=False,
+        key="dfs_source_matrix_flagged_only",
+    )
+    matrix_view_df = source_matrix_df.copy()
+    if show_flagged_matrix_only:
+        matrix_view_df = matrix_view_df[
+            matrix_view_df["Outside Range"].fillna(False)
+        ].copy()
+    matrix_view_df = matrix_view_df.sort_values(
+        ["Outside Range", "Max Proj Delta %", "Max Own Delta %", "Player"],
+        ascending=[False, False, False, True],
+    )
+    st.dataframe(
+        matrix_view_df[
+            [
+                "Player",
+                "Team",
+                "Pos",
+                "Salary",
+                "Our Proj FPTS",
+                "RotoWire Proj FPTS",
+                "LineupStarter Proj FPTS",
+                "Blend Proj FPTS",
+                "Our Own %",
+                "RotoWire Own %",
+                "LineupStarter Own %",
+                "Blend Own %",
+                "Max Proj Delta %",
+                "Max Own Delta %",
+                "Outside Range",
+            ]
+        ],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Salary": st.column_config.NumberColumn(format="$%d"),
+            "Our Proj FPTS": st.column_config.NumberColumn(format="%.1f"),
+            "RotoWire Proj FPTS": st.column_config.NumberColumn(format="%.1f"),
+            "LineupStarter Proj FPTS": st.column_config.NumberColumn(format="%.1f"),
+            "Blend Proj FPTS": st.column_config.NumberColumn(format="%.1f"),
+            "Our Own %": st.column_config.NumberColumn(format="%.1f%%"),
+            "RotoWire Own %": st.column_config.NumberColumn(format="%.1f%%"),
+            "LineupStarter Own %": st.column_config.NumberColumn(format="%.1f%%"),
+            "Blend Own %": st.column_config.NumberColumn(format="%.1f%%"),
+            "Max Proj Delta %": st.column_config.NumberColumn(format="%.1f%%"),
+            "Max Own Delta %": st.column_config.NumberColumn(format="%.1f%%"),
+        },
+    )
+
+
+def _render_dfs_supplement_archive(
+    conn: sqlite3.Connection,
+    current_slate_date: str,
+) -> None:
+    from dfs_tracking import (
+        get_recent_supplement_runs as _get_recent_supplement_runs,
+        get_supplement_run_player_deltas as _get_supplement_run_player_deltas,
+    )
+
+    show_all_archive = st.toggle(
+        "Show all dates in archive",
+        value=False,
+        key="dfs_supplement_show_all_archive",
+    )
+    source_filter_value = st.text_input(
+        "Archive source filter",
+        value="",
+        key="dfs_supplement_archive_source_filter",
+        help="Optional substring filter such as rotowire or lineupstarter.",
+    ).strip()
+    archive_slate_filter = "" if show_all_archive else str(current_slate_date)
+    try:
+        recent_supplement_runs_df = _get_recent_supplement_runs(
+            conn,
+            limit=20,
+            slate_date=archive_slate_filter,
+            source_name_filter=source_filter_value,
+        )
+    except Exception:
+        recent_supplement_runs_df = pd.DataFrame()
+
+    if recent_supplement_runs_df.empty:
+        st.caption("No saved supplement archive rows match the current filters.")
+        return
+
+    history_view = recent_supplement_runs_df.copy()
+    history_view["Created"] = pd.to_datetime(
+        history_view["created_at"], errors="coerce"
+    ).dt.strftime("%Y-%m-%d %H:%M")
+    history_view["Source"] = history_view["source_name"].fillna("").replace("", "Supplement")
+    history_view["Matched"] = history_view.apply(
+        lambda row: f"{int(row.get('rows_matched', 0) or 0)}/{int(row.get('rows_total', 0) or 0)}",
+        axis=1,
+    )
+    history_view["Scope"] = history_view["slate_date"].map(
+        lambda slate_date: _supplement_run_scope_label(slate_date, current_slate_date)
+    )
+    history_view = history_view.rename(
+        columns={
+            "slate_date": "Slate",
+            "match_rate": "Match Rate %",
+            "projection_mae": "Proj MAE",
+            "ownership_mae": "Own MAE",
+            "avg_proj_delta": "Avg Proj Delta",
+            "avg_own_delta": "Avg Own Delta",
+        }
+    )
+    st.markdown("**Saved Archive**")
+    st.dataframe(
+        history_view[
+            [
+                "Scope",
+                "Slate",
+                "Source",
+                "Matched",
+                "Match Rate %",
+                "Proj MAE",
+                "Own MAE",
+                "Avg Proj Delta",
+                "Avg Own Delta",
+                "Created",
+            ]
+        ],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Match Rate %": st.column_config.NumberColumn(format="%.1f%%"),
+            "Proj MAE": st.column_config.NumberColumn(format="%.2f"),
+            "Own MAE": st.column_config.NumberColumn(format="%.2f"),
+            "Avg Proj Delta": st.column_config.NumberColumn(format="%+.2f"),
+            "Avg Own Delta": st.column_config.NumberColumn(format="%+.2f"),
+        },
+    )
+
+    history_records = recent_supplement_runs_df.to_dict("records")
+    history_lookup = {
+        str(row.get("run_key") or ""): row
+        for row in history_records
+        if str(row.get("run_key") or "")
+    }
+    history_keys = list(history_lookup.keys())
+    selected_run_key = st.selectbox(
+        "Review Archive Snapshot",
+        options=history_keys,
+        format_func=lambda key: (
+            f"{history_lookup.get(key, {}).get('slate_date', '—')} | "
+            f"{history_lookup.get(key, {}).get('source_name') or 'Supplement'} | "
+            f"{int(history_lookup.get(key, {}).get('rows_matched', 0) or 0)}/"
+            f"{int(history_lookup.get(key, {}).get('rows_total', 0) or 0)} matched"
+        ),
+        key="dfs_supplement_history_select",
+    )
+    st.session_state.dfs_supplement_review_run_key = selected_run_key
+    selected_history_row = history_lookup.get(selected_run_key, {}) if selected_run_key else {}
+    if not selected_history_row:
+        return
+
+    archive_action_col1, archive_action_col2 = st.columns([1.6, 4])
+    with archive_action_col1:
+        can_activate_current_slate = (
+            str(selected_history_row.get("slate_date") or "") == str(current_slate_date)
+        )
+        activate_clicked = st.button(
+            "Activate for Current Slate",
+            key=f"dfs_supplement_activate_archive_{selected_run_key}",
+            disabled=not can_activate_current_slate,
+            use_container_width=True,
+        )
+    with archive_action_col2:
+        if can_activate_current_slate:
+            st.caption("This archive snapshot matches the active slate and can be activated.")
+        else:
+            st.caption(
+                f"This archive snapshot is for {selected_history_row.get('slate_date') or 'another slate'} and cannot be activated for {current_slate_date}."
+            )
+
+    if activate_clicked and can_activate_current_slate:
+        activated_state = _load_saved_dfs_supplement_state(
+            conn,
+            current_slate_date,
+            run_key=str(selected_run_key),
+        )
+        if activated_state:
+            st.session_state.dfs_supplement_state = activated_state
+            st.success(
+                f"Activated saved current-slate snapshot: {activated_state.get('source_name') or 'Supplement'}"
+            )
+            st.rerun()
+
+    try:
+        history_details_df = _get_supplement_run_player_deltas(conn, selected_run_key)
+    except Exception:
+        history_details_df = pd.DataFrame()
+    if not history_details_df.empty:
+        st.markdown("**Archive Snapshot Detail**")
+        st.dataframe(
+            history_details_df.head(40),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "salary": st.column_config.NumberColumn(format="$%d"),
+                "match_score": st.column_config.NumberColumn(format="%.2f"),
+                "our_proj_fpts": st.column_config.NumberColumn(format="%.1f"),
+                "supplement_proj_fpts": st.column_config.NumberColumn(format="%.1f"),
+                "proj_delta": st.column_config.NumberColumn(format="%+.1f"),
+                "our_own_pct": st.column_config.NumberColumn(format="%.1f%%"),
+                "supplement_own_pct": st.column_config.NumberColumn(format="%.1f%%"),
+                "own_delta_pp": st.column_config.NumberColumn(format="%+.1f"),
+            },
+        )
     signal_key = (
         "supplement_proj_fpts"
         if str(signal_name or "").strip().lower().startswith("proj")
@@ -16838,6 +17270,10 @@ if selected_page == "DFS Lineup Builder":
         st.session_state.dfs_slate_context = {}
     if 'dfs_supplement_state' not in st.session_state:
         st.session_state.dfs_supplement_state = {}
+    if 'dfs_supplement_working_state' not in st.session_state:
+        st.session_state.dfs_supplement_working_state = {}
+    if 'dfs_supplement_review_run_key' not in st.session_state:
+        st.session_state.dfs_supplement_review_run_key = ""
     if 'dfs_supplement_cached_upload' not in st.session_state:
         st.session_state.dfs_supplement_cached_upload = {}
     if 'dfs_supplement_saved_run_key' not in st.session_state:
@@ -23843,8 +24279,6 @@ if selected_page == "DFS Lineup Builder":
         from dfs_tracking import (
             create_dfs_tracking_tables as _create_dfs_tracking_tables,
             get_recent_supplement_runs as _get_recent_supplement_runs,
-            get_supplement_run_player_deltas as _get_supplement_run_player_deltas,
-            save_supplement_snapshot as _save_supplement_snapshot,
         )
 
         try:
@@ -23852,114 +24286,91 @@ if selected_page == "DFS Lineup Builder":
         except Exception:
             pass
 
-        active_supplement_state = st.session_state.get("dfs_supplement_state", {}) or {}
-        if active_supplement_state.get("summary"):
-            active_summary = active_supplement_state["summary"]
-            active_col, clear_col = st.columns([5, 1])
-            with active_col:
-                st.info(
-                    f"Most recent loaded supplement: {active_supplement_state.get('source_name', 'Supplement')} | "
-                    f"Slate {active_supplement_state.get('slate_date', '—')} | "
-                    f"Matched {active_summary.get('matched_rows', 0)}/{active_summary.get('total_rows', 0)} | "
-                    f"Proj MAE {active_summary.get('projection_mae_display', '—')} | "
-                    f"Own MAE {active_summary.get('ownership_mae_display', '—')}"
+        current_slate_date = (
+            st.session_state.get("dfs_projection_date")
+            or str(datetime.now(EASTERN_TZ).date())
+        )
+        active_supplement_state = _get_active_current_slate_supplement_state(
+            st.session_state.get("dfs_supplement_state", {}) or {},
+            current_slate_date,
+        )
+        working_supplement_state = dict(
+            st.session_state.get("dfs_supplement_working_state", {}) or {}
+        )
+        if str(working_supplement_state.get("slate_date") or "") != str(current_slate_date):
+            st.session_state.dfs_supplement_working_state = {}
+            working_supplement_state = {}
+
+        latest_saved_current_slate_state = _load_saved_dfs_supplement_state(
+            dfs_conn,
+            str(current_slate_date),
+        )
+
+        st.markdown("**Current Slate**")
+        status_col, action_col1, action_col2 = st.columns([6, 1.2, 1.8])
+        with status_col:
+            if active_supplement_state:
+                st.success(
+                    "Active Snapshot | "
+                    + _format_dfs_supplement_summary_line(active_supplement_state)
                 )
-            with clear_col:
-                if st.button("Clear", key="dfs_supplement_clear_loaded", use_container_width=True):
+                st.caption(
+                    "Player Pool and Generated Lineups will use this active current-slate snapshot."
+                )
+            elif latest_saved_current_slate_state:
+                created_at_label = ""
+                try:
+                    current_runs_df = _get_recent_supplement_runs(
+                        dfs_conn,
+                        limit=1,
+                        slate_date=str(current_slate_date),
+                    )
+                    if not current_runs_df.empty:
+                        created_at_label = str(
+                            pd.to_datetime(
+                                current_runs_df.iloc[0].get("created_at"),
+                                errors="coerce",
+                            ).strftime("%Y-%m-%d %H:%M")
+                        )
+                except Exception:
+                    created_at_label = ""
+                st.info(
+                    "No active current-slate snapshot is loaded. Latest saved snapshot is available | "
+                    + _format_dfs_supplement_summary_line(
+                        latest_saved_current_slate_state,
+                        include_created_at=created_at_label,
+                    )
+                )
+                st.caption(
+                    "Load the saved current-slate snapshot below, or fetch/upload a new source and save that instead."
+                )
+            else:
+                st.info(
+                    "No active current-slate snapshot is loaded. Fetch RotoWire or upload a CSV, compare it, then save the result as the active snapshot."
+                )
+        with action_col1:
+            if active_supplement_state:
+                if st.button("Clear Active", key="dfs_supplement_clear_loaded", use_container_width=True):
                     st.session_state.dfs_supplement_state = {}
                     st.rerun()
-
-        try:
-            recent_supplement_runs_df = _get_recent_supplement_runs(dfs_conn, limit=12)
-        except Exception:
-            recent_supplement_runs_df = pd.DataFrame()
-
-        if not recent_supplement_runs_df.empty:
-            with st.expander("Saved Supplement History", expanded=False):
-                history_view = recent_supplement_runs_df.copy()
-                history_view["Created"] = pd.to_datetime(
-                    history_view["created_at"], errors="coerce"
-                ).dt.strftime("%Y-%m-%d %H:%M")
-                history_view["Source"] = history_view["source_name"].fillna("").replace("", "Supplement")
-                history_view["Matched"] = history_view.apply(
-                    lambda row: f"{int(row.get('rows_matched', 0) or 0)}/{int(row.get('rows_total', 0) or 0)}",
-                    axis=1,
-                )
-                history_view = history_view.rename(
-                    columns={
-                        "slate_date": "Slate",
-                        "match_rate": "Match Rate %",
-                        "projection_mae": "Proj MAE",
-                        "ownership_mae": "Own MAE",
-                        "avg_proj_delta": "Avg Proj Delta",
-                        "avg_own_delta": "Avg Own Delta",
-                    }
-                )
-                st.dataframe(
-                    history_view[
-                        [
-                            "Slate",
-                            "Source",
-                            "Matched",
-                            "Match Rate %",
-                            "Proj MAE",
-                            "Own MAE",
-                            "Avg Proj Delta",
-                            "Avg Own Delta",
-                            "Created",
-                        ]
-                    ],
+        with action_col2:
+            if (not active_supplement_state) and latest_saved_current_slate_state:
+                if st.button(
+                    "Load Current-Slate Snapshot",
+                    key="dfs_supplement_load_current_saved",
                     use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "Match Rate %": st.column_config.NumberColumn(format="%.1f%%"),
-                        "Proj MAE": st.column_config.NumberColumn(format="%.2f"),
-                        "Own MAE": st.column_config.NumberColumn(format="%.2f"),
-                        "Avg Proj Delta": st.column_config.NumberColumn(format="%+.2f"),
-                        "Avg Own Delta": st.column_config.NumberColumn(format="%+.2f"),
-                    },
-                )
+                ):
+                    st.session_state.dfs_supplement_state = latest_saved_current_slate_state
+                    st.rerun()
 
-                history_records = recent_supplement_runs_df.to_dict("records")
-                history_lookup = {
-                    str(row.get("run_key") or ""): row
-                    for row in history_records
-                    if str(row.get("run_key") or "")
-                }
-                history_keys = list(history_lookup.keys())
-                selected_run_key = st.selectbox(
-                    "Review Saved Snapshot",
-                    options=history_keys,
-                    format_func=lambda key: (
-                        f"{history_lookup.get(key, {}).get('slate_date', '—')} | "
-                        f"{history_lookup.get(key, {}).get('source_name') or 'Supplement'} | "
-                        f"{int(history_lookup.get(key, {}).get('rows_matched', 0) or 0)}/"
-                        f"{int(history_lookup.get(key, {}).get('rows_total', 0) or 0)} matched"
-                    ),
-                    key="dfs_supplement_history_select",
-                )
-                if selected_run_key:
-                    try:
-                        history_details_df = _get_supplement_run_player_deltas(dfs_conn, selected_run_key)
-                    except Exception:
-                        history_details_df = pd.DataFrame()
-                    if not history_details_df.empty:
-                        st.markdown("**Saved Snapshot Detail**")
-                        st.dataframe(
-                            history_details_df.head(40),
-                            use_container_width=True,
-                            hide_index=True,
-                            column_config={
-                                "salary": st.column_config.NumberColumn(format="$%d"),
-                                "match_score": st.column_config.NumberColumn(format="%.2f"),
-                                "our_proj_fpts": st.column_config.NumberColumn(format="%.1f"),
-                                "supplement_proj_fpts": st.column_config.NumberColumn(format="%.1f"),
-                                "proj_delta": st.column_config.NumberColumn(format="%+.1f"),
-                                "our_own_pct": st.column_config.NumberColumn(format="%.1f%%"),
-                                "supplement_own_pct": st.column_config.NumberColumn(format="%.1f%%"),
-                                "own_delta_pp": st.column_config.NumberColumn(format="%+.1f"),
-                            },
-                        )
+        if working_supplement_state.get("summary"):
+            st.info(
+                "Working Comparison | "
+                + _format_dfs_supplement_summary_line(working_supplement_state)
+            )
+            st.caption(
+                "This working comparison is not used by downstream tabs until you save it as the active snapshot."
+            )
 
         _recover_dfs_session_from_cache(
             dfs_conn,
@@ -23993,244 +24404,45 @@ if selected_page == "DFS Lineup Builder":
                 current_slate_date,
                 active_supplement_state,
             )
-            dual_proj_available = bool(
-                _supplement_state_has_signal(rotowire_source_state, "projection")
-                and _supplement_state_has_signal(lineupstarter_source_state, "projection")
-            )
-            dual_own_available = bool(
-                _supplement_state_has_signal(rotowire_source_state, "ownership")
-                and _supplement_state_has_signal(lineupstarter_source_state, "ownership")
-            )
-            matrix_use_dual_proj = bool(
-                st.session_state.get(
-                    "dfs_dual_proj_blend_enabled_state",
-                    st.session_state.get("dfs_dual_proj_blend_enabled", dual_proj_available),
+            with st.expander("Advanced", expanded=False):
+                st.caption(
+                    "Advanced tools for multi-source blending, source-matrix review, and saved archive browsing."
                 )
-            )
-            matrix_lineupstarter_proj_weight = float(
-                st.session_state.get("dfs_dual_proj_weight", 0.35)
-            )
-            matrix_use_dual_own = bool(
-                st.session_state.get(
-                    "dfs_dual_own_blend_enabled_state",
-                    st.session_state.get("dfs_dual_own_blend_enabled", dual_own_available),
+                _render_dfs_supplement_source_matrix(
+                    supplement_players,
+                    rotowire_source_state,
+                    lineupstarter_source_state,
+                    str(current_slate_date),
                 )
-            )
-            matrix_lineupstarter_own_weight = float(
-                st.session_state.get("dfs_dual_own_weight", 0.35)
-            )
-
-            st.markdown("**Source Matrix**")
-            source_m1, source_m2, source_m3 = st.columns(3)
-            source_m1.metric(
-                "RotoWire Snapshot",
-                "Ready" if rotowire_source_state.get("player_map") else "Missing",
-                (
-                    f"{int(rotowire_source_state.get('summary', {}).get('matched_rows', 0) or 0)} matched"
-                    if rotowire_source_state.get("player_map")
-                    else None
-                ),
-            )
-            source_m2.metric(
-                "LineupStarter Snapshot",
-                "Ready" if lineupstarter_source_state.get("player_map") else "Missing",
-                (
-                    f"{int(lineupstarter_source_state.get('summary', {}).get('matched_rows', 0) or 0)} matched"
-                    if lineupstarter_source_state.get("player_map")
-                    else None
-                ),
-            )
-            source_m3.metric(
-                "Blend Ready",
-                "Yes" if (dual_proj_available or dual_own_available) else "No",
-                (
-                    "Projection + Ownership"
-                    if dual_proj_available and dual_own_available
-                    else "Projection only"
-                    if dual_proj_available
-                    else "Ownership only"
-                    if dual_own_available
-                    else None
-                ),
-            )
-
-            matrix_blend_col1, matrix_blend_col2 = st.columns(2)
-            with matrix_blend_col1:
-                matrix_use_dual_proj = st.toggle(
-                    "Blend RotoWire + LineupStarter Projection",
-                    value=matrix_use_dual_proj and dual_proj_available,
-                    disabled=not dual_proj_available,
-                    key="dfs_source_matrix_proj_toggle",
-                    help="Blend external projection signals for the source matrix and supplement lineup models.",
-                )
-                if matrix_use_dual_proj and dual_proj_available:
-                    matrix_lineupstarter_proj_weight = (
-                        st.slider(
-                            "LineupStarter projection weight",
-                            min_value=10,
-                            max_value=90,
-                            value=int(round(matrix_lineupstarter_proj_weight * 100)),
-                            step=5,
-                            format="%d%%",
-                            key="dfs_source_matrix_proj_weight_pct",
-                        )
-                        / 100.0
-                    )
-            with matrix_blend_col2:
-                matrix_use_dual_own = st.toggle(
-                    "Blend RotoWire + LineupStarter Ownership",
-                    value=matrix_use_dual_own and dual_own_available,
-                    disabled=not dual_own_available,
-                    key="dfs_source_matrix_own_toggle",
-                    help="Blend external ownership signals for the source matrix and lineup generation.",
-                )
-                if matrix_use_dual_own and dual_own_available:
-                    matrix_lineupstarter_own_weight = (
-                        st.slider(
-                            "LineupStarter ownership weight",
-                            min_value=10,
-                            max_value=90,
-                            value=int(round(matrix_lineupstarter_own_weight * 100)),
-                            step=5,
-                            format="%d%%",
-                            key="dfs_source_matrix_own_weight_pct",
-                        )
-                        / 100.0
-                    )
-
-            st.session_state["dfs_dual_proj_blend_enabled_state"] = bool(matrix_use_dual_proj)
-            st.session_state.dfs_dual_proj_weight = float(matrix_lineupstarter_proj_weight)
-            st.session_state["dfs_dual_own_blend_enabled_state"] = bool(matrix_use_dual_own)
-            st.session_state.dfs_dual_own_weight = float(matrix_lineupstarter_own_weight)
-
-            matrix_projection_state: Dict[str, Any] = {}
-            if matrix_use_dual_proj and dual_proj_available:
-                matrix_projection_state = _build_combined_dual_source_supplement_state(
-                    primary_state=rotowire_source_state,
-                    secondary_state=lineupstarter_source_state,
-                    primary_proj_weight=max(0.0, 1.0 - float(matrix_lineupstarter_proj_weight)),
-                    secondary_proj_weight=float(matrix_lineupstarter_proj_weight),
-                    primary_own_weight=0.0,
-                    secondary_own_weight=0.0,
-                    slate_date=current_slate_date,
-                    blend_projection=True,
-                    blend_ownership=False,
+                _render_dfs_supplement_archive(
+                    dfs_conn,
+                    str(current_slate_date),
                 )
 
-            matrix_ownership_state: Dict[str, Any] = {}
-            if matrix_use_dual_own and dual_own_available:
-                matrix_ownership_state = _build_combined_ownership_supplement_state(
-                    rotowire_state=rotowire_source_state,
-                    secondary_state=lineupstarter_source_state,
-                    rotowire_weight=max(0.0, 1.0 - float(matrix_lineupstarter_own_weight)),
-                    secondary_weight=float(matrix_lineupstarter_own_weight),
-                    slate_date=current_slate_date,
-                )
-
-            matrix_signal_state = _merge_supplement_signal_states(
-                matrix_projection_state,
-                matrix_ownership_state,
-                current_slate_date,
-            )
-            source_matrix_df = _build_supplement_source_matrix_df(
-                supplement_players,
-                rotowire_source_state,
-                lineupstarter_source_state,
-                matrix_signal_state,
-            )
-            if not source_matrix_df.empty:
-                matrix_threshold_pct = st.slider(
-                    "Source matrix flag threshold (% difference)",
-                    min_value=5,
-                    max_value=60,
-                    value=20,
-                    step=5,
-                    key="dfs_source_matrix_threshold_pct",
-                    help="Flag a player when any external source differs from our model by at least this percentage.",
-                )
-                source_matrix_df["Outside Range"] = (
-                    source_matrix_df["Max Proj Delta %"].fillna(0.0)
-                    >= float(matrix_threshold_pct)
-                ) | (
-                    source_matrix_df["Max Own Delta %"].fillna(0.0)
-                    >= float(matrix_threshold_pct)
-                )
-                show_flagged_matrix_only = st.toggle(
-                    "Show flagged source-matrix players only",
-                    value=False,
-                    key="dfs_source_matrix_flagged_only",
-                )
-                matrix_view_df = source_matrix_df.copy()
-                if show_flagged_matrix_only:
-                    matrix_view_df = matrix_view_df[
-                        matrix_view_df["Outside Range"].fillna(False)
-                    ].copy()
-                matrix_view_df = matrix_view_df.sort_values(
-                    ["Outside Range", "Max Proj Delta %", "Max Own Delta %", "Player"],
-                    ascending=[False, False, False, True],
-                )
-                st.dataframe(
-                    matrix_view_df[
-                        [
-                            "Player",
-                            "Team",
-                            "Pos",
-                            "Salary",
-                            "Our Proj FPTS",
-                            "RotoWire Proj FPTS",
-                            "LineupStarter Proj FPTS",
-                            "Blend Proj FPTS",
-                            "Our Own %",
-                            "RotoWire Own %",
-                            "LineupStarter Own %",
-                            "Blend Own %",
-                            "Max Proj Delta %",
-                            "Max Own Delta %",
-                            "Outside Range",
-                        ]
-                    ],
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "Salary": st.column_config.NumberColumn(format="$%d"),
-                        "Our Proj FPTS": st.column_config.NumberColumn(format="%.1f"),
-                        "RotoWire Proj FPTS": st.column_config.NumberColumn(format="%.1f"),
-                        "LineupStarter Proj FPTS": st.column_config.NumberColumn(format="%.1f"),
-                        "Blend Proj FPTS": st.column_config.NumberColumn(format="%.1f"),
-                        "Our Own %": st.column_config.NumberColumn(format="%.1f%%"),
-                        "RotoWire Own %": st.column_config.NumberColumn(format="%.1f%%"),
-                        "LineupStarter Own %": st.column_config.NumberColumn(format="%.1f%%"),
-                        "Blend Own %": st.column_config.NumberColumn(format="%.1f%%"),
-                        "Max Proj Delta %": st.column_config.NumberColumn(format="%.1f%%"),
-                        "Max Own Delta %": st.column_config.NumberColumn(format="%.1f%%"),
-                    },
-                )
-
+            st.markdown("**Load Source**")
             st.caption(
-                "RotoWire and CSV are distinct supplement sources. "
-                "Run both each slate: load RotoWire snapshot, then upload CSV. "
-                "Both are saved and can feed projection and ownership blending/tracking."
+                "RotoWire and CSV are separate supplement sources. Use one or both on the current slate, then save the comparison you want to make active."
             )
             quick_rw_col1, quick_rw_col2 = st.columns([1.4, 2.6])
             with quick_rw_col1:
                 refresh_rw_snapshot = st.button(
-                    "Refresh RotoWire Snapshot",
+                    "Fetch + Save RotoWire Snapshot",
                     key="dfs_supplement_quick_rotowire_snapshot",
                     help=(
-                        "Fetch/save the latest RotoWire supplement for the current slate "
-                        "without changing the CSV upload flow."
+                        "Fetch and save the latest RotoWire supplement for the current slate without changing the CSV upload flow."
                     ),
                 )
             with quick_rw_col2:
                 st.caption(f"Current slate date: `{current_slate_date}`")
             if refresh_rw_snapshot:
                 with st.spinner(f"Refreshing RotoWire supplement for {current_slate_date}..."):
-                    rw_state, rw_message = _auto_load_rotowire_supplement(
+                    rw_state, rw_message = _autofetch_rotowire_supplement_state(
                         dfs_conn,
+                        supplement_players,
                         str(current_slate_date),
-                        (_resolve_rotowire_cookie() or "").strip(),
                     )
                 if rw_state:
+                    st.session_state.dfs_supplement_state = rw_state
                     st.success(rw_message)
                 elif rw_message:
                     st.warning(rw_message)
@@ -24238,7 +24450,7 @@ if selected_page == "DFS Lineup Builder":
                     st.warning("Could not refresh RotoWire supplement snapshot.")
 
             source_mode = st.radio(
-                "Supplement Import Source (current action)",
+                "Choose Source to Load",
                 options=["Upload CSV", "Fetch RotoWire"],
                 horizontal=True,
                 key="dfs_supplement_source_mode",
@@ -24525,6 +24737,10 @@ if selected_page == "DFS Lineup Builder":
                     supplement_df = pd.DataFrame()
 
             if not supplement_df.empty:
+                st.markdown("**Map and Compare**")
+                st.caption(
+                    "Review the source columns below, then inspect the matched and unmatched comparison before saving an active snapshot."
+                )
                 supplement_df.columns = [str(col).strip() for col in supplement_df.columns]
                 column_options = supplement_df.columns.tolist()
                 none_option = DFS_SUPPLEMENT_NONE_OPTION
@@ -24768,178 +24984,72 @@ if selected_page == "DFS Lineup Builder":
                             float(own_comp_df["Own Delta (pp)"].abs().mean())
                             if not own_comp_df.empty else np.nan
                         )
-                        supplement_player_map = _build_dfs_supplement_player_map(comparison_df)
-                        run_key = _compute_dfs_supplement_run_key(
-                            slate_date=slate_date,
-                            source_filename=source_filename,
-                            projection_col=resolved_proj_col,
-                            ownership_col=resolved_own_col,
-                            comparison_df=comparison_df,
-                            unmatched_df=unmatched_df,
-                        )
                         is_rotowire_source = bool(
                             source_mode == "Fetch RotoWire"
                             or rotowire_layout is not None
                             or "rotowire" in str(source_name or "").lower()
                         )
-                        st.session_state.dfs_supplement_state = {
-                            "run_key": run_key,
-                            "slate_date": slate_date,
-                            "source_name": source_name,
-                            "source_filename": source_filename,
-                            "source_mode": source_mode,
-                            "is_rotowire_source": is_rotowire_source,
-                            "projection_col": resolved_proj_col,
-                            "ownership_col": resolved_own_col,
-                            "raw_records": supplement_df.to_dict("records"),
-                            "raw_columns": supplement_df.columns.tolist(),
-                            "comparison_records": comparison_df.to_dict("records"),
-                            "player_map": supplement_player_map,
-                            "summary": {
-                                "total_rows": total_rows,
-                                "matched_rows": matched_rows,
-                                "match_rate": match_rate,
-                                "projection_mae": projection_mae_value,
-                                "projection_mae_display": (
-                                    f"{projection_mae_value:.2f}"
-                                    if np.isfinite(projection_mae_value) else "—"
-                                ),
-                                "ownership_mae": ownership_mae_value,
-                                "ownership_mae_display": (
-                                    f"{ownership_mae_value:.2f}pp"
-                                    if np.isfinite(ownership_mae_value) else "—"
-                                ),
-                            },
-                        }
-                        st.caption(
-                            "Matched supplement snapshots auto-save as soon as this comparison is built. "
-                            "Use the button below to force a re-save if you want to confirm persistence."
+                        working_comparison_state = _build_dfs_supplement_state(
+                            slate_date=str(slate_date),
+                            source_name=source_name,
+                            source_filename=source_filename,
+                            source_mode=source_mode,
+                            is_rotowire_source=is_rotowire_source,
+                            projection_col=resolved_proj_col,
+                            ownership_col=resolved_own_col,
+                            supplement_df=supplement_df,
+                            comparison_df=comparison_df,
+                            unmatched_df=unmatched_df,
                         )
+                        st.session_state.dfs_supplement_working_state = working_comparison_state
+                        run_key = str(working_comparison_state.get("run_key") or "")
 
-                        if matched_rows > 0 and run_key != st.session_state.get("dfs_supplement_saved_run_key", ""):
-                            try:
-                                _save_supplement_snapshot(
-                                    dfs_conn,
-                                    slate_date=slate_date,
-                                    run_key=run_key,
-                                    source_name=source_name,
-                                    source_filename=source_filename,
-                                    projection_col=resolved_proj_col,
-                                    ownership_col=resolved_own_col,
-                                    comparison_df=comparison_df,
-                                    unmatched_df=unmatched_df,
-                                    rows_total=total_rows,
-                                )
-                                st.session_state.dfs_supplement_saved_run_key = run_key
-
-                                with tempfile.NamedTemporaryFile(
-                                    mode="w",
-                                    suffix=".csv",
-                                    delete=False,
-                                    encoding="utf-8",
-                                ) as tmp_csv:
-                                    tmp_csv.write(comparison_df.to_csv(index=False))
-                                    tmp_csv_path = Path(tmp_csv.name)
-                                artifact_token = _sanitize_supplement_artifact_token(source_name)
-                                with tempfile.NamedTemporaryFile(
-                                    mode="w",
-                                    suffix=".csv",
-                                    delete=False,
-                                    encoding="utf-8",
-                                ) as tmp_source_csv:
-                                    tmp_source_csv.write(supplement_df.to_csv(index=False))
-                                    tmp_source_csv_path = Path(tmp_source_csv.name)
-                                _s3_upload_slate_file(
-                                    tmp_source_csv_path,
-                                    slate_date,
-                                    f"{artifact_token}_supplement_raw.csv",
-                                )
-                                try:
-                                    tmp_source_csv_path.unlink()
-                                except OSError:
-                                    pass
-
-                                _s3_upload_slate_file(
-                                    tmp_csv_path,
-                                    slate_date,
-                                    f"{artifact_token}_supplement_comparison.csv",
-                                )
-                                try:
-                                    tmp_csv_path.unlink()
-                                except OSError:
-                                    pass
-
-                                summary_payload = {
-                                    "run_key": run_key,
-                                    "slate_date": slate_date,
-                                    "source_name": source_name,
-                                    "source_filename": source_filename,
-                                    "projection_col": resolved_proj_col,
-                                    "ownership_col": resolved_own_col,
-                                    "rows_total": total_rows,
-                                    "rows_matched": matched_rows,
-                                    "rows_unmatched": int(len(unmatched_df)),
-                                    "match_rate": match_rate,
-                                    "projection_mae": projection_mae_value if np.isfinite(projection_mae_value) else None,
-                                    "ownership_mae": ownership_mae_value if np.isfinite(ownership_mae_value) else None,
-                                }
-                                with tempfile.NamedTemporaryFile(
-                                    mode="w",
-                                    suffix=".json",
-                                    delete=False,
-                                    encoding="utf-8",
-                                ) as tmp_json:
-                                    json.dump(summary_payload, tmp_json, indent=2, default=str)
-                                    tmp_json_path = Path(tmp_json.name)
-                                _s3_upload_slate_file(
-                                    tmp_json_path,
-                                    slate_date,
-                                    f"{artifact_token}_supplement_summary.json",
-                                )
-                                try:
-                                    tmp_json_path.unlink()
-                                except OSError:
-                                    pass
-                                st.caption(
-                                    f"Saved supplement snapshot for {slate_date} to tracking and cloud storage."
-                                )
-                            except Exception as exc:
-                                st.warning(f"Could not save supplement snapshot: {exc}")
-                        elif matched_rows == 0:
+                        st.markdown("**Save / Activate**")
+                        if matched_rows > 0:
                             st.caption(
-                                "Snapshot auto-save is skipped until at least one supplement row matches the active slate."
+                                "This comparison is a working snapshot only. Save it to make it the active current-slate supplement used by downstream tabs."
+                            )
+                        else:
+                            st.caption(
+                                "Working comparison is not eligible to save until at least one player matches the active slate."
                             )
 
                         save_button_col, save_status_col = st.columns([1.2, 4])
                         with save_button_col:
                             manual_save_clicked = st.button(
-                                "Save / Resave Snapshot",
+                                f"Save Active Snapshot for {slate_date}",
                                 key=f"dfs_supplement_manual_save_{run_key}",
                                 use_container_width=True,
                             )
                         with save_status_col:
-                            if st.session_state.get("dfs_supplement_saved_run_key", "") == run_key:
+                            if str(active_supplement_state.get("run_key") or "") == run_key and run_key:
                                 st.caption(
-                                    f"Current snapshot run key `{run_key}` is saved for slate {slate_date}."
+                                    f"This working comparison is already the active snapshot for slate {slate_date}."
+                                )
+                            elif run_key:
+                                st.caption(
+                                    f"Working comparison run key `{run_key}` is ready to save for slate {slate_date}."
                                 )
 
                         if manual_save_clicked:
                             if matched_rows == 0:
                                 st.warning(
-                                    "Cannot save a supplement snapshot with zero matched players."
+                                    "Cannot save an active snapshot with zero matched players."
                                 )
                             else:
                                 save_error = _save_dfs_supplement_state(
                                     dfs_conn,
-                                    supplement_state=st.session_state.get("dfs_supplement_state", {}) or {},
+                                    supplement_state=working_comparison_state,
                                     comparison_df=comparison_df,
                                     unmatched_df=unmatched_df,
                                 )
                                 if save_error:
                                     st.warning(f"Could not save supplement snapshot: {save_error}")
                                 else:
+                                    st.session_state.dfs_supplement_state = working_comparison_state
+                                    active_supplement_state = working_comparison_state
                                     st.success(
-                                        f"Saved supplement snapshot for {slate_date}: {source_name}"
+                                        f"Saved and activated supplement snapshot for {slate_date}: {source_name}"
                                     )
 
                         if method_counts:
