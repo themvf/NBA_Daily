@@ -15211,6 +15211,39 @@ def _build_dfs_supplement_player_map(
     return player_map
 
 
+def _build_dfs_supplement_overlap_diagnostics(
+    supplement_df: pd.DataFrame,
+    players: List[Any],
+    player_col: str,
+) -> Dict[str, Any]:
+    if supplement_df is None or supplement_df.empty or not player_col:
+        return {"supplement_name_count": 0, "active_name_count": 0, "exact_overlap_count": 0, "sample_overlap": []}
+
+    supplement_names = {
+        _clean_dfs_supplement_player_name(value)
+        for value in supplement_df.get(player_col, pd.Series(dtype=object)).tolist()
+    }
+    supplement_names.discard("")
+
+    active_name_lookup: Dict[str, str] = {}
+    for player in players or []:
+        cleaned_name = _clean_dfs_supplement_player_name(getattr(player, "name", "") or "")
+        if cleaned_name:
+            active_name_lookup[cleaned_name] = str(getattr(player, "name", "") or cleaned_name)
+
+    overlap_names = sorted(
+        active_name_lookup[name]
+        for name in supplement_names
+        if name in active_name_lookup
+    )
+    return {
+        "supplement_name_count": len(supplement_names),
+        "active_name_count": len(active_name_lookup),
+        "exact_overlap_count": len(overlap_names),
+        "sample_overlap": overlap_names[:10],
+    }
+
+
 def _compute_dfs_supplement_run_key(
     slate_date: str,
     source_filename: str,
@@ -24826,6 +24859,15 @@ if selected_page == "DFS Lineup Builder":
                     if resolved_proj_col == DFS_SUPPLEMENT_ROTOWIRE_DERIVED_LABEL:
                         resolved_proj_col = DFS_SUPPLEMENT_ROTOWIRE_DERIVED_FPTS
                     resolved_own_col = None if own_col == none_option else own_col
+                    if resolved_team_col and resolved_team_col in supplement_df.columns:
+                        nonblank_team_count = int(
+                            supplement_df[resolved_team_col].fillna("").astype(str).str.strip().ne("").sum()
+                        )
+                        if nonblank_team_count == 0:
+                            st.caption(
+                                "Selected team column is blank for all rows, so matching will use player names only."
+                            )
+                            resolved_team_col = None
                     preview_label = "Upload Preview"
                 else:
                     player_col = str(known_mapping.get("player_col") or "player_name")
@@ -24840,6 +24882,12 @@ if selected_page == "DFS Lineup Builder":
                         "Using fixed RotoWire mapping: "
                         "`player_name` / `team_abbr` / `proj_fantasy_points` / `proj_ownership`."
                     )
+                    if resolved_team_col and resolved_team_col in supplement_df.columns:
+                        nonblank_team_count = int(
+                            supplement_df[resolved_team_col].fillna("").astype(str).str.strip().ne("").sum()
+                        )
+                        if nonblank_team_count == 0:
+                            resolved_team_col = None
                     preview_label = "RotoWire Preview"
 
                 preview_df = supplement_df.head(10).copy()
@@ -24909,6 +24957,11 @@ if selected_page == "DFS Lineup Builder":
                     total_rows = int(
                         working_df[player_col].map(_clean_dfs_supplement_player_name).ne("").sum()
                     )
+                    overlap_diagnostics = _build_dfs_supplement_overlap_diagnostics(
+                        working_df,
+                        supplement_players,
+                        player_col,
+                    )
                     matched_rows = int(len(comparison_df))
                     match_rate = (matched_rows / total_rows * 100.0) if total_rows > 0 else 0.0
                     slate_date = (
@@ -24951,6 +25004,22 @@ if selected_page == "DFS Lineup Builder":
                                 "The supplement file loaded, but zero players matched the active DFS slate. "
                                 "Review the player/team columns or alias mapping before saving or using it."
                             )
+                            exact_overlap_count = int(overlap_diagnostics.get("exact_overlap_count", 0) or 0)
+                            sample_overlap = overlap_diagnostics.get("sample_overlap") or []
+                            if exact_overlap_count == 0:
+                                st.error(
+                                    "Diagnostic: zero supplement player names overlap the active player pool. "
+                                    "This usually means the wrong slate, wrong sport, or a stale player pool is loaded."
+                                )
+                            else:
+                                st.info(
+                                    f"Diagnostic: {exact_overlap_count} supplement player names do overlap the active player pool, "
+                                    "so this looks more like a column-mapping or matching issue than a full slate mismatch."
+                                )
+                            if sample_overlap:
+                                st.caption(
+                                    "Example overlapping names: " + ", ".join(sample_overlap[:8])
+                                )
 
                         metric_col5, metric_col6, metric_col7, metric_col8 = st.columns(4)
                         metric_col5.metric(
