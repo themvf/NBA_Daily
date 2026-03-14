@@ -16063,16 +16063,6 @@ def _render_dfs_supplement_archive(
                 "own_delta_pp": st.column_config.NumberColumn(format="%+.1f"),
             },
         )
-    signal_key = (
-        "supplement_proj_fpts"
-        if str(signal_name or "").strip().lower().startswith("proj")
-        else "supplement_ownership"
-    )
-    return any(
-        info.get(signal_key) is not None
-        for info in player_map.values()
-        if isinstance(info, Mapping)
-    )
 
 
 def _blend_dual_source_metric(
@@ -21246,6 +21236,12 @@ if selected_page == "DFS Lineup Builder":
                     "Run and export the tournament postmortem packet before reviewing "
                     "the slate summary below."
                 )
+                show_postmortem_debug = st.toggle(
+                    "Show postmortem debug",
+                    value=False,
+                    key="model_accuracy_postmortem_debug",
+                    help="Display widget and session-state details for the postmortem controls.",
+                )
 
                 postmortem_state_key = "dfs_tournament_postmortem_payload"
                 postmortem_slate_options = sorted(all_dates, reverse=True) if all_dates else []
@@ -21291,22 +21287,86 @@ if selected_page == "DFS Lineup Builder":
                             ),
                         )
                     with pm_action_col3:
-                        default_top_n_postmortem = (
-                            min(50, available_postmortem_lineups)
-                            if available_postmortem_lineups > 0
-                            else 50
+                        postmortem_top_n_state_key = (
+                            f"model_accuracy_postmortem_top_n_{selected_postmortem_slate}"
                         )
-                        top_n_step = 1 if available_postmortem_lineups <= 25 else 25
-                        manual_top_n_postmortem = st.number_input(
-                            "Top Field Lineups",
-                            min_value=1,
-                            max_value=max(1, available_postmortem_lineups),
-                            value=max(1, default_top_n_postmortem),
-                            step=max(1, top_n_step),
-                            disabled=(
-                                use_full_field_postmortem or available_postmortem_lineups <= 0
-                            ),
-                            key=f"model_accuracy_postmortem_top_n_{selected_postmortem_slate}",
+                        max_postmortem_lineups = max(1, available_postmortem_lineups)
+                        postmortem_top_n_widget_key = (
+                            f"{postmortem_top_n_state_key}_widget_{max_postmortem_lineups}"
+                        )
+                        default_top_n_postmortem = min(50, max_postmortem_lineups)
+                        top_n_step = 1 if max_postmortem_lineups <= 25 else 25
+                        existing_top_n_value = st.session_state.get(
+                            postmortem_top_n_state_key
+                        )
+                        try:
+                            normalized_top_n_value = int(existing_top_n_value)
+                        except (TypeError, ValueError):
+                            normalized_top_n_value = default_top_n_postmortem
+                        normalized_top_n_value = min(
+                            max(1, normalized_top_n_value),
+                            max_postmortem_lineups,
+                        )
+                        st.session_state[postmortem_top_n_state_key] = (
+                            normalized_top_n_value
+                        )
+                        widget_key_prefix = f"{postmortem_top_n_state_key}_widget_"
+                        for session_key in list(st.session_state.keys()):
+                            if (
+                                session_key.startswith(widget_key_prefix)
+                                and session_key != postmortem_top_n_widget_key
+                            ):
+                                del st.session_state[session_key]
+                        st.session_state[postmortem_top_n_widget_key] = (
+                            normalized_top_n_value
+                        )
+                        postmortem_debug_context = {
+                            "selected_postmortem_slate": selected_postmortem_slate,
+                            "available_postmortem_lineups": available_postmortem_lineups,
+                            "max_postmortem_lineups": max_postmortem_lineups,
+                            "default_top_n_postmortem": default_top_n_postmortem,
+                            "top_n_step": top_n_step,
+                            "use_full_field_postmortem": bool(use_full_field_postmortem),
+                            "postmortem_top_n_state_key": postmortem_top_n_state_key,
+                            "postmortem_top_n_widget_key": postmortem_top_n_widget_key,
+                            "existing_top_n_value": existing_top_n_value,
+                            "normalized_top_n_value": normalized_top_n_value,
+                            "matching_session_state": {
+                                str(session_key): st.session_state.get(session_key)
+                                for session_key in sorted(st.session_state.keys())
+                                if str(session_key).startswith(postmortem_top_n_state_key)
+                            },
+                        }
+                        st.session_state["model_accuracy_postmortem_debug_ctx"] = (
+                            postmortem_debug_context
+                        )
+                        if show_postmortem_debug:
+                            with st.expander("Postmortem widget debug", expanded=True):
+                                st.json(postmortem_debug_context)
+                        try:
+                            manual_top_n_postmortem = st.number_input(
+                                "Top Field Lineups",
+                                min_value=1,
+                                max_value=max_postmortem_lineups,
+                                value=normalized_top_n_value,
+                                step=max(1, top_n_step),
+                                disabled=(
+                                    use_full_field_postmortem
+                                    or available_postmortem_lineups <= 0
+                                ),
+                                key=postmortem_top_n_widget_key,
+                            )
+                        except Exception as widget_error:
+                            postmortem_debug_context["widget_error"] = str(widget_error)
+                            st.session_state["model_accuracy_postmortem_debug_ctx"] = (
+                                postmortem_debug_context
+                            )
+                            if show_postmortem_debug:
+                                st.error(f"Postmortem widget debug: {widget_error}")
+                                st.json(postmortem_debug_context)
+                            raise
+                        st.session_state[postmortem_top_n_state_key] = int(
+                            manual_top_n_postmortem
                         )
                         top_n_postmortem = (
                             available_postmortem_lineups
@@ -22167,6 +22227,12 @@ if selected_page == "DFS Lineup Builder":
 
         except Exception as e:
             st.error(f"❌ Error loading model accuracy: {e}")
+            postmortem_debug_context = st.session_state.get(
+                "model_accuracy_postmortem_debug_ctx"
+            )
+            if isinstance(postmortem_debug_context, Mapping):
+                with st.expander("Model accuracy debug context", expanded=True):
+                    st.json(postmortem_debug_context)
             import traceback
             st.code(traceback.format_exc())
 
