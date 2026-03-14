@@ -914,6 +914,24 @@ def _apply_dk_id_repair_to_lineups(
     return _apply_dk_id_repair_to_players(list(unique_players.values()), dk_players)
 
 
+def _extract_normalized_dfs_game_pairs(players: List[Any]) -> List[Tuple[str, str]]:
+    """Return a stable set of team-vs-team pairs for slate-matching checks."""
+    game_pairs = set()
+    for player in players or []:
+        team = str(getattr(player, "team", "") or "").strip().upper()
+        opponent = str(getattr(player, "opponent", "") or "").strip().upper()
+        if not team or not opponent:
+            continue
+        game_pairs.add(tuple(sorted((team, opponent))))
+    return sorted(game_pairs)
+
+
+def _format_dfs_game_pairs(game_pairs: List[Tuple[str, str]]) -> str:
+    if not game_pairs:
+        return "unknown"
+    return ", ".join(f"{team_a} vs {team_b}" for team_a, team_b in game_pairs)
+
+
 def _load_cached_dk_slate_players(
     conn: sqlite3.Connection,
     slate_date: str,
@@ -17663,8 +17681,12 @@ if selected_page == "DFS Lineup Builder":
             )
             use_as_id_repair = st.checkbox(
                 "Use upload as DK ID repair for the current loaded slate",
-                value=bool(active_loaded_players),
+                value=False,
                 key="dfs_primary_dk_repair_mode",
+                help=(
+                    "Only enable this when the uploaded DK CSV is for the exact same slate "
+                    "already loaded in the builder and you only want to repair DK IDs."
+                ),
             )
 
             if uploaded_file is not None:
@@ -17679,6 +17701,43 @@ if selected_page == "DFS Lineup Builder":
 
                         dk_players, metadata = dfs.parse_dk_csv(csv_path, dfs_conn)
                         active_slate_date = str(dk_slate_date or default_dk_slate_date)
+                        uploaded_game_pairs = _extract_normalized_dfs_game_pairs(dk_players)
+                        active_game_pairs = _extract_normalized_dfs_game_pairs(
+                            active_loaded_players
+                        )
+                        current_loaded_slate_date = str(
+                            active_slate_context.get("slate_date")
+                            or st.session_state.get("dfs_projection_date")
+                            or ""
+                        ).strip()
+                        if use_as_id_repair and active_loaded_players:
+                            repair_mismatch_reasons: List[str] = []
+                            if (
+                                current_loaded_slate_date
+                                and current_loaded_slate_date != str(active_slate_date)
+                            ):
+                                repair_mismatch_reasons.append(
+                                    f"current loaded slate date is {current_loaded_slate_date}, "
+                                    f"but uploaded DK slate date is {active_slate_date}"
+                                )
+                            if (
+                                active_game_pairs
+                                and uploaded_game_pairs
+                                and active_game_pairs != uploaded_game_pairs
+                            ):
+                                repair_mismatch_reasons.append(
+                                    "game sets do not match "
+                                    f"({ _format_dfs_game_pairs(active_game_pairs) } vs "
+                                    f"{ _format_dfs_game_pairs(uploaded_game_pairs) })"
+                                )
+                            if repair_mismatch_reasons:
+                                st.session_state.dfs_primary_dk_repair_mode = False
+                                use_as_id_repair = False
+                                st.warning(
+                                    "Uploaded DK CSV does not match the currently loaded slate. "
+                                    "Loading it as a new slate instead of applying DK ID repair."
+                                )
+                                st.caption(" | ".join(repair_mismatch_reasons))
                         _create_dfs_tracking_tables(dfs_conn)
                         cached_count = _save_dk_slate_player_cache(
                             dfs_conn,
