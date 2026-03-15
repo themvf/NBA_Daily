@@ -1034,10 +1034,10 @@ LINEUP_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
         ],
     },
     "rotowire_both_v1_blend": {
-        "label": "RotoWire v1 (Proj+Own Blend)",
+        "label": "Legacy Supplement v1 (Proj+Own Blend)",
         "description": (
-            "Standard portfolio logic with RotoWire fantasy-point and ownership "
-            "signals blended into our model for matched players."
+            "Legacy supplement blend profile retained for historical lineups. "
+            "Uses the active supplement snapshot without enforcing a provider."
         ),
         "aggressive_ceiling_stack": False,
         "overlap_cap": 6,
@@ -1055,7 +1055,7 @@ LINEUP_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
         "supplement_match_score_min": 0.90,
         "supplement_proj_delta_cap": 6.0,
         "supplement_own_delta_cap": 20.0,
-        "supplement_source_required": "rotowire",
+        "ui_hidden": True,
         "strategy_mix": [
             ("projection", 0.25, 0.20),
             ("ceiling", 0.30, 0.25),

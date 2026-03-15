@@ -17446,6 +17446,9 @@ if selected_page == "DFS Lineup Builder":
     regime_hint_keys = list(regime_hint_metadata.keys())
 
     # Ensure expected model catalog is always present in UI order.
+    hidden_model_keys = {
+        key for key, profile in model_profiles.items() if bool((profile or {}).get("ui_hidden"))
+    }
     expected_model_labels = {
         "standard_v1": "Standard v1",
         "spike_v1_legacy": "Spike v1 (Legacy)",
@@ -17457,14 +17460,17 @@ if selected_page == "DFS Lineup Builder":
         "supp_proj_v1_blend": "Supplement v1 (Proj Blend)",
         "supp_own_v1_blend": "Supplement v1 (Own Blend)",
         "supp_both_v1_blend": "Supplement v1 (Proj+Own Blend)",
-        "rotowire_both_v1_blend": "RotoWire v1 (Proj+Own Blend)",
     }
     for key, label in expected_model_labels.items():
         if key not in model_profiles:
             model_profiles[key] = {"label": label}
 
-    extra_model_keys = [k for k in model_profiles.keys() if k not in expected_model_labels]
-    model_keys = list(expected_model_labels.keys()) + sorted(extra_model_keys)
+    extra_model_keys = [
+        k for k in model_profiles.keys() if k not in expected_model_labels and k not in hidden_model_keys
+    ]
+    model_keys = [
+        key for key in expected_model_labels.keys() if key not in hidden_model_keys
+    ] + sorted(extra_model_keys)
     all_versions_model_keys = list(model_keys)
 
     default_model_key = st.session_state.get("dfs_lineup_model_key", "standout_v1_capture")
@@ -19460,6 +19466,12 @@ if selected_page == "DFS Lineup Builder":
                 current_slate_date,
                 supplement_state,
             )
+            primary_source_name = str(
+                (rotowire_own_state or {}).get("source_name") or "Primary source"
+            )
+            secondary_source_name = str(
+                (lineupstarter_own_state or {}).get("source_name") or "Secondary source"
+            )
             dual_proj_available = bool(
                 _supplement_state_has_signal(rotowire_own_state, "projection")
                 and _supplement_state_has_signal(lineupstarter_own_state, "projection")
@@ -19478,7 +19490,7 @@ if selected_page == "DFS Lineup Builder":
                 proj_blend_col1, proj_blend_col2 = st.columns([1, 2])
                 with proj_blend_col1:
                     use_dual_proj = st.toggle(
-                        "Blend RotoWire + LineupStarter Projection",
+                        f"Blend {primary_source_name} + {secondary_source_name} Projection",
                         value=default_dual_proj,
                         key="dfs_dual_proj_blend_enabled",
                     )
@@ -19520,7 +19532,7 @@ if selected_page == "DFS Lineup Builder":
                 own_blend_col1, own_blend_col2 = st.columns([1, 2])
                 with own_blend_col1:
                     use_dual_own = st.toggle(
-                        "Blend RotoWire + LineupStarter Ownership",
+                        f"Blend {primary_source_name} + {secondary_source_name} Ownership",
                         value=default_dual_own,
                         key="dfs_dual_own_blend_enabled",
                     )
@@ -19620,7 +19632,7 @@ if selected_page == "DFS Lineup Builder":
             if proj_mix.get("enabled"):
                 st.caption(
                     "Projection source blend active: "
-                    f"RotoWire {int(round((1.0 - float(lineupstarter_proj_weight)) * 100))}% + "
+                    f"{primary_source_name} {int(round((1.0 - float(lineupstarter_proj_weight)) * 100))}% + "
                     f"{str(proj_mix.get('secondary_source_name') or 'secondary source')} "
                     f"{int(round(float(proj_mix.get('secondary_weight', 0.0)) * 100))}%."
                 )
@@ -19817,7 +19829,7 @@ if selected_page == "DFS Lineup Builder":
                 st.warning(
                     f"No active or saved supplement snapshot is loaded for {current_slate_date}. "
                     "Supplement blend models will be skipped in `All Versions`. "
-                    "Open `DFS Supplement` and fetch/compare the source first."
+                    "Open `DFS Supplement` and upload/compare the source first."
                 )
             elif (
                 run_mode == "Single Version"
@@ -19830,7 +19842,7 @@ if selected_page == "DFS Lineup Builder":
                 )
                 st.warning(
                     f"{selected_model_label} needs a supplement snapshot for {current_slate_date}. "
-                    "Open `DFS Supplement` and fetch/compare the source first."
+                    "Open `DFS Supplement` and upload/compare the source first."
                 )
 
             # --- Game Stack Selection ---
@@ -20141,104 +20153,13 @@ if selected_page == "DFS Lineup Builder":
                             if float(profile.get("supplement_proj_weight", 0.0) or 0.0) > 0
                             or float(profile.get("supplement_own_weight", 0.0) or 0.0) > 0
                         }
-                        requested_supplement_models = [
-                            key for key in model_run_keys if key in supplement_required_models
-                        ]
-                        current_supplement_loaded = bool(
-                            lineup_generation_supplement_state
-                            and str(lineup_generation_supplement_state.get("slate_date") or "") == current_slate_date
-                            and (lineup_generation_supplement_state.get("player_map") or {})
-                        )
-                        if not current_supplement_loaded:
-                            auto_supplement_state, auto_supplement_msg = _autofetch_rotowire_supplement_state(
-                                dfs_conn,
-                                players,
-                                current_slate_date,
-                            )
-                            if auto_supplement_state:
-                                st.session_state.dfs_supplement_state = auto_supplement_state
-                                supplement_state = auto_supplement_state
-                                runtime_rotowire_state, runtime_lineupstarter_state = _resolve_ownership_source_states(
-                                    dfs_conn,
-                                    current_slate_date,
-                                    supplement_state,
-                                )
-                                runtime_projection_state = dict(supplement_state or {})
-                                if (
-                                    use_dual_proj
-                                    and _supplement_state_has_signal(runtime_rotowire_state, "projection")
-                                    and _supplement_state_has_signal(runtime_lineupstarter_state, "projection")
-                                ):
-                                    runtime_projection_state = _build_combined_dual_source_supplement_state(
-                                        primary_state=runtime_rotowire_state,
-                                        secondary_state=runtime_lineupstarter_state,
-                                        primary_proj_weight=max(
-                                            0.0,
-                                            1.0 - float(lineupstarter_proj_weight),
-                                        ),
-                                        secondary_proj_weight=float(lineupstarter_proj_weight),
-                                        primary_own_weight=0.0,
-                                        secondary_own_weight=0.0,
-                                        slate_date=current_slate_date,
-                                        blend_projection=True,
-                                        blend_ownership=False,
-                                    )
-                                runtime_ownership_state = dict(runtime_rotowire_state or supplement_state or {})
-                                if (
-                                    use_dual_own
-                                    and runtime_rotowire_state
-                                    and (runtime_rotowire_state.get("player_map") or {})
-                                    and runtime_lineupstarter_state
-                                    and (runtime_lineupstarter_state.get("player_map") or {})
-                                ):
-                                    runtime_ownership_state = (
-                                        _build_combined_ownership_supplement_state(
-                                            rotowire_state=runtime_rotowire_state,
-                                            secondary_state=runtime_lineupstarter_state,
-                                            rotowire_weight=max(
-                                                0.0,
-                                                1.0 - float(lineupstarter_own_weight),
-                                            ),
-                                            secondary_weight=float(lineupstarter_own_weight),
-                                            slate_date=current_slate_date,
-                                        )
-                                    )
-                                rotowire_ownership_stats = _apply_runtime_ownership_calibration(
-                                    dfs_conn,
-                                    players,
-                                    runtime_ownership_state,
-                                    current_slate_date,
-                                )
-                                lineup_generation_supplement_state = _merge_supplement_signal_states(
-                                    runtime_projection_state,
-                                    runtime_ownership_state,
-                                    current_slate_date,
-                                )
-                                if not lineup_generation_supplement_state:
-                                    lineup_generation_supplement_state = dict(
-                                        runtime_projection_state or runtime_ownership_state or {}
-                                    )
-                                st.info(auto_supplement_msg)
-                            elif auto_supplement_msg:
-                                st.warning(
-                                    "Could not auto-load RotoWire supplement. "
-                                    + auto_supplement_msg
-                                )
-
                         supplement_player_map = {}
-                        supplement_source_name = str(
-                            lineup_generation_supplement_state.get("source_name") or ""
-                        )
-                        supplement_is_rotowire = bool(
-                            lineup_generation_supplement_state.get("is_rotowire_source")
-                        ) or ("rotowire" in supplement_source_name.lower())
                         if (
                             lineup_generation_supplement_state
                             and str(lineup_generation_supplement_state.get("slate_date") or "") == current_slate_date
                         ):
                             supplement_player_map = lineup_generation_supplement_state.get("player_map", {}) or {}
                         skipped_supplement_models: List[str] = []
-                        skipped_source_mismatch_models: List[str] = []
                         if not supplement_player_map:
                             skipped_supplement_models = [
                                 key for key in model_run_keys if key in supplement_required_models
@@ -20259,42 +20180,6 @@ if selected_page == "DFS Lineup Builder":
                                 model_run_keys = [
                                     key for key in model_run_keys if key not in supplement_required_models
                                 ]
-                        elif supplement_required_models:
-                            valid_model_run_keys: List[str] = []
-                            for key in model_run_keys:
-                                profile = model_profiles.get(key, {}) or {}
-                                required_source = str(
-                                    profile.get("supplement_source_required", "") or ""
-                                ).strip().lower()
-                                if not required_source:
-                                    valid_model_run_keys.append(key)
-                                    continue
-
-                                source_matches = False
-                                if required_source == "rotowire":
-                                    source_matches = supplement_is_rotowire
-                                else:
-                                    source_matches = required_source in supplement_source_name.lower()
-
-                                if source_matches:
-                                    valid_model_run_keys.append(key)
-                                else:
-                                    skipped_source_mismatch_models.append(key)
-
-                            if skipped_source_mismatch_models:
-                                if run_mode == "Single Version":
-                                    missing_label = model_profiles.get(selected_model_key, {}).get(
-                                        "label", selected_model_key
-                                    )
-                                    active_source = supplement_source_name or "active supplement"
-                                    st.error(
-                                        f"{missing_label} requires a RotoWire supplement source for "
-                                        f"{current_slate_date}. Current source: {active_source}."
-                                    )
-                                    progress_bar.empty()
-                                    status_text.empty()
-                                    st.stop()
-                                model_run_keys = valid_model_run_keys
 
                         if not model_run_keys:
                             st.error("No lineup models are available for this run.")
@@ -20396,17 +20281,6 @@ if selected_page == "DFS Lineup Builder":
                         ]
                         st.warning(
                             "Skipped supplement-dependent models because no saved supplement comparison was loaded: "
-                            + ", ".join(skipped_labels)
-                        )
-                    if skipped_source_mismatch_models and run_mode == "All Versions":
-                        skipped_labels = [
-                            model_profiles.get(key, {}).get("label", key)
-                            for key in skipped_source_mismatch_models
-                        ]
-                        active_source = supplement_source_name or "active supplement"
-                        st.warning(
-                            "Skipped supplement models because the active source did not satisfy "
-                            f"their source requirement ({active_source}): "
                             + ", ".join(skipped_labels)
                         )
 
@@ -24756,7 +24630,7 @@ if selected_page == "DFS Lineup Builder":
                 )
             else:
                 st.info(
-                    "No active current-slate snapshot is loaded. Fetch RotoWire or upload a CSV, compare it, then save the result as the active snapshot."
+                    "No active current-slate snapshot is loaded. Upload a CSV, compare it, then save the result as the active snapshot."
                 )
         with action_col1:
             if active_supplement_state:
@@ -24831,40 +24705,10 @@ if selected_page == "DFS Lineup Builder":
 
             st.markdown("**Load Source**")
             st.caption(
-                "RotoWire and CSV are separate supplement sources. Use one or both on the current slate, then save the comparison you want to make active."
+                "Upload the current supplement CSV, map it to the active slate, and save the comparison you want to make active."
             )
-            quick_rw_col1, quick_rw_col2 = st.columns([1.4, 2.6])
-            with quick_rw_col1:
-                refresh_rw_snapshot = st.button(
-                    "Fetch + Save RotoWire Snapshot",
-                    key="dfs_supplement_quick_rotowire_snapshot",
-                    help=(
-                        "Fetch and save the latest RotoWire supplement for the current slate without changing the CSV upload flow."
-                    ),
-                )
-            with quick_rw_col2:
-                st.caption(f"Current slate date: `{current_slate_date}`")
-            if refresh_rw_snapshot:
-                with st.spinner(f"Refreshing RotoWire supplement for {current_slate_date}..."):
-                    rw_state, rw_message = _autofetch_rotowire_supplement_state(
-                        dfs_conn,
-                        supplement_players,
-                        str(current_slate_date),
-                    )
-                if rw_state:
-                    st.session_state.dfs_supplement_state = rw_state
-                    st.success(rw_message)
-                elif rw_message:
-                    st.warning(rw_message)
-                else:
-                    st.warning("Could not refresh RotoWire supplement snapshot.")
-
-            source_mode = st.radio(
-                "Choose Source to Load",
-                options=["Upload CSV", "Fetch RotoWire"],
-                horizontal=True,
-                key="dfs_supplement_source_mode",
-            )
+            st.caption(f"Current slate date: `{current_slate_date}`")
+            source_mode = "Upload CSV"
 
             supplement_df = pd.DataFrame()
             headerless_detected = False

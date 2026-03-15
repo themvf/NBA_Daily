@@ -1,6 +1,11 @@
 import sqlite3
 
-from dfs_optimizer import DFSLineup, DFSPlayer, resolve_lineup_generation_regime
+from dfs_optimizer import (
+    DFSLineup,
+    DFSPlayer,
+    get_lineup_model_profiles,
+    resolve_lineup_generation_regime,
+)
 from dfs_tracking import (
     build_tournament_postmortem,
     create_dfs_tracking_tables,
@@ -100,6 +105,15 @@ def test_resolve_lineup_generation_regime_auto_large_slate_large_field() -> None
     assert regime["contest_field_size"] == 20000
     assert regime["overlap_cap_delta"] == -2
     assert regime["force_aggressive_ceiling_stack"] is True
+
+
+def test_legacy_rotowire_model_is_hidden_and_not_source_gated() -> None:
+    profiles = get_lineup_model_profiles()
+
+    legacy_profile = profiles["rotowire_both_v1_blend"]
+
+    assert legacy_profile["ui_hidden"] is True
+    assert not legacy_profile.get("supplement_source_required")
 
 
 def test_postmortem_exposes_saved_regime_breakdown() -> None:
