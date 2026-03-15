@@ -1,4 +1,5 @@
 import sqlite3
+from types import SimpleNamespace
 
 import pandas as pd
 
@@ -357,3 +358,202 @@ def test_fit_ownership_calibrator_builds_and_saves_run():
     latest = oc.get_latest_ownership_calibration_run(conn)
     assert latest is not None
     assert latest["run_key"] == summary.run_key
+
+
+def test_apply_live_ownership_calibration_updates_runtime_players() -> None:
+    conn = sqlite3.connect(":memory:")
+    _create_minimal_tables(conn)
+
+    training_slates = ["2026-03-01", "2026-03-03", "2026-03-05"]
+    player_id = 200
+    for slate in training_slates:
+        conn.execute(
+            """
+            INSERT INTO dfs_contest_entries (contest_id, slate_date, username)
+            VALUES (?, ?, ?)
+            """,
+            (f"contest-{slate}", slate, "tester"),
+        )
+
+    for slate_idx, slate in enumerate(training_slates):
+        conn.execute(
+            """
+            INSERT INTO dfs_supplement_runs (run_key, slate_date, source_name, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (f"rw-{slate}", slate, "RotoWire NBA Optimizer", f"{slate}T19:00:00"),
+        )
+        for idx in range(12):
+            salary = 3600 + (idx * 420)
+            proj_fpts = 18.0 + idx + (slate_idx * 0.7)
+            proj_floor = proj_fpts - 5.5
+            proj_ceiling = proj_fpts + 9.0
+            fpts_per_dollar = (proj_fpts / salary) * 1000.0
+            our_own = max(1.0, min(40.0, 3.0 + proj_fpts * 0.35 - max(0, salary - 6800) / 1200.0))
+            rw_own = max(0.0, our_own + (4.0 if salary <= 5600 else -2.0))
+            actual_own = max(
+                0.0,
+                min(
+                    60.0,
+                    (our_own * 0.55)
+                    + (rw_own * 0.45)
+                    + (1.2 if idx % 4 == 0 else -0.6),
+                ),
+            )
+
+            conn.execute(
+                """
+                INSERT INTO dfs_slate_projections (
+                    slate_date, player_id, player_name, team, opponent, salary, positions,
+                    proj_fpts, proj_floor, proj_ceiling, fpts_per_dollar, ownership_proj,
+                    actual_ownership, actual_fpts, actual_minutes, did_play
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    slate,
+                    player_id,
+                    f"Player {player_id}",
+                    f"T{idx % 6}",
+                    f"O{idx % 6}",
+                    salary,
+                    "PG/SG" if idx % 2 == 0 else "SF/PF",
+                    proj_fpts,
+                    proj_floor,
+                    proj_ceiling,
+                    fpts_per_dollar,
+                    our_own,
+                    actual_own,
+                    proj_fpts + 2.0,
+                    26.0 + (idx % 6),
+                    1,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO predictions (
+                    prediction_date, game_date, player_id, projected_ppg, proj_confidence,
+                    season_avg_ppg, recent_avg_3, recent_avg_5, dfs_score, proj_minutes,
+                    l5_minutes_avg, minutes_confidence, role_change, p_top1, p_top3,
+                    sim_sigma, role_tier, vegas_implied_fpts, vegas_vs_proj_diff,
+                    injury_adjusted, opponent_injury_detected, opponent_def_rating,
+                    opponent_pace, analytics_used, last_refreshed_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    slate,
+                    slate,
+                    player_id,
+                    proj_fpts * 0.58,
+                    0.6,
+                    proj_fpts * 0.5,
+                    proj_fpts * 0.56,
+                    proj_fpts * 0.59,
+                    proj_fpts * 1.15,
+                    27.0,
+                    26.0,
+                    0.68,
+                    0.0,
+                    0.01 * idx,
+                    0.04 * ((idx % 5) + 1),
+                    6.5,
+                    "STARTER",
+                    proj_fpts + 1.0,
+                    1.0,
+                    0.0,
+                    0.0,
+                    112.0,
+                    99.0,
+                    "PACE",
+                    f"{slate}T12:00:00",
+                    f"{slate}T12:00:00",
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO dfs_supplement_player_deltas (
+                    run_key, slate_date, player_id, supplement_proj_fpts, supplement_own_pct,
+                    proj_delta, own_delta_pp, match_score
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"rw-{slate}",
+                    slate,
+                    player_id,
+                    proj_fpts + 0.5,
+                    rw_own,
+                    0.5,
+                    rw_own - our_own,
+                    99.0,
+                ),
+            )
+            player_id += 1
+
+    live_players = [
+        SimpleNamespace(
+            player_id=901,
+            name="Live Value",
+            team="AAA",
+            opponent="BBB",
+            positions=["PG"],
+            salary=4800,
+            proj_fpts=27.0,
+            proj_floor=20.0,
+            proj_ceiling=36.0,
+            fpts_per_dollar=(27.0 / 4800) * 1000.0,
+            ownership_proj=10.0,
+            recent_minutes_avg=31.0,
+            role_tier="STARTER",
+            analytics_used="PACE",
+        ),
+        SimpleNamespace(
+            player_id=902,
+            name="Live Chalk",
+            team="CCC",
+            opponent="DDD",
+            positions=["SF"],
+            salary=9200,
+            proj_fpts=45.0,
+            proj_floor=35.0,
+            proj_ceiling=58.0,
+            fpts_per_dollar=(45.0 / 9200) * 1000.0,
+            ownership_proj=28.0,
+            recent_minutes_avg=35.0,
+            role_tier="STARTER",
+            analytics_used="",
+        ),
+    ]
+
+    supplement_state = {
+        "source_name": "RotoWire NBA Optimizer",
+        "player_map": {
+            901: {
+                "supplement_proj_fpts": 27.5,
+                "supplement_ownership": 16.5,
+                "proj_delta": 0.5,
+                "own_delta_pp": 6.5,
+                "match_score": 99.0,
+            },
+            902: {
+                "supplement_proj_fpts": 44.0,
+                "supplement_ownership": 21.0,
+                "proj_delta": -1.0,
+                "own_delta_pp": -7.0,
+                "match_score": 99.0,
+            },
+        },
+    }
+
+    result = oc.apply_live_ownership_calibration(
+        conn,
+        live_players,
+        "2026-03-08",
+        supplement_state=supplement_state,
+        min_train_rows=20,
+    )
+
+    assert result["active"] is True
+    assert result["train_rows"] >= 20
+    assert result["calibrated_players"] == 2
+    assert live_players[0].ownership_proj != 10.0
+    assert live_players[1].ownership_proj != 28.0
+    assert getattr(live_players[0], "_ownership_calibration_base_proj") == 10.0

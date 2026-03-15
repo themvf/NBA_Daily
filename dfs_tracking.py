@@ -2382,9 +2382,11 @@ def build_tournament_postmortem(
             result['errors'].append("No contest standings found for this slate.")
             return result
 
-        field_lineups = int(len(top_entries_df))
+        field_lineups_raw = int(len(top_entries_df))
+        field_lineups = field_lineups_raw
         top_entries_df = top_entries_df.reset_index(drop=True).copy()
-        top_entries_df['field_lineup_num'] = np.arange(1, field_lineups + 1)
+        top_entries_df['field_lineup_num'] = np.arange(1, field_lineups_raw + 1)
+        raw_top_entries_df = top_entries_df.copy()
         pos_cols = _lineup_position_columns()
         field_long = top_entries_df[['field_lineup_num'] + pos_cols].melt(
             id_vars=['field_lineup_num'],
@@ -2397,21 +2399,9 @@ def build_tournament_postmortem(
             result['errors'].append("Contest standings have no parsed lineup player names.")
             return result
         field_long['name_key'] = field_long['player'].map(_normalize_name)
-        field_lineup_name_sets = (
-            field_long.groupby('field_lineup_num')['name_key']
-            .apply(lambda s: {x for x in s.tolist() if x})
-            .tolist()
-        )
-
-        field_exposure_df = (
-            field_long.groupby('name_key', as_index=False)
-            .agg(
-                field_slots=('player', 'size'),
-                field_player=('player', lambda s: s.value_counts().index[0]),
-            )
-        )
-        field_exposure_df['field_exposure_pct'] = (
-            100.0 * field_exposure_df['field_slots'] / float(max(1, field_lineups))
+        field_lineup_name_sets = []
+        field_exposure_df = pd.DataFrame(
+            columns=['name_key', 'field_slots', 'field_player', 'field_exposure_pct']
         )
 
         # 2) Our generated lineup exposures on this slate
@@ -2681,6 +2671,64 @@ def build_tournament_postmortem(
                 on='name_key',
                 how='left',
             )
+        unresolved_topn_lineups = 0
+        resolved_topn_pct = None
+        if not field_long.empty:
+            field_long['resolved_player'] = field_long['team'].notna()
+            lineup_resolution_df = (
+                field_long.groupby('field_lineup_num', as_index=False)
+                .agg(
+                    resolved_slots=('resolved_player', 'sum'),
+                    total_slots=('slot', 'size'),
+                )
+            )
+            lineup_resolution_df['resolved_lineup'] = (
+                pd.to_numeric(lineup_resolution_df['resolved_slots'], errors='coerce')
+                == pd.to_numeric(lineup_resolution_df['total_slots'], errors='coerce')
+            )
+            resolved_lineup_nums = set(
+                lineup_resolution_df.loc[
+                    lineup_resolution_df['resolved_lineup'],
+                    'field_lineup_num',
+                ].astype(int).tolist()
+            )
+            unresolved_topn_lineups = int(
+                max(0, int(field_lineups_raw) - int(len(resolved_lineup_nums)))
+            )
+            resolved_topn_pct = (
+                100.0 * float(len(resolved_lineup_nums)) / float(max(1, field_lineups_raw))
+                if field_lineups_raw > 0
+                else None
+            )
+            if resolved_lineup_nums:
+                top_entries_df = top_entries_df[
+                    top_entries_df['field_lineup_num'].isin(resolved_lineup_nums)
+                ].copy()
+                field_long = field_long[
+                    field_long['field_lineup_num'].isin(resolved_lineup_nums)
+                ].copy()
+            field_lineups = int(len(top_entries_df))
+            if not field_long.empty:
+                field_lineup_name_sets = (
+                    field_long.groupby('field_lineup_num')['name_key']
+                    .apply(lambda s: {x for x in s.tolist() if x})
+                    .tolist()
+                )
+                field_exposure_df = (
+                    field_long.groupby('name_key', as_index=False)
+                    .agg(
+                        field_slots=('player', 'size'),
+                        field_player=('player', lambda s: s.value_counts().index[0]),
+                    )
+                )
+                field_exposure_df['field_exposure_pct'] = (
+                    100.0 * field_exposure_df['field_slots'] / float(max(1, field_lineups))
+                )
+            else:
+                field_lineup_name_sets = []
+                field_exposure_df = pd.DataFrame(
+                    columns=['name_key', 'field_slots', 'field_player', 'field_exposure_pct']
+                )
         if not our_long.empty and not player_context_agg.empty:
             our_long = our_long.merge(
                 player_context_agg[context_cols],
@@ -3174,8 +3222,8 @@ def build_tournament_postmortem(
             else None
         )
 
-        topn_avg_points = float(pd.to_numeric(top_entries_df['points'], errors='coerce').mean())
-        topn_best_points = float(pd.to_numeric(top_entries_df['points'], errors='coerce').max())
+        topn_avg_points = float(pd.to_numeric(raw_top_entries_df['points'], errors='coerce').mean())
+        topn_best_points = float(pd.to_numeric(raw_top_entries_df['points'], errors='coerce').max())
 
         proj_mae = None
         proj_rank_corr = None
@@ -4084,8 +4132,11 @@ def build_tournament_postmortem(
 
         result['metrics'] = {
             'field_lineups_analyzed': field_lineups,
+            'field_lineups_raw_sampled': field_lineups_raw,
             'field_lineups_available': total_field_lineups,
             'field_sample_pct': field_sample_pct,
+            'field_unresolved_topn_count': int(unresolved_topn_lineups),
+            'field_resolved_topn_pct': resolved_topn_pct,
             'our_lineups': our_lineups,
             'selected_contest_id': selected_contest_id,
             'selected_contest_count': int(contest_resolution.get('contest_count') or 0),
@@ -4236,6 +4287,15 @@ def build_tournament_postmortem(
             note = (
                 f"Selected contest `{selected_contest_id}` only matched "
                 f"{float(selected_slot_match_pct):.1f}% of sampled lineup slots to the saved slate pool."
+            )
+            if sample_text:
+                note += f" Unmatched sample: {sample_text}."
+            wrong_notes.append(note)
+        if unresolved_topn_lineups > 0:
+            sample_text = ", ".join(selected_unmatched_players[:4])
+            note = (
+                f"Excluded {int(unresolved_topn_lineups)} unresolved top-{int(field_lineups_raw)} "
+                "field lineup(s) from exposure/combo analysis."
             )
             if sample_text:
                 note += f" Unmatched sample: {sample_text}."

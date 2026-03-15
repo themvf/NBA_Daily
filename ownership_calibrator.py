@@ -35,6 +35,93 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 MODEL_VERSION = "ownership_calibrator_v1"
 SOURCE_SHRINK_K = 250.0
 
+BASE_NUMERIC_FEATURES: Tuple[str, ...] = (
+    "salary",
+    "salary_k",
+    "proj_fpts",
+    "proj_floor",
+    "proj_ceiling",
+    "ceiling_gap",
+    "floor_gap",
+    "fpts_per_dollar",
+    "our_ownership_proj",
+    "projected_ppg",
+    "proj_confidence",
+    "season_avg_ppg",
+    "recent_avg_3",
+    "recent_avg_5",
+    "dfs_score",
+    "proj_minutes",
+    "l5_minutes_avg",
+    "minutes_confidence",
+    "role_change",
+    "p_top1",
+    "p_top3",
+    "sim_sigma",
+    "vegas_implied_fpts",
+    "vegas_vs_proj_diff",
+    "vegas_edge_fpts",
+    "game_total",
+    "game_spread_abs",
+    "game_pace_score",
+    "game_blowout_risk",
+    "game_stack_score",
+    "slate_game_count",
+    "slate_player_count",
+    "proj_fpts_rank_pct",
+    "value_rank_pct",
+    "salary_rank_pct",
+    "our_ownership_rank_pct",
+    "game_total_rank_pct",
+    "injury_adjusted",
+    "opponent_injury_detected",
+    "opponent_def_rating",
+    "opponent_pace",
+    "flag_pace",
+    "flag_defense",
+    "flag_injury",
+    "flag_rest",
+)
+BASE_CATEGORICAL_FEATURES: Tuple[str, ...] = (
+    "primary_position",
+    "salary_tier",
+    "ownership_tier",
+    "role_tier",
+)
+SOURCE_NUMERIC_FEATURES: Tuple[str, ...] = (
+    "salary",
+    "proj_fpts",
+    "our_ownership_proj",
+    "proj_confidence",
+    "game_total",
+    "rw_present",
+    "ls_present",
+    "supplement_source_count",
+    "rw_own_pct",
+    "ls_own_pct",
+    "supplement_own_consensus",
+    "rw_our_own_gap",
+    "ls_our_own_gap",
+    "rw_ls_own_gap",
+    "supplement_consensus_own_gap",
+    "rw_proj_fpts",
+    "ls_proj_fpts",
+    "supplement_proj_consensus",
+    "rw_our_proj_gap",
+    "ls_our_proj_gap",
+    "rw_ls_proj_gap",
+    "supplement_consensus_proj_gap",
+    "both_sources_zero_own",
+    "both_sources_zero_proj",
+    "rw_match_score",
+    "ls_match_score",
+    "source_match_score_avg",
+)
+SOURCE_CATEGORICAL_FEATURES: Tuple[str, ...] = (
+    "primary_position",
+    "role_tier",
+)
+
 
 @dataclass
 class OwnershipCalibrationResult:
@@ -495,28 +582,29 @@ def _series_or_default(
     return pd.Series(default_value, index=df.index)
 
 
-def build_ownership_training_dataset(
-    conn: sqlite3.Connection,
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
+def _assemble_ownership_feature_frame(
+    base_df: pd.DataFrame,
+    predictions_df: Optional[pd.DataFrame] = None,
+    game_env_df: Optional[pd.DataFrame] = None,
+    supplement_df: Optional[pd.DataFrame] = None,
+    *,
+    sort_with_target: bool = True,
 ) -> pd.DataFrame:
-    """Build a per-player, per-slate ownership training frame."""
+    """Build the shared ownership feature frame for training or live scoring."""
+    if base_df is None or base_df.empty:
+        return pd.DataFrame()
 
-    base_df = _read_base_ownership_rows(conn, start_date=start_date, end_date=end_date)
-    if base_df.empty:
-        return base_df
+    df = base_df.copy()
+    predictions_df = predictions_df if predictions_df is not None else pd.DataFrame()
+    game_env_df = game_env_df if game_env_df is not None else pd.DataFrame()
+    supplement_df = supplement_df if supplement_df is not None else pd.DataFrame()
 
-    predictions_df = _read_predictions_frame(conn, start_date=start_date, end_date=end_date)
-    game_env_df = _read_game_environment_frame(conn, start_date=start_date, end_date=end_date)
-    supplement_df = _read_latest_supplement_frame(
-        conn, start_date=start_date, end_date=end_date
-    )
-
-    df = base_df.merge(
-        predictions_df,
-        on=["slate_date", "player_id"],
-        how="left",
-    )
+    if not predictions_df.empty:
+        df = df.merge(
+            predictions_df,
+            on=["slate_date", "player_id"],
+            how="left",
+        )
     if not game_env_df.empty:
         df = df.merge(
             game_env_df,
@@ -738,12 +826,36 @@ def build_ownership_training_dataset(
     _add_rank_features(df, "our_ownership_proj", "our_ownership")
     _add_rank_features(df, "game_total", "game_total")
 
-    return (
-        df.sort_values(
-            ["slate_date", "target_actual_ownership", "player_name"],
-            ascending=[True, False, True],
-        )
-        .reset_index(drop=True)
+    sort_cols = ["slate_date", "player_name"]
+    ascending = [True, True]
+    if sort_with_target and "target_actual_ownership" in df.columns:
+        sort_cols = ["slate_date", "target_actual_ownership", "player_name"]
+        ascending = [True, False, True]
+    return df.sort_values(sort_cols, ascending=ascending).reset_index(drop=True)
+
+
+def build_ownership_training_dataset(
+    conn: sqlite3.Connection,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+) -> pd.DataFrame:
+    """Build a per-player, per-slate ownership training frame."""
+
+    base_df = _read_base_ownership_rows(conn, start_date=start_date, end_date=end_date)
+    if base_df.empty:
+        return base_df
+
+    predictions_df = _read_predictions_frame(conn, start_date=start_date, end_date=end_date)
+    game_env_df = _read_game_environment_frame(conn, start_date=start_date, end_date=end_date)
+    supplement_df = _read_latest_supplement_frame(
+        conn, start_date=start_date, end_date=end_date
+    )
+    return _assemble_ownership_feature_frame(
+        base_df,
+        predictions_df=predictions_df,
+        game_env_df=game_env_df,
+        supplement_df=supplement_df,
+        sort_with_target=True,
     )
 
 
@@ -869,23 +981,17 @@ def _filter_live_features(
     return numeric_live, categorical_live
 
 
-def fit_ownership_calibrator(
-    conn: sqlite3.Connection,
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
+def _train_ownership_calibration_models(
+    df: pd.DataFrame,
     holdout_slates: int = 2,
-    save_run: bool = True,
 ) -> Dict[str, Any]:
-    """Fit a two-stage ownership calibrator and return training artifacts."""
-
-    df = build_ownership_training_dataset(conn, start_date=start_date, end_date=end_date)
-    if df.empty:
-        return {"error": "No ownership rows with actuals were available for calibration."}
-
+    """Fit the base and supplement residual ownership models."""
     target = pd.to_numeric(df["target_actual_ownership"], errors="coerce")
     valid_mask = target.notna()
     df = df.loc[valid_mask].copy()
     target = target.loc[valid_mask].astype(float)
+    if df.empty:
+        return {"error": "No ownership rows with actuals were available for calibration."}
 
     holdout_dates = _select_holdout_dates(df, holdout_slates=holdout_slates)
     if holdout_dates:
@@ -899,95 +1005,11 @@ def fit_ownership_calibrator(
         test_mask[:] = False
         holdout_dates = []
 
-    base_numeric_features = [
-        "salary",
-        "salary_k",
-        "proj_fpts",
-        "proj_floor",
-        "proj_ceiling",
-        "ceiling_gap",
-        "floor_gap",
-        "fpts_per_dollar",
-        "our_ownership_proj",
-        "projected_ppg",
-        "proj_confidence",
-        "season_avg_ppg",
-        "recent_avg_3",
-        "recent_avg_5",
-        "dfs_score",
-        "proj_minutes",
-        "l5_minutes_avg",
-        "minutes_confidence",
-        "role_change",
-        "p_top1",
-        "p_top3",
-        "sim_sigma",
-        "vegas_implied_fpts",
-        "vegas_vs_proj_diff",
-        "vegas_edge_fpts",
-        "game_total",
-        "game_spread_abs",
-        "game_pace_score",
-        "game_blowout_risk",
-        "game_stack_score",
-        "slate_game_count",
-        "slate_player_count",
-        "proj_fpts_rank_pct",
-        "value_rank_pct",
-        "salary_rank_pct",
-        "our_ownership_rank_pct",
-        "game_total_rank_pct",
-        "injury_adjusted",
-        "opponent_injury_detected",
-        "opponent_def_rating",
-        "opponent_pace",
-        "flag_pace",
-        "flag_defense",
-        "flag_injury",
-        "flag_rest",
-    ]
-    base_categorical_features = [
-        "primary_position",
-        "salary_tier",
-        "ownership_tier",
-        "role_tier",
-    ]
-    source_numeric_features = [
-        "salary",
-        "proj_fpts",
-        "our_ownership_proj",
-        "proj_confidence",
-        "game_total",
-        "rw_present",
-        "ls_present",
-        "supplement_source_count",
-        "rw_own_pct",
-        "ls_own_pct",
-        "supplement_own_consensus",
-        "rw_our_own_gap",
-        "ls_our_own_gap",
-        "rw_ls_own_gap",
-        "supplement_consensus_own_gap",
-        "rw_proj_fpts",
-        "ls_proj_fpts",
-        "supplement_proj_consensus",
-        "rw_our_proj_gap",
-        "ls_our_proj_gap",
-        "rw_ls_proj_gap",
-        "supplement_consensus_proj_gap",
-        "both_sources_zero_own",
-        "both_sources_zero_proj",
-        "rw_match_score",
-        "ls_match_score",
-        "source_match_score_avg",
-    ]
-    source_categorical_features = ["primary_position", "role_tier"]
-
-    base_numeric_features = [col for col in base_numeric_features if col in df.columns]
-    base_categorical_features = [col for col in base_categorical_features if col in df.columns]
-    source_numeric_features = [col for col in source_numeric_features if col in df.columns]
+    base_numeric_features = [col for col in BASE_NUMERIC_FEATURES if col in df.columns]
+    base_categorical_features = [col for col in BASE_CATEGORICAL_FEATURES if col in df.columns]
+    source_numeric_features = [col for col in SOURCE_NUMERIC_FEATURES if col in df.columns]
     source_categorical_features = [
-        col for col in source_categorical_features if col in df.columns
+        col for col in SOURCE_CATEGORICAL_FEATURES if col in df.columns
     ]
     train_df = df.loc[train_mask].copy()
     base_numeric_features, base_categorical_features = _filter_live_features(
@@ -1005,8 +1027,7 @@ def fit_ownership_calibrator(
     base_columns = base_numeric_features + base_categorical_features
     base_model.fit(df.loc[train_mask, base_columns], target.loc[train_mask])
 
-    base_pred_all = base_model.predict(df[base_columns])
-    base_pred_all = np.clip(base_pred_all, 0.0, 100.0)
+    base_pred_all = np.clip(base_model.predict(df[base_columns]), 0.0, 100.0)
 
     source_train_mask = train_mask & df["supplement_source_count"].gt(0)
     source_rows_train = int(source_train_mask.sum())
@@ -1018,6 +1039,7 @@ def fit_ownership_calibrator(
     )
 
     source_model: Optional[Pipeline] = None
+    source_columns: List[str] = []
     source_adjustment_all = np.zeros(len(df), dtype=float)
     if source_rows_train >= 25 and source_numeric_features + source_categorical_features:
         source_model = _build_ridge_pipeline(
@@ -1033,6 +1055,61 @@ def fit_ownership_calibrator(
         source_adjustment_all = raw_adjustment * source_adjustment_weight * source_active
 
     final_pred_all = np.clip(base_pred_all + source_adjustment_all, 0.0, 100.0)
+    return {
+        "df": df,
+        "target": target,
+        "train_mask": train_mask,
+        "test_mask": test_mask,
+        "holdout_dates": holdout_dates,
+        "base_model": base_model,
+        "base_columns": base_columns,
+        "base_pred_all": base_pred_all,
+        "source_model": source_model,
+        "source_columns": source_columns,
+        "source_adjustment_all": source_adjustment_all,
+        "final_pred_all": final_pred_all,
+        "source_rows_train": source_rows_train,
+        "source_rows_test": source_rows_test,
+        "source_adjustment_weight": source_adjustment_weight,
+        "base_numeric_features": base_numeric_features,
+        "base_categorical_features": base_categorical_features,
+        "source_numeric_features": source_numeric_features,
+        "source_categorical_features": source_categorical_features,
+    }
+
+
+def fit_ownership_calibrator(
+    conn: sqlite3.Connection,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    holdout_slates: int = 2,
+    save_run: bool = True,
+) -> Dict[str, Any]:
+    """Fit a two-stage ownership calibrator and return training artifacts."""
+
+    df = build_ownership_training_dataset(conn, start_date=start_date, end_date=end_date)
+    if df.empty:
+        return {"error": "No ownership rows with actuals were available for calibration."}
+    model_bundle = _train_ownership_calibration_models(df, holdout_slates=holdout_slates)
+    if model_bundle.get("error"):
+        return {"error": str(model_bundle.get("error"))}
+    df = model_bundle["df"]
+    target = model_bundle["target"]
+    train_mask = model_bundle["train_mask"]
+    test_mask = model_bundle["test_mask"]
+    holdout_dates = model_bundle["holdout_dates"]
+    base_model = model_bundle["base_model"]
+    source_model = model_bundle["source_model"]
+    base_pred_all = model_bundle["base_pred_all"]
+    source_adjustment_all = model_bundle["source_adjustment_all"]
+    final_pred_all = model_bundle["final_pred_all"]
+    source_rows_train = int(model_bundle["source_rows_train"])
+    source_rows_test = int(model_bundle["source_rows_test"])
+    source_adjustment_weight = float(model_bundle["source_adjustment_weight"])
+    base_numeric_features = list(model_bundle["base_numeric_features"])
+    base_categorical_features = list(model_bundle["base_categorical_features"])
+    source_numeric_features = list(model_bundle["source_numeric_features"])
+    source_categorical_features = list(model_bundle["source_categorical_features"])
 
     baseline_metrics = {
         "our_model_all": _metrics_from_predictions(target, df["our_ownership_proj"]),
@@ -1170,6 +1247,262 @@ def fit_ownership_calibrator(
         "training_df": df,
         "prediction_df": prediction_frame,
     }
+
+
+def _build_live_base_ownership_rows(
+    players: Sequence[Any],
+    slate_date: str,
+) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    for player in players or []:
+        try:
+            player_id = int(getattr(player, "player_id", 0) or 0)
+        except (TypeError, ValueError):
+            player_id = 0
+        if player_id <= 0:
+            continue
+
+        current_own = max(0.0, float(getattr(player, "ownership_proj", 0.0) or 0.0))
+        stored_base = max(
+            0.0,
+            float(getattr(player, "_ownership_calibration_base_proj", 0.0) or 0.0),
+        )
+        stored_delta = float(getattr(player, "_ownership_calibration_delta", 0.0) or 0.0)
+        expected_adjusted = stored_base + stored_delta if stored_base > 0 else None
+        if expected_adjusted is not None and abs(current_own - expected_adjusted) <= 0.05:
+            base_own = stored_base
+        else:
+            base_own = current_own
+
+        positions = getattr(player, "positions", []) or []
+        rows.append(
+            {
+                "slate_date": str(slate_date),
+                "player_id": player_id,
+                "player_name": str(getattr(player, "name", "") or ""),
+                "team": str(getattr(player, "team", "") or ""),
+                "opponent": str(getattr(player, "opponent", "") or ""),
+                "salary": int(getattr(player, "salary", 0) or 0),
+                "positions": "/".join([str(pos).strip() for pos in positions if str(pos).strip()]),
+                "proj_fpts": float(getattr(player, "proj_fpts", 0.0) or 0.0),
+                "proj_floor": float(getattr(player, "proj_floor", 0.0) or 0.0),
+                "proj_ceiling": float(getattr(player, "proj_ceiling", 0.0) or 0.0),
+                "fpts_per_dollar": float(getattr(player, "fpts_per_dollar", 0.0) or 0.0),
+                "our_ownership_proj": base_own,
+                "recorded_actual_ownership": np.nan,
+                "target_actual_ownership": np.nan,
+                "actual_ownership_imputed_zero": 0,
+                "contest_imported": 0,
+                "actual_fpts": np.nan,
+                "actual_minutes": pd.to_numeric(
+                    getattr(player, "recent_minutes_avg", np.nan),
+                    errors="coerce",
+                ),
+                "did_play": np.nan,
+                "role_tier": str(getattr(player, "role_tier", "UNK") or "UNK"),
+                "analytics_used": str(getattr(player, "analytics_used", "") or ""),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _supplement_feature_prefix(source_name: object) -> str:
+    bucket = _normalize_source_bucket(source_name)
+    if bucket == "lineupstarter":
+        return "ls"
+    if bucket == "rotowire":
+        return "rw"
+    lowered = str(source_name or "").strip().lower()
+    if "lineupstarter" in lowered or "lineup starter" in lowered or "linestarter" in lowered:
+        return "ls"
+    return "rw"
+
+
+def _build_live_supplement_frame(
+    slate_date: str,
+    supplement_state: Optional[Dict[str, Any]] = None,
+) -> pd.DataFrame:
+    state = dict(supplement_state or {})
+    player_map = state.get("player_map") or {}
+    if not player_map:
+        return pd.DataFrame()
+
+    source_name = (
+        state.get("ownership_source_name")
+        or state.get("source_name")
+        or ""
+    )
+    prefix = _supplement_feature_prefix(source_name)
+    rows: List[Dict[str, Any]] = []
+    for raw_player_id, info in player_map.items():
+        try:
+            player_id = int(raw_player_id or 0)
+        except (TypeError, ValueError):
+            player_id = 0
+        if player_id <= 0:
+            continue
+        row = {
+            "slate_date": str(slate_date),
+            "player_id": player_id,
+            f"{prefix}_proj_fpts": pd.to_numeric(
+                info.get("supplement_proj_fpts"),
+                errors="coerce",
+            ),
+            f"{prefix}_own_pct": pd.to_numeric(
+                info.get("supplement_ownership"),
+                errors="coerce",
+            ),
+            f"{prefix}_proj_delta": pd.to_numeric(
+                info.get("proj_delta"),
+                errors="coerce",
+            ),
+            f"{prefix}_own_delta_pp": pd.to_numeric(
+                info.get("own_delta_pp"),
+                errors="coerce",
+            ),
+            f"{prefix}_match_score": pd.to_numeric(
+                info.get("match_score"),
+                errors="coerce",
+            ),
+        }
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def apply_live_ownership_calibration(
+    conn: sqlite3.Connection,
+    players: Sequence[Any],
+    slate_date: str,
+    supplement_state: Optional[Dict[str, Any]] = None,
+    min_train_rows: int = 100,
+) -> Dict[str, Any]:
+    """Fit the ownership calibrator on historical slates and apply it live."""
+    stats = {
+        "active": False,
+        "mode": "calibrator",
+        "calibrated_players": 0,
+        "train_rows": 0,
+        "source_rows_train": 0,
+        "source_adjustment_weight": 0.0,
+        "train_end_date": "",
+        "avg_delta_pp": 0.0,
+    }
+
+    base_df = _build_live_base_ownership_rows(players, slate_date)
+    if base_df.empty:
+        stats["reason"] = "no_live_players"
+        return stats
+
+    slate_ts = pd.to_datetime(slate_date, errors="coerce")
+    if pd.isna(slate_ts):
+        train_end_date = None
+    else:
+        train_end_date = (slate_ts - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        stats["train_end_date"] = train_end_date
+
+    training_df = build_ownership_training_dataset(
+        conn,
+        start_date=None,
+        end_date=train_end_date,
+    )
+    if training_df.empty or len(training_df) < int(min_train_rows):
+        stats["reason"] = "insufficient_training_rows"
+        stats["train_rows"] = int(len(training_df))
+        return stats
+
+    model_bundle = _train_ownership_calibration_models(training_df, holdout_slates=0)
+    if model_bundle.get("error"):
+        stats["reason"] = str(model_bundle.get("error"))
+        return stats
+
+    live_df = _assemble_ownership_feature_frame(
+        base_df,
+        predictions_df=_read_predictions_frame(conn, start_date=slate_date, end_date=slate_date),
+        game_env_df=_read_game_environment_frame(conn, start_date=slate_date, end_date=slate_date),
+        supplement_df=_build_live_supplement_frame(slate_date, supplement_state),
+        sort_with_target=False,
+    )
+    if live_df.empty:
+        stats["reason"] = "empty_live_frame"
+        return stats
+
+    base_columns = list(model_bundle["base_columns"])
+    source_columns = list(model_bundle["source_columns"])
+    for col in base_columns + source_columns:
+        if col in live_df.columns:
+            continue
+        if col in BASE_CATEGORICAL_FEATURES or col in SOURCE_CATEGORICAL_FEATURES:
+            live_df[col] = ""
+        else:
+            live_df[col] = np.nan
+
+    base_model = model_bundle["base_model"]
+    base_pred = np.clip(base_model.predict(live_df[base_columns]), 0.0, 100.0)
+
+    source_model = model_bundle["source_model"]
+    source_adjustment = np.zeros(len(live_df), dtype=float)
+    if source_model is not None and source_columns:
+        source_active = live_df["supplement_source_count"].gt(0).astype(float).to_numpy()
+        raw_adjustment = source_model.predict(live_df[source_columns])
+        source_adjustment = (
+            raw_adjustment
+            * float(model_bundle["source_adjustment_weight"])
+            * source_active
+        )
+
+    final_pred = np.clip(base_pred + source_adjustment, 0.0, 100.0)
+    prediction_df = live_df[
+        ["player_id", "our_ownership_proj", "supplement_source_count"]
+    ].copy()
+    prediction_df["base_pred"] = base_pred
+    prediction_df["source_adjustment"] = source_adjustment
+    prediction_df["calibrated_ownership"] = final_pred
+    prediction_df["calibration_delta"] = (
+        prediction_df["calibrated_ownership"] - prediction_df["our_ownership_proj"]
+    )
+    prediction_map = {
+        int(row["player_id"]): row for row in prediction_df.to_dict("records")
+    }
+
+    adjusted_players = 0
+    delta_values: List[float] = []
+    for player in players or []:
+        try:
+            player_id = int(getattr(player, "player_id", 0) or 0)
+        except (TypeError, ValueError):
+            player_id = 0
+        row = prediction_map.get(player_id)
+        if not row:
+            continue
+        calibrated_own = float(row["calibrated_ownership"] or 0.0)
+        base_own = float(row["our_ownership_proj"] or 0.0)
+        delta_own = float(row["calibration_delta"] or 0.0)
+        player.ownership_proj = round(calibrated_own, 3)
+        player._ownership_calibration_base_proj = round(base_own, 4)
+        player._ownership_calibration_delta = round(delta_own, 4)
+        player.ownership_calibration_base_pred = round(float(row["base_pred"] or 0.0), 4)
+        player.ownership_calibration_source_adjustment = round(
+            float(row["source_adjustment"] or 0.0),
+            4,
+        )
+        if abs(delta_own) >= 0.1:
+            adjusted_players += 1
+            delta_values.append(delta_own)
+
+    stats.update(
+        {
+            "active": True,
+            "calibrated_players": int(len(prediction_map)),
+            "adjusted_players": int(adjusted_players),
+            "train_rows": int(len(model_bundle["df"])),
+            "source_rows_train": int(model_bundle["source_rows_train"]),
+            "source_adjustment_weight": float(model_bundle["source_adjustment_weight"]),
+            "avg_delta_pp": (
+                float(np.mean(np.abs(delta_values))) if delta_values else 0.0
+            ),
+        }
+    )
+    return stats
 
 
 def get_latest_ownership_calibration_run(conn: sqlite3.Connection) -> Optional[Dict[str, Any]]:

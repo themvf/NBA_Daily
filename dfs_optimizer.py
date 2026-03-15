@@ -575,6 +575,9 @@ class DFSPlayer:
     supplement_own_delta_applied: float = 0.0
     rotowire_ownership_blend_active: bool = False
     rotowire_ownership_delta_applied: float = 0.0
+    ownership_context_base_proj: float = 0.0
+    ownership_context_delta: float = 0.0
+    ownership_context_multiplier: float = 1.0
 
     # Status flags
     is_locked: bool = False      # Force include in all lineups
@@ -2797,6 +2800,192 @@ def _get_historical_ownership(conn: sqlite3.Connection, player_id: int,
     return None
 
 
+def apply_slate_context_ownership_adjustments(
+    player_pool: List[DFSPlayer],
+    today_num_games: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Re-rank ownership within a slate so value clusters gain and fake chalk trims.
+
+    The base ownership model and third-party feeds are useful priors, but both can
+    miss slate-relative concentration. This pass is intentionally lightweight:
+    it boosts under-owned cheap/midrange value clusters and trims expensive plays
+    whose ownership rank materially outruns their projection/value rank.
+
+    Adjustments are re-based from the last pre-context ownership snapshot so the
+    function can be called multiple times without compounding drift.
+    """
+    stats = {
+        "adjusted_players": 0,
+        "boosted_players": 0,
+        "trimmed_players": 0,
+        "context_factor": 0.0,
+    }
+
+    active_players = [
+        p
+        for p in player_pool or []
+        if not bool(getattr(p, "is_injured", False))
+        and float(getattr(p, "salary", 0) or 0) > 0
+        and float(getattr(p, "proj_fpts", 0.0) or 0.0) > 0
+    ]
+    if len(active_players) < 3:
+        return stats
+
+    if today_num_games is None or int(today_num_games or 0) <= 0:
+        slate_teams = {str(getattr(p, "team", "") or "").strip() for p in active_players}
+        slate_teams = {team for team in slate_teams if team}
+        if slate_teams:
+            today_num_games = max(1, int(round(len(slate_teams) / 2.0)))
+
+    small_slate_factor = max(
+        0.0,
+        min(1.0, (7.0 - float(today_num_games or 7.0)) / 4.0),
+    )
+    context_factor = max(0.12, small_slate_factor)
+    stats["context_factor"] = round(float(context_factor), 4)
+
+    rows: List[Dict[str, Any]] = []
+    for idx, player in enumerate(active_players):
+        current_own = max(0.0, float(getattr(player, "ownership_proj", 0.0) or 0.0))
+        if current_own <= 0:
+            continue
+
+        stored_base = max(
+            0.0,
+            float(getattr(player, "ownership_context_base_proj", 0.0) or 0.0),
+        )
+        stored_delta = float(getattr(player, "ownership_context_delta", 0.0) or 0.0)
+        expected_adjusted = stored_base + stored_delta if stored_base > 0 else None
+        if expected_adjusted is not None and abs(current_own - expected_adjusted) <= 0.05:
+            base_own = stored_base
+        else:
+            base_own = current_own
+
+        player.ownership_context_base_proj = round(base_own, 4)
+        player.ownership_context_delta = 0.0
+        player.ownership_context_multiplier = 1.0
+
+        rows.append(
+            {
+                "idx": idx,
+                "player": player,
+                "team": str(getattr(player, "team", "") or "").strip(),
+                "salary": float(getattr(player, "salary", 0) or 0),
+                "proj_fpts": float(getattr(player, "proj_fpts", 0.0) or 0.0),
+                "proj_ceiling": float(getattr(player, "proj_ceiling", 0.0) or 0.0),
+                "value_score": float(getattr(player, "fpts_per_dollar", 0.0) or 0.0),
+                "base_own": base_own,
+            }
+        )
+
+    if len(rows) < 3:
+        return stats
+
+    context_df = pd.DataFrame(rows)
+    for metric in ("base_own", "value_score", "proj_fpts", "proj_ceiling"):
+        rank_col = f"{metric}_rank_pct"
+        context_df[rank_col] = context_df[metric].rank(
+            ascending=False,
+            method="average",
+            pct=True,
+        )
+        context_df[f"{metric}_strength"] = 1.0 - context_df[rank_col].fillna(1.0)
+
+    cheap_mask = context_df["salary"].between(3200.0, 7000.0)
+    team_core_mask = (
+        cheap_mask
+        & context_df["proj_fpts"].ge(21.0)
+        & context_df["value_score"].ge(4.8)
+    )
+    team_core_counts = (
+        context_df.loc[team_core_mask]
+        .groupby("team", dropna=False)
+        .size()
+        .rename("team_core_count")
+    )
+    context_df = context_df.merge(team_core_counts, on="team", how="left")
+    context_df["team_core_count"] = pd.to_numeric(
+        context_df["team_core_count"],
+        errors="coerce",
+    ).fillna(0.0)
+    context_df["team_core_strength"] = context_df["team_core_count"].clip(0.0, 4.0) / 4.0
+
+    context_df["composite_strength"] = (
+        0.42 * context_df["value_score_strength"]
+        + 0.33 * context_df["proj_fpts_strength"]
+        + 0.10 * context_df["proj_ceiling_strength"]
+        + 0.15 * (context_df["team_core_strength"] * cheap_mask.astype(float))
+    )
+    context_df["rank_gap"] = (
+        context_df["composite_strength"] - context_df["base_own_strength"]
+    )
+
+    multiplier = 1.0 + (context_factor * 2.0 * context_df["rank_gap"])
+    multiplier += (
+        context_factor
+        * 0.30
+        * (
+            context_df["team_core_count"].ge(2.0)
+            & cheap_mask
+            & context_df["base_own"].le(16.0)
+            & context_df["proj_fpts"].ge(24.0)
+        ).astype(float)
+    )
+    multiplier += (
+        context_factor
+        * 0.15
+        * (
+            cheap_mask
+            & context_df["value_score"].ge(5.2)
+            & context_df["base_own"].le(12.0)
+        ).astype(float)
+    )
+    multiplier -= (
+        context_factor
+        * 0.28
+        * (
+            context_df["salary"].between(5600.0, 7600.0)
+            & context_df["base_own"].ge(18.0)
+            & context_df["team_core_count"].lt(2.0)
+        ).astype(float)
+    )
+    multiplier -= (
+        context_factor
+        * 0.40
+        * (
+            context_df["salary"].ge(7600.0)
+            & context_df["base_own"].ge(18.0)
+            & context_df["value_score"].lt(5.0)
+        ).astype(float)
+    )
+    context_df["multiplier"] = multiplier.clip(0.65, 1.55)
+
+    adjusted_own = (context_df["base_own"] * context_df["multiplier"]).clip(lower=0.3)
+    base_total = float(context_df["base_own"].sum())
+    adjusted_total = float(adjusted_own.sum())
+    if base_total > 0 and adjusted_total > 0:
+        adjusted_own = adjusted_own * (base_total / adjusted_total)
+    context_df["adjusted_own"] = adjusted_own.clip(lower=0.3)
+    context_df["delta"] = context_df["adjusted_own"] - context_df["base_own"]
+
+    for _, row in context_df.iterrows():
+        player = row["player"]
+        adjusted_value = float(row["adjusted_own"] or 0.0)
+        delta_value = float(row["delta"] or 0.0)
+        player.ownership_proj = round(max(0.3, adjusted_value), 3)
+        player.ownership_context_base_proj = round(float(row["base_own"] or 0.0), 4)
+        player.ownership_context_delta = round(delta_value, 4)
+        player.ownership_context_multiplier = round(float(row["multiplier"] or 1.0), 4)
+        if abs(delta_value) >= 0.1:
+            stats["adjusted_players"] += 1
+        if delta_value >= 0.1:
+            stats["boosted_players"] += 1
+        elif delta_value <= -0.1:
+            stats["trimmed_players"] += 1
+
+    return stats
+
+
 def _project_stat_multi_factor(
     stat_name: str,
     logs: pd.DataFrame,
@@ -4557,6 +4746,10 @@ def generate_diversified_lineups(
         or bool(profile_cfg.get("aggressive_ceiling_stack", False))
         or bool(resolved_regime.get("force_aggressive_ceiling_stack", False))
     )
+    ownership_context_stats = apply_slate_context_ownership_adjustments(
+        filtered_pool,
+        today_num_games=slate_game_count,
+    )
     cheap_core_context = _build_cheap_core_context(filtered_pool, profile_cfg)
     cheap_core_player_ids = set(cheap_core_context.get("candidate_ids", set()) or set())
 
@@ -4595,6 +4788,18 @@ def generate_diversified_lineups(
     refresh_game_leverage_signals(filtered_pool, profile_cfg)
     for p in filtered_pool:
         refresh_gpp_ceiling_signal(p, profile_cfg)
+    _dbg(
+        "ownership_context_adjusted",
+        int(ownership_context_stats.get("adjusted_players", 0) or 0),
+    )
+    _dbg(
+        "ownership_context_boosted",
+        int(ownership_context_stats.get("boosted_players", 0) or 0),
+    )
+    _dbg(
+        "ownership_context_trimmed",
+        int(ownership_context_stats.get("trimmed_players", 0) or 0),
+    )
     _dbg("cheap_core_candidates", int(cheap_core_context.get("candidate_count", 0) or 0))
     _dbg("cheap_core_pairs", len(cheap_core_context.get("pair_pool", []) or []))
     _dbg("cheap_core_triples", len(cheap_core_context.get("triple_pool", []) or []))

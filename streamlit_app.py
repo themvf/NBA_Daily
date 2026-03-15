@@ -17293,6 +17293,39 @@ def _apply_rotowire_pre_run_ownership_blend(
     return stats
 
 
+def _apply_runtime_ownership_calibration(
+    conn: sqlite3.Connection,
+    players: List[Any],
+    supplement_state: Mapping[str, Any],
+    slate_date: str,
+) -> Dict[str, Any]:
+    """Apply the learned ownership calibrator, falling back to pre-run blending."""
+    calibrator_error = ""
+    try:
+        import ownership_calibrator as oc
+
+        calib_stats = oc.apply_live_ownership_calibration(
+            conn,
+            players,
+            slate_date,
+            supplement_state=dict(supplement_state or {}),
+        )
+        if calib_stats.get("active"):
+            return calib_stats
+    except Exception as exc:
+        calibrator_error = str(exc)
+
+    fallback_stats = _apply_rotowire_pre_run_ownership_blend(
+        players,
+        supplement_state,
+        slate_date,
+    )
+    fallback_stats["mode"] = "fallback_rotowire"
+    if calibrator_error:
+        fallback_stats["calibrator_error"] = calibrator_error
+    return fallback_stats
+
+
 # DFS Lineup Builder tab ---------------------------------------------------
 if selected_page == "DFS Lineup Builder":
     st.title("🏀 DFS Lineup Builder")
@@ -18424,13 +18457,26 @@ if selected_page == "DFS Lineup Builder":
                     f"total projection shift {ai_total_delta:+.1f} FPTS."
                 )
 
-            rotowire_ownership_stats = _apply_rotowire_pre_run_ownership_blend(
+            rotowire_ownership_stats = _apply_runtime_ownership_calibration(
+                dfs_conn,
                 players,
                 supplement_state,
                 current_slate_date,
             )
             if rotowire_ownership_stats.get("active"):
-                if rotowire_ownership_stats.get("guardrailed_players", 0) > 0:
+                if rotowire_ownership_stats.get("mode") == "calibrator":
+                    st.caption(
+                        "Ownership calibrator active - "
+                        f"{rotowire_ownership_stats.get('calibrated_players', 0)} players scored "
+                        f"from {rotowire_ownership_stats.get('train_rows', 0)} historical rows"
+                        + (
+                            f" through {rotowire_ownership_stats.get('train_end_date')}"
+                            if rotowire_ownership_stats.get("train_end_date")
+                            else ""
+                        )
+                        + "."
+                    )
+                elif rotowire_ownership_stats.get("guardrailed_players", 0) > 0:
                     st.caption(
                         "LineupStarter ownership guardrails active inside the external blend: "
                         f"{rotowire_ownership_stats.get('guardrailed_players', 0)} players, "
@@ -19477,7 +19523,8 @@ if selected_page == "DFS Lineup Builder":
                 lineup_generation_supplement_state = dict(
                     projection_supplement_state or ownership_supplement_state or {}
                 )
-            rotowire_ownership_stats = _apply_rotowire_pre_run_ownership_blend(
+            rotowire_ownership_stats = _apply_runtime_ownership_calibration(
+                dfs_conn,
                 players,
                 ownership_supplement_state,
                 current_slate_date,
@@ -19526,7 +19573,18 @@ if selected_page == "DFS Lineup Builder":
                     f"{int(round(float(proj_mix.get('secondary_weight', 0.0)) * 100))}%."
                 )
             if rotowire_ownership_stats.get("active"):
-                if rotowire_ownership_stats.get("guardrailed_players", 0) > 0:
+                if rotowire_ownership_stats.get("mode") == "calibrator":
+                    st.caption(
+                        "Ownership calibrator is feeding lineup generation: "
+                        f"{rotowire_ownership_stats.get('calibrated_players', 0)} players "
+                        f"from {rotowire_ownership_stats.get('train_rows', 0)} historical rows"
+                        + (
+                            f", trained through {rotowire_ownership_stats.get('train_end_date')}."
+                            if rotowire_ownership_stats.get("train_end_date")
+                            else "."
+                        )
+                    )
+                elif rotowire_ownership_stats.get("guardrailed_players", 0) > 0:
                     st.caption(
                         "LineupStarter ownership guardrails active: "
                         f"{rotowire_ownership_stats.get('guardrailed_players', 0)} players, "
@@ -20093,7 +20151,8 @@ if selected_page == "DFS Lineup Builder":
                                             slate_date=current_slate_date,
                                         )
                                     )
-                                rotowire_ownership_stats = _apply_rotowire_pre_run_ownership_blend(
+                                rotowire_ownership_stats = _apply_runtime_ownership_calibration(
+                                    dfs_conn,
                                     players,
                                     runtime_ownership_state,
                                     current_slate_date,
