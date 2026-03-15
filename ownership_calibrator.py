@@ -1323,50 +1323,74 @@ def _build_live_supplement_frame(
     supplement_state: Optional[Dict[str, Any]] = None,
 ) -> pd.DataFrame:
     state = dict(supplement_state or {})
-    player_map = state.get("player_map") or {}
-    if not player_map:
+    source_player_maps = state.get("source_player_maps") or []
+    if not source_player_maps:
+        player_map = state.get("player_map") or {}
+        source_name = (
+            state.get("ownership_source_name")
+            or state.get("source_name")
+            or ""
+        )
+        if player_map and source_name:
+            source_player_maps = [
+                {
+                    "source_name": source_name,
+                    "player_map": player_map,
+                }
+            ]
+    if not source_player_maps:
         return pd.DataFrame()
 
-    source_name = (
-        state.get("ownership_source_name")
-        or state.get("source_name")
-        or ""
-    )
-    prefix = _supplement_feature_prefix(source_name)
-    rows: List[Dict[str, Any]] = []
-    for raw_player_id, info in player_map.items():
-        try:
-            player_id = int(raw_player_id or 0)
-        except (TypeError, ValueError):
-            player_id = 0
-        if player_id <= 0:
+    merged_df = pd.DataFrame()
+    for entry in source_player_maps:
+        source_name = str(entry.get("source_name") or "")
+        player_map = entry.get("player_map") or {}
+        prefix = _supplement_feature_prefix(source_name)
+        rows: List[Dict[str, Any]] = []
+        for raw_player_id, info in player_map.items():
+            try:
+                player_id = int(raw_player_id or 0)
+            except (TypeError, ValueError):
+                player_id = 0
+            if player_id <= 0:
+                continue
+            row = {
+                "slate_date": str(slate_date),
+                "player_id": player_id,
+                f"{prefix}_proj_fpts": pd.to_numeric(
+                    info.get("supplement_proj_fpts"),
+                    errors="coerce",
+                ),
+                f"{prefix}_own_pct": pd.to_numeric(
+                    info.get("supplement_ownership"),
+                    errors="coerce",
+                ),
+                f"{prefix}_proj_delta": pd.to_numeric(
+                    info.get("proj_delta"),
+                    errors="coerce",
+                ),
+                f"{prefix}_own_delta_pp": pd.to_numeric(
+                    info.get("own_delta_pp"),
+                    errors="coerce",
+                ),
+                f"{prefix}_match_score": pd.to_numeric(
+                    info.get("match_score"),
+                    errors="coerce",
+                ),
+            }
+            rows.append(row)
+        source_df = pd.DataFrame(rows)
+        if source_df.empty:
             continue
-        row = {
-            "slate_date": str(slate_date),
-            "player_id": player_id,
-            f"{prefix}_proj_fpts": pd.to_numeric(
-                info.get("supplement_proj_fpts"),
-                errors="coerce",
-            ),
-            f"{prefix}_own_pct": pd.to_numeric(
-                info.get("supplement_ownership"),
-                errors="coerce",
-            ),
-            f"{prefix}_proj_delta": pd.to_numeric(
-                info.get("proj_delta"),
-                errors="coerce",
-            ),
-            f"{prefix}_own_delta_pp": pd.to_numeric(
-                info.get("own_delta_pp"),
-                errors="coerce",
-            ),
-            f"{prefix}_match_score": pd.to_numeric(
-                info.get("match_score"),
-                errors="coerce",
-            ),
-        }
-        rows.append(row)
-    return pd.DataFrame(rows)
+        if merged_df.empty:
+            merged_df = source_df
+        else:
+            merged_df = merged_df.merge(
+                source_df,
+                on=["slate_date", "player_id"],
+                how="outer",
+            )
+    return merged_df
 
 
 def apply_live_ownership_calibration(
@@ -1480,6 +1504,7 @@ def apply_live_ownership_calibration(
         player.ownership_proj = round(calibrated_own, 3)
         player._ownership_calibration_base_proj = round(base_own, 4)
         player._ownership_calibration_delta = round(delta_own, 4)
+        player.ownership_calibration_active = True
         player.ownership_calibration_base_pred = round(float(row["base_pred"] or 0.0), 4)
         player.ownership_calibration_source_adjustment = round(
             float(row["source_adjustment"] or 0.0),

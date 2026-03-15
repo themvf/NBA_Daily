@@ -557,3 +557,44 @@ def test_apply_live_ownership_calibration_updates_runtime_players() -> None:
     assert live_players[0].ownership_proj != 10.0
     assert live_players[1].ownership_proj != 28.0
     assert getattr(live_players[0], "_ownership_calibration_base_proj") == 10.0
+
+
+def test_build_live_supplement_frame_preserves_multiple_raw_sources() -> None:
+    state = {
+        "source_name": "RotoWire NBA Optimizer + LineupStarter CSV (Signal Matrix)",
+        "source_player_maps": [
+            {
+                "source_name": "RotoWire NBA Optimizer",
+                "player_map": {
+                    1: {
+                        "supplement_proj_fpts": 30.0,
+                        "supplement_ownership": 18.0,
+                        "proj_delta": 1.0,
+                        "own_delta_pp": 5.0,
+                        "match_score": 99.0,
+                    }
+                },
+            },
+            {
+                "source_name": "LineupStarter CSV",
+                "player_map": {
+                    1: {
+                        "supplement_proj_fpts": 31.0,
+                        "supplement_ownership": 16.0,
+                        "proj_delta": 2.0,
+                        "own_delta_pp": 3.0,
+                        "match_score": 97.0,
+                    }
+                },
+            },
+        ],
+    }
+
+    df = oc._build_live_supplement_frame("2026-03-08", state)
+
+    assert list(df["player_id"]) == [1]
+    row = df.iloc[0]
+    assert row["rw_own_pct"] == 18.0
+    assert row["ls_own_pct"] == 16.0
+    assert row["rw_proj_fpts"] == 30.0
+    assert row["ls_proj_fpts"] == 31.0

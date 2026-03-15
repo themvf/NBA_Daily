@@ -16116,6 +16116,48 @@ def _blend_dual_source_metric(
     return float(blended), "combined"
 
 
+def _collect_supplement_source_player_maps(
+    *states: Mapping[str, Any],
+) -> List[Dict[str, Any]]:
+    """Return unique raw source maps so downstream models can see each provider."""
+    collected: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for state in states:
+        state_dict = dict(state or {})
+        source_maps = state_dict.get("source_player_maps") or []
+        if not source_maps:
+            source_name = str(
+                state_dict.get("ownership_source_name")
+                or state_dict.get("source_name")
+                or ""
+            ).strip()
+            player_map = state_dict.get("player_map") or {}
+            source_maps = (
+                [{"source_name": source_name, "player_map": player_map}]
+                if source_name and player_map
+                else []
+            )
+
+        for entry in source_maps:
+            source_name = str(entry.get("source_name") or "").strip()
+            player_map = entry.get("player_map") or {}
+            if not source_name or not player_map:
+                continue
+            source_key = source_name.lower()
+            if source_key in seen:
+                continue
+            seen.add(source_key)
+            collected.append(
+                {
+                    "source_name": source_name,
+                    "player_map": dict(player_map),
+                }
+            )
+
+    return collected
+
+
 def _build_combined_dual_source_supplement_state(
     primary_state: Mapping[str, Any],
     secondary_state: Mapping[str, Any],
@@ -16255,6 +16297,10 @@ def _build_combined_dual_source_supplement_state(
         sec_state.get("is_rotowire_source")
     ) or ("rotowire" in f"{pri_name} {sec_name}".lower())
     combined_state["player_map"] = combined_map
+    combined_state["source_player_maps"] = _collect_supplement_source_player_maps(
+        pri_state,
+        sec_state,
+    )
     combined_state["comparison_records"] = combined_records
     summary = dict(pri_state.get("summary", {}) or {})
     summary["matched_rows"] = int(len(combined_map))
@@ -16423,6 +16469,10 @@ def _merge_supplement_signal_states(
     merged_state["summary"] = summary
     merged_state["projection_source_name"] = proj_name
     merged_state["ownership_source_name"] = own_name
+    merged_state["source_player_maps"] = _collect_supplement_source_player_maps(
+        proj_state,
+        own_state,
+    )
     merged_state["slate_date"] = str(slate_date or proj_state.get("slate_date") or own_state.get("slate_date") or "")
     merged_state["run_key"] = (
         f"{str(proj_state.get('run_key') or '')[:8]}_"
@@ -17111,6 +17161,7 @@ def _apply_supplement_profile_blend(
         supplement_own = supplement_info.get("supplement_ownership")
         effective_own_weight = 0.0 if bool(
             getattr(player, "rotowire_ownership_blend_active", False)
+            or getattr(player, "ownership_calibration_active", False)
         ) else own_weight
         has_requested_signal = bool(
             (proj_weight > 0 and supplement_proj is not None)
@@ -17217,6 +17268,7 @@ def _apply_rotowire_pre_run_ownership_blend(
             )
         player.ownership_proj = float(getattr(player, "_model_ownership_proj", 0.0) or 0.0)
         player.rotowire_ownership_blend_active = False
+        player.ownership_calibration_active = False
         player.rotowire_ownership_delta_applied = 0.0
         _recalculate_player_leverage(player)
 
