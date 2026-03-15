@@ -350,7 +350,11 @@ def test_fit_ownership_calibrator_builds_and_saves_run():
     assert summary.train_rows > 0
     assert summary.test_rows > 0
     assert summary.source_rows_train > 0
+    assert summary.model_version.startswith("ownership_calibrator_v2_")
     assert "final_ownership_pred" in prediction_df.columns
+    assert summary.artifact["base_model_backend"] == (
+        "xgboost" if oc.HAS_XGBOOST else "ridge"
+    )
     assert conn.execute(
         "SELECT COUNT(*) FROM dfs_ownership_calibration_runs"
     ).fetchone()[0] == 1
@@ -554,6 +558,7 @@ def test_apply_live_ownership_calibration_updates_runtime_players() -> None:
     assert result["active"] is True
     assert result["train_rows"] >= 20
     assert result["calibrated_players"] == 2
+    assert result["base_model_backend"] == ("xgboost" if oc.HAS_XGBOOST else "ridge")
     assert live_players[0].ownership_proj != 10.0
     assert live_players[1].ownership_proj != 28.0
     assert getattr(live_players[0], "_ownership_calibration_base_proj") == 10.0

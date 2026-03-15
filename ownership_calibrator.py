@@ -30,9 +30,20 @@ from sklearn.impute import SimpleImputer
 from sklearn.linear_model import Ridge
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
+try:
+    from xgboost import XGBRegressor
+
+    HAS_XGBOOST = True
+except Exception:  # pragma: no cover - fallback only used if dependency is missing
+    XGBRegressor = None
+    HAS_XGBOOST = False
 
 
-MODEL_VERSION = "ownership_calibrator_v1"
+MODEL_VERSION = (
+    "ownership_calibrator_v2_xgboost"
+    if HAS_XGBOOST
+    else "ownership_calibrator_v2_ridge_fallback"
+)
 SOURCE_SHRINK_K = 250.0
 
 BASE_NUMERIC_FEATURES: Tuple[str, ...] = (
@@ -899,6 +910,100 @@ def _build_ridge_pipeline(
     )
 
 
+def _build_xgboost_pipeline(
+    numeric_features: Sequence[str],
+    categorical_features: Sequence[str],
+    *,
+    stage: str,
+) -> Pipeline:
+    transformers: List[Tuple[str, Any, Sequence[str]]] = []
+    if numeric_features:
+        transformers.append(
+            (
+                "num",
+                Pipeline(steps=[("imputer", SimpleImputer(strategy="median"))]),
+                list(numeric_features),
+            )
+        )
+    if categorical_features:
+        transformers.append(
+            (
+                "cat",
+                Pipeline(
+                    steps=[
+                        ("imputer", SimpleImputer(strategy="most_frequent")),
+                        ("encoder", OneHotEncoder(handle_unknown="ignore")),
+                    ]
+                ),
+                list(categorical_features),
+            )
+        )
+    if stage == "source":
+        model = XGBRegressor(
+            objective="reg:squarederror",
+            n_estimators=120,
+            learning_rate=0.05,
+            max_depth=3,
+            min_child_weight=6,
+            subsample=0.82,
+            colsample_bytree=0.8,
+            reg_alpha=0.15,
+            reg_lambda=2.5,
+            random_state=42,
+            n_jobs=1,
+            tree_method="hist",
+            verbosity=0,
+        )
+    else:
+        model = XGBRegressor(
+            objective="reg:squarederror",
+            n_estimators=180,
+            learning_rate=0.045,
+            max_depth=4,
+            min_child_weight=8,
+            subsample=0.86,
+            colsample_bytree=0.84,
+            reg_alpha=0.1,
+            reg_lambda=3.0,
+            random_state=42,
+            n_jobs=1,
+            tree_method="hist",
+            verbosity=0,
+        )
+    return Pipeline(
+        steps=[
+            ("preprocessor", ColumnTransformer(transformers=transformers)),
+            ("model", model),
+        ]
+    )
+
+
+def _build_ownership_pipeline(
+    numeric_features: Sequence[str],
+    categorical_features: Sequence[str],
+    *,
+    stage: str,
+) -> Tuple[Pipeline, str]:
+    if HAS_XGBOOST:
+        return (
+            _build_xgboost_pipeline(
+                numeric_features=numeric_features,
+                categorical_features=categorical_features,
+                stage=stage,
+            ),
+            "xgboost",
+        )
+    ridge_alpha = 18.0 if stage == "source" else 10.0
+    return (
+        _build_ridge_pipeline(
+            numeric_features=numeric_features,
+            categorical_features=categorical_features,
+            alpha=ridge_alpha,
+        ),
+        "ridge",
+    )
+
+
 def _metrics_from_predictions(y_true: Sequence[float], y_pred: Sequence[float]) -> Dict[str, Any]:
     actual = pd.to_numeric(pd.Series(list(y_true)), errors="coerce").reset_index(drop=True)
     pred = pd.to_numeric(pd.Series(list(y_pred)), errors="coerce").reset_index(drop=True)
@@ -931,12 +1036,24 @@ def _coefficient_summary(model: Optional[Pipeline], top_n: int = 20) -> List[Dic
         return []
     try:
         feature_names = model.named_steps["preprocessor"].get_feature_names_out()
-        coefficients = model.named_steps["model"].coef_
+        estimator = model.named_steps["model"]
     except Exception:
         return []
 
+    metric_name = "coef"
+    coefficients = getattr(estimator, "coef_", None)
+    if coefficients is None:
+        coefficients = getattr(estimator, "feature_importances_", None)
+        metric_name = "feature_importance"
+    if coefficients is None:
+        return []
+
     pairs = [
-        {"feature": str(name), "coef": float(value)}
+        {
+            "feature": str(name),
+            "coef": float(value),
+            "metric": metric_name,
+        }
         for name, value in zip(feature_names, coefficients)
     ]
     pairs.sort(key=lambda row: abs(row["coef"]), reverse=True)
@@ -1019,10 +1136,10 @@ def _train_ownership_calibration_models(
         train_df, source_numeric_features, source_categorical_features
     )
 
-    base_model = _build_ridge_pipeline(
+    base_model, base_backend = _build_ownership_pipeline(
         numeric_features=base_numeric_features,
         categorical_features=base_categorical_features,
-        alpha=10.0,
+        stage="base",
     )
     base_columns = base_numeric_features + base_categorical_features
     base_model.fit(df.loc[train_mask, base_columns], target.loc[train_mask])
@@ -1040,12 +1157,13 @@ def _train_ownership_calibration_models(
 
     source_model: Optional[Pipeline] = None
     source_columns: List[str] = []
+    source_backend = ""
     source_adjustment_all = np.zeros(len(df), dtype=float)
     if source_rows_train >= 25 and source_numeric_features + source_categorical_features:
-        source_model = _build_ridge_pipeline(
+        source_model, source_backend = _build_ownership_pipeline(
             numeric_features=source_numeric_features,
             categorical_features=source_categorical_features,
-            alpha=18.0,
+            stage="source",
         )
         residual_target = target.loc[train_mask] - base_pred_all[train_mask.to_numpy()]
         source_columns = source_numeric_features + source_categorical_features
@@ -1062,9 +1180,11 @@ def _train_ownership_calibration_models(
         "test_mask": test_mask,
         "holdout_dates": holdout_dates,
         "base_model": base_model,
+        "base_backend": base_backend,
         "base_columns": base_columns,
         "base_pred_all": base_pred_all,
         "source_model": source_model,
+        "source_backend": source_backend,
         "source_columns": source_columns,
         "source_adjustment_all": source_adjustment_all,
         "final_pred_all": final_pred_all,
@@ -1100,6 +1220,8 @@ def fit_ownership_calibrator(
     holdout_dates = model_bundle["holdout_dates"]
     base_model = model_bundle["base_model"]
     source_model = model_bundle["source_model"]
+    base_backend = str(model_bundle.get("base_backend") or "ridge")
+    source_backend = str(model_bundle.get("source_backend") or "")
     base_pred_all = model_bundle["base_pred_all"]
     source_adjustment_all = model_bundle["source_adjustment_all"]
     final_pred_all = model_bundle["final_pred_all"]
@@ -1168,6 +1290,9 @@ def fit_ownership_calibrator(
     prediction_frame["split"] = np.where(test_mask.to_numpy(), "test", "train")
 
     artifact = {
+        "xgboost_available": bool(HAS_XGBOOST),
+        "base_model_backend": base_backend,
+        "source_model_backend": source_backend,
         "source_adjustment_weight": round(float(source_adjustment_weight), 6),
         "holdout_dates": test_dates,
         "base_top_coefficients": _coefficient_summary(base_model),
@@ -1404,12 +1529,15 @@ def apply_live_ownership_calibration(
     stats = {
         "active": False,
         "mode": "calibrator",
+        "model_version": MODEL_VERSION,
         "calibrated_players": 0,
         "train_rows": 0,
         "source_rows_train": 0,
         "source_adjustment_weight": 0.0,
         "train_end_date": "",
         "avg_delta_pp": 0.0,
+        "base_model_backend": "",
+        "source_model_backend": "",
     }
 
     base_df = _build_live_base_ownership_rows(players, slate_date)
@@ -1438,6 +1566,8 @@ def apply_live_ownership_calibration(
     if model_bundle.get("error"):
         stats["reason"] = str(model_bundle.get("error"))
         return stats
+    stats["base_model_backend"] = str(model_bundle.get("base_backend") or "ridge")
+    stats["source_model_backend"] = str(model_bundle.get("source_backend") or "")
 
     live_df = _assemble_ownership_feature_frame(
         base_df,
@@ -1604,6 +1734,12 @@ def _print_summary(result: OwnershipCalibrationResult) -> None:
 
     print(f"Run key: {result.run_key}")
     print(f"Model version: {result.model_version}")
+    if result.artifact:
+        print(
+            "Backends:"
+            f" base={result.artifact.get('base_model_backend')}"
+            f" source={result.artifact.get('source_model_backend') or 'n/a'}"
+        )
     print(
         f"Rows: total={result.total_rows} train={result.train_rows} "
         f"test={result.test_rows}"
