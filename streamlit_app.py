@@ -14196,6 +14196,11 @@ def _clean_dfs_supplement_player_name(value: object) -> str:
     return "" if text.upper() in DFS_SUPPLEMENT_STATUS_TOKENS else text
 
 
+def _clean_dfs_supplement_text(value: object) -> str:
+    text = "" if pd.isna(value) else str(value or "").strip()
+    return "" if text.lower() in {"nan", "none", "null"} else text
+
+
 def _is_probably_headerless_supplement(columns: List[str]) -> bool:
     """Heuristic: detect feeds where the first data row was treated as headers."""
     if not columns:
@@ -14842,6 +14847,28 @@ def _build_dfs_supplement_player_lookup(players: List[Any]) -> Dict[str, Any]:
     }
 
 
+def _extract_dfs_supplement_normalized_names(
+    supplement_df: pd.DataFrame,
+    player_col: str,
+) -> Dict[str, str]:
+    if (
+        supplement_df is None
+        or supplement_df.empty
+        or not player_col
+        or player_col not in supplement_df.columns
+    ):
+        return {}
+
+    normalized_to_display: Dict[str, str] = {}
+    for value in supplement_df[player_col].tolist():
+        cleaned_name = _clean_dfs_supplement_player_name(value)
+        normalized_name = dfs.normalize_name(cleaned_name)
+        if not cleaned_name or not normalized_name:
+            continue
+        normalized_to_display.setdefault(normalized_name, cleaned_name)
+    return normalized_to_display
+
+
 def _load_dfs_global_player_name_lookup(conn: sqlite3.Connection) -> Dict[str, Any]:
     """Build a broad player-name master to classify unmatched supplement rows."""
     master_df = pd.DataFrame()
@@ -14955,8 +14982,14 @@ def _match_dfs_supplement_player(
     if not candidate_keys:
         candidate_keys = lookup["all_name_keys"]
 
+    fuzzy_cutoff = 0.90 if not normalized_team else 0.84
     for variant in variants:
-        fuzzy_matches = difflib.get_close_matches(variant, candidate_keys, n=1, cutoff=0.84)
+        fuzzy_matches = difflib.get_close_matches(
+            variant,
+            candidate_keys,
+            n=1,
+            cutoff=fuzzy_cutoff,
+        )
         if not fuzzy_matches:
             continue
         best_key = fuzzy_matches[0]
@@ -14995,7 +15028,11 @@ def _build_dfs_supplement_comparison(
         if not player_name:
             continue
 
-        team_value = str(row.get(team_col, "") or "").strip() if team_col else ""
+        team_value = (
+            _clean_dfs_supplement_text(row.get(team_col, ""))
+            if team_col else ""
+        )
+        display_team = _normalize_dfs_supplement_team(team_value) or team_value
         matched_player, match_method, match_score = _match_dfs_supplement_player(
             player_name,
             team_value,
@@ -15017,7 +15054,7 @@ def _build_dfs_supplement_comparison(
             unmatched_rows.append(
                 {
                     "Supplement Player": player_name,
-                    "Supplement Team": _normalize_dfs_supplement_team(team_value) or team_value,
+                    "Supplement Team": display_team,
                     "Projection": supp_proj,
                     "Ownership %": supp_own,
                 }
@@ -15030,7 +15067,7 @@ def _build_dfs_supplement_comparison(
             {
                 "Our Player ID": matched_player.get("player_id"),
                 "Supplement Player": player_name,
-                "Supplement Team": _normalize_dfs_supplement_team(team_value) or team_value,
+                "Supplement Team": display_team,
                 "Our Player": matched_player.get("name"),
                 "Our Team": matched_player.get("team"),
                 "Pos": matched_player.get("positions"),
@@ -15237,22 +15274,22 @@ def _build_dfs_supplement_overlap_diagnostics(
     if supplement_df is None or supplement_df.empty or not player_col:
         return {"supplement_name_count": 0, "active_name_count": 0, "exact_overlap_count": 0, "sample_overlap": []}
 
-    supplement_names = {
-        _clean_dfs_supplement_player_name(value)
-        for value in supplement_df.get(player_col, pd.Series(dtype=object)).tolist()
-    }
-    supplement_names.discard("")
-
+    supplement_name_lookup = _extract_dfs_supplement_normalized_names(
+        supplement_df,
+        player_col,
+    )
+    supplement_names = set(supplement_name_lookup.keys())
     active_name_lookup: Dict[str, str] = {}
     for player in players or []:
         cleaned_name = _clean_dfs_supplement_player_name(getattr(player, "name", "") or "")
-        if cleaned_name:
-            active_name_lookup[cleaned_name] = str(getattr(player, "name", "") or cleaned_name)
+        normalized_name = dfs.normalize_name(cleaned_name)
+        if normalized_name:
+            active_name_lookup[normalized_name] = str(
+                getattr(player, "name", "") or cleaned_name
+            )
 
     overlap_names = sorted(
-        active_name_lookup[name]
-        for name in supplement_names
-        if name in active_name_lookup
+        active_name_lookup[name] for name in supplement_names if name in active_name_lookup
     )
     return {
         "supplement_name_count": len(supplement_names),
@@ -15260,6 +15297,98 @@ def _build_dfs_supplement_overlap_diagnostics(
         "exact_overlap_count": len(overlap_names),
         "sample_overlap": overlap_names[:10],
     }
+
+
+def _build_dfs_supplement_candidate_slates_df(
+    conn: sqlite3.Connection,
+    supplement_df: pd.DataFrame,
+    player_col: str,
+    current_slate_date: str,
+    limit: int = 5,
+) -> pd.DataFrame:
+    normalized_name_lookup = _extract_dfs_supplement_normalized_names(
+        supplement_df,
+        player_col,
+    )
+    supplement_names = set(normalized_name_lookup.keys())
+    if not supplement_names:
+        return pd.DataFrame()
+
+    try:
+        slate_name_df = pd.read_sql_query(
+            """
+            WITH recent_slates AS (
+                SELECT DISTINCT slate_date
+                FROM dfs_slate_projections
+                WHERE slate_date IS NOT NULL
+                  AND trim(slate_date) != ''
+                ORDER BY date(slate_date) DESC
+                LIMIT 60
+            )
+            SELECT
+                p.slate_date,
+                p.player_name
+            FROM dfs_slate_projections p
+            JOIN recent_slates rs
+                ON rs.slate_date = p.slate_date
+            WHERE p.player_name IS NOT NULL
+              AND trim(p.player_name) != ''
+            """,
+            conn,
+        )
+    except Exception:
+        return pd.DataFrame()
+
+    if slate_name_df.empty:
+        return pd.DataFrame()
+
+    rows: List[Dict[str, Any]] = []
+    for slate_date, group_df in slate_name_df.groupby("slate_date", dropna=False):
+        slate_name_lookup: Dict[str, str] = {}
+        for value in group_df["player_name"].tolist():
+            cleaned_name = _clean_dfs_supplement_player_name(value)
+            normalized_name = dfs.normalize_name(cleaned_name)
+            if not cleaned_name or not normalized_name:
+                continue
+            slate_name_lookup.setdefault(normalized_name, cleaned_name)
+        overlap_names = sorted(supplement_names & set(slate_name_lookup.keys()))
+        overlap_count = int(len(overlap_names))
+        if overlap_count <= 0:
+            continue
+        rows.append(
+            {
+                "Slate Date": str(slate_date),
+                "Overlap": overlap_count,
+                "Match Rate %": round(
+                    100.0 * float(overlap_count) / float(max(len(supplement_names), 1)),
+                    1,
+                ),
+                "Current Slate": str(slate_date) == str(current_slate_date or ""),
+                "Sample Players": ", ".join(
+                    slate_name_lookup[name] for name in overlap_names[:6]
+                ),
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame()
+
+    candidate_df = pd.DataFrame(rows)
+    candidate_df = candidate_df.sort_values(
+        ["Overlap", "Slate Date"],
+        ascending=[False, False],
+    ).reset_index(drop=True)
+    if int(limit or 0) > 0:
+        current_rows = candidate_df[
+            candidate_df["Current Slate"].astype(bool)
+        ].copy()
+        top_rows = candidate_df.head(int(limit)).copy()
+        if not current_rows.empty and current_rows.iloc[0]["Slate Date"] not in set(
+            top_rows["Slate Date"].tolist()
+        ):
+            top_rows = pd.concat([current_rows, top_rows], ignore_index=True)
+        candidate_df = top_rows.drop_duplicates(subset=["Slate Date"]).reset_index(drop=True)
+    return candidate_df
 
 
 def _compute_dfs_supplement_run_key(
@@ -25478,6 +25607,13 @@ if selected_page == "DFS Lineup Builder":
                         st.session_state.get("dfs_projection_date")
                         or str(datetime.now(EASTERN_TZ).date())
                     )
+                    candidate_slates_df = _build_dfs_supplement_candidate_slates_df(
+                        dfs_conn,
+                        working_df,
+                        player_col,
+                        current_slate_date=str(slate_date),
+                        limit=5,
+                    )
                     source_filename = str(
                         supplement_source_filename
                         or (
@@ -25529,6 +25665,15 @@ if selected_page == "DFS Lineup Builder":
                             if sample_overlap:
                                 st.caption(
                                     "Example overlapping names: " + ", ".join(sample_overlap[:8])
+                                )
+                            if isinstance(candidate_slates_df, pd.DataFrame) and not candidate_slates_df.empty:
+                                st.caption(
+                                    "Best historical slate overlaps for this upload:"
+                                )
+                                st.dataframe(
+                                    candidate_slates_df,
+                                    use_container_width=True,
+                                    hide_index=True,
                                 )
 
                         metric_col5, metric_col6, metric_col7, metric_col8 = st.columns(4)
