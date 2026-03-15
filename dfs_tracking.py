@@ -1508,6 +1508,227 @@ def _normalized_entropy(counts: List[float]) -> Optional[float]:
     return entropy / max_entropy
 
 
+def _lineup_position_columns() -> List[str]:
+    """Return the DraftKings lineup slot columns used in contest-entry tables."""
+    return ['pg', 'sg', 'sf', 'pf', 'c', 'g', 'f', 'util']
+
+
+def _summarize_contest_projection_match(
+    entries_df: pd.DataFrame,
+    projection_name_keys: set[str],
+) -> Dict[str, Any]:
+    """Summarize how well a contest's sampled lineups match the saved slate pool."""
+    pos_cols = _lineup_position_columns()
+    if not isinstance(entries_df, pd.DataFrame) or entries_df.empty:
+        return {
+            'sample_lineups': 0,
+            'matched_slots': 0,
+            'total_slots': 0,
+            'slot_match_pct': None,
+            'resolved_lineups': 0,
+            'resolved_lineup_pct': None,
+            'unique_players': 0,
+            'matched_unique_players': 0,
+            'unique_player_match_pct': None,
+            'unmatched_player_sample': [],
+        }
+
+    total_slots = 0
+    matched_slots = 0
+    resolved_lineups = 0
+    unique_counts: Counter[str] = Counter()
+    display_lookup: Dict[str, str] = {}
+    has_projection_pool = bool(projection_name_keys)
+
+    for _, row in entries_df.iterrows():
+        raw_players = []
+        match_flags: List[bool] = []
+        for col in pos_cols:
+            player_name = str(row.get(col) or '').strip()
+            if not player_name or player_name.lower() == 'nan':
+                continue
+            norm_name = _normalize_name(player_name)
+            if not norm_name:
+                continue
+            raw_players.append(norm_name)
+            total_slots += 1
+            unique_counts[norm_name] += 1
+            display_lookup.setdefault(norm_name, player_name)
+            matched = norm_name in projection_name_keys if has_projection_pool else False
+            if matched:
+                matched_slots += 1
+            match_flags.append(bool(matched))
+
+        if raw_players and len(raw_players) == len(pos_cols) and all(match_flags):
+            resolved_lineups += 1
+
+    unique_player_count = len(unique_counts)
+    matched_unique_players = sum(1 for name_key in unique_counts if name_key in projection_name_keys)
+    unmatched_player_sample = [
+        display_lookup.get(name_key, name_key)
+        for name_key, _ in unique_counts.most_common()
+        if name_key not in projection_name_keys
+    ][:10]
+
+    return {
+        'sample_lineups': int(len(entries_df)),
+        'matched_slots': int(matched_slots),
+        'total_slots': int(total_slots),
+        'slot_match_pct': (
+            100.0 * float(matched_slots) / float(max(1, total_slots))
+            if has_projection_pool and total_slots > 0
+            else None
+        ),
+        'resolved_lineups': int(resolved_lineups),
+        'resolved_lineup_pct': (
+            100.0 * float(resolved_lineups) / float(max(1, len(entries_df)))
+            if has_projection_pool and len(entries_df) > 0
+            else None
+        ),
+        'unique_players': int(unique_player_count),
+        'matched_unique_players': int(matched_unique_players),
+        'unique_player_match_pct': (
+            100.0 * float(matched_unique_players) / float(max(1, unique_player_count))
+            if has_projection_pool and unique_player_count > 0
+            else None
+        ),
+        'unmatched_player_sample': unmatched_player_sample,
+    }
+
+
+def _resolve_postmortem_contest(
+    conn: sqlite3.Connection,
+    slate_date: str,
+    top_n: int,
+    projection_name_keys: set[str],
+    contest_field_size_target: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Select the best contest import for a slate before building a postmortem."""
+    contest_rows = conn.execute(
+        """
+        WITH contest_ids AS (
+            SELECT DISTINCT contest_id
+            FROM dfs_contest_entries
+            WHERE slate_date = ?
+            UNION
+            SELECT DISTINCT contest_id
+            FROM dfs_contest_meta
+            WHERE slate_date = ?
+        )
+        SELECT
+            c.contest_id,
+            m.total_entries,
+            m.unique_users,
+            m.top_score,
+            m.import_date
+        FROM contest_ids c
+        LEFT JOIN dfs_contest_meta m
+            ON m.contest_id = c.contest_id
+        ORDER BY COALESCE(m.import_date, '') DESC, c.contest_id ASC
+        """,
+        (slate_date, slate_date),
+    ).fetchall()
+
+    if not contest_rows:
+        return {}
+
+    sample_n = max(25, min(100, max(1, int(top_n))))
+    candidate_rows: List[Dict[str, Any]] = []
+    for row in contest_rows:
+        contest_id = str(row[0] or '').strip()
+        if not contest_id:
+            continue
+
+        ranked_row = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM dfs_contest_entries
+            WHERE slate_date = ? AND contest_id = ? AND rank IS NOT NULL
+            """,
+            (slate_date, contest_id),
+        ).fetchone()
+        ranked_entries = int(ranked_row[0]) if ranked_row else 0
+        if ranked_entries <= 0:
+            continue
+
+        sample_df = pd.read_sql_query(
+            """
+            SELECT rank, points, pg, sg, sf, pf, c, g, f, util
+            FROM dfs_contest_entries
+            WHERE slate_date = ? AND contest_id = ? AND rank IS NOT NULL
+            ORDER BY rank ASC
+            LIMIT ?
+            """,
+            conn,
+            params=[slate_date, contest_id, min(ranked_entries, sample_n)],
+        )
+        match_summary = _summarize_contest_projection_match(sample_df, projection_name_keys)
+        total_entries = (
+            int(row[1])
+            if len(row) > 1 and row[1] is not None and pd.notna(row[1])
+            else None
+        )
+        field_gap = (
+            abs(int(total_entries) - int(contest_field_size_target))
+            if total_entries is not None and contest_field_size_target is not None
+            else None
+        )
+        candidate_rows.append({
+            'contest_id': contest_id,
+            'ranked_entries': ranked_entries,
+            'total_entries': total_entries,
+            'unique_users': (
+                int(row[2])
+                if len(row) > 2 and row[2] is not None and pd.notna(row[2])
+                else None
+            ),
+            'top_score': (
+                float(row[3])
+                if len(row) > 3 and row[3] is not None and pd.notna(row[3])
+                else None
+            ),
+            'import_date': str(row[4] or ''),
+            'contest_field_gap': field_gap,
+            **match_summary,
+        })
+
+    if not candidate_rows:
+        return {}
+
+    candidates_df = pd.DataFrame(candidate_rows)
+    has_projection_pool = bool(projection_name_keys)
+    for col in ['resolved_lineup_pct', 'slot_match_pct', 'unique_player_match_pct']:
+        candidates_df[col] = pd.to_numeric(candidates_df[col], errors='coerce')
+    candidates_df['contest_field_gap_sort'] = pd.to_numeric(
+        candidates_df['contest_field_gap'],
+        errors='coerce',
+    ).fillna(np.inf)
+    candidates_df['import_date_sort'] = pd.to_datetime(
+        candidates_df['import_date'],
+        errors='coerce',
+    ).fillna(pd.Timestamp("1970-01-01"))
+
+    sort_cols: List[str] = []
+    ascending: List[bool] = []
+    if has_projection_pool:
+        sort_cols.extend(['resolved_lineup_pct', 'slot_match_pct', 'unique_player_match_pct'])
+        ascending.extend([False, False, False])
+    if contest_field_size_target is not None:
+        sort_cols.append('contest_field_gap_sort')
+        ascending.append(True)
+    sort_cols.extend(['ranked_entries', 'import_date_sort', 'contest_id'])
+    ascending.extend([False, False, True])
+
+    selected_row = candidates_df.sort_values(sort_cols, ascending=ascending).iloc[0].to_dict()
+    selected_row['contest_count'] = int(len(candidate_rows))
+    selected_row['contest_field_size_target'] = (
+        int(contest_field_size_target)
+        if contest_field_size_target is not None
+        else None
+    )
+    return selected_row
+
+
 def get_opponent_contest_history(conn: sqlite3.Connection) -> pd.DataFrame:
     """Get list of imported contests with metadata."""
     return pd.read_sql_query(
@@ -2083,13 +2304,60 @@ def build_tournament_postmortem(
     }
 
     try:
+        projection_name_rows = conn.execute(
+            """
+            SELECT DISTINCT player_name
+            FROM dfs_slate_projections
+            WHERE slate_date = ?
+              AND player_name IS NOT NULL
+              AND TRIM(player_name) != ''
+            """,
+            (slate_date,),
+        ).fetchall()
+        projection_name_keys = {
+            _normalize_name(str(row[0] or ''))
+            for row in projection_name_rows
+            if str(row[0] or '').strip()
+        }
+        contest_field_size_row = conn.execute(
+            """
+            SELECT contest_field_size, COUNT(*) AS lineup_count
+            FROM dfs_slate_lineups
+            WHERE slate_date = ?
+              AND contest_field_size IS NOT NULL
+              AND contest_field_size > 0
+            GROUP BY contest_field_size
+            ORDER BY lineup_count DESC, contest_field_size ASC
+            LIMIT 1
+            """,
+            (slate_date,),
+        ).fetchone()
+        contest_field_size_target = (
+            int(contest_field_size_row[0])
+            if contest_field_size_row
+            and contest_field_size_row[0] is not None
+            and pd.notna(contest_field_size_row[0])
+            else None
+        )
+        contest_resolution = _resolve_postmortem_contest(
+            conn,
+            slate_date,
+            top_n=top_n,
+            projection_name_keys=projection_name_keys,
+            contest_field_size_target=contest_field_size_target,
+        )
+        selected_contest_id = str(contest_resolution.get('contest_id') or '').strip()
+        if not selected_contest_id:
+            result['errors'].append("No contest standings found for this slate.")
+            return result
+
         total_field_lineups_row = conn.execute(
             """
             SELECT COUNT(*)
             FROM dfs_contest_entries
-            WHERE slate_date = ? AND rank IS NOT NULL
+            WHERE slate_date = ? AND contest_id = ? AND rank IS NOT NULL
             """,
-            (slate_date,),
+            (slate_date, selected_contest_id),
         ).fetchone()
         total_field_lineups = int(total_field_lineups_row[0]) if total_field_lineups_row else 0
         if total_field_lineups <= 0:
@@ -2103,12 +2371,12 @@ def build_tournament_postmortem(
             """
             SELECT rank, points, username, total_salary, pg, sg, sf, pf, c, g, f, util
             FROM dfs_contest_entries
-            WHERE slate_date = ? AND rank IS NOT NULL
+            WHERE slate_date = ? AND contest_id = ? AND rank IS NOT NULL
             ORDER BY rank ASC
             LIMIT ?
             """,
             conn,
-            params=[slate_date, top_n],
+            params=[slate_date, selected_contest_id, top_n],
         )
         if top_entries_df.empty:
             result['errors'].append("No contest standings found for this slate.")
@@ -2117,7 +2385,7 @@ def build_tournament_postmortem(
         field_lineups = int(len(top_entries_df))
         top_entries_df = top_entries_df.reset_index(drop=True).copy()
         top_entries_df['field_lineup_num'] = np.arange(1, field_lineups + 1)
-        pos_cols = ['pg', 'sg', 'sf', 'pf', 'c', 'g', 'f', 'util']
+        pos_cols = _lineup_position_columns()
         field_long = top_entries_df[['field_lineup_num'] + pos_cols].melt(
             id_vars=['field_lineup_num'],
             var_name='slot',
@@ -2871,15 +3139,31 @@ def build_tournament_postmortem(
         # 5) Score and accuracy metrics
         winner_row = conn.execute(
             """
-            SELECT top_score
-            FROM dfs_contest_meta
-            WHERE slate_date = ?
-            ORDER BY import_date DESC
-            LIMIT 1
+            SELECT MAX(points)
+            FROM dfs_contest_entries
+            WHERE slate_date = ? AND contest_id = ? AND rank IS NOT NULL
             """,
-            (slate_date,),
+            (slate_date, selected_contest_id),
         ).fetchone()
         winner_score = float(winner_row[0]) if winner_row and pd.notna(winner_row[0]) else None
+        meta_winner_row = conn.execute(
+            """
+            SELECT top_score
+            FROM dfs_contest_meta
+            WHERE contest_id = ?
+            LIMIT 1
+            """,
+            (selected_contest_id,),
+        ).fetchone()
+        contest_meta_top_score = (
+            float(meta_winner_row[0])
+            if meta_winner_row and pd.notna(meta_winner_row[0])
+            else None
+        )
+        winner_score_source = 'contest_entries'
+        if winner_score is None and contest_meta_top_score is not None:
+            winner_score = contest_meta_top_score
+            winner_score_source = 'contest_meta'
 
         our_scores = pd.to_numeric(our_lineups_df.get('total_actual_fpts'), errors='coerce').dropna()
         our_best_score = float(our_scores.max()) if not our_scores.empty else None
@@ -3803,7 +4087,57 @@ def build_tournament_postmortem(
             'field_lineups_available': total_field_lineups,
             'field_sample_pct': field_sample_pct,
             'our_lineups': our_lineups,
+            'selected_contest_id': selected_contest_id,
+            'selected_contest_count': int(contest_resolution.get('contest_count') or 0),
+            'selected_contest_total_entries': (
+                int(contest_resolution.get('total_entries'))
+                if contest_resolution.get('total_entries') is not None
+                and pd.notna(contest_resolution.get('total_entries'))
+                else None
+            ),
+            'selected_contest_unique_users': (
+                int(contest_resolution.get('unique_users'))
+                if contest_resolution.get('unique_users') is not None
+                and pd.notna(contest_resolution.get('unique_users'))
+                else None
+            ),
+            'selected_contest_import_date': str(contest_resolution.get('import_date') or ''),
+            'selected_contest_slot_match_pct': (
+                float(contest_resolution.get('slot_match_pct'))
+                if contest_resolution.get('slot_match_pct') is not None
+                and pd.notna(contest_resolution.get('slot_match_pct'))
+                else None
+            ),
+            'selected_contest_resolved_lineup_pct': (
+                float(contest_resolution.get('resolved_lineup_pct'))
+                if contest_resolution.get('resolved_lineup_pct') is not None
+                and pd.notna(contest_resolution.get('resolved_lineup_pct'))
+                else None
+            ),
+            'selected_contest_unique_player_match_pct': (
+                float(contest_resolution.get('unique_player_match_pct'))
+                if contest_resolution.get('unique_player_match_pct') is not None
+                and pd.notna(contest_resolution.get('unique_player_match_pct'))
+                else None
+            ),
+            'selected_contest_field_size_target': (
+                int(contest_resolution.get('contest_field_size_target'))
+                if contest_resolution.get('contest_field_size_target') is not None
+                and pd.notna(contest_resolution.get('contest_field_size_target'))
+                else None
+            ),
+            'selected_contest_field_size_gap': (
+                int(contest_resolution.get('contest_field_gap'))
+                if contest_resolution.get('contest_field_gap') is not None
+                and pd.notna(contest_resolution.get('contest_field_gap'))
+                else None
+            ),
+            'selected_contest_unmatched_player_sample': list(
+                contest_resolution.get('unmatched_player_sample') or []
+            ),
             'winner_score': winner_score,
+            'winner_score_source': winner_score_source,
+            'contest_meta_top_score': contest_meta_top_score,
             'our_best_score': our_best_score,
             'winner_gap': winner_gap,
             'our_avg_score': our_avg_score,
@@ -3891,6 +4225,21 @@ def build_tournament_postmortem(
                 wrong_notes.append(f"Winner gap was {winner_gap:.1f} DK points.")
         else:
             wrong_notes.append("Winner gap is unavailable (missing winner score or lineup actuals).")
+
+        selected_slot_match_pct = pd.to_numeric(
+            contest_resolution.get('slot_match_pct'),
+            errors='coerce',
+        )
+        selected_unmatched_players = list(contest_resolution.get('unmatched_player_sample') or [])
+        if pd.notna(selected_slot_match_pct) and float(selected_slot_match_pct) < 95.0:
+            sample_text = ", ".join(selected_unmatched_players[:4])
+            note = (
+                f"Selected contest `{selected_contest_id}` only matched "
+                f"{float(selected_slot_match_pct):.1f}% of sampled lineup slots to the saved slate pool."
+            )
+            if sample_text:
+                note += f" Unmatched sample: {sample_text}."
+            wrong_notes.append(note)
 
         if proj_mae is not None:
             if proj_mae <= 10:
