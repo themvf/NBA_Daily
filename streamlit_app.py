@@ -21654,7 +21654,7 @@ if selected_page == "DFS Lineup Builder":
 
                         metrics_payload = pm_payload.get("metrics") or {}
                         pm_export_payload = {
-                            "schema_version": "dfs_tournament_postmortem_v4",
+                            "schema_version": "dfs_tournament_postmortem_v5",
                             "generated_at": datetime.now(EASTERN_TZ).isoformat(),
                             "context": {
                                 "slate_date": selected_postmortem_slate,
@@ -21695,6 +21695,9 @@ if selected_page == "DFS Lineup Builder":
                                 ),
                                 "ownership_context": _df_records_safe(
                                     pm_payload.get("ownership_context_df")
+                                ),
+                                "source_vs_actual_ownership": _df_records_safe(
+                                    pm_payload.get("source_vs_actual_ownership_df")
                                 ),
                                 "missed_core": _df_records_safe(pm_payload.get("missed_core_df")),
                                 "missed_standouts": _df_records_safe(
@@ -21744,6 +21747,9 @@ if selected_page == "DFS Lineup Builder":
                                 ),
                                 "selection_reason_snapshot": _df_records_safe(
                                     pm_payload.get("selection_reason_snapshot_df")
+                                ),
+                                "player_exclusion_attribution": _df_records_safe(
+                                    pm_payload.get("player_exclusion_attribution_df")
                                 ),
                                 "improvements": _df_records_safe(
                                     pm_payload.get("improvements_df")
@@ -23524,6 +23530,78 @@ if selected_page == "DFS Lineup Builder":
                                             )
                                         st.dataframe(reason_view.head(60), use_container_width=True, hide_index=True)
 
+                                exclusion_attribution_df = pm_payload.get('player_exclusion_attribution_df')
+                                if (
+                                    isinstance(exclusion_attribution_df, pd.DataFrame)
+                                    and not exclusion_attribution_df.empty
+                                ):
+                                    st.markdown("**Player Exclusion Attribution**")
+                                    ea_m1, ea_m2, ea_m3 = st.columns(3)
+                                    ea_m1.metric(
+                                        "Missed-Core Ownership Gates",
+                                        int(pm_metrics.get('missed_core_ownership_blocker_count') or 0),
+                                    )
+                                    ea_m2.metric(
+                                        "Teacher Misses",
+                                        int(pm_metrics.get('missed_core_teacher_signal_miss_count') or 0),
+                                    )
+                                    ea_m3.metric(
+                                        "Rows Exported",
+                                        int(len(exclusion_attribution_df)),
+                                    )
+                                    exclusion_view = exclusion_attribution_df[
+                                        [
+                                            'Name',
+                                            'Team',
+                                            'Salary',
+                                            'field_exposure_pct',
+                                            'our_exposure_pct',
+                                            'Own %',
+                                            'supplement_own_pct',
+                                            'actual_ownership',
+                                            'Selection Path',
+                                            'primary_blocker',
+                                            'blocker_family',
+                                            'ownership_teacher_status',
+                                            'attribution_label',
+                                            'signal_tags',
+                                        ]
+                                    ].copy()
+                                    exclusion_view.columns = [
+                                        'Player',
+                                        'Team',
+                                        'Salary',
+                                        'Top-N Field Exp %',
+                                        'Our Exp %',
+                                        'Proj Own%',
+                                        'Source Own%',
+                                        'Actual Own%',
+                                        'Selection Path',
+                                        'Primary Blocker',
+                                        'Blocker Family',
+                                        'Teacher Status',
+                                        'Attribution',
+                                        'Signals',
+                                    ]
+                                    exclusion_view['Salary'] = exclusion_view['Salary'].apply(
+                                        lambda x: f"${int(x):,}" if pd.notna(x) else "—"
+                                    )
+                                    for c in [
+                                        'Top-N Field Exp %',
+                                        'Our Exp %',
+                                        'Proj Own%',
+                                        'Source Own%',
+                                        'Actual Own%',
+                                    ]:
+                                        exclusion_view[c] = exclusion_view[c].apply(
+                                            lambda x: f"{x:.1f}%" if pd.notna(x) else "—"
+                                        )
+                                    st.dataframe(
+                                        exclusion_view.head(60),
+                                        use_container_width=True,
+                                        hide_index=True,
+                                    )
+
                             exp_df = pm_payload.get('top_field_players_df')
                             if isinstance(exp_df, pd.DataFrame) and not exp_df.empty:
                                 st.markdown("**Top-N Field vs Our Exposure**")
@@ -23623,6 +23701,69 @@ if selected_page == "DFS Lineup Builder":
                                     )
                                 st.dataframe(
                                     ownership_context_view.head(40),
+                                    use_container_width=True,
+                                    hide_index=True,
+                                )
+
+                            source_vs_actual_df = pm_payload.get('source_vs_actual_ownership_df')
+                            if (
+                                isinstance(source_vs_actual_df, pd.DataFrame)
+                                and not source_vs_actual_df.empty
+                            ):
+                                st.markdown("**Ownership Source vs Actual**")
+                                own_m1, own_m2, own_m3 = st.columns(3)
+                                own_m1.metric(
+                                    "Source Beat Us",
+                                    int(pm_metrics.get('source_ownership_beats_our_count') or 0),
+                                )
+                                own_m2.metric(
+                                    "We Beat Source",
+                                    int(pm_metrics.get('our_ownership_beats_source_count') or 0),
+                                )
+                                own_m3.metric(
+                                    "Source Rows",
+                                    int(pm_metrics.get('source_ownership_rows_with_supplement') or 0),
+                                )
+                                source_view = source_vs_actual_df[
+                                    [
+                                        'display_name',
+                                        'field_exposure_pct',
+                                        'actual_ownership',
+                                        'ownership_proj',
+                                        'supplement_own_pct',
+                                        'our_abs_error_pp',
+                                        'supplement_abs_error_pp',
+                                        'supplement_edge_pp',
+                                        'ownership_source_winner',
+                                        'ownership_miss_context',
+                                    ]
+                                ].copy()
+                                source_view.columns = [
+                                    'Player',
+                                    'Top-N Field Exp %',
+                                    'Actual Own%',
+                                    'Proj Own%',
+                                    'Source Own%',
+                                    'Our Abs Error',
+                                    'Source Abs Error',
+                                    'Source Edge (pp)',
+                                    'Winner',
+                                    'Miss Context',
+                                ]
+                                for c in ['Top-N Field Exp %', 'Actual Own%', 'Proj Own%', 'Source Own%']:
+                                    source_view[c] = source_view[c].apply(
+                                        lambda x: f"{x:.1f}%" if pd.notna(x) else "—"
+                                    )
+                                for c in ['Our Abs Error', 'Source Abs Error']:
+                                    source_view[c] = source_view[c].apply(
+                                        lambda x: f"{x:.1f}" if pd.notna(x) else "—"
+                                    )
+                                for c in ['Source Edge (pp)']:
+                                    source_view[c] = source_view[c].apply(
+                                        lambda x: f"{x:+.1f}" if pd.notna(x) else "—"
+                                    )
+                                st.dataframe(
+                                    source_view.head(50),
                                     use_container_width=True,
                                     hide_index=True,
                                 )

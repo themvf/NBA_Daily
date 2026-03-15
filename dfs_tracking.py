@@ -2283,6 +2283,8 @@ def build_tournament_postmortem(
         'missed_core_df': pd.DataFrame(),
         'missed_standouts_df': pd.DataFrame(),
         'ownership_polarity_df': pd.DataFrame(),
+        'source_vs_actual_ownership_df': pd.DataFrame(),
+        'player_exclusion_attribution_df': pd.DataFrame(),
         'overexposed_duds_df': pd.DataFrame(),
         'value_tier_misses_df': pd.DataFrame(),
         'combo_capture_misses_df': pd.DataFrame(),
@@ -3337,6 +3339,8 @@ def build_tournament_postmortem(
         cheap_core_combo_coverage_df = pd.DataFrame()
         cheap_core_model_coverage_df = pd.DataFrame()
         selection_reason_snapshot_df = pd.DataFrame()
+        source_vs_actual_ownership_df = pd.DataFrame()
+        player_exclusion_attribution_df = pd.DataFrame()
         cheap_core_candidate_keys: set[str] = set()
         cheap_core_field_lineup_share = None
         cheap_core_our_lineup_share = None
@@ -3799,6 +3803,393 @@ def build_tournament_postmortem(
                             ascending=[False, False, False],
                         ).reset_index(drop=True)
 
+        supplement_compare_df = pd.DataFrame(
+            columns=[
+                'player_id',
+                'supplement_player',
+                'supplement_team',
+                'supplement_own_pct',
+                'own_delta_pp',
+                'match_method',
+                'match_score',
+            ]
+        )
+        if not supplement_player_deltas_df.empty:
+            supplement_compare_df = supplement_player_deltas_df[
+                [
+                    'player_id',
+                    'supplement_player',
+                    'supplement_team',
+                    'supplement_own_pct',
+                    'own_delta_pp',
+                    'match_method',
+                    'match_score',
+                ]
+            ].copy()
+            supplement_compare_df['player_id'] = pd.to_numeric(
+                supplement_compare_df.get('player_id'),
+                errors='coerce',
+            ).astype('Int64')
+            supplement_compare_df = supplement_compare_df.drop_duplicates(subset=['player_id'])
+
+        def _split_blockers(value: Any) -> List[str]:
+            text = str(value or '').strip()
+            if not text:
+                return []
+            return [part.strip() for part in text.split(';') if part.strip()]
+
+        def _blocker_family(blocker_text: Any) -> str:
+            blocker = str(blocker_text or '').strip().lower()
+            if not blocker:
+                return 'none'
+            if 'own' in blocker or 'low-own' in blocker:
+                return 'ownership'
+            if 'proj' in blocker:
+                return 'projection'
+            if blocker.startswith('segment cap'):
+                return 'exposure_cap'
+            if blocker.startswith('risk'):
+                return 'risk'
+            return 'other'
+
+        def _ownership_source_winner(row: pd.Series) -> str:
+            our_abs = pd.to_numeric(row.get('our_abs_error_pp'), errors='coerce')
+            source_abs = pd.to_numeric(row.get('supplement_abs_error_pp'), errors='coerce')
+            if pd.isna(our_abs) and pd.isna(source_abs):
+                return 'no-signal'
+            if pd.isna(source_abs):
+                return 'ours-only'
+            if pd.isna(our_abs):
+                return 'supplement-only'
+            if abs(float(our_abs) - float(source_abs)) <= 0.5:
+                return 'tie'
+            return 'supplement' if float(source_abs) < float(our_abs) else 'ours'
+
+        def _ownership_miss_context(row: pd.Series) -> str:
+            our_error = pd.to_numeric(row.get('our_error_pp'), errors='coerce')
+            source_error = pd.to_numeric(row.get('supplement_error_pp'), errors='coerce')
+            tags: List[str] = []
+            if pd.notna(our_error):
+                if float(our_error) <= -8.0:
+                    tags.append('ours-undercalled')
+                elif float(our_error) >= 8.0:
+                    tags.append('ours-overcalled')
+            if pd.notna(source_error):
+                if float(source_error) <= -8.0:
+                    tags.append('source-undercalled')
+                elif float(source_error) >= 8.0:
+                    tags.append('source-overcalled')
+            return ', '.join(tags) if tags else 'aligned'
+
+        if not top_field_players_df.empty:
+            source_compare_df = top_field_players_df.copy()
+            source_compare_df['player_id'] = pd.to_numeric(
+                source_compare_df.get('player_id'),
+                errors='coerce',
+            ).astype('Int64')
+            if not supplement_compare_df.empty:
+                source_compare_df = source_compare_df.merge(
+                    supplement_compare_df,
+                    on='player_id',
+                    how='left',
+                )
+            for col in [
+                'salary',
+                'field_exposure_pct',
+                'our_exposure_pct',
+                'ownership_proj',
+                'actual_ownership',
+                'supplement_own_pct',
+                'match_score',
+            ]:
+                source_compare_df[col] = pd.to_numeric(
+                    source_compare_df.get(col),
+                    errors='coerce',
+                )
+            for col, default_value in [('match_method', ''), ('source_name', '')]:
+                if col not in source_compare_df.columns:
+                    source_compare_df[col] = default_value
+            source_compare_df = source_compare_df.dropna(subset=['actual_ownership']).copy()
+            if not source_compare_df.empty:
+                source_compare_df['our_error_pp'] = (
+                    source_compare_df['ownership_proj'] - source_compare_df['actual_ownership']
+                )
+                source_compare_df['our_abs_error_pp'] = source_compare_df['our_error_pp'].abs()
+                source_compare_df['supplement_error_pp'] = (
+                    source_compare_df['supplement_own_pct'] - source_compare_df['actual_ownership']
+                )
+                source_compare_df['supplement_abs_error_pp'] = (
+                    source_compare_df['supplement_error_pp'].abs()
+                )
+                source_compare_df['topn_vs_actual_own_pp'] = (
+                    source_compare_df['field_exposure_pct'] - source_compare_df['actual_ownership']
+                )
+                source_compare_df['our_vs_source_own_pp'] = (
+                    source_compare_df['ownership_proj'] - source_compare_df['supplement_own_pct']
+                )
+                source_compare_df['supplement_edge_pp'] = (
+                    source_compare_df['our_abs_error_pp']
+                    - source_compare_df['supplement_abs_error_pp']
+                )
+                source_compare_df['ownership_source_winner'] = source_compare_df.apply(
+                    _ownership_source_winner,
+                    axis=1,
+                )
+                source_compare_df['ownership_miss_context'] = source_compare_df.apply(
+                    _ownership_miss_context,
+                    axis=1,
+                )
+                source_compare_df['source_name'] = str(supplement_source_name or '')
+                source_vs_actual_ownership_df = source_compare_df[
+                    [
+                        'display_name',
+                        'team',
+                        'salary',
+                        'field_exposure_pct',
+                        'our_exposure_pct',
+                        'actual_ownership',
+                        'ownership_proj',
+                        'supplement_own_pct',
+                        'topn_vs_actual_own_pp',
+                        'our_error_pp',
+                        'supplement_error_pp',
+                        'our_abs_error_pp',
+                        'supplement_abs_error_pp',
+                        'supplement_edge_pp',
+                        'ownership_source_winner',
+                        'ownership_miss_context',
+                        'match_method',
+                        'match_score',
+                        'source_name',
+                    ]
+                ].copy().sort_values(
+                    ['actual_ownership', 'field_exposure_pct', 'supplement_edge_pp'],
+                    ascending=[False, False, False],
+                ).reset_index(drop=True)
+
+        def _ownership_teacher_status(row: pd.Series) -> str:
+            our_error = pd.to_numeric(row.get('our_own_error_pp'), errors='coerce')
+            source_error = pd.to_numeric(row.get('supplement_own_error_pp'), errors='coerce')
+            if pd.isna(our_error) and pd.isna(source_error):
+                return 'no-ownership-data'
+            if pd.isna(source_error):
+                if pd.notna(our_error) and float(our_error) <= -8.0:
+                    return 'our-undercall'
+                if pd.notna(our_error) and float(our_error) >= 8.0:
+                    return 'our-overcall'
+                return 'our-only'
+            if pd.isna(our_error):
+                if float(source_error) <= -8.0:
+                    return 'supplement-undercall'
+                if float(source_error) >= 8.0:
+                    return 'supplement-overcall'
+                return 'supplement-only'
+            if float(our_error) <= -8.0 and float(source_error) <= -8.0:
+                return 'both-undercall'
+            if float(our_error) >= 8.0 and float(source_error) >= 8.0:
+                return 'both-overcall'
+            if float(our_error) <= -8.0:
+                return 'our-undercall'
+            if float(source_error) <= -8.0:
+                return 'supplement-undercall'
+            if float(our_error) >= 8.0:
+                return 'our-overcall'
+            if float(source_error) >= 8.0:
+                return 'supplement-overcall'
+            return 'mixed'
+
+        def _exclusion_attribution_label(row: pd.Series) -> str:
+            blocker_family = str(row.get('blocker_family') or 'none')
+            teacher_status = str(row.get('ownership_teacher_status') or '')
+            if bool(row.get('is_missed_core')):
+                if blocker_family == 'ownership':
+                    if teacher_status == 'both-undercall':
+                        return 'ownership gate + teacher miss'
+                    if teacher_status == 'our-undercall':
+                        return 'ownership gate + model miss'
+                    if teacher_status == 'supplement-undercall':
+                        return 'ownership gate + source miss'
+                    return 'ownership gate'
+                if blocker_family == 'projection':
+                    return 'projection gate'
+                if blocker_family == 'exposure_cap':
+                    return 'portfolio cap'
+                if blocker_family == 'risk':
+                    return 'risk penalty'
+                return 'portfolio underweight'
+            if blocker_family == 'ownership':
+                return 'ownership review'
+            if blocker_family == 'projection':
+                return 'projection review'
+            return 'informational'
+
+        if not selection_reason_snapshot_df.empty:
+            exclusion_df = selection_reason_snapshot_df.copy()
+            exclusion_df['player_id'] = pd.to_numeric(
+                exclusion_df.get('player_id'),
+                errors='coerce',
+            ).astype('Int64')
+            if not supplement_compare_df.empty:
+                exclusion_df = exclusion_df.merge(
+                    supplement_compare_df[
+                        [
+                            'player_id',
+                            'supplement_player',
+                            'supplement_team',
+                            'supplement_own_pct',
+                            'match_method',
+                            'match_score',
+                        ]
+                    ],
+                    on='player_id',
+                    how='left',
+                    suffixes=('', '_supp'),
+                )
+                if 'supplement_own_pct_supp' in exclusion_df.columns:
+                    exclusion_df['supplement_own_pct'] = pd.to_numeric(
+                        exclusion_df.get('supplement_own_pct'),
+                        errors='coerce',
+                    ).where(
+                        pd.to_numeric(exclusion_df.get('supplement_own_pct'), errors='coerce').notna(),
+                        pd.to_numeric(exclusion_df.get('supplement_own_pct_supp'), errors='coerce'),
+                    )
+                    exclusion_df = exclusion_df.drop(columns=['supplement_own_pct_supp'])
+                for extra_col in ['match_method', 'match_score']:
+                    supp_col = f'{extra_col}_supp'
+                    if supp_col in exclusion_df.columns:
+                        exclusion_df[extra_col] = exclusion_df.get(extra_col).where(
+                            exclusion_df.get(extra_col).notna(),
+                            exclusion_df.get(supp_col),
+                        )
+                        exclusion_df = exclusion_df.drop(columns=[supp_col])
+            for col, default_value in [('match_method', ''), ('supplement_own_pct', np.nan), ('match_score', np.nan)]:
+                if col not in exclusion_df.columns:
+                    exclusion_df[col] = default_value
+            for col in [
+                'Salary',
+                'Own %',
+                'supplement_own_pct',
+                'field_exposure_pct',
+                'our_exposure_pct',
+                'actual_ownership',
+                'actual_minus_proj',
+                'match_score',
+            ]:
+                exclusion_df[col] = pd.to_numeric(exclusion_df.get(col), errors='coerce')
+            exclusion_df['is_missed_core'] = exclusion_df['name_key'].astype(str).isin(missed_core_keys)
+            exclusion_df['is_field_core'] = exclusion_df['name_key'].astype(str).isin(core_signal_keys)
+            exclusion_df['primary_blocker'] = exclusion_df['Likely Blocker'].map(
+                lambda value: _split_blockers(value)[0] if _split_blockers(value) else ''
+            )
+            exclusion_df['blocker_count'] = exclusion_df['Likely Blocker'].map(
+                lambda value: len(_split_blockers(value))
+            )
+            exclusion_df['blocker_family'] = exclusion_df['primary_blocker'].map(_blocker_family)
+            exclusion_df['our_own_error_pp'] = exclusion_df['Own %'] - exclusion_df['actual_ownership']
+            exclusion_df['supplement_own_error_pp'] = (
+                exclusion_df['supplement_own_pct'] - exclusion_df['actual_ownership']
+            )
+            exclusion_df['ownership_teacher_status'] = exclusion_df.apply(
+                _ownership_teacher_status,
+                axis=1,
+            )
+            exclusion_df['attribution_label'] = exclusion_df.apply(
+                _exclusion_attribution_label,
+                axis=1,
+            )
+            exclusion_df = exclusion_df[
+                exclusion_df['is_missed_core']
+                | exclusion_df['is_field_core']
+                | (
+                    pd.to_numeric(exclusion_df['field_exposure_pct'], errors='coerce').fillna(0.0)
+                    >= 10.0
+                )
+            ].copy()
+            if not exclusion_df.empty:
+                player_exclusion_attribution_df = exclusion_df[
+                    [
+                        'Name',
+                        'Team',
+                        'Salary',
+                        'Own %',
+                        'supplement_own_pct',
+                        'actual_ownership',
+                        'field_exposure_pct',
+                        'our_exposure_pct',
+                        'Selection Path',
+                        'Likely Blocker',
+                        'primary_blocker',
+                        'blocker_family',
+                        'blocker_count',
+                        'ownership_teacher_status',
+                        'attribution_label',
+                        'Cheap Core',
+                        'Cheap Core Score',
+                        'signal_tags',
+                        'actual_minus_proj',
+                        'is_field_core',
+                        'is_missed_core',
+                        'match_method',
+                        'match_score',
+                    ]
+                ].copy().sort_values(
+                    ['is_missed_core', 'field_exposure_pct', 'Cheap Core Score', 'actual_minus_proj'],
+                    ascending=[False, False, False, False],
+                ).reset_index(drop=True)
+
+        source_ownership_rows = int(len(source_vs_actual_ownership_df))
+        source_ownership_rows_with_supplement = (
+            int(
+                pd.to_numeric(
+                    source_vs_actual_ownership_df.get('supplement_own_pct'),
+                    errors='coerce',
+                ).notna().sum()
+            )
+            if not source_vs_actual_ownership_df.empty
+            else 0
+        )
+        source_ownership_beats_our_count = (
+            int((source_vs_actual_ownership_df['ownership_source_winner'] == 'supplement').sum())
+            if not source_vs_actual_ownership_df.empty
+            else 0
+        )
+        our_ownership_beats_source_count = (
+            int((source_vs_actual_ownership_df['ownership_source_winner'] == 'ours').sum())
+            if not source_vs_actual_ownership_df.empty
+            else 0
+        )
+        ownership_source_tie_count = (
+            int((source_vs_actual_ownership_df['ownership_source_winner'] == 'tie').sum())
+            if not source_vs_actual_ownership_df.empty
+            else 0
+        )
+        missed_core_ownership_blocker_count = (
+            int(
+                (
+                    player_exclusion_attribution_df['is_missed_core'].astype(bool)
+                    & (
+                        player_exclusion_attribution_df['blocker_family'].astype(str)
+                        == 'ownership'
+                    )
+                ).sum()
+            )
+            if not player_exclusion_attribution_df.empty
+            else 0
+        )
+        missed_core_teacher_signal_miss_count = (
+            int(
+                (
+                    player_exclusion_attribution_df['is_missed_core'].astype(bool)
+                    & (
+                        player_exclusion_attribution_df['ownership_teacher_status'].astype(str)
+                        == 'both-undercall'
+                    )
+                ).sum()
+            )
+            if not player_exclusion_attribution_df.empty
+            else 0
+        )
+
         field_overlap = _pairwise_overlap_summary(field_lineup_name_sets)
         our_overlap = _pairwise_overlap_summary(lineup_name_sets)
         field_entropy = _normalized_entropy(
@@ -4200,7 +4591,14 @@ def build_tournament_postmortem(
             'ownership_rank_corr': ownership_rank_corr,
             'topn_vs_actual_ownership_mae': topn_vs_actual_ownership_mae,
             'our_vs_actual_ownership_gap_mae': our_vs_actual_ownership_gap_mae,
+            'source_ownership_rows': source_ownership_rows,
+            'source_ownership_rows_with_supplement': source_ownership_rows_with_supplement,
+            'source_ownership_beats_our_count': source_ownership_beats_our_count,
+            'our_ownership_beats_source_count': our_ownership_beats_source_count,
+            'ownership_source_tie_count': ownership_source_tie_count,
             'missed_core_count': int(len(missed_core_df)),
+            'missed_core_ownership_blocker_count': missed_core_ownership_blocker_count,
+            'missed_core_teacher_signal_miss_count': missed_core_teacher_signal_miss_count,
             'missed_standout_count': int(len(missed_standouts_df)),
             'ownership_polarity_count': ownership_polarity_count,
             'underprojected_chalk_count': underprojected_chalk_count,
@@ -4315,12 +4713,35 @@ def build_tournament_postmortem(
             else:
                 wrong_notes.append(f"Ownership MAE was elevated at {ownership_mae:.2f}%.")
 
+        if source_ownership_rows_with_supplement > 0:
+            if source_ownership_beats_our_count > our_ownership_beats_source_count:
+                wrong_notes.append(
+                    "Latest supplement ownership beat our live ownership on "
+                    f"{source_ownership_beats_our_count} top-field players vs "
+                    f"{our_ownership_beats_source_count} where we beat it."
+                )
+            elif our_ownership_beats_source_count > source_ownership_beats_our_count:
+                right_notes.append(
+                    "Live ownership beat the latest supplement on "
+                    f"{our_ownership_beats_source_count} top-field players."
+                )
+
         if len(missed_core_df) == 0:
             right_notes.append("No major underexposure on core top-N field plays.")
         else:
             wrong_notes.append(
                 f"Missed {len(missed_core_df)} core top-N field plays (top-N field exp >= {core_field_exposure_pct:.0f}% with underexposure)."
             )
+            if missed_core_ownership_blocker_count > 0:
+                wrong_notes.append(
+                    "Ownership gating was the primary blocker on "
+                    f"{missed_core_ownership_blocker_count} missed-core plays."
+                )
+            if missed_core_teacher_signal_miss_count > 0:
+                wrong_notes.append(
+                    "Both our model and the latest supplement undercalled "
+                    f"{missed_core_teacher_signal_miss_count} missed-core plays."
+                )
 
         if len(missed_standouts_df) > 0:
             wrong_notes.append(
@@ -4665,6 +5086,10 @@ def build_tournament_postmortem(
         result['missed_core_df'] = missed_core_df.reset_index(drop=True)
         result['missed_standouts_df'] = missed_standouts_df.reset_index(drop=True)
         result['ownership_polarity_df'] = ownership_polarity_df.reset_index(drop=True)
+        result['source_vs_actual_ownership_df'] = source_vs_actual_ownership_df.reset_index(drop=True)
+        result['player_exclusion_attribution_df'] = (
+            player_exclusion_attribution_df.reset_index(drop=True)
+        )
         result['overexposed_duds_df'] = overexposed_duds_df.reset_index(drop=True)
         result['value_tier_misses_df'] = value_tier_misses_df.reset_index(drop=True)
         result['combo_capture_misses_df'] = combo_capture_misses_df.reset_index(drop=True)

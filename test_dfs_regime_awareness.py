@@ -451,3 +451,189 @@ def test_postmortem_excludes_unresolved_topn_lineups_from_exposure_analysis() ->
         "Excluded 1 unresolved top-2 field lineup" in note
         for note in payload["wrong_notes"]
     )
+
+
+def test_postmortem_exports_source_vs_actual_and_exclusion_attribution() -> None:
+    conn = sqlite3.connect(":memory:")
+    create_dfs_tracking_tables(conn)
+
+    slate_date = "2026-03-11"
+    players = [
+        _make_player(1, "Alpha Guard", "AAA", "BBB", "AAA_BBB", ["PG"], 7000, 38.0, 18.0),
+        _make_player(2, "Bravo Wing", "AAA", "BBB", "AAA_BBB", ["SG"], 6800, 36.0, 16.0),
+        _make_player(3, "Charlie Forward", "CCC", "DDD", "CCC_DDD", ["SF"], 6400, 34.0, 14.0),
+        _make_player(4, "Delta Big", "CCC", "DDD", "CCC_DDD", ["PF"], 6200, 32.0, 12.0),
+        _make_player(5, "Echo Center", "EEE", "FFF", "EEE_FFF", ["C"], 7600, 40.0, 20.0),
+        _make_player(6, "Foxtrot Guard", "EEE", "FFF", "EEE_FFF", ["PG", "SG"], 5600, 29.0, 9.0),
+        _make_player(7, "Golf Forward", "GGG", "HHH", "GGG_HHH", ["SF", "PF"], 5400, 28.0, 8.0),
+        _make_player(8, "Hotel Core", "GGG", "HHH", "GGG_HHH", ["SG", "SF"], 4800, 25.0, 8.0),
+        _make_player(9, "Indigo Pivot", "III", "JJJ", "III_JJJ", ["SG", "SF"], 4900, 24.0, 18.0),
+    ]
+    save_slate_projections(conn, slate_date, players)
+
+    actual_ownership = {
+        1: 19.0,
+        2: 17.0,
+        3: 15.0,
+        4: 13.0,
+        5: 21.0,
+        6: 10.0,
+        7: 9.0,
+        8: 35.0,
+        9: 5.0,
+    }
+    actual_fpts = {
+        1: 39.0,
+        2: 36.5,
+        3: 34.5,
+        4: 33.0,
+        5: 41.0,
+        6: 29.5,
+        7: 28.5,
+        8: 31.0,
+        9: 18.0,
+    }
+    for player in players:
+        conn.execute(
+            """
+            UPDATE dfs_slate_projections
+            SET actual_fpts = ?, actual_ownership = ?, did_play = 1
+            WHERE slate_date = ? AND player_id = ?
+            """,
+            (
+                actual_fpts[player.player_id],
+                actual_ownership[player.player_id],
+                slate_date,
+                player.player_id,
+            ),
+        )
+
+    lineup = DFSLineup(
+        players={
+            "PG": players[0],
+            "SG": players[1],
+            "SF": players[2],
+            "PF": players[3],
+            "C": players[4],
+            "G": players[5],
+            "F": players[6],
+            "UTIL": players[8],
+        },
+        model_key="standard_v1",
+        model_label="Standard v1",
+        generation_strategy="projection",
+        regime_key="small_slate__medium_field",
+        regime_label="Small Slate + Mid-Field / 20-max",
+        regime_notes="test",
+        regime_hint="auto",
+        contest_field_size=1800,
+    )
+    save_slate_lineups(conn, slate_date, [lineup])
+    conn.execute(
+        """
+        UPDATE dfs_slate_lineups
+        SET total_actual_fpts = ?
+        WHERE slate_date = ? AND lineup_num = 1
+        """,
+        (268.0, slate_date),
+    )
+
+    _insert_contest_entry(
+        conn,
+        contest_id="contest-attribution",
+        slate_date=slate_date,
+        username="top_user",
+        rank=1,
+        points=300.0,
+        players=[
+            players[0].name,
+            players[1].name,
+            players[2].name,
+            players[3].name,
+            players[4].name,
+            players[5].name,
+            players[6].name,
+            players[7].name,
+        ],
+        total_salary=55400,
+    )
+    conn.execute(
+        """
+        INSERT INTO dfs_contest_meta (contest_id, slate_date, total_entries, unique_users, top_score)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        ("contest-attribution", slate_date, 1800, 1, 300.0),
+    )
+    conn.execute(
+        """
+        INSERT INTO dfs_supplement_runs (
+            run_key, slate_date, source_name, source_filename, ownership_col,
+            rows_total, rows_matched, rows_unmatched, match_rate, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "supp-run-1",
+            slate_date,
+            "RotoWire",
+            "rotowire.csv",
+            "ownership",
+            1,
+            1,
+            0,
+            100.0,
+            "2026-03-11T23:30:00",
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO dfs_supplement_player_deltas (
+            run_key, slate_date, player_id, supplement_player, supplement_team,
+            our_player, our_team, pos, salary, match_method, match_score,
+            our_proj_fpts, supplement_proj_fpts, proj_delta, our_own_pct,
+            supplement_own_pct, own_delta_pp, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "supp-run-1",
+            slate_date,
+            8,
+            "Hotel Core",
+            "GGG",
+            "Hotel Core",
+            "GGG",
+            "SG/SF",
+            4800,
+            "player_id",
+            1.0,
+            25.0,
+            27.0,
+            2.0,
+            8.0,
+            12.0,
+            4.0,
+            "2026-03-11T23:30:00",
+        ),
+    )
+    conn.commit()
+
+    payload = build_tournament_postmortem(conn, slate_date, top_n=1)
+
+    assert not payload["errors"]
+    source_df = payload["source_vs_actual_ownership_df"]
+    exclusion_df = payload["player_exclusion_attribution_df"]
+
+    assert not source_df.empty
+    hotel_source = source_df.loc[source_df["display_name"] == "Hotel Core"].iloc[0]
+    assert hotel_source["supplement_own_pct"] == 12.0
+    assert hotel_source["ownership_source_winner"] == "supplement"
+    assert hotel_source["ownership_miss_context"] == "ours-undercalled, source-undercalled"
+
+    assert not exclusion_df.empty
+    hotel_exclusion = exclusion_df.loc[exclusion_df["Name"] == "Hotel Core"].iloc[0]
+    assert bool(hotel_exclusion["is_missed_core"]) is True
+    assert hotel_exclusion["primary_blocker"] == "core own low"
+    assert hotel_exclusion["ownership_teacher_status"] == "both-undercall"
+    assert hotel_exclusion["attribution_label"] == "ownership gate + teacher miss"
+    assert payload["metrics"]["source_ownership_beats_our_count"] == 1
+    assert payload["metrics"]["missed_core_ownership_blocker_count"] == 1
+    assert payload["metrics"]["missed_core_teacher_signal_miss_count"] == 1
