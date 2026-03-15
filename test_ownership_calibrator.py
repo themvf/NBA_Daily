@@ -603,3 +603,210 @@ def test_build_live_supplement_frame_preserves_multiple_raw_sources() -> None:
     assert row["ls_own_pct"] == 16.0
     assert row["rw_proj_fpts"] == 30.0
     assert row["ls_proj_fpts"] == 31.0
+
+
+def test_run_walkforward_ownership_benchmark_returns_summary_tables() -> None:
+    conn = sqlite3.connect(":memory:")
+    _create_minimal_tables(conn)
+
+    slates = [
+        "2026-02-20",
+        "2026-02-22",
+        "2026-02-24",
+        "2026-02-26",
+        "2026-02-28",
+    ]
+    positions = ["PG", "SG", "SF", "PF", "C"]
+
+    for slate in slates:
+        conn.execute(
+            """
+            INSERT INTO dfs_contest_entries (contest_id, slate_date, username)
+            VALUES (?, ?, ?)
+            """,
+            (f"contest-{slate}", slate, "tester"),
+        )
+        conn.execute(
+            """
+            INSERT INTO dfs_supplement_runs (run_key, slate_date, source_name, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (f"rw-{slate}", slate, "RotoWire NBA Optimizer", f"{slate}T11:00:00"),
+        )
+        conn.execute(
+            """
+            INSERT INTO dfs_supplement_runs (run_key, slate_date, source_name, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (f"ls-{slate}", slate, "LineupStarter CSV", f"{slate}T11:05:00"),
+        )
+
+    player_id = 300
+    for slate_idx, slate in enumerate(slates):
+        for idx in range(12):
+            salary = 3400 + (idx * 420)
+            proj_fpts = 18.0 + idx + (slate_idx * 0.7)
+            proj_floor = proj_fpts - 6.0
+            proj_ceiling = proj_fpts + 9.0
+            fpts_per_dollar = (proj_fpts / salary) * 1000.0
+            our_own = max(
+                1.0,
+                min(
+                    42.0,
+                    2.5 + proj_fpts * 0.26 - max(0.0, salary - 7000) / 950.0,
+                ),
+            )
+            value_boost = 7.0 if salary <= 5200 else -2.5
+            team_boost = 1.8 if idx % 4 == 0 else -0.6
+            rw_own = max(0.0, min(55.0, our_own + value_boost + team_boost))
+            ls_own = max(0.0, min(55.0, our_own + (value_boost * 0.75) + 0.8))
+            actual_own = max(
+                0.0,
+                min(
+                    65.0,
+                    (our_own * 0.18)
+                    + (rw_own * 0.52)
+                    + (ls_own * 0.30)
+                    + (1.1 if idx % 5 == 0 else -0.4),
+                ),
+            )
+
+            conn.execute(
+                """
+                INSERT INTO dfs_slate_projections (
+                    slate_date, player_id, player_name, team, opponent, salary, positions,
+                    proj_fpts, proj_floor, proj_ceiling, fpts_per_dollar, ownership_proj,
+                    actual_ownership, actual_fpts, actual_minutes, did_play
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    slate,
+                    player_id,
+                    f"Player {player_id}",
+                    f"T{idx % 6}",
+                    f"O{idx % 6}",
+                    salary,
+                    positions[idx % len(positions)],
+                    proj_fpts,
+                    proj_floor,
+                    proj_ceiling,
+                    fpts_per_dollar,
+                    our_own,
+                    actual_own,
+                    proj_fpts + 1.5,
+                    24.0 + (idx % 7),
+                    1,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO predictions (
+                    prediction_date, game_date, player_id, projected_ppg, proj_confidence,
+                    season_avg_ppg, recent_avg_3, recent_avg_5, dfs_score, proj_minutes,
+                    l5_minutes_avg, minutes_confidence, role_change, p_top1, p_top3,
+                    sim_sigma, role_tier, vegas_implied_fpts, vegas_vs_proj_diff,
+                    injury_adjusted, opponent_injury_detected, opponent_def_rating,
+                    opponent_pace, analytics_used, last_refreshed_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    slate,
+                    slate,
+                    player_id,
+                    proj_fpts * 0.57,
+                    0.55 + ((idx % 4) * 0.07),
+                    proj_fpts * 0.5,
+                    proj_fpts * 0.54,
+                    proj_fpts * 0.58,
+                    proj_fpts * 1.1,
+                    26.0 + (idx % 5),
+                    25.0 + (idx % 4),
+                    0.62 + ((idx % 3) * 0.08),
+                    float(idx % 2),
+                    0.01 * (idx % 4),
+                    0.04 * ((idx % 5) + 1),
+                    6.0 + (idx % 3),
+                    "STARTER" if idx < 8 else "ROTATION",
+                    proj_fpts + 1.2,
+                    1.2,
+                    float(idx % 4 == 0),
+                    float(idx % 3 == 0),
+                    111.0 + (idx % 4),
+                    99.0 + (idx % 3),
+                    "PACE|INJ" if idx % 3 == 0 else "DEF",
+                    f"{slate}T12:00:00",
+                    f"{slate}T12:00:00",
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO dfs_supplement_player_deltas (
+                    run_key, slate_date, player_id, supplement_proj_fpts, supplement_own_pct,
+                    proj_delta, own_delta_pp, match_score
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"rw-{slate}",
+                    slate,
+                    player_id,
+                    proj_fpts + 0.9,
+                    rw_own,
+                    0.9,
+                    rw_own - our_own,
+                    99.0,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO dfs_supplement_player_deltas (
+                    run_key, slate_date, player_id, supplement_proj_fpts, supplement_own_pct,
+                    proj_delta, own_delta_pp, match_score
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"ls-{slate}",
+                    slate,
+                    player_id,
+                    proj_fpts + 0.4,
+                    ls_own,
+                    0.4,
+                    ls_own - our_own,
+                    97.0,
+                ),
+            )
+            player_id += 1
+    conn.commit()
+
+    result = oc.run_walkforward_ownership_benchmark(
+        conn,
+        min_train_rows=24,
+        min_test_rows=10,
+    )
+
+    assert "error" not in result
+    summary = result["summary"]
+    summary_df = result["summary_df"]
+    per_slate_df = result["per_slate_df"]
+    skipped_df = result["skipped_slates_df"]
+
+    assert summary["benchmarked_slates"] == 3
+    assert summary["prediction_rows"] == 36
+    assert set(summary_df["model_key"]) == {
+        "raw_our",
+        "source_consensus",
+        "base_model",
+        "final_model",
+    }
+    assert list(per_slate_df["slate_date"]) == ["2026-02-24", "2026-02-26", "2026-02-28"]
+    assert skipped_df["reason"].tolist() == [
+        "insufficient_train_rows",
+        "insufficient_train_rows",
+    ]
+
+    raw_mae = float(
+        summary_df.loc[summary_df["model_key"] == "raw_our", "mae"].iloc[0]
+    )
+    final_mae = float(
+        summary_df.loc[summary_df["model_key"] == "final_model", "mae"].iloc[0]
+    )
+    assert final_mae < raw_mae

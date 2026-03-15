@@ -132,6 +132,12 @@ SOURCE_CATEGORICAL_FEATURES: Tuple[str, ...] = (
     "primary_position",
     "role_tier",
 )
+BENCHMARK_MODEL_SPECS: Tuple[Tuple[str, str, str, bool], ...] = (
+    ("raw_our", "Raw Our", "our_ownership_proj", False),
+    ("source_consensus", "Source Consensus", "supplement_own_consensus", True),
+    ("base_model", "Base Model", "base_ownership_pred", False),
+    ("final_model", "Final Model", "final_ownership_pred", False),
+)
 
 
 @dataclass
@@ -1015,6 +1021,11 @@ def _metrics_from_predictions(y_true: Sequence[float], y_pred: Sequence[float]) 
             "rmse": None,
             "bias": None,
             "correlation": None,
+            "rank_correlation": None,
+            "top10_capture_pct": None,
+            "top20_capture_pct": None,
+            "top10_overlap_pct": None,
+            "top20_overlap_pct": None,
         }
     actual_arr = actual[mask].to_numpy(dtype=float)
     pred_arr = pred[mask].to_numpy(dtype=float)
@@ -1022,13 +1033,70 @@ def _metrics_from_predictions(y_true: Sequence[float], y_pred: Sequence[float]) 
     corr = None
     if len(actual_arr) >= 2 and np.unique(actual_arr).size > 1 and np.unique(pred_arr).size > 1:
         corr = float(np.corrcoef(actual_arr, pred_arr)[0, 1])
+    rank_corr = None
+    if len(actual_arr) >= 2 and np.unique(actual_arr).size > 1 and np.unique(pred_arr).size > 1:
+        rank_corr = float(
+            pd.Series(actual_arr).corr(pd.Series(pred_arr), method="spearman")
+        )
+    actual_series = pd.Series(actual_arr)
+    pred_series = pd.Series(pred_arr)
     return {
         "rows": int(mask.sum()),
         "mae": float(np.mean(np.abs(err))),
         "rmse": float(np.sqrt(np.mean(np.square(err)))),
         "bias": float(np.mean(err)),
         "correlation": corr,
+        "rank_correlation": rank_corr,
+        "top10_capture_pct": _top_k_capture_pct(actual_series, pred_series, 10),
+        "top20_capture_pct": _top_k_capture_pct(actual_series, pred_series, 20),
+        "top10_overlap_pct": _top_k_overlap_pct(actual_series, pred_series, 10),
+        "top20_overlap_pct": _top_k_overlap_pct(actual_series, pred_series, 20),
     }
+
+
+def _top_k_capture_pct(
+    actual: pd.Series,
+    pred: pd.Series,
+    top_k: int,
+) -> Optional[float]:
+    mask = actual.notna() & pred.notna()
+    if int(mask.sum()) == 0:
+        return None
+    actual = pd.to_numeric(actual.loc[mask], errors="coerce")
+    pred = pd.to_numeric(pred.loc[mask], errors="coerce")
+    row_count = int(len(actual))
+    if row_count == 0:
+        return None
+    k = min(max(int(top_k), 1), row_count)
+    actual_top = actual.nlargest(k)
+    pred_top = pred.nlargest(k)
+    denom = float(actual.loc[actual_top.index].sum())
+    if denom <= 0.0:
+        return None
+    numer = float(actual.loc[pred_top.index].sum())
+    return 100.0 * numer / denom
+
+
+def _top_k_overlap_pct(
+    actual: pd.Series,
+    pred: pd.Series,
+    top_k: int,
+) -> Optional[float]:
+    mask = actual.notna() & pred.notna()
+    if int(mask.sum()) == 0:
+        return None
+    actual = pd.to_numeric(actual.loc[mask], errors="coerce")
+    pred = pd.to_numeric(pred.loc[mask], errors="coerce")
+    row_count = int(len(actual))
+    if row_count == 0:
+        return None
+    k = min(max(int(top_k), 1), row_count)
+    actual_idx = set(actual.nlargest(k).index.tolist())
+    pred_idx = set(pred.nlargest(k).index.tolist())
+    if not actual_idx:
+        return None
+    overlap = len(actual_idx & pred_idx)
+    return 100.0 * float(overlap) / float(k)
 
 
 def _coefficient_summary(model: Optional[Pipeline], top_n: int = 20) -> List[Dict[str, Any]]:
@@ -1096,6 +1164,293 @@ def _filter_live_features(
         if col in df.columns and df[col].fillna("").astype(str).ne("").any()
     ]
     return numeric_live, categorical_live
+
+
+def _predict_with_model_bundle(
+    feature_df: pd.DataFrame,
+    model_bundle: Dict[str, Any],
+) -> pd.DataFrame:
+    """Score a feature frame with a previously trained ownership model bundle."""
+    if feature_df is None or feature_df.empty:
+        return pd.DataFrame()
+
+    scored_df = feature_df.copy()
+    base_columns = list(model_bundle.get("base_columns") or [])
+    source_columns = list(model_bundle.get("source_columns") or [])
+    for col in base_columns + source_columns:
+        if col in scored_df.columns:
+            continue
+        if col in BASE_CATEGORICAL_FEATURES or col in SOURCE_CATEGORICAL_FEATURES:
+            scored_df[col] = ""
+        else:
+            scored_df[col] = np.nan
+
+    base_model = model_bundle["base_model"]
+    base_pred = np.clip(base_model.predict(scored_df[base_columns]), 0.0, 100.0)
+
+    source_model = model_bundle.get("source_model")
+    source_adjustment = np.zeros(len(scored_df), dtype=float)
+    if source_model is not None and source_columns:
+        source_active = scored_df["supplement_source_count"].gt(0).astype(float).to_numpy()
+        raw_adjustment = source_model.predict(scored_df[source_columns])
+        source_adjustment = (
+            raw_adjustment
+            * float(model_bundle.get("source_adjustment_weight") or 0.0)
+            * source_active
+        )
+
+    final_pred = np.clip(base_pred + source_adjustment, 0.0, 100.0)
+    prediction_df = scored_df.copy()
+    prediction_df["base_ownership_pred"] = base_pred
+    prediction_df["source_adjustment"] = source_adjustment
+    prediction_df["final_ownership_pred"] = final_pred
+    prediction_df["calibration_delta"] = (
+        prediction_df["final_ownership_pred"] - prediction_df["our_ownership_proj"]
+    )
+    return prediction_df
+
+
+def _slate_size_bucket(game_count: object) -> str:
+    game_count_value = pd.to_numeric(pd.Series([game_count]), errors="coerce").iloc[0]
+    if pd.isna(game_count_value):
+        return "Unknown"
+    if float(game_count_value) <= 4.0:
+        return "Small"
+    if float(game_count_value) <= 8.0:
+        return "Medium"
+    return "Large"
+
+
+def _build_benchmark_metrics_rows(
+    prediction_df: pd.DataFrame,
+    *,
+    extra_fields: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    if prediction_df is None or prediction_df.empty:
+        return rows
+
+    actual_col = "target_actual_ownership"
+    for model_key, model_label, pred_col, require_sources in BENCHMARK_MODEL_SPECS:
+        scoped_df = prediction_df.copy()
+        if require_sources:
+            scoped_df = scoped_df[scoped_df["supplement_source_count"].gt(0)].copy()
+        metrics = _metrics_from_predictions(scoped_df[actual_col], scoped_df[pred_col])
+        row = {
+            "model_key": model_key,
+            "model_label": model_label,
+            "prediction_column": pred_col,
+            "source_required": bool(require_sources),
+            "slates": int(scoped_df["slate_date"].nunique()) if "slate_date" in scoped_df.columns else 0,
+        }
+        row.update(metrics)
+        if extra_fields:
+            row.update(extra_fields)
+        rows.append(row)
+    return rows
+
+
+def _rows_to_sorted_frame(rows: List[Dict[str, Any]], sort_col: str) -> pd.DataFrame:
+    df = pd.DataFrame(rows)
+    if df.empty or sort_col not in df.columns:
+        return df.reset_index(drop=True)
+    return df.sort_values(sort_col).reset_index(drop=True)
+
+
+def run_walkforward_ownership_benchmark(
+    conn: sqlite3.Connection,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    *,
+    min_train_rows: int = 100,
+    min_test_rows: int = 10,
+    max_slates: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Benchmark the ownership calibrator by walking forward across historical slates."""
+
+    full_df = build_ownership_training_dataset(conn, start_date=start_date, end_date=end_date)
+    if full_df.empty:
+        return {"error": "No historical ownership rows were available for benchmarking."}
+
+    full_df = full_df.dropna(subset=["target_actual_ownership"]).copy()
+    if full_df.empty:
+        return {"error": "No historical ownership rows with actuals were available."}
+
+    unique_dates = sorted(full_df["slate_date"].dropna().astype(str).unique().tolist())
+    if len(unique_dates) < 2:
+        return {"error": "Walk-forward benchmarking requires at least two distinct slate dates."}
+    evaluation_dates = list(unique_dates)
+    if max_slates is not None and int(max_slates) > 0:
+        evaluation_dates = evaluation_dates[-int(max_slates):]
+
+    per_slate_rows: List[Dict[str, Any]] = []
+    prediction_frames: List[pd.DataFrame] = []
+    skipped_rows: List[Dict[str, Any]] = []
+
+    for slate_date in evaluation_dates:
+        train_df = full_df[full_df["slate_date"].astype(str) < str(slate_date)].copy()
+        test_df = full_df[full_df["slate_date"].astype(str) == str(slate_date)].copy()
+        if len(test_df) < int(min_test_rows):
+            skipped_rows.append(
+                {
+                    "slate_date": str(slate_date),
+                    "reason": "insufficient_test_rows",
+                    "train_rows": int(len(train_df)),
+                    "test_rows": int(len(test_df)),
+                }
+            )
+            continue
+        if len(train_df) < int(min_train_rows):
+            skipped_rows.append(
+                {
+                    "slate_date": str(slate_date),
+                    "reason": "insufficient_train_rows",
+                    "train_rows": int(len(train_df)),
+                    "test_rows": int(len(test_df)),
+                }
+            )
+            continue
+
+        model_bundle = _train_ownership_calibration_models(train_df, holdout_slates=0)
+        if model_bundle.get("error"):
+            skipped_rows.append(
+                {
+                    "slate_date": str(slate_date),
+                    "reason": str(model_bundle.get("error")),
+                    "train_rows": int(len(train_df)),
+                    "test_rows": int(len(test_df)),
+                }
+            )
+            continue
+
+        scored_df = _predict_with_model_bundle(test_df, model_bundle)
+        scored_df["slate_size_bucket"] = scored_df["slate_game_count"].map(_slate_size_bucket)
+        prediction_frames.append(scored_df)
+
+        slate_row: Dict[str, Any] = {
+            "slate_date": str(slate_date),
+            "train_rows": int(len(train_df)),
+            "test_rows": int(len(scored_df)),
+            "source_rows_test": int(scored_df["supplement_source_count"].gt(0).sum()),
+            "source_coverage_pct": 100.0
+            * float(scored_df["supplement_source_count"].gt(0).mean() or 0.0),
+            "slate_game_count": float(
+                pd.to_numeric(scored_df["slate_game_count"], errors="coerce")
+                .dropna()
+                .median()
+                if "slate_game_count" in scored_df.columns
+                else np.nan
+            ),
+            "slate_size_bucket": _slate_size_bucket(
+                pd.to_numeric(scored_df["slate_game_count"], errors="coerce")
+                .dropna()
+                .median()
+                if "slate_game_count" in scored_df.columns
+                else np.nan
+            ),
+            "base_model_backend": str(model_bundle.get("base_backend") or ""),
+            "source_model_backend": str(model_bundle.get("source_backend") or ""),
+        }
+        for metric_row in _build_benchmark_metrics_rows(scored_df):
+            prefix = str(metric_row["model_key"])
+            for metric_key in (
+                "rows",
+                "mae",
+                "rmse",
+                "bias",
+                "correlation",
+                "rank_correlation",
+                "top10_capture_pct",
+                "top20_capture_pct",
+                "top10_overlap_pct",
+                "top20_overlap_pct",
+            ):
+                slate_row[f"{prefix}_{metric_key}"] = metric_row.get(metric_key)
+        raw_mae = slate_row.get("raw_our_mae")
+        final_mae = slate_row.get("final_model_mae")
+        source_mae = slate_row.get("source_consensus_mae")
+        slate_row["final_vs_raw_mae_improvement"] = (
+            float(raw_mae) - float(final_mae)
+            if raw_mae is not None and final_mae is not None
+            else None
+        )
+        slate_row["final_vs_source_mae_improvement"] = (
+            float(source_mae) - float(final_mae)
+            if source_mae is not None and final_mae is not None
+            else None
+        )
+        per_slate_rows.append(slate_row)
+
+    if not prediction_frames:
+        skipped_df = _rows_to_sorted_frame(skipped_rows, "slate_date")
+        return {
+            "error": "No benchmarkable slates met the walk-forward minimums.",
+            "skipped_slates_df": skipped_df,
+            "summary": {
+                "total_candidate_slates": int(len(evaluation_dates)),
+                "benchmarked_slates": 0,
+                "skipped_slates": int(len(skipped_df)),
+                "min_train_rows": int(min_train_rows),
+                "min_test_rows": int(min_test_rows),
+            },
+        }
+
+    prediction_df = pd.concat(prediction_frames, ignore_index=True)
+    per_slate_df = _rows_to_sorted_frame(per_slate_rows, "slate_date")
+    skipped_df = _rows_to_sorted_frame(skipped_rows, "slate_date")
+    model_order = {
+        model_key: idx for idx, (model_key, _, _, _) in enumerate(BENCHMARK_MODEL_SPECS)
+    }
+
+    summary_df = pd.DataFrame(_build_benchmark_metrics_rows(prediction_df))
+    if not summary_df.empty:
+        summary_df["model_order"] = summary_df["model_key"].map(model_order).fillna(999)
+        summary_df["benchmarked_slates"] = int(per_slate_df["slate_date"].nunique())
+        summary_df = (
+            summary_df.sort_values(["model_order", "model_key"])
+            .drop(columns=["model_order"])
+            .reset_index(drop=True)
+        )
+
+    regime_rows: List[Dict[str, Any]] = []
+    for bucket, bucket_df in prediction_df.groupby("slate_size_bucket", dropna=False):
+        regime_rows.extend(
+            _build_benchmark_metrics_rows(
+                bucket_df,
+                extra_fields={
+                    "slate_size_bucket": str(bucket),
+                },
+            )
+        )
+    regime_summary_df = pd.DataFrame(regime_rows)
+    if not regime_summary_df.empty:
+        regime_summary_df["model_order"] = (
+            regime_summary_df["model_key"].map(model_order).fillna(999)
+        )
+        regime_summary_df = (
+            regime_summary_df.sort_values(
+                ["slate_size_bucket", "model_order", "model_key"]
+            )
+            .drop(columns=["model_order"])
+            .reset_index(drop=True)
+        )
+
+    return {
+        "summary": {
+            "total_candidate_slates": int(len(evaluation_dates)),
+            "benchmarked_slates": int(per_slate_df["slate_date"].nunique()),
+            "skipped_slates": int(len(skipped_df)),
+            "min_train_rows": int(min_train_rows),
+            "min_test_rows": int(min_test_rows),
+            "max_slates": int(max_slates) if max_slates is not None else None,
+            "prediction_rows": int(len(prediction_df)),
+        },
+        "summary_df": summary_df,
+        "per_slate_df": per_slate_df,
+        "regime_summary_df": regime_summary_df,
+        "prediction_df": prediction_df,
+        "skipped_slates_df": skipped_df,
+    }
 
 
 def _train_ownership_calibration_models(
@@ -1580,39 +1935,23 @@ def apply_live_ownership_calibration(
         stats["reason"] = "empty_live_frame"
         return stats
 
-    base_columns = list(model_bundle["base_columns"])
-    source_columns = list(model_bundle["source_columns"])
-    for col in base_columns + source_columns:
-        if col in live_df.columns:
-            continue
-        if col in BASE_CATEGORICAL_FEATURES or col in SOURCE_CATEGORICAL_FEATURES:
-            live_df[col] = ""
-        else:
-            live_df[col] = np.nan
-
-    base_model = model_bundle["base_model"]
-    base_pred = np.clip(base_model.predict(live_df[base_columns]), 0.0, 100.0)
-
-    source_model = model_bundle["source_model"]
-    source_adjustment = np.zeros(len(live_df), dtype=float)
-    if source_model is not None and source_columns:
-        source_active = live_df["supplement_source_count"].gt(0).astype(float).to_numpy()
-        raw_adjustment = source_model.predict(live_df[source_columns])
-        source_adjustment = (
-            raw_adjustment
-            * float(model_bundle["source_adjustment_weight"])
-            * source_active
-        )
-
-    final_pred = np.clip(base_pred + source_adjustment, 0.0, 100.0)
-    prediction_df = live_df[
-        ["player_id", "our_ownership_proj", "supplement_source_count"]
+    scored_live_df = _predict_with_model_bundle(live_df, model_bundle)
+    prediction_df = scored_live_df[
+        [
+            "player_id",
+            "our_ownership_proj",
+            "supplement_source_count",
+            "base_ownership_pred",
+            "source_adjustment",
+            "final_ownership_pred",
+            "calibration_delta",
+        ]
     ].copy()
-    prediction_df["base_pred"] = base_pred
-    prediction_df["source_adjustment"] = source_adjustment
-    prediction_df["calibrated_ownership"] = final_pred
-    prediction_df["calibration_delta"] = (
-        prediction_df["calibrated_ownership"] - prediction_df["our_ownership_proj"]
+    prediction_df = prediction_df.rename(
+        columns={
+            "base_ownership_pred": "base_pred",
+            "final_ownership_pred": "calibrated_ownership",
+        }
     )
     prediction_map = {
         int(row["player_id"]): row for row in prediction_df.to_dict("records")

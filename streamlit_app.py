@@ -21090,6 +21090,295 @@ if selected_page == "DFS Lineup Builder":
                 if pending_dates:
                     st.info(f"📋 **{len(pending_dates)} slate(s)** pending actuals update: {', '.join(pending_dates[:5])}{'...' if len(pending_dates) > 5 else ''}")
 
+                st.divider()
+                with st.expander("Ownership Walk-Forward Benchmark", expanded=False):
+                    st.caption(
+                        "Train on prior tournaments only and compare raw ownership, "
+                        "source consensus, base model, and final calibrated ownership."
+                    )
+                    benchmark_state_key = "dfs_ownership_walkforward_benchmark"
+                    benchmark_col1, benchmark_col2, benchmark_col3 = st.columns(3)
+                    max_benchmark_slates = max(1, len(all_dates))
+                    default_benchmark_slates = min(12, max_benchmark_slates)
+                    with benchmark_col1:
+                        benchmark_lookback_slates = st.slider(
+                            "Benchmark Slates",
+                            min_value=1,
+                            max_value=max_benchmark_slates,
+                            value=default_benchmark_slates,
+                            key="dfs_ownership_benchmark_lookback",
+                            help="Evaluate the most recent N slates while still training on all earlier history.",
+                        )
+                    with benchmark_col2:
+                        benchmark_min_train_rows = st.number_input(
+                            "Min Train Rows",
+                            min_value=25,
+                            max_value=5000,
+                            value=100,
+                            step=25,
+                            key="dfs_ownership_benchmark_min_train_rows",
+                        )
+                    with benchmark_col3:
+                        benchmark_min_test_rows = st.number_input(
+                            "Min Test Rows",
+                            min_value=5,
+                            max_value=500,
+                            value=10,
+                            step=5,
+                            key="dfs_ownership_benchmark_min_test_rows",
+                        )
+                    run_walkforward_benchmark = st.button(
+                        "Run Ownership Benchmark",
+                        key="dfs_run_ownership_walkforward_benchmark",
+                    )
+                    if run_walkforward_benchmark:
+                        import ownership_calibrator as oc
+
+                        with st.spinner("Running walk-forward ownership benchmark..."):
+                            benchmark_payload = oc.run_walkforward_ownership_benchmark(
+                                dfs_conn,
+                                min_train_rows=int(benchmark_min_train_rows),
+                                min_test_rows=int(benchmark_min_test_rows),
+                                max_slates=int(benchmark_lookback_slates),
+                            )
+                        benchmark_payload["__lookback_slates"] = int(benchmark_lookback_slates)
+                        benchmark_payload["__min_train_rows"] = int(benchmark_min_train_rows)
+                        benchmark_payload["__min_test_rows"] = int(benchmark_min_test_rows)
+                        st.session_state[benchmark_state_key] = benchmark_payload
+
+                    benchmark_payload = st.session_state.get(benchmark_state_key)
+                    benchmark_matches_selection = (
+                        isinstance(benchmark_payload, dict)
+                        and int(benchmark_payload.get("__lookback_slates", -1))
+                        == int(benchmark_lookback_slates)
+                        and int(benchmark_payload.get("__min_train_rows", -1))
+                        == int(benchmark_min_train_rows)
+                        and int(benchmark_payload.get("__min_test_rows", -1))
+                        == int(benchmark_min_test_rows)
+                    )
+                    if benchmark_matches_selection:
+                        if benchmark_payload.get("error"):
+                            st.warning(str(benchmark_payload.get("error")))
+                        else:
+                            benchmark_summary = benchmark_payload.get("summary") or {}
+                            benchmark_summary_df = benchmark_payload.get("summary_df")
+                            benchmark_per_slate_df = benchmark_payload.get("per_slate_df")
+                            benchmark_regime_df = benchmark_payload.get("regime_summary_df")
+                            benchmark_skipped_df = benchmark_payload.get("skipped_slates_df")
+
+                            def _benchmark_metric_value(
+                                df: Any,
+                                model_key: str,
+                                metric_key: str,
+                            ) -> Optional[float]:
+                                if not isinstance(df, pd.DataFrame) or df.empty:
+                                    return None
+                                if "model_key" not in df.columns or metric_key not in df.columns:
+                                    return None
+                                subset = df.loc[df["model_key"] == model_key, metric_key]
+                                if subset.empty:
+                                    return None
+                                return pd.to_numeric(subset, errors="coerce").iloc[0]
+
+                            raw_mae = _benchmark_metric_value(
+                                benchmark_summary_df, "raw_our", "mae"
+                            )
+                            final_mae = _benchmark_metric_value(
+                                benchmark_summary_df, "final_model", "mae"
+                            )
+                            raw_rank_corr = _benchmark_metric_value(
+                                benchmark_summary_df, "raw_our", "rank_correlation"
+                            )
+                            final_rank_corr = _benchmark_metric_value(
+                                benchmark_summary_df, "final_model", "rank_correlation"
+                            )
+
+                            bm1, bm2, bm3, bm4 = st.columns(4)
+                            bm1.metric(
+                                "Benchmarked Slates",
+                                str(int(benchmark_summary.get("benchmarked_slates") or 0)),
+                            )
+                            bm2.metric(
+                                "Prediction Rows",
+                                str(int(benchmark_summary.get("prediction_rows") or 0)),
+                            )
+                            bm3.metric(
+                                "Final MAE",
+                                f"{float(final_mae):.2f}"
+                                if final_mae is not None and pd.notna(final_mae)
+                                else "—",
+                                delta=(
+                                    f"{float(raw_mae) - float(final_mae):+.2f} vs raw"
+                                    if raw_mae is not None
+                                    and final_mae is not None
+                                    and pd.notna(raw_mae)
+                                    and pd.notna(final_mae)
+                                    else None
+                                ),
+                                delta_color="normal",
+                            )
+                            bm4.metric(
+                                "Final Rank Corr",
+                                f"{float(final_rank_corr):.3f}"
+                                if final_rank_corr is not None and pd.notna(final_rank_corr)
+                                else "—",
+                                delta=(
+                                    f"{float(final_rank_corr) - float(raw_rank_corr):+.3f} vs raw"
+                                    if raw_rank_corr is not None
+                                    and final_rank_corr is not None
+                                    and pd.notna(raw_rank_corr)
+                                    and pd.notna(final_rank_corr)
+                                    else None
+                                ),
+                                delta_color="normal",
+                            )
+
+                            if isinstance(benchmark_summary_df, pd.DataFrame) and not benchmark_summary_df.empty:
+                                summary_display = benchmark_summary_df[
+                                    [
+                                        "model_label",
+                                        "rows",
+                                        "slates",
+                                        "mae",
+                                        "rmse",
+                                        "rank_correlation",
+                                        "top10_capture_pct",
+                                        "top20_capture_pct",
+                                    ]
+                                ].copy()
+                                summary_display = summary_display.rename(
+                                    columns={
+                                        "model_label": "Model",
+                                        "rows": "Rows",
+                                        "slates": "Slates",
+                                        "mae": "MAE",
+                                        "rmse": "RMSE",
+                                        "rank_correlation": "Rank Corr",
+                                        "top10_capture_pct": "Top-10 Capture %",
+                                        "top20_capture_pct": "Top-20 Capture %",
+                                    }
+                                )
+                                for col in [
+                                    "MAE",
+                                    "RMSE",
+                                    "Rank Corr",
+                                    "Top-10 Capture %",
+                                    "Top-20 Capture %",
+                                ]:
+                                    summary_display[col] = pd.to_numeric(
+                                        summary_display[col], errors="coerce"
+                                    ).round(3)
+                                st.dataframe(summary_display, use_container_width=True, hide_index=True)
+
+                            if isinstance(benchmark_per_slate_df, pd.DataFrame) and not benchmark_per_slate_df.empty:
+                                benchmark_chart_df = benchmark_per_slate_df[
+                                    [
+                                        "slate_date",
+                                        "raw_our_mae",
+                                        "source_consensus_mae",
+                                        "final_model_mae",
+                                    ]
+                                ].rename(
+                                    columns={
+                                        "raw_our_mae": "Raw Our",
+                                        "source_consensus_mae": "Source Consensus",
+                                        "final_model_mae": "Final Model",
+                                    }
+                                )
+                                benchmark_chart_df = benchmark_chart_df.melt(
+                                    id_vars=["slate_date"],
+                                    var_name="Model",
+                                    value_name="MAE",
+                                ).dropna(subset=["MAE"])
+                                if not benchmark_chart_df.empty:
+                                    fig_ownership_benchmark = px.line(
+                                        benchmark_chart_df,
+                                        x="slate_date",
+                                        y="MAE",
+                                        color="Model",
+                                        markers=True,
+                                        title="Walk-Forward Ownership MAE by Slate",
+                                    )
+                                    fig_ownership_benchmark.update_layout(height=340)
+                                    st.plotly_chart(fig_ownership_benchmark, use_container_width=True)
+
+                                per_slate_display = benchmark_per_slate_df[
+                                    [
+                                        "slate_date",
+                                        "slate_size_bucket",
+                                        "train_rows",
+                                        "test_rows",
+                                        "source_coverage_pct",
+                                        "raw_our_mae",
+                                        "source_consensus_mae",
+                                        "final_model_mae",
+                                        "final_vs_raw_mae_improvement",
+                                    ]
+                                ].copy()
+                                per_slate_display = per_slate_display.rename(
+                                    columns={
+                                        "slate_date": "Slate",
+                                        "slate_size_bucket": "Slate Size",
+                                        "train_rows": "Train Rows",
+                                        "test_rows": "Test Rows",
+                                        "source_coverage_pct": "Source Coverage %",
+                                        "raw_our_mae": "Raw MAE",
+                                        "source_consensus_mae": "Source MAE",
+                                        "final_model_mae": "Final MAE",
+                                        "final_vs_raw_mae_improvement": "Final vs Raw",
+                                    }
+                                )
+                                for col in [
+                                    "Source Coverage %",
+                                    "Raw MAE",
+                                    "Source MAE",
+                                    "Final MAE",
+                                    "Final vs Raw",
+                                ]:
+                                    per_slate_display[col] = pd.to_numeric(
+                                        per_slate_display[col], errors="coerce"
+                                    ).round(3)
+                                st.dataframe(
+                                    per_slate_display,
+                                    use_container_width=True,
+                                    hide_index=True,
+                                )
+
+                            if isinstance(benchmark_regime_df, pd.DataFrame) and not benchmark_regime_df.empty:
+                                regime_display = benchmark_regime_df[
+                                    [
+                                        "slate_size_bucket",
+                                        "model_label",
+                                        "slates",
+                                        "rows",
+                                        "mae",
+                                        "rank_correlation",
+                                    ]
+                                ].copy()
+                                regime_display = regime_display.rename(
+                                    columns={
+                                        "slate_size_bucket": "Slate Size",
+                                        "model_label": "Model",
+                                        "slates": "Slates",
+                                        "rows": "Rows",
+                                        "mae": "MAE",
+                                        "rank_correlation": "Rank Corr",
+                                    }
+                                )
+                                for col in ["MAE", "Rank Corr"]:
+                                    regime_display[col] = pd.to_numeric(
+                                        regime_display[col], errors="coerce"
+                                    ).round(3)
+                                st.dataframe(regime_display, use_container_width=True, hide_index=True)
+
+                            if isinstance(benchmark_skipped_df, pd.DataFrame) and not benchmark_skipped_df.empty:
+                                st.caption("Skipped slates")
+                                st.dataframe(
+                                    benchmark_skipped_df,
+                                    use_container_width=True,
+                                    hide_index=True,
+                                )
+
                 if st.button("🔄 Update All Pending Slates", type="primary"):
                     if pending_dates:
                         with st.spinner(f"Updating {len(pending_dates)} slate(s)..."):
